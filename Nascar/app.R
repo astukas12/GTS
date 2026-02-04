@@ -15,8 +15,8 @@ library(shinycssloaders)
 library(shinyjs)
 
 # === SOURCE CORE FUNCTIONS ===
-source("~/GitHub/GTS/CoreFunctions/OptimalLineups_Core.R")
-source("~/GitHub/GTS/CoreFunctions/LineupBuilder_Core.R")
+source("OptimalLineups_Core.R")
+source("LineupBuilder_Core.R")
 source("nascar_config.R")
 
 # === GLOBAL CONSTANTS ===
