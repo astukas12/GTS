@@ -13,7 +13,7 @@ nascar_dk_optimal_config <- list(
   salary_cap = 50000,
   
   # Optimization settings
-  lineups_per_sim = 2,           # 2 lineups per sim (good balance)
+  lineups_per_sim = 3,           # 2 lineups per sim (good balance)
   
   # Performance settings
   progress_frequency = 500,      # Update every 500 sims
@@ -38,7 +38,7 @@ nascar_dk_optimal_config <- list(
 nascar_fd_optimal_config <- list(
   roster_size = 5,
   salary_cap = 50000,
-  lineups_per_sim = 2,
+  lineups_per_sim = 3,
   progress_frequency = 500,
   verbose = TRUE,
   use_parallel = TRUE,
