@@ -1,0 +1,512 @@
+/* ============================================
+   GOLDEN TICKET SIMS - UNIVERSAL THEME
+   Version: 2.0
+   Last Updated: January 2026
+   
+   Brand Colors: Black & Gold Only
+   NO BLUE. NO ORANGE. CONSISTENCY ACROSS ALL APPS.
+   ============================================ */
+
+/* === COLOR VARIABLES === */
+:root {
+  /* Brand Colors */
+  --gts-gold:         #FFD700;
+  --gts-black:        #000000;
+  --gts-white:        #FFFFFF;
+  --gts-dark-gold:    #DAA520;
+  --gts-darker-gold:  #B8860B;
+  
+  /* Backgrounds */
+  --gts-bg-primary:   #000000;
+  --gts-bg-secondary: #1a1a1a;
+  --gts-bg-tertiary:  #222222;
+  --gts-bg-hover:     #333333;
+  
+  /* Text */
+  --gts-text-primary:    #FFFFFF;
+  --gts-text-secondary:  #CCCCCC;
+  --gts-text-muted:      #888888;
+  --gts-text-on-gold:    #000000;
+  
+  /* Borders */
+  --gts-border:       #FFD700;
+  --gts-border-light: #444444;
+}
+
+/* === DASHBOARD HEADER === */
+.skin-blue .main-header {
+  background-color: var(--gts-bg-primary);
+  border-bottom: 3px solid var(--gts-gold);
+}
+
+.skin-blue .main-header .logo {
+  background-color: var(--gts-bg-primary);
+  color: var(--gts-gold);
+  font-weight: 900;
+  font-size: 24px;
+  border-right: 1px solid var(--gts-gold);
+}
+
+.skin-blue .main-header .logo:hover {
+  background-color: var(--gts-bg-hover);
+}
+
+.skin-blue .main-header .navbar {
+  background-color: var(--gts-bg-primary);
+}
+
+/* === SIDEBAR === */
+.skin-blue .left-side, 
+.skin-blue .main-sidebar, 
+.skin-blue .wrapper {
+  background-color: var(--gts-bg-tertiary);
+}
+
+.skin-blue .sidebar-menu > li > a {
+  color: var(--gts-gold);
+  font-weight: 500;
+  transition: all 0.2s ease;
+}
+
+.skin-blue .sidebar-menu > li.active > a,
+.skin-blue .sidebar-menu > li:hover > a {
+  color: var(--gts-white);
+  background-color: var(--gts-bg-hover);
+  border-left: 4px solid var(--gts-gold);
+  padding-left: 12px;
+}
+
+.skin-blue .sidebar-menu > li > a > .fa,
+.skin-blue .sidebar-menu > li > a > .glyphicon,
+.skin-blue .sidebar-menu > li > a > .ion {
+  color: var(--gts-gold);
+}
+
+/* === BOXES & CARDS === */
+.box {
+  background-color: var(--gts-bg-secondary);
+  border: 1px solid var(--gts-border-light);
+  box-shadow: 0 2px 4px rgba(255, 215, 0, 0.1);
+}
+
+.box.box-primary {
+  border-top: 3px solid var(--gts-gold);
+}
+
+.box.box-primary > .box-header {
+  background-color: var(--gts-bg-hover);
+  color: var(--gts-gold);
+  font-weight: 700;
+  border-bottom: 1px solid var(--gts-gold);
+}
+
+.box-header .box-title {
+  font-size: 18px;
+  font-weight: 700;
+}
+
+/* === BUTTONS === */
+.btn-primary {
+  background-color: var(--gts-gold);
+  border-color: var(--gts-dark-gold);
+  color: var(--gts-text-on-gold);
+  font-weight: 700;
+  transition: all 0.2s ease;
+}
+
+.btn-primary:hover, 
+.btn-primary:focus {
+  background-color: var(--gts-dark-gold);
+  border-color: var(--gts-darker-gold);
+  color: var(--gts-text-on-gold);
+  box-shadow: 0 0 10px rgba(255, 215, 0, 0.5);
+}
+
+.btn-primary:active {
+  background-color: var(--gts-darker-gold);
+}
+
+.btn-secondary {
+  background-color: var(--gts-bg-hover);
+  border-color: var(--gts-gold);
+  color: var(--gts-gold);
+  font-weight: 600;
+}
+
+.btn-secondary:hover {
+  background-color: var(--gts-gold);
+  color: var(--gts-text-on-gold);
+}
+
+/* === DATA TABLES === */
+.dataTables_wrapper {
+  background-color: var(--gts-bg-secondary);
+  color: var(--gts-text-primary);
+  padding: 15px;
+  border-radius: 4px;
+}
+
+/* Table Headers - GOLD BACKGROUND, BLACK TEXT */
+.dataTables_wrapper thead th {
+  background-color: var(--gts-gold);
+  color: var(--gts-text-on-gold);
+  font-weight: 700;
+  border-bottom: 2px solid var(--gts-darker-gold);
+  padding: 12px 8px;
+  text-align: center;
+}
+
+/* Table Rows */
+.dataTables_wrapper tbody tr {
+  background-color: var(--gts-bg-secondary);
+  color: var(--gts-text-primary);
+  transition: background-color 0.2s ease;
+}
+
+.dataTables_wrapper tbody tr:hover {
+  background-color: var(--gts-bg-hover);
+}
+
+.dataTables_wrapper tbody tr.even {
+  background-color: #1c1c1c;
+}
+
+.dataTables_wrapper tbody tr.even:hover {
+  background-color: var(--gts-bg-hover);
+}
+
+.dataTables_wrapper tbody td {
+  padding: 10px 8px;
+  border-bottom: 1px solid var(--gts-border-light);
+}
+
+/* Table Controls */
+.dataTables_wrapper .dataTables_length,
+.dataTables_wrapper .dataTables_filter,
+.dataTables_wrapper .dataTables_info,
+.dataTables_wrapper .dataTables_paginate {
+  color: var(--gts-text-primary);
+}
+
+.dataTables_wrapper .dataTables_filter input {
+  background-color: var(--gts-bg-hover);
+  border: 1px solid var(--gts-gold);
+  color: var(--gts-text-primary);
+  padding: 5px 10px;
+  border-radius: 4px;
+}
+
+/* === PAGINATION === */
+.pagination > .active > a, 
+.pagination > .active > span, 
+.pagination > .active > a:hover, 
+.pagination > .active > span:hover, 
+.pagination > .active > a:focus, 
+.pagination > .active > span:focus {
+  background-color: var(--gts-gold);
+  border-color: var(--gts-dark-gold);
+  color: var(--gts-text-on-gold);
+}
+
+.pagination > li > a,
+.pagination > li > span {
+  background-color: var(--gts-bg-hover);
+  border-color: var(--gts-border-light);
+  color: var(--gts-gold);
+}
+
+.pagination > li > a:hover,
+.pagination > li > span:hover {
+  background-color: var(--gts-bg-tertiary);
+  color: var(--gts-white);
+}
+
+/* === TABS === */
+.nav-tabs-custom {
+  background-color: var(--gts-bg-secondary);
+}
+
+.nav-tabs-custom > .nav-tabs {
+  border-bottom: 2px solid var(--gts-gold);
+}
+
+.nav-tabs-custom > .nav-tabs > li.active {
+  border-top: 3px solid var(--gts-gold);
+}
+
+.nav-tabs-custom > .nav-tabs > li.active > a {
+  background-color: var(--gts-bg-secondary);
+  color: var(--gts-gold);
+  font-weight: 700;
+}
+
+.nav-tabs-custom > .nav-tabs > li > a {
+  color: var(--gts-text-secondary);
+}
+
+.nav-tabs-custom > .nav-tabs > li > a:hover {
+  color: var(--gts-gold);
+  background-color: var(--gts-bg-hover);
+}
+
+/* === FORMS & INPUTS === */
+.form-control {
+  background-color: var(--gts-bg-hover);
+  border: 1px solid var(--gts-border-light);
+  color: var(--gts-text-primary);
+}
+
+.form-control:focus {
+  background-color: var(--gts-bg-secondary);
+  border-color: var(--gts-gold);
+  box-shadow: 0 0 5px rgba(255, 215, 0, 0.3);
+  color: var(--gts-text-primary);
+}
+
+.form-group label {
+  color: var(--gts-gold);
+  font-weight: 600;
+}
+
+/* === SLIDERS (shinyWidgets) === */
+.irs-bar,
+.irs-bar-edge {
+  background: var(--gts-gold);
+  border: 1px solid var(--gts-dark-gold);
+}
+
+.irs-single,
+.irs-from,
+.irs-to {
+  background: var(--gts-gold);
+  color: var(--gts-text-on-gold);
+  font-weight: 700;
+}
+
+.irs-line {
+  background: var(--gts-bg-hover);
+  border: 1px solid var(--gts-border-light);
+}
+
+.irs-slider {
+  background: var(--gts-gold);
+  border: 2px solid var(--gts-darker-gold);
+}
+
+/* === CHECKBOXES & RADIO BUTTONS === */
+input[type='checkbox']:checked, 
+input[type='radio']:checked {
+  background-color: var(--gts-gold);
+  border-color: var(--gts-dark-gold);
+}
+
+/* === SELECT INPUTS === */
+.selectize-input {
+  background-color: var(--gts-bg-hover);
+  border: 1px solid var(--gts-border-light);
+  color: var(--gts-text-primary);
+}
+
+.selectize-input.focus {
+  border-color: var(--gts-gold);
+}
+
+.selectize-dropdown {
+  background-color: var(--gts-bg-hover);
+  border: 1px solid var(--gts-gold);
+}
+
+.selectize-dropdown .option {
+  color: var(--gts-text-primary);
+}
+
+.selectize-dropdown .option:hover,
+.selectize-dropdown .option.active {
+  background-color: var(--gts-gold);
+  color: var(--gts-text-on-gold);
+}
+
+/* === LOADING SPINNERS === */
+.shiny-spinner .load-container .loader {
+  border-top-color: var(--gts-gold);
+  border-right-color: var(--gts-dark-gold);
+}
+
+/* === ALERTS & NOTIFICATIONS === */
+.alert-success {
+  background-color: rgba(255, 215, 0, 0.1);
+  border-color: var(--gts-gold);
+  color: var(--gts-gold);
+}
+
+.alert-warning {
+  background-color: rgba(218, 165, 32, 0.1);
+  border-color: var(--gts-dark-gold);
+  color: var(--gts-dark-gold);
+}
+
+.alert-danger {
+  background-color: rgba(255, 0, 0, 0.1);
+  border-color: #cc0000;
+  color: #ff3333;
+}
+
+.alert-info {
+  background-color: rgba(255, 215, 0, 0.05);
+  border-color: var(--gts-gold);
+  color: var(--gts-text-secondary);
+}
+
+/* === PROGRESS BARS === */
+.progress {
+  background-color: var(--gts-bg-hover);
+  border: 1px solid var(--gts-border-light);
+}
+
+.progress-bar {
+  background-color: var(--gts-gold);
+  background-image: linear-gradient(
+    45deg,
+    rgba(0, 0, 0, 0.1) 25%,
+    transparent 25%,
+    transparent 50%,
+    rgba(0, 0, 0, 0.1) 50%,
+    rgba(0, 0, 0, 0.1) 75%,
+    transparent 75%,
+    transparent
+  );
+}
+
+/* === VALUE BOXES === */
+.small-box {
+  background-color: var(--gts-bg-secondary);
+  border: 1px solid var(--gts-gold);
+}
+
+.small-box .icon {
+  color: rgba(255, 215, 0, 0.3);
+}
+
+.small-box h3,
+.small-box p {
+  color: var(--gts-text-primary);
+}
+
+.small-box:hover {
+  box-shadow: 0 0 15px rgba(255, 215, 0, 0.3);
+}
+
+/* === SCROLLBARS === */
+::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--gts-bg-tertiary);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--gts-gold);
+  border-radius: 6px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--gts-dark-gold);
+}
+
+/* === TOOLTIPS === */
+.tooltip-inner {
+  background-color: var(--gts-gold);
+  color: var(--gts-text-on-gold);
+  font-weight: 600;
+}
+
+.tooltip.top .tooltip-arrow {
+  border-top-color: var(--gts-gold);
+}
+
+.tooltip.right .tooltip-arrow {
+  border-right-color: var(--gts-gold);
+}
+
+.tooltip.bottom .tooltip-arrow {
+  border-bottom-color: var(--gts-gold);
+}
+
+.tooltip.left .tooltip-arrow {
+  border-left-color: var(--gts-gold);
+}
+
+/* === MODALS === */
+.modal-content {
+  background-color: var(--gts-bg-secondary);
+  border: 2px solid var(--gts-gold);
+}
+
+.modal-header {
+  background-color: var(--gts-bg-hover);
+  border-bottom: 2px solid var(--gts-gold);
+}
+
+.modal-title {
+  color: var(--gts-gold);
+  font-weight: 700;
+}
+
+.modal-body {
+  color: var(--gts-text-primary);
+}
+
+.modal-footer {
+  border-top: 1px solid var(--gts-border-light);
+}
+
+/* === CUSTOM: FILTERED POOL COUNT === */
+.gts-pool-count {
+  font-size: 32px;
+  font-weight: 900;
+  color: var(--gts-gold);
+  font-family: "Arial Black", sans-serif;
+  text-shadow: 0 0 10px rgba(255, 215, 0, 0.3);
+}
+
+/* === CUSTOM: BUILD LABELS === */
+.gts-build-label {
+  display: inline-block;
+  padding: 4px 12px;
+  background-color: var(--gts-gold);
+  color: var(--gts-text-on-gold);
+  font-weight: 700;
+  border-radius: 4px;
+  font-size: 12px;
+  margin-right: 8px;
+}
+
+/* === CUSTOM: DUPLICATE HIGHLIGHT === */
+.gts-duplicate-row {
+  background-color: rgba(255, 215, 0, 0.15);
+  border-left: 4px solid var(--gts-gold);
+}
+
+/* === CUSTOM: EXPOSURE BARS === */
+.gts-exposure-bar {
+  height: 20px;
+  background: linear-gradient(
+    90deg,
+    var(--gts-gold) 0%,
+    var(--gts-dark-gold) 100%
+  );
+  border-radius: 4px;
+  position: relative;
+}
+
+.gts-exposure-text {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--gts-text-on-gold);
+  font-weight: 700;
+  font-size: 12px;
+}
