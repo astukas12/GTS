@@ -198,116 +198,39 @@ ui <- dashboardPage(
       }
       
       /* ==================================================================
-         PORTFOLIO DROPDOWNS - IMPROVED VERSION
+         PORTFOLIO DROPDOWNS - MINIMAL STYLING
          ================================================================== */
       
-      /* Selectize container */
-      .selectize-control {
-        position: relative !important;
-      }
-      
-      /* Selectize input box */
+      /* Just style colors, don't mess with display/positioning */
       .selectize-input {
         background-color: #1e1e1e !important;
+        border: 1px solid #404040 !important;
         color: #ffffff !important;
-        border: 2px solid #404040 !important;
-        min-height: 38px !important;
-        max-height: 120px !important;
-        overflow-y: auto !important;
-        padding: 6px 12px !important;
-        cursor: text !important;
       }
       
-      /* When focused/active */
-      .selectize-input.focus,
-      .selectize-input.dropdown-active {
+      .selectize-input.focus {
         border-color: #FFE500 !important;
-        box-shadow: 0 0 0 2px rgba(255, 229, 0, 0.2) !important;
       }
       
-      /* Input field inside */
-      .selectize-input input {
-        background: transparent !important;
-        color: #ffffff !important;
-      }
-      
-      /* Selected items (gold pills) */
       .selectize-input .item {
         background: #FFE500 !important;
         color: #000000 !important;
-        padding: 4px 10px !important;
-        margin: 2px 4px 2px 0 !important;
-        border-radius: 4px !important;
-        font-size: 12px !important;
         font-weight: 600 !important;
-        display: inline-block !important;
       }
       
-      /* Remove button on items */
-      .selectize-input .item .remove {
-        color: #000000 !important;
-        font-weight: bold !important;
-        padding-left: 6px !important;
-        margin-left: 6px !important;
-        border-left: 1px solid rgba(0, 0, 0, 0.3) !important;
-        text-decoration: none !important;
-      }
-      
-      .selectize-input .item .remove:hover {
-        color: #D4B000 !important;
-      }
-      
-      /* Dropdown menu */
       .selectize-dropdown {
-        position: absolute !important;
         background: #1e1e1e !important;
-        border: 2px solid #FFE500 !important;
-        border-top: none !important;
-        max-height: 250px !important;
-        overflow-y: auto !important;
-        z-index: 10000 !important;
-        box-shadow: 0 4px 8px rgba(0, 0, 0, 0.5) !important;
+        border: 1px solid #FFE500 !important;
       }
       
-      /* Dropdown content wrapper */
-      .selectize-dropdown-content {
-        max-height: 248px !important;
-        overflow-y: auto !important;
-      }
-      
-      /* Options in dropdown */
       .selectize-dropdown .option {
-        background: #1e1e1e !important;
         color: #ffffff !important;
-        padding: 10px 12px !important;
-        cursor: pointer !important;
-        border-bottom: 1px solid #2d2d2d !important;
       }
       
-      /* Option hover/active */
       .selectize-dropdown .option:hover,
       .selectize-dropdown .option.active {
         background: #FFE500 !important;
         color: #000000 !important;
-      }
-      
-      /* Scrollbar in dropdown */
-      .selectize-dropdown-content::-webkit-scrollbar {
-        width: 8px !important;
-      }
-      
-      .selectize-dropdown-content::-webkit-scrollbar-track {
-        background: #1e1e1e !important;
-      }
-      
-      .selectize-dropdown-content::-webkit-scrollbar-thumb {
-        background: #FFE500 !important;
-        border-radius: 4px !important;
-      }
-      
-      /* Box for selected items scrolls if too many */
-      .selectize-input.has-items {
-        overflow-y: auto !important;
       }
       
       /* ==================================================================
@@ -1683,7 +1606,7 @@ server <- function(input, output, session) {
     )
   })
   
-
+  
   output$view_platform_ui <- renderUI({
     # Check which platforms have results
     platforms_ready <- c()
@@ -1871,8 +1794,48 @@ server <- function(input, output, session) {
                   # Column 3: Selection (smaller)
                   column(3,
                          h6("Selection", style = "color: #FFE500; font-weight: bold; margin: 0 0 8px 0; font-size: 13px;"),
-                         #uiOutput(paste0(tolower(platform), "_locked_ui")),
-                        # uiOutput(paste0(tolower(platform), "_excluded_ui")),
+                         
+                         # Locked Players - MMA app pattern
+                         selectizeInput(
+                           paste0(tolower(platform), "_locked_players"),
+                           "Locked:",
+                           choices = if(!is.null(rv[[paste0(tolower(platform), "_optimal_lineups")]])) {
+                             player_cols <- grep("^Player|^Captain|^MVP", 
+                                                 names(rv[[paste0(tolower(platform), "_optimal_lineups")]]), 
+                                                 value = TRUE)
+                             all_players <- unique(unlist(rv[[paste0(tolower(platform), "_optimal_lineups")]][, ..player_cols]))
+                             sort(all_players[!is.na(all_players) & all_players != ""])
+                           } else NULL,
+                           multiple = TRUE,
+                           selected = character(0),
+                           options = list(
+                             plugins = list('remove_button'),
+                             placeholder = 'Lock players (optional)',
+                             maxItems = 6
+                           ),
+                           width = "100%"
+                         ),
+                         
+                         # Excluded Players - MMA app pattern
+                         selectizeInput(
+                           paste0(tolower(platform), "_excluded_players"),
+                           "Exclude:",
+                           choices = if(!is.null(rv[[paste0(tolower(platform), "_optimal_lineups")]])) {
+                             player_cols <- grep("^Player|^Captain|^MVP", 
+                                                 names(rv[[paste0(tolower(platform), "_optimal_lineups")]]), 
+                                                 value = TRUE)
+                             all_players <- unique(unlist(rv[[paste0(tolower(platform), "_optimal_lineups")]][, ..player_cols]))
+                             sort(all_players[!is.na(all_players) & all_players != ""])
+                           } else NULL,
+                           multiple = TRUE,
+                           selected = character(0),
+                           options = list(
+                             plugins = list('remove_button'),
+                             placeholder = 'Exclude players'
+                           ),
+                           width = "100%"
+                         ),
+                         
                          h4(textOutput(paste0(tolower(platform), "_filtered_count")),
                             style = "text-align: center; color: #FFE500; font-weight: bold; margin-top: 10px; font-size: 18px;")
                   ),
@@ -2182,20 +2145,19 @@ server <- function(input, output, session) {
       plot_data <- as.data.frame(plot_data)
       plot_data$Name <- factor(plot_data$Name, levels = rev(ordered_drivers))
       
-      # Create violin plot - ALL GOLD, NO LEGEND
+      # Create box plot - GOLD COLOR, NO VIOLIN
       p <- plot_ly(
         data = plot_data,
         x = ~FinishPosition,
         y = ~Name,
-        type = "violin",
+        type = "box",
         orientation = "h",
-        fillcolor = "#FFE500",     # GOLD COLOR
+        marker = list(color = "#FFE500"),
         line = list(color = "#FFE500"),
-        box = list(visible = TRUE),
-        meanline = list(visible = TRUE),
+        fillcolor = "rgba(255, 229, 0, 0.3)",
         hovertemplate = paste(
           "<b>%{y}</b><br>",
-          "Position: %{x}<br>",
+          "Median: %{x}<br>",
           "<extra></extra>"
         )
       ) %>%
@@ -2222,7 +2184,7 @@ server <- function(input, output, session) {
           paper_bgcolor = "#121212",
           plot_bgcolor = "#1e1e1e",
           font = list(color = "#FFFFFF", size = 12),
-          showlegend = FALSE,    # NO LEGEND
+          showlegend = FALSE,
           height = 600,
           margin = list(l = 150, r = 50, t = 50, b = 50)
         ) %>%
@@ -2245,7 +2207,10 @@ server <- function(input, output, session) {
     })
   })
   
-
+  # ============================================================================
+  # CHART 2: DOMINATOR BY DRIVER - BOX AND WHISKER
+  # Replace output$dominator_violin_driver (around line 1920)
+  # ============================================================================
   
   output$dominator_violin_driver <- renderPlotly({
     req(rv$sport == "NASCAR", rv$full_sim_results, input$sim_results_platform)
@@ -2280,20 +2245,19 @@ server <- function(input, output, session) {
       plot_data$Name <- factor(plot_data$Name, levels = rev(driver_medians$Name))
       plot_data$DomPoints <- plot_data[[dom_col]]
       
-      # Create violin plot - ALL GOLD, NO LEGEND
+      # Create box plot - GOLD COLOR, NO VIOLIN
       p <- plot_ly(
         data = plot_data,
         x = ~DomPoints,
         y = ~Name,
-        type = "violin",
+        type = "box",
         orientation = "h",
-        fillcolor = "#FFE500",     # GOLD COLOR
+        marker = list(color = "#FFE500"),
         line = list(color = "#FFE500"),
-        box = list(visible = TRUE),
-        meanline = list(visible = TRUE),
+        fillcolor = "rgba(255, 229, 0, 0.3)",
         hovertemplate = paste(
           "<b>%{y}</b><br>",
-          "Dominator Points: %{x}<br>",
+          "Median: %{x}<br>",
           "<extra></extra>"
         )
       ) %>%
@@ -2318,7 +2282,7 @@ server <- function(input, output, session) {
           paper_bgcolor = "#121212",
           plot_bgcolor = "#1e1e1e",
           font = list(color = "#FFFFFF", size = 12),
-          showlegend = FALSE,    # NO LEGEND
+          showlegend = FALSE,
           height = 600,
           margin = list(l = 150, r = 50, t = 50, b = 50)
         ) %>%
