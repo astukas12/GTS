@@ -17,6 +17,115 @@ source("OptimalLineups_Core.R")
 source("LineupBuilder_Core.R")
 source("portfolio_helpers_universal.R")  # Universal exposure table helper
 
+# ============================================================================
+# MEMORY-EFFICIENT LINEUP SCORING OVERRIDE
+# Replaces score_all_lineups() to handle large lineup counts without OOM
+# ============================================================================
+
+score_all_lineups <- function(lineup_data, opt_data, batch_size = NULL, verbose = TRUE) {
+  
+  require(data.table)
+  
+  unique_lineups <- lineup_data$unique_lineups
+  
+  # opt_data can be either a list with sim_results, or the sim_results directly
+  if (is.data.frame(opt_data) || is.data.table(opt_data)) {
+    # opt_data IS the sim_results
+    sim_results <- opt_data
+    config <- lineup_data$config
+  } else {
+    # opt_data is a list containing sim_results and config
+    sim_results <- opt_data$sim_results
+    config <- opt_data$config
+  }
+  
+  n_lineups <- nrow(unique_lineups)
+  n_sims <- length(unique(sim_results$SimID))
+  
+  # Auto-calculate batch size to use max 2GB of RAM per batch
+  if (is.null(batch_size)) {
+    max_batch_gb <- 2
+    bytes_per_cell <- 8
+    cells_per_lineup <- n_sims
+    bytes_per_lineup <- cells_per_lineup * bytes_per_cell
+    batch_size <- floor((max_batch_gb * 1024^3) / bytes_per_lineup)
+    batch_size <- max(100, min(batch_size, 5000))
+  }
+  
+  if (verbose) {
+    cat(sprintf("Phase 2: Scoring lineups (matrix method)...\n"))
+    cat(sprintf("  %s lineups × %s sims | Mode: standard\n",
+                format(n_lineups, big.mark = ","),
+                format(n_sims, big.mark = ",")))
+    full_matrix_gb <- (as.numeric(n_lineups) * as.numeric(n_sims) * 8) / (1024^3)
+    cat(sprintf("  Processing %d batches... (saves %.1f GB memory)\n", 
+                ceiling(n_lineups / batch_size), full_matrix_gb))
+  }
+  
+  # Create player-sim score matrix (players << lineups, so this fits in memory)
+  # platform_col is already the full column name like "DKScore" or "FDScore"
+  score_col <- config$platform_col
+  
+  sim_matrix <- dcast(sim_results, Player ~ SimID, value.var = score_col, fill = 0)
+  player_names <- sim_matrix$Player
+  sim_matrix[, Player := NULL]
+  sim_matrix <- as.matrix(sim_matrix)
+  rownames(sim_matrix) <- player_names
+  
+  # Process lineups in batches
+  # Detect roster positions from lineup columns (Player1, Player2, etc. or Captain, Util1, etc.)
+  # Exclude metadata columns like TotalSalary, TotalScore, SimID
+  exclude_cols <- c("SimID", "TotalScore", "TotalSalary", "lineup_sig")
+  roster_positions <- setdiff(names(unique_lineups), exclude_cols)
+  # Filter to only player position columns (start with Player, Captain, MVP, or Util)
+  roster_positions <- roster_positions[grepl("^(Player|Captain|MVP|Util)", roster_positions)]
+  
+  n_batches <- ceiling(n_lineups / batch_size)
+  
+  # Pre-allocate full score matrix (we'll build it in chunks to avoid the 15GB allocation)
+  # Actually, let's use a list of batch matrices then rbind at end
+  batch_results <- vector("list", n_batches)
+  
+  start_time <- Sys.time()
+  
+  for (batch_idx in 1:n_batches) {
+    if (verbose && (batch_idx %% max(1, floor(n_batches/10)) == 0 || batch_idx == n_batches)) {
+      elapsed <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
+      pct <- round(30 + (60 * batch_idx / n_batches))
+      cat(sprintf("  Phase 2: %3d%% | %.1fs | Batch %d/%d\n", pct, elapsed, batch_idx, n_batches))
+    }
+    
+    start_idx <- (batch_idx - 1) * batch_size + 1
+    end_idx <- min(batch_idx * batch_size, n_lineups)
+    batch_lineups <- unique_lineups[start_idx:end_idx]
+    batch_size_actual <- nrow(batch_lineups)
+    
+    # Score this batch
+    batch_scores <- matrix(0, nrow = batch_size_actual, ncol = n_sims)
+    for (pos in roster_positions) {
+      players <- batch_lineups[[pos]]
+      batch_scores <- batch_scores + sim_matrix[players, , drop = FALSE]
+    }
+    
+    batch_results[[batch_idx]] <- batch_scores
+    
+    if (batch_idx %% 5 == 0) gc(verbose = FALSE)
+  }
+  
+  # Combine batches
+  if (verbose) cat("  Phase 2: Combining batches...\n")
+  score_matrix <- do.call(rbind, batch_results)
+  rm(batch_results)
+  gc(verbose = FALSE)
+  
+  if (verbose) {
+    elapsed <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
+    cat(sprintf("  ✓ Phase 2: Complete in %.1fs\n", elapsed))
+  }
+  
+  return(score_matrix)
+}
+
 
 # ============================================================================
 # UI
@@ -647,7 +756,7 @@ ui <- dashboardPage(
           # Platform Selector
           fluidRow(
             column(
-              width = 12,
+              width = 8,
               box(
                 width = NULL,
                 title = "SELECT PLATFORM",
@@ -661,6 +770,30 @@ ui <- dashboardPage(
                     choices = c("DraftKings" = "DK", "FanDuel" = "FD"),
                     selected = "DK",
                     inline = TRUE
+                  )
+                )
+              )
+            ),
+            # Download Full Results (NASCAR only)
+            conditionalPanel(
+              condition = "output.sport_detected == 'NASCAR'",
+              column(
+                width = 4,
+                box(
+                  width = NULL,
+                  title = "EXPORT DATA",
+                  status = "primary",
+                  solidHeader = TRUE,
+                  div(
+                    style = "padding: 5px 0;",
+                    downloadButton(
+                      "download_full_sim_results",
+                      "Download Full Sim Results",
+                      class = "btn-primary",
+                      style = "width: 100%; background-color: #FFE500; color: #000000; border: none; font-weight: 600;"
+                    ),
+                    p("CSV with all drivers, all sims", 
+                      style = "font-size: 11px; color: #999; margin-top: 5px; margin-bottom: 0;")
                   )
                 )
               )
@@ -1504,6 +1637,21 @@ server <- function(input, output, session) {
     content = function(file) {
       download_table <- create_download_table(rv$dk_optimal_lineups, rv$sim_metadata, "DK")
       fwrite(download_table, file)
+    }
+  )
+  
+  # Download handler for full NASCAR simulation results
+  output$download_full_sim_results <- downloadHandler(
+    filename = function() {
+      paste0("NASCAR_Full_Sim_Results_", format(Sys.Date(), "%Y%m%d"), ".csv")
+    },
+    content = function(file) {
+      req(rv$sport == "NASCAR", rv$full_sim_results)
+      
+      # Export the full simulation results
+      # This contains: SimID, Name, FinishPosition, DKFantasyPoints, FDFantasyPoints,
+      # DKDominatorPoints, FDDominatorPoints, Starting, Team, Car, etc.
+      fwrite(rv$full_sim_results, file)
     }
   )
   

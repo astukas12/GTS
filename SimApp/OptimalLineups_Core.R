@@ -41,6 +41,10 @@ find_optimal_lineups_standard <- function(sim_results, config, k = 3, verbose = 
   max_lineups <- if (!is.null(config$max_lineups)) config$max_lineups else Inf
   use_parallel <- if (!is.null(config$use_parallel)) config$use_parallel else TRUE
   
+  # OPTIMIZATION: Pre-filter to viable player pool per sim
+  # Default: top 15 scorers + top 15 value (pts per dollar)
+  player_pool_size <- if (!is.null(config$player_pool_size)) config$player_pool_size else 15
+  
   sim_ids <- unique(sim_results$SimID)
   n_sims <- length(sim_ids)
   
@@ -48,13 +52,41 @@ find_optimal_lineups_standard <- function(sim_results, config, k = 3, verbose = 
     cat(sprintf("  %s sims | top %d per sim | cap: %s\n",
                 format(n_sims, big.mark = ","), k,
                 if (is.finite(max_lineups)) format(max_lineups, big.mark = ",") else "none"))
+    cat(sprintf("  Player pool: top %d by score + top %d by value\n", 
+                player_pool_size, player_pool_size))
   }
   
   start_time <- Sys.time()
   
   # Helper function for one sim
-  find_top_k_for_sim <- function(sim_data, roster_size, salary_cap, k) {
+  find_top_k_for_sim <- function(sim_data, roster_size, salary_cap, k, pool_size) {
     n_players <- nrow(sim_data)
+    if (n_players < roster_size) return(NULL)
+    
+    # OPTIMIZATION: Filter to viable player pool
+    # Keep top scorers + top value players (union, not intersection)
+    if (n_players > pool_size * 2) {
+      # Calculate value efficiently: points per $1000
+      value <- sim_data$FantasyPoints / sim_data$Salary * 1000
+      
+      # Get top players by score
+      # Use order() instead of partial sort (works in parallel)
+      top_score_indices <- head(order(sim_data$FantasyPoints, decreasing = TRUE), pool_size)
+      top_by_score <- sim_data$Player[top_score_indices]
+      
+      # Get top players by value
+      top_value_indices <- head(order(value, decreasing = TRUE), pool_size)
+      top_by_value <- sim_data$Player[top_value_indices]
+      
+      # Union of both
+      viable_players <- unique(c(top_by_score, top_by_value))
+      
+      # Filter sim_data to viable pool
+      sim_data <- sim_data[Player %in% viable_players]
+      
+      n_players <- nrow(sim_data)
+    }
+    
     if (n_players < roster_size) return(NULL)
     
     objective <- sim_data$FantasyPoints
@@ -129,13 +161,13 @@ find_optimal_lineups_standard <- function(sim_results, config, k = 3, verbose = 
       library(data.table)
       library(lpSolve)
     })
-    clusterExport(cl, c("find_top_k_for_sim", "roster_size", "salary_cap", "k"), 
+    clusterExport(cl, c("find_top_k_for_sim", "roster_size", "salary_cap", "k", "player_pool_size"), 
                   envir = environment())
     clusterExport(cl, "sim_results", envir = environment())
     
     all_lineups <- parLapply(cl, sim_ids, function(sid) {
       sim_data <- sim_results[SimID == sid]
-      find_top_k_for_sim(sim_data, roster_size, salary_cap, k)
+      find_top_k_for_sim(sim_data, roster_size, salary_cap, k, player_pool_size)
     })
     
     stopCluster(cl)
@@ -148,7 +180,7 @@ find_optimal_lineups_standard <- function(sim_results, config, k = 3, verbose = 
       sim_id <- sim_ids[i]
       sim_data <- sim_results[SimID == sim_id]
       
-      sim_lineups <- find_top_k_for_sim(sim_data, roster_size, salary_cap, k)
+      sim_lineups <- find_top_k_for_sim(sim_data, roster_size, salary_cap, k, player_pool_size)
       
       if (!is.null(sim_lineups) && nrow(sim_lineups) > 0) {
         all_lineups[[length(all_lineups) + 1]] <- sim_lineups
@@ -617,11 +649,20 @@ score_all_lineups <- function(lineup_data, sim_results, verbose = TRUE, sims_per
   config <- lineup_data$config
   mode <- lineup_data$mode
   
+  # MEMORY CHECK: Calculate if we can fit full matrix in memory (assume 4GB available)
+  # Use as.numeric() to avoid integer overflow for large matrices
+  matrix_size_gb <- (as.numeric(n_lineups) * as.numeric(n_sims) * 8) / (1024^3)
+  use_efficient_mode <- matrix_size_gb > 4
+  
   if (verbose) {
     cat(sprintf("  %s lineups × %s sims | Mode: %s\n",
                 format(n_lineups, big.mark = ","),
                 format(n_sims, big.mark = ","),
                 mode))
+    
+    if (use_efficient_mode) {
+      cat(sprintf("  Memory-efficient: %.1f GB needed, using rank accumulation\n", matrix_size_gb))
+    }
   }
   
   start_time <- Sys.time()
@@ -681,6 +722,128 @@ score_all_lineups <- function(lineup_data, sim_results, verbose = TRUE, sims_per
                 elapsed, n_batches))
     flush.console()
   }
+  
+  # ============================================================================
+  # MEMORY-EFFICIENT MODE: Accumulate ranks instead of storing full matrix
+  # ============================================================================
+  
+  if (use_efficient_mode) {
+    # Initialize counters
+    percentiles_config <- c(0.01, 0.05, 0.10, 0.20)
+    win_counts <- rep(0, n_lineups)
+    top_counts <- matrix(0, nrow = n_lineups, ncol = length(percentiles_config))
+    
+    sims_processed <- 0
+    
+    for (batch_idx in 1:n_batches) {
+      sim_start <- (batch_idx - 1) * sims_per_batch + 1
+      sim_end <- min(batch_idx * sims_per_batch, n_sims)
+      batch_sim_ids <- sim_start:sim_end
+      n_batch_sims <- length(batch_sim_ids)
+      
+      batch_score_matrix <- matrix(0, nrow = n_batch_sims, ncol = length(all_players))
+      
+      for (player_idx in seq_along(all_players)) {
+        player_name <- all_players[player_idx]
+        player_data <- sim_score_list[[player_name]]
+        
+        matching_sims <- player_data[J(batch_sim_ids), nomatch = 0]
+        if (nrow(matching_sims) > 0) {
+          row_indices <- matching_sims$SimID - sim_start + 1
+          batch_score_matrix[row_indices, player_idx] <- matching_sims$Score
+        }
+      }
+      
+      # Calculate lineup scores for this batch: lineups × sims
+      batch_lineup_scores <- lineup_matrix %*% t(batch_score_matrix)
+      
+      # ======================================================================
+      # OPTIMIZATION: Vectorized batch ranking with partial sorting
+      # Instead of ranking each sim individually, process in mini-batches
+      # ======================================================================
+      
+      # Process sims in mini-batches for vectorization
+      rank_batch_size <- 100  # Process 100 sims at once
+      n_rank_batches <- ceiling(n_batch_sims / rank_batch_size)
+      
+      for (rank_batch_idx in 1:n_rank_batches) {
+        rb_start <- (rank_batch_idx - 1) * rank_batch_size + 1
+        rb_end <- min(rank_batch_idx * rank_batch_size, n_batch_sims)
+        rb_size <- rb_end - rb_start + 1
+        
+        # Get scores for this mini-batch: lineups × mini_batch_sims
+        mini_batch_scores <- batch_lineup_scores[, rb_start:rb_end, drop = FALSE]
+        
+        # VECTORIZED: Find max scores across all sims in mini-batch
+        max_scores <- apply(mini_batch_scores, 2, max)
+        
+        # VECTORIZED: Accumulate win counts (lineups that equal max in each sim)
+        win_matrix <- sweep(mini_batch_scores, 2, max_scores, "==")
+        win_counts <- win_counts + rowSums(win_matrix)
+        
+        # PARTIAL SORTING: For each percentile, find threshold and count
+        # This is faster than full ranking
+        for (p_idx in seq_along(percentiles_config)) {
+          threshold_rank <- ceiling(n_lineups * percentiles_config[p_idx])
+          
+          # For each sim in mini-batch, use partial sort to find top threshold_rank
+          for (sim_offset in 1:rb_size) {
+            sim_scores <- mini_batch_scores[, sim_offset]
+            
+            if (threshold_rank < n_lineups) {
+              # Sort and get threshold value
+              sorted_scores <- sort(sim_scores, decreasing = TRUE)
+              threshold_score <- sorted_scores[threshold_rank]
+              # Count lineups >= threshold (handles ties correctly)
+              top_counts[, p_idx] <- top_counts[, p_idx] + (sim_scores >= threshold_score)
+            } else {
+              # If threshold_rank >= n_lineups, all lineups qualify
+              top_counts[, p_idx] <- top_counts[, p_idx] + 1
+            }
+          }
+        }
+        
+        sims_processed <- sims_processed + rb_size
+      }
+      
+      if (verbose) {
+        pct <- 30 + ((sims_processed / n_sims) * 60)
+        elapsed <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
+        
+        if (sims_processed < n_sims) {
+          rate <- sims_processed / elapsed
+          eta <- (n_sims - sims_processed) / rate
+          cat(sprintf("\r  Phase 2: %.0f%% | %.1fs | ETA: %.0fs", pct, elapsed, eta))
+        } else {
+          cat(sprintf("\r  Phase 2: 90%% | %.1fs | Finalizing...", elapsed))
+        }
+        flush.console()
+      }
+      
+      rm(batch_score_matrix, batch_lineup_scores)
+      gc(verbose = FALSE)
+    }
+    
+    if (verbose) {
+      cat("\n")
+      elapsed_time <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
+      cat(sprintf("  ✓ Phase 2: %.1fs (memory-efficient)\n", elapsed_time))
+    }
+    
+    # Return accumulated counts
+    return(list(
+      win_counts = win_counts,
+      top_counts = top_counts,
+      percentiles_config = percentiles_config,
+      mode = "efficient",
+      n_lineups = n_lineups,
+      n_sims = n_sims
+    ))
+  }
+  
+  # ============================================================================
+  # STANDARD MODE: Store full score matrix
+  # ============================================================================
   
   score_matrix <- matrix(0, nrow = n_lineups, ncol = n_sims)
   
@@ -751,53 +914,108 @@ calculate_distribution_metrics <- function(score_matrix, lineup_data, config,
   
   start_time <- Sys.time()
   
-  percentiles <- config$percentiles
+  # ============================================================================
+  # CHECK FORMAT: Efficient (pre-calculated counts) or Standard (full matrix)
+  # ============================================================================
   
-  if (verbose) {
-    cat("  Phase 3: 20%% | Calculating rankings...\n")
-    flush.console()
-  }
+  is_efficient <- is.list(score_matrix) && !is.null(score_matrix$mode) && 
+    score_matrix$mode == "efficient"
   
-  # Calculate Top %
-  top_pcts <- matrix(0, nrow = n_lineups, ncol = length(percentiles))
-  chunk_size <- max(1, floor(n_sims / 5))
-  
-  for (chunk_start in seq(1, n_sims, by = chunk_size)) {
-    chunk_end <- min(chunk_start + chunk_size - 1, n_sims)
+  if (is_efficient) {
+    # EFFICIENT PATH: Use pre-calculated win/top counts
+    if (verbose) {
+      cat("  Using pre-calculated ranks (memory-efficient mode)\n")
+    }
     
-    for (i in chunk_start:chunk_end) {
-      sim_scores <- score_matrix[, i]
-      sim_rank <- rank(-sim_scores, ties.method = "min")
+    win_counts <- score_matrix$win_counts
+    top_counts <- score_matrix$top_counts
+    percentiles_config <- score_matrix$percentiles_config
+    
+    win_rate <- (win_counts / n_sims) * 100
+    top_pcts <- (top_counts / n_sims) * 100
+    
+  } else {
+    # STANDARD PATH: Calculate from full matrix
+    percentiles <- config$percentiles
+    
+    if (verbose) {
+      cat("  Phase 3: 20%% | Calculating rankings...\n")
+      flush.console()
+    }
+    
+    # Calculate Top % - OPTIMIZED with partial sorting
+    top_pcts <- matrix(0, nrow = n_lineups, ncol = length(percentiles))
+    
+    # Process in larger chunks with vectorization
+    chunk_size <- 1000  # Process 1000 sims at once
+    n_chunks <- ceiling(n_sims / chunk_size)
+    
+    if (verbose) {
+      cat(sprintf("  Phase 3: 20%% | Calculating rankings (vectorized)...\n"))
+      flush.console()
+    }
+    
+    for (chunk_idx in 1:n_chunks) {
+      chunk_start <- (chunk_idx - 1) * chunk_size + 1
+      chunk_end <- min(chunk_idx * chunk_size, n_sims)
+      chunk_sims <- chunk_start:chunk_end
+      n_chunk_sims <- length(chunk_sims)
       
+      # Get scores for this chunk: lineups × chunk_sims
+      chunk_scores <- score_matrix[, chunk_sims, drop = FALSE]
+      
+      # VECTORIZED win rate accumulation
+      max_scores <- apply(chunk_scores, 2, max)
+      win_matrix <- sweep(chunk_scores, 2, max_scores, "==")
+      if (chunk_idx == 1) {
+        win_counts_accum <- rowSums(win_matrix)
+      } else {
+        win_counts_accum <- win_counts_accum + rowSums(win_matrix)
+      }
+      
+      # Top% - use sort without partial parameter
       for (p_idx in seq_along(percentiles)) {
         threshold_rank <- ceiling(n_lineups * percentiles[p_idx])
-        top_pcts[, p_idx] <- top_pcts[, p_idx] + (sim_rank <= threshold_rank)
+        
+        # Process each sim in chunk
+        for (sim_offset in 1:n_chunk_sims) {
+          sim_scores <- chunk_scores[, sim_offset]
+          
+          if (threshold_rank < n_lineups) {
+            # Sort and get the threshold value
+            sorted_scores <- sort(sim_scores, decreasing = TRUE)
+            threshold_score <- sorted_scores[threshold_rank]
+            top_pcts[, p_idx] <- top_pcts[, p_idx] + (sim_scores >= threshold_score)
+          } else {
+            top_pcts[, p_idx] <- top_pcts[, p_idx] + 1
+          }
+        }
+      }
+      
+      if (verbose && chunk_idx < n_chunks) {
+        pct_done <- (chunk_end / n_sims) * 40 + 20
+        cat(sprintf("\r  Phase 3: %.0f%% | Ranking sims...", pct_done))
+        flush.console()
       }
     }
     
-    if (verbose && chunk_end < n_sims) {
-      pct_done <- (chunk_end / n_sims) * 40 + 20
-      cat(sprintf("\r  Phase 3: %.0f%% | Ranking sims...", pct_done))
+    top_pcts <- (top_pcts / n_sims) * 100
+    win_rate <- (win_counts_accum / n_sims) * 100
+    
+    if (verbose) {
+      elapsed <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
+      cat(sprintf("\r  Phase 3: 60%% | %.1fs | Rankings complete\n", elapsed))
       flush.console()
     }
   }
   
-  top_pcts <- (top_pcts / n_sims) * 100
+  # ============================================================================
+  # OWNERSHIP CALCULATION - VECTORIZED for massive speedup
+  # ============================================================================
   
   if (verbose) {
     elapsed <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
-    cat(sprintf("\r  Phase 3: 60%% | %.1fs | Calculating win rates...\n", elapsed))
-    flush.console()
-  }
-  
-  # Win rate
-  max_scores <- apply(score_matrix, 2, max)
-  win_counts <- rowSums(sweep(score_matrix, 2, max_scores, "=="))
-  win_rate <- (win_counts / n_sims) * 100
-  
-  if (verbose) {
-    elapsed <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
-    cat(sprintf("  Phase 3: 70%% | %.1fs | Calculating ownership...\n", elapsed))
+    cat(sprintf("  Phase 3: 70%% | %.1fs | Calculating ownership (vectorized)...\n", elapsed))
     flush.console()
   }
   
@@ -838,28 +1056,73 @@ calculate_distribution_metrics <- function(score_matrix, lineup_data, config,
         own_col <- "FDOwn"
       }
       
-      for (i in 1:n_lineups) {
-        players <- as.character(unique_lineups[i, ..player_cols])
+      # ====================================================================
+      # VECTORIZED OWNERSHIP CALCULATION
+      # Instead of looping through lineups, create ownership lookup matrix
+      # ====================================================================
+      
+      # Create fast lookup: player name -> ownership
+      setkey(ownership_data, Player)
+      
+      # Extract all players from all lineups into matrix form
+      # This creates a lineups × positions matrix of player names
+      player_matrix <- as.matrix(unique_lineups[, ..player_cols])
+      
+      # Vectorized lookup: replace player names with ownership values
+      # Using match() which is very fast
+      all_players_flat <- as.vector(player_matrix)
+      ownership_lookup <- ownership_data[[own_col]]
+      names(ownership_lookup) <- ownership_data$Player
+      
+      # Get ownership for all players in all lineups (vectorized)
+      ownership_flat <- ownership_lookup[all_players_flat]
+      ownership_flat[is.na(ownership_flat)] <- 0  # Handle missing players
+      
+      # Reshape back to matrix: lineups × positions
+      ownership_matrix <- matrix(ownership_flat, nrow = n_lineups, ncol = length(player_cols))
+      
+      # Apply multipliers (for Captain/MVP modes)
+      multiplier_matrix <- matrix(rep(multipliers, each = n_lineups), nrow = n_lineups)
+      weighted_ownership <- ownership_matrix * multiplier_matrix
+      
+      # CUMULATIVE OWNERSHIP: Just sum across positions (vectorized!)
+      cumulative_own <- rowSums(weighted_ownership)
+      
+      # GEOMETRIC MEAN OWNERSHIP: 
+      # Geometric mean = exp(mean(log(x))) for x > 0
+      # Handle zeros and NAs properly
+      
+      # Replace zeros with NA for geometric mean calculation
+      ownership_for_geomean <- ownership_matrix
+      ownership_for_geomean[ownership_for_geomean <= 0] <- NA
+      
+      # For positions with multipliers > 1, replicate the ownership values
+      if (any(multipliers > 1)) {
+        # Create expanded matrix for geometric mean (accounts for multipliers)
+        max_mult <- max(multipliers)
+        expanded_cols <- sum(multipliers)
+        expanded_ownership <- matrix(NA, nrow = n_lineups, ncol = expanded_cols)
         
-        for (j in seq_along(players)) {
-          player_own <- ownership_data[Player == players[j], get(own_col)]
-          
-          if (length(player_own) > 0 && !is.na(player_own)) {
-            cumulative_own[i] <- cumulative_own[i] + (player_own * multipliers[j])
+        col_idx <- 1
+        for (pos_idx in seq_along(player_cols)) {
+          mult <- multipliers[pos_idx]
+          own_vals <- ownership_matrix[, pos_idx]
+          for (m in 1:mult) {
+            expanded_ownership[, col_idx] <- own_vals
+            col_idx <- col_idx + 1
           }
         }
-        
-        # Geometric mean
-        all_owns <- sapply(seq_along(players), function(j) {
-          own <- ownership_data[Player == players[j], get(own_col)]
-          if (length(own) > 0 && !is.na(own)) rep(own, multipliers[j]) else NULL
-        })
-        all_owns <- unlist(all_owns)
-        all_owns_safe <- all_owns[!is.na(all_owns) & all_owns > 0]
-        if (length(all_owns_safe) > 0) {
-          geometric_own[i] <- exp(mean(log(all_owns_safe)))
-        }
+        ownership_for_geomean <- expanded_ownership
       }
+      
+      # Calculate geometric mean: exp(mean(log(x))) for each lineup
+      # Use rowMeans with na.rm=TRUE to handle NAs
+      log_ownership <- log(ownership_for_geomean)
+      mean_log_ownership <- rowMeans(log_ownership, na.rm = TRUE)
+      geometric_own <- exp(mean_log_ownership)
+      
+      # Handle cases where all values were NA/zero
+      geometric_own[is.na(geometric_own) | is.infinite(geometric_own)] <- 0
     }
   }
   
