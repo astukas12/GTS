@@ -22,15 +22,35 @@ run_nascar_simulation <- function(input_data, n_sims, config, progress_callback 
   race_weights <- as.data.table(input_data$Race_Weights)
   race_profiles <- as.data.table(input_data$Race_Profiles)
   
-  # Validate required columns (using your actual column names)
-  required_cols <- c("Name", "W", "T3", "T5", "T10", "T15", "T20", "T25", "T30",
-                     "DKSalary", "DKID", "DKOP", "DKMax",  # DKOP not DKOwn
-                     "FDSalary", "FDID", "FDName", "FDOP", "FDMax",  # FDOP not FDOwn
-                     "Starting", "team", "car")  # lowercase team and car
+  # Validate required columns
+  # Core columns (always required)
+  core_required <- c("Name", "W", "T3", "T5", "T10", "T15", "T20", "T25", "T30",
+                     "Starting", "team", "car")
   
+  # DraftKings columns (always required since you always have DK data)
+  dk_required <- c("DKSalary", "DKID", "DKOP", "DKMax")
+  
+  # FanDuel columns (optional - not all races have FD contests)
+  fd_optional <- c("FDSalary", "FDID", "FDName", "FDOP", "FDMax")
+  
+  # Check for missing core and DK columns
+  required_cols <- c(core_required, dk_required)
   missing_cols <- setdiff(required_cols, names(driver_data))
   if (length(missing_cols) > 0) {
     stop("Missing required columns in Driver sheet: ", paste(missing_cols, collapse = ", "))
+  }
+  
+  # Check if FanDuel data is present
+  has_fd <- all(fd_optional %in% names(driver_data))
+  
+  if (!has_fd) {
+    cat("Note: FanDuel columns not found - FD scoring will be skipped\n")
+    # Add placeholder FD columns so the rest of the code doesn't break
+    driver_data[, FDSalary := 0]
+    driver_data[, FDID := ""]
+    driver_data[, FDName := Name]
+    driver_data[, FDOP := 0]
+    driver_data[, FDMax := 0]
   }
   
   # Rename columns to standardize (DKOP -> DKOwn, team -> Team, car -> Car)
@@ -46,7 +66,8 @@ run_nascar_simulation <- function(input_data, n_sims, config, progress_callback 
   cat(sprintf("\n[NASCAR SIMULATION]\n"))
   cat(sprintf("Drivers: %d\n", nrow(driver_data)))
   cat(sprintf("Simulations: %s\n", format(n_sims, big.mark = ",")))
-  cat(sprintf("Race Profiles: %d\n\n", nrow(race_profiles)))
+  cat(sprintf("Race Profiles: %d\n", nrow(race_profiles)))
+  cat(sprintf("Platforms: DK%s\n\n", ifelse(has_fd, " + FD", " only")))
   
   # ========================================================================
   # STEP 1: Simulate Finish Positions
@@ -99,7 +120,7 @@ run_nascar_simulation <- function(input_data, n_sims, config, progress_callback 
       }
     }
     
-    # Create race result for this simulation
+    # Create race result for this simulation (DK data always included)
     race_result <- data.table(
       SimID = sim_id,
       Name = driver_data$Name,
@@ -109,14 +130,18 @@ run_nascar_simulation <- function(input_data, n_sims, config, progress_callback 
       DKID = driver_data$DKID,
       DKOwn = driver_data$DKOwn,
       DKMax = driver_data$DKMax,
-      FDSalary = driver_data$FDSalary,
-      FDID = driver_data$FDID,
-      FDName = driver_data$FDName,
-      FDOwn = driver_data$FDOwn,
-      FDMax = driver_data$FDMax,
       Team = driver_data$Team,
       Car = driver_data$Car
     )
+    
+    # Add FD data only if present
+    if (has_fd) {
+      race_result[, FDSalary := driver_data$FDSalary]
+      race_result[, FDID := driver_data$FDID]
+      race_result[, FDName := driver_data$FDName]
+      race_result[, FDOwn := driver_data$FDOwn]
+      race_result[, FDMax := driver_data$FDMax]
+    }
     
     # Pre-allocate space for columns that will be added
     setalloccol(race_result)
@@ -125,12 +150,16 @@ run_nascar_simulation <- function(input_data, n_sims, config, progress_callback 
     race_result <- assign_dominator_points_from_profiles_cached(
       race_result, race_weights, race_profiles_by_race, "DK"
     )
-    race_result <- assign_dominator_points_from_profiles_cached(
-      race_result, race_weights, race_profiles_by_race, "FD"
-    )
+    
+    # Only calculate FD dominator points if FD data is present
+    if (has_fd) {
+      race_result <- assign_dominator_points_from_profiles_cached(
+        race_result, race_weights, race_profiles_by_race, "FD"
+      )
+    }
     
     # Calculate total fantasy points
-    race_result <- calculate_fantasy_points(race_result, scoring_systems)
+    race_result <- calculate_fantasy_points(race_result, scoring_systems, has_fd)
     
     all_results[[sim_id]] <- race_result
   }
@@ -190,7 +219,8 @@ run_nascar_simulation <- function(input_data, n_sims, config, progress_callback 
   return(list(
     sim_results = sim_results,      # Summary for optimization
     metadata = metadata,             # Player metadata  
-    full_results = combined_results  # Full data for visualizations
+    full_results = combined_results, # Full data for visualizations
+    has_fd = has_fd                  # Flag indicating if FD data was present
   ))
 }
 
@@ -324,8 +354,12 @@ assign_dominator_points_from_profiles <- function(race_result, race_weights,
   dom_col <- paste0(platform, "DomPoints")
   max_col <- paste0(platform, "Max")
   
+  # Check if dominator column exists (FD might not be present)
   if (!dom_col %in% names(profiles)) {
-    stop("Missing column: ", dom_col, " in Race_Profiles")
+    # No dominator points for this platform - assign 0 points
+    col_name <- paste0(platform, "DominatorPoints")
+    set(race_result, j = col_name, value = 0)
+    return(race_result)
   }
   
   # Calculate distances (vectorized)
@@ -383,9 +417,9 @@ create_scoring_system <- function() {
 
 
 #' Calculate total fantasy points
-calculate_fantasy_points <- function(race_result, scoring_systems) {
+calculate_fantasy_points <- function(race_result, scoring_systems, has_fd = TRUE) {
   
-  # DraftKings
+  # DraftKings (always calculated)
   dk_finish_points <- scoring_systems$DK$Points[race_result$FinishPosition]
   dk_position_diff <- race_result$Starting - race_result$FinishPosition
   
@@ -393,13 +427,18 @@ calculate_fantasy_points <- function(race_result, scoring_systems) {
   set(race_result, j = "DKFantasyPoints", 
       value = dk_finish_points + race_result$DKDominatorPoints + dk_position_diff)
   
-  # FanDuel
-  fd_finish_points <- scoring_systems$FD$Points[race_result$FinishPosition]
-  fd_position_diff <- race_result$Starting - race_result$FinishPosition
-  
-  # Use set() instead of := to avoid internal reference warnings
-  set(race_result, j = "FDFantasyPoints", 
-      value = fd_finish_points + race_result$FDDominatorPoints + fd_position_diff)
+  # FanDuel (only if has_fd is TRUE)
+  if (has_fd) {
+    fd_finish_points <- scoring_systems$FD$Points[race_result$FinishPosition]
+    fd_position_diff <- race_result$Starting - race_result$FinishPosition
+    
+    # Use set() instead of := to avoid internal reference warnings
+    set(race_result, j = "FDFantasyPoints", 
+        value = fd_finish_points + race_result$FDDominatorPoints + fd_position_diff)
+  } else {
+    # Set FD fantasy points to 0 when not available
+    set(race_result, j = "FDFantasyPoints", value = 0)
+  }
   
   return(race_result)
 }
@@ -1016,8 +1055,12 @@ assign_dominator_points_from_profiles_cached <- function(race_result, race_weigh
   dom_col <- paste0(platform, "DomPoints")
   max_col <- paste0(platform, "Max")
   
+  # Check if dominator column exists (FD might not be present)
   if (!dom_col %in% names(profiles)) {
-    stop("Missing column: ", dom_col, " in Race_Profiles")
+    # No dominator points for this platform - assign 0 points
+    col_name <- paste0(platform, "DominatorPoints")
+    set(race_result, j = col_name, value = 0)
+    return(race_result)
   }
   
   # Calculate distances (vectorized)
@@ -1129,4 +1172,3 @@ get_full_nascar_simulation_data <- function(input_data, n_sims, config) {
   
   return(combined_results)
 }
-

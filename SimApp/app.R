@@ -818,10 +818,20 @@ server <- function(input, output, session) {
       })
       
       output$platforms_display <- renderText({
-        platform_names <- sapply(rv$config$platforms, function(p) {
-          switch(p, "DK" = "DraftKings", "FD" = "FanDuel", "SD" = "Showdown")
-        })
-        paste(platform_names, collapse = ", ")
+        # For NASCAR, show actual detected platforms after simulation runs
+        if (rv$sport == "NASCAR" && !is.null(rv$has_fd)) {
+          if (rv$has_fd) {
+            "DraftKings, FanDuel"
+          } else {
+            "DraftKings"
+          }
+        } else {
+          # For other sports or before NASCAR simulation, show config platforms
+          platform_names <- sapply(rv$config$platforms, function(p) {
+            switch(p, "DK" = "DraftKings", "FD" = "FanDuel", "SD" = "Showdown")
+          })
+          paste(platform_names, collapse = ", ")
+        }
       })
       
       # AUTO-LOAD DATA (no button needed)
@@ -941,10 +951,13 @@ server <- function(input, output, session) {
       rv$simulation_results <- result$sim_results
       rv$sim_metadata <- result$metadata
       
+      # Store platform availability (for NASCAR)
       if (rv$sport == "NASCAR") {
         rv$full_sim_results <- result$full_results
+        rv$has_fd <- if (!is.null(result$has_fd)) result$has_fd else TRUE
       } else {
         rv$full_sim_results <- NULL
+        rv$has_fd <- TRUE  # Other sports default to having all platforms
       }
       
       cat("Stored simulation results with", nrow(rv$simulation_results), "rows\n")
@@ -2145,6 +2158,10 @@ server <- function(input, output, session) {
       plot_data <- as.data.frame(plot_data)
       plot_data$Name <- factor(plot_data$Name, levels = rev(ordered_drivers))
       
+      # Calculate dynamic height: minimum 600px, or 25px per driver
+      num_drivers <- length(ordered_drivers)
+      plot_height <- max(600, num_drivers * 25)
+      
       # Create box plot - GOLD COLOR, NO VIOLIN
       p <- plot_ly(
         data = plot_data,
@@ -2185,7 +2202,7 @@ server <- function(input, output, session) {
           plot_bgcolor = "#1e1e1e",
           font = list(color = "#FFFFFF", size = 12),
           showlegend = FALSE,
-          height = 600,
+          height = plot_height,  # Dynamic height based on driver count
           margin = list(l = 150, r = 50, t = 50, b = 50)
         ) %>%
         config(
