@@ -49,11 +49,8 @@ find_optimal_lineups_standard <- function(sim_results, config, k = 3, verbose = 
   n_sims <- length(sim_ids)
   
   if (verbose) {
-    cat(sprintf("  %s sims | top %d per sim | cap: %s\n",
-                format(n_sims, big.mark = ","), k,
-                if (is.finite(max_lineups)) format(max_lineups, big.mark = ",") else "none"))
-    cat(sprintf("  Player pool: top %d by score + top %d by value\n", 
-                player_pool_size, player_pool_size))
+    cat(sprintf("  %s sims | top %d per sim | Player pool: top %d\n",
+                format(n_sims, big.mark = ","), k, player_pool_size))
   }
   
   start_time <- Sys.time()
@@ -63,27 +60,12 @@ find_optimal_lineups_standard <- function(sim_results, config, k = 3, verbose = 
     n_players <- nrow(sim_data)
     if (n_players < roster_size) return(NULL)
     
-    # OPTIMIZATION: Filter to viable player pool
-    # Keep top scorers + top value players (union, not intersection)
+    # OPTIMIZATION: Filter to viable player pool  
+    # Just take top scorers - simple and fast
     if (n_players > pool_size * 2) {
-      # Calculate value efficiently: points per $1000
-      value <- sim_data$FantasyPoints / sim_data$Salary * 1000
-      
-      # Get top players by score
-      # Use order() instead of partial sort (works in parallel)
-      top_score_indices <- head(order(sim_data$FantasyPoints, decreasing = TRUE), pool_size)
-      top_by_score <- sim_data$Player[top_score_indices]
-      
-      # Get top players by value
-      top_value_indices <- head(order(value, decreasing = TRUE), pool_size)
-      top_by_value <- sim_data$Player[top_value_indices]
-      
-      # Union of both
-      viable_players <- unique(c(top_by_score, top_by_value))
-      
-      # Filter sim_data to viable pool
-      sim_data <- sim_data[Player %in% viable_players]
-      
+      # Get top players by score only (skip value calculation for speed)
+      top_score_indices <- head(order(sim_data$FantasyPoints, decreasing = TRUE), pool_size * 2)
+      sim_data <- sim_data[top_score_indices]
       n_players <- nrow(sim_data)
     }
     
@@ -216,6 +198,31 @@ find_optimal_lineups_standard <- function(sim_results, config, k = 3, verbose = 
   if (verbose) {
     cat(sprintf("  ✓ Phase 1: %s lineups | %.1fs\n",
                 format(nrow(unique_lineups), big.mark = ","), elapsed_time))
+  }
+  
+  # ============================================================================
+  # PHASE 1.5: Smart Filtering (if > 20k lineups)
+  # Use salary diversity instead of scoring - MUCH faster
+  # ============================================================================
+  
+  target_lineups <- 20000
+  
+  if (nrow(unique_lineups) > target_lineups) {
+    if (verbose) cat(sprintf("\n  Phase 1.5: Filtering to %s...\n", format(target_lineups, big.mark = ",")))
+    
+    phase15_start <- Sys.time()
+    
+    # Sort by TotalScore descending (from Phase 1), then by salary descending
+    # This keeps the highest-scoring lineups from Phase 1
+    setorder(unique_lineups, -TotalScore, -TotalSalary)
+    
+    # Keep top lineups
+    unique_lineups <- unique_lineups[1:target_lineups]
+    
+    if (verbose) {
+      elapsed_15 <- as.numeric(difftime(Sys.time(), phase15_start, units = "secs"))
+      cat(sprintf("  ✓ Phase 1.5: %.1fs\n", elapsed_15))
+    }
   }
   
   return(list(
