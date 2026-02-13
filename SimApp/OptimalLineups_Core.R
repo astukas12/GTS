@@ -205,7 +205,7 @@ find_optimal_lineups_standard <- function(sim_results, config, k = 3, verbose = 
   # Use salary diversity instead of scoring - MUCH faster
   # ============================================================================
   
-  target_lineups <- 20000
+  target_lineups <- 25000
   
   if (nrow(unique_lineups) > target_lineups) {
     if (verbose) cat(sprintf("\n  Phase 1.5: Filtering to %s...\n", format(target_lineups, big.mark = ",")))
