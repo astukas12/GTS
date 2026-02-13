@@ -41,34 +41,19 @@ find_optimal_lineups_standard <- function(sim_results, config, k = 3, verbose = 
   max_lineups <- if (!is.null(config$max_lineups)) config$max_lineups else Inf
   use_parallel <- if (!is.null(config$use_parallel)) config$use_parallel else TRUE
   
-  # OPTIMIZATION: Pre-filter to viable player pool per sim
-  # Default: top 15 scorers + top 15 value (pts per dollar)
-  player_pool_size <- if (!is.null(config$player_pool_size)) config$player_pool_size else 15
-  
   sim_ids <- unique(sim_results$SimID)
   n_sims <- length(sim_ids)
   
   if (verbose) {
-    cat(sprintf("  %s sims | top %d per sim | Player pool: top %d\n",
-                format(n_sims, big.mark = ","), k, player_pool_size))
+    cat(sprintf("  %s sims | top %d per sim\n",
+                format(n_sims, big.mark = ","), k))
   }
   
   start_time <- Sys.time()
   
   # Helper function for one sim
-  find_top_k_for_sim <- function(sim_data, roster_size, salary_cap, k, pool_size) {
+  find_top_k_for_sim <- function(sim_data, roster_size, salary_cap, k) {
     n_players <- nrow(sim_data)
-    if (n_players < roster_size) return(NULL)
-    
-    # OPTIMIZATION: Filter to viable player pool  
-    # Just take top scorers - simple and fast
-    if (n_players > pool_size * 2) {
-      # Get top players by score only (skip value calculation for speed)
-      top_score_indices <- head(order(sim_data$FantasyPoints, decreasing = TRUE), pool_size * 2)
-      sim_data <- sim_data[top_score_indices]
-      n_players <- nrow(sim_data)
-    }
-    
     if (n_players < roster_size) return(NULL)
     
     objective <- sim_data$FantasyPoints
@@ -143,13 +128,13 @@ find_optimal_lineups_standard <- function(sim_results, config, k = 3, verbose = 
       library(data.table)
       library(lpSolve)
     })
-    clusterExport(cl, c("find_top_k_for_sim", "roster_size", "salary_cap", "k", "player_pool_size"), 
+    clusterExport(cl, c("find_top_k_for_sim", "roster_size", "salary_cap", "k"), 
                   envir = environment())
     clusterExport(cl, "sim_results", envir = environment())
     
     all_lineups <- parLapply(cl, sim_ids, function(sid) {
       sim_data <- sim_results[SimID == sid]
-      find_top_k_for_sim(sim_data, roster_size, salary_cap, k, player_pool_size)
+      find_top_k_for_sim(sim_data, roster_size, salary_cap, k)
     })
     
     stopCluster(cl)
@@ -162,7 +147,7 @@ find_optimal_lineups_standard <- function(sim_results, config, k = 3, verbose = 
       sim_id <- sim_ids[i]
       sim_data <- sim_results[SimID == sim_id]
       
-      sim_lineups <- find_top_k_for_sim(sim_data, roster_size, salary_cap, k, player_pool_size)
+      sim_lineups <- find_top_k_for_sim(sim_data, roster_size, salary_cap, k)
       
       if (!is.null(sim_lineups) && nrow(sim_lineups) > 0) {
         all_lineups[[length(all_lineups) + 1]] <- sim_lineups
@@ -185,8 +170,23 @@ find_optimal_lineups_standard <- function(sim_results, config, k = 3, verbose = 
   player_cols <- grep("^Player", names(all_lineups_dt), value = TRUE)
   all_lineups_dt[, lineup_sig := do.call(paste, c(.SD, sep = "_")), .SDcols = player_cols]
   
+  # Track which rank each lineup achieved in each sim (1st, 2nd, or 3rd optimal)
+  # Assuming lineups are ordered by TotalScore within each SimID from Phase 1
+  all_lineups_dt[, rank_in_sim := seq_len(.N), by = SimID]
+  
+  # Aggregate counts by lineup
+  lineup_stats <- all_lineups_dt[, .(
+    Top1Count = sum(rank_in_sim == 1),  # How many times was #1 optimal
+    Top2Count = sum(rank_in_sim <= 2),  # How many times in top 2
+    Top3Count = .N,                      # Total times it appeared (all top 3)
+    AvgScore = mean(TotalScore),
+    MaxSalary = max(TotalSalary)
+  ), by = lineup_sig]
+  
+  # Get unique lineups and merge with stats
   unique_lineups <- all_lineups_dt[!duplicated(lineup_sig)]
-  unique_lineups[, lineup_sig := NULL]
+  unique_lineups <- merge(unique_lineups, lineup_stats, by = "lineup_sig")
+  unique_lineups[, c("lineup_sig", "rank_in_sim") := NULL]
   
   if (nrow(unique_lineups) > max_lineups) {
     if (verbose) cat(sprintf("  Capping at %s lineups\n", format(max_lineups, big.mark = ",")))
@@ -201,20 +201,19 @@ find_optimal_lineups_standard <- function(sim_results, config, k = 3, verbose = 
   }
   
   # ============================================================================
-  # PHASE 1.5: Smart Filtering (if > 20k lineups)
-  # Use salary diversity instead of scoring - MUCH faster
+  # PHASE 1.5: Rank and Filter to Top 25k
+  # Sort by: Top1Count (ties → Top2Count, ties → Top3Count)
   # ============================================================================
   
   target_lineups <- 25000
   
   if (nrow(unique_lineups) > target_lineups) {
-    if (verbose) cat(sprintf("\n  Phase 1.5: Filtering to %s...\n", format(target_lineups, big.mark = ",")))
+    if (verbose) cat(sprintf("\n  Phase 1.5: Ranking and filtering to top %s...\n", format(target_lineups, big.mark = ",")))
     
     phase15_start <- Sys.time()
     
-    # Sort by TotalScore descending (from Phase 1), then by salary descending
-    # This keeps the highest-scoring lineups from Phase 1
-    setorder(unique_lineups, -TotalScore, -TotalSalary)
+    # Sort by optimal counts: Top1 first, then Top2 for ties, then Top3 for ties
+    setorder(unique_lineups, -Top1Count, -Top2Count, -Top3Count)
     
     # Keep top lineups
     unique_lineups <- unique_lineups[1:target_lineups]
