@@ -547,6 +547,112 @@ ui <- dashboardPage(
       });
     ")),
     
+    # JavaScript for delete button handlers
+    tags$script(HTML("
+      console.log('DELETE SCRIPT LOADING');
+      
+      $(document).on('click', '.delete-build', function(e) {
+        console.log('DELETE BUILD CLICKED');
+        e.stopPropagation();
+        e.preventDefault();
+        
+        var buildName = $(this).data('build');
+        
+        // Try multiple ways to get the active platform tab
+        var activePlatformTab = null;
+        
+        // Method 1: Direct tab text
+        var tabText = $('#portfolio_platform > .nav-tabs > li.active > a').text().trim();
+        console.log('Tab text method:', tabText);
+        
+        // Method 2: Check which subtab is visible
+        if ($('#portfolio_dk_tabs').is(':visible')) {
+          activePlatformTab = 'DraftKings';
+        } else if ($('#portfolio_fd_tabs').is(':visible')) {
+          activePlatformTab = 'FanDuel';
+        } else if ($('#portfolio_sd_tabs').is(':visible')) {
+          activePlatformTab = 'Showdown';
+        }
+        
+        // Fallback to Method 1 if Method 2 didn't work
+        if (!activePlatformTab && tabText) {
+          activePlatformTab = tabText;
+        }
+        
+        console.log('Build:', buildName, 'Platform:', activePlatformTab);
+        
+        if (activePlatformTab === 'DraftKings') {
+          console.log('Sending dk_delete_build');
+          Shiny.setInputValue('dk_delete_build', buildName, {priority: 'event'});
+        } else if (activePlatformTab === 'FanDuel') {
+          console.log('Sending fd_delete_build');
+          Shiny.setInputValue('fd_delete_build', buildName, {priority: 'event'});
+        } else if (activePlatformTab === 'Showdown') {
+          console.log('Sending sd_delete_build');
+          Shiny.setInputValue('sd_delete_build', buildName, {priority: 'event'});
+        } else {
+          console.error('Could not determine platform tab:', activePlatformTab);
+        }
+      });
+      
+      $(document).on('click', '.delete-lineup', function(e) {
+        console.log('DELETE LINEUP CLICKED');
+        e.stopPropagation();
+        e.preventDefault();
+        
+        var rowId = $(this).data('row');
+        
+        // Try multiple ways to get the active platform tab
+        var activePlatformTab = null;
+        
+        // Method 1: Direct tab text
+        var tabText = $('#portfolio_platform > .nav-tabs > li.active > a').text().trim();
+        console.log('Tab text method:', tabText);
+        
+        // Method 2: Check which subtab is visible
+        if ($('#portfolio_dk_tabs').is(':visible')) {
+          activePlatformTab = 'DraftKings';
+        } else if ($('#portfolio_fd_tabs').is(':visible')) {
+          activePlatformTab = 'FanDuel';
+        } else if ($('#portfolio_sd_tabs').is(':visible')) {
+          activePlatformTab = 'Showdown';
+        }
+        
+        // Fallback to Method 1 if Method 2 didn't work
+        if (!activePlatformTab && tabText) {
+          activePlatformTab = tabText;
+        }
+        
+        console.log('Row:', rowId, 'Platform:', activePlatformTab);
+        
+        if (activePlatformTab === 'DraftKings') {
+          console.log('Sending dk_delete_lineup');
+          Shiny.setInputValue('dk_delete_lineup', rowId, {priority: 'event'});
+        } else if (activePlatformTab === 'FanDuel') {
+          console.log('Sending fd_delete_lineup');
+          Shiny.setInputValue('fd_delete_lineup', rowId, {priority: 'event'});
+        } else if (activePlatformTab === 'Showdown') {
+          console.log('Sending sd_delete_lineup');
+          Shiny.setInputValue('sd_delete_lineup', rowId, {priority: 'event'});
+        } else {
+          console.error('Could not determine platform tab:', activePlatformTab);
+        }
+      });
+      
+      console.log('DELETE SCRIPT LOADED');
+    ")),
+    
+    # CSS to ensure buttons are clickable
+    tags$style(HTML("
+      .delete-build,
+      .delete-lineup {
+        position: relative;
+        z-index: 100 !important;
+        pointer-events: auto !important;
+        cursor: pointer !important;
+      }
+    ")),
+    
     # ========================================================================
     # MAIN CONTENT TABS
     # ========================================================================
@@ -2858,6 +2964,38 @@ server <- function(input, output, session) {
     showNotification("Deleted lineup from portfolio", type = "warning")
   })
   
+  # Delete individual lineup from DK portfolio (from Portfolio Lineups tab)
+  observeEvent(input$dk_delete_lineup, {
+    req(input$dk_delete_lineup, rv$dk_portfolio)
+    
+    row_to_delete <- as.integer(input$dk_delete_lineup)
+    
+    # Get the build name before deleting
+    deleted_build <- rv$dk_portfolio[row_to_delete, Build]
+    
+    # Remove the row
+    rv$dk_portfolio <- rv$dk_portfolio[-row_to_delete]
+    
+    # Update builds list - decrement count or remove if no lineups left
+    if (deleted_build %in% names(rv$dk_builds)) {
+      rv$dk_builds[[deleted_build]]$num_lineups <- rv$dk_builds[[deleted_build]]$num_lineups - 1
+      
+      # If build has no more lineups, remove it
+      if (rv$dk_builds[[deleted_build]]$num_lineups == 0) {
+        rv$dk_builds[[deleted_build]] <- NULL
+      }
+    }
+    
+    # If portfolio is now empty, reset
+    if (nrow(rv$dk_portfolio) == 0) {
+      rv$dk_portfolio <- NULL
+      rv$dk_builds <- list()
+      rv$dk_build_counter <- 0
+    }
+    
+    showNotification("Deleted lineup from DK portfolio", type = "warning")
+  })
+  
   # Portfolio count
   output$dk_portfolio_count <- renderText({
     if (is.null(rv$dk_portfolio)) {
@@ -3394,6 +3532,65 @@ server <- function(input, output, session) {
     showNotification("FD Portfolio cleared", type = "message")
   })
   
+  # Delete build from FD portfolio
+  observeEvent(input$fd_delete_build, {
+    req(input$fd_delete_build)
+    
+    build_to_delete <- input$fd_delete_build
+    
+    if (build_to_delete %in% names(rv$fd_builds)) {
+      # Remove lineups for this build from portfolio
+      if (!is.null(rv$fd_portfolio)) {
+        rv$fd_portfolio <- rv$fd_portfolio[Build != build_to_delete]
+        
+        # If portfolio is now empty, clear it
+        if (nrow(rv$fd_portfolio) == 0) {
+          rv$fd_portfolio <- NULL
+        }
+      }
+      
+      # Remove build from builds list
+      rv$fd_builds[[build_to_delete]] <- NULL
+      
+      showNotification(
+        paste0("Deleted build: ", build_to_delete),
+        type = "message"
+      )
+    }
+  })
+  
+  # Delete individual lineup from FD portfolio
+  observeEvent(input$fd_delete_lineup, {
+    req(input$fd_delete_lineup, rv$fd_portfolio)
+    
+    row_to_delete <- as.integer(input$fd_delete_lineup)
+    
+    # Get the build name before deleting
+    deleted_build <- rv$fd_portfolio[row_to_delete, Build]
+    
+    # Remove the row
+    rv$fd_portfolio <- rv$fd_portfolio[-row_to_delete]
+    
+    # Update builds list - decrement count or remove if no lineups left
+    if (deleted_build %in% names(rv$fd_builds)) {
+      rv$fd_builds[[deleted_build]]$num_lineups <- rv$fd_builds[[deleted_build]]$num_lineups - 1
+      
+      # If build has no more lineups, remove it
+      if (rv$fd_builds[[deleted_build]]$num_lineups == 0) {
+        rv$fd_builds[[deleted_build]] <- NULL
+      }
+    }
+    
+    # If portfolio is now empty, reset
+    if (nrow(rv$fd_portfolio) == 0) {
+      rv$fd_portfolio <- NULL
+      rv$fd_builds <- list()
+      rv$fd_build_counter <- 0
+    }
+    
+    showNotification("Deleted lineup from FD portfolio", type = "warning")
+  })
+  
   output$fd_portfolio_count <- renderText({
     if (is.null(rv$fd_portfolio)) {
       "Portfolio: 0 lineups"
@@ -3552,6 +3749,65 @@ server <- function(input, output, session) {
       fwrite(download_table, file)
     }
   )
+  
+  # Delete build from SD portfolio
+  observeEvent(input$sd_delete_build, {
+    req(input$sd_delete_build)
+    
+    build_to_delete <- input$sd_delete_build
+    
+    if (build_to_delete %in% names(rv$sd_builds)) {
+      # Remove lineups for this build from portfolio
+      if (!is.null(rv$sd_portfolio)) {
+        rv$sd_portfolio <- rv$sd_portfolio[Build != build_to_delete]
+        
+        # If portfolio is now empty, clear it
+        if (nrow(rv$sd_portfolio) == 0) {
+          rv$sd_portfolio <- NULL
+        }
+      }
+      
+      # Remove build from builds list
+      rv$sd_builds[[build_to_delete]] <- NULL
+      
+      showNotification(
+        paste0("Deleted build: ", build_to_delete),
+        type = "message"
+      )
+    }
+  })
+  
+  # Delete individual lineup from SD portfolio
+  observeEvent(input$sd_delete_lineup, {
+    req(input$sd_delete_lineup, rv$sd_portfolio)
+    
+    row_to_delete <- as.integer(input$sd_delete_lineup)
+    
+    # Get the build name before deleting
+    deleted_build <- rv$sd_portfolio[row_to_delete, Build]
+    
+    # Remove the row
+    rv$sd_portfolio <- rv$sd_portfolio[-row_to_delete]
+    
+    # Update builds list - decrement count or remove if no lineups left
+    if (deleted_build %in% names(rv$sd_builds)) {
+      rv$sd_builds[[deleted_build]]$num_lineups <- rv$sd_builds[[deleted_build]]$num_lineups - 1
+      
+      # If build has no more lineups, remove it
+      if (rv$sd_builds[[deleted_build]]$num_lineups == 0) {
+        rv$sd_builds[[deleted_build]] <- NULL
+      }
+    }
+    
+    # If portfolio is now empty, reset
+    if (nrow(rv$sd_portfolio) == 0) {
+      rv$sd_portfolio <- NULL
+      rv$sd_builds <- list()
+      rv$sd_build_counter <- 0
+    }
+    
+    showNotification("Deleted lineup from SD portfolio", type = "warning")
+  })
   
   # Portfolio overview - SD
   output$sd_builds_summary <- renderDT({
