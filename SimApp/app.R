@@ -1272,8 +1272,13 @@ server <- function(input, output, session) {
     # Add custom metric columns from config
     if (!is.null(sport_config$custom_metrics)) {
       for (metric in sport_config$custom_metrics) {
-        if (metric$format == "percentage") {
-          pct_cols <- c(pct_cols, metric$display_name)
+        # Check if format exists and is "percentage"
+        if (!is.null(metric$format) && length(metric$format) > 0 && metric$format == "percentage") {
+          # Use display_name if available, otherwise use label
+          col_name <- if (!is.null(metric$display_name)) metric$display_name else metric$label
+          if (!is.null(col_name)) {
+            pct_cols <- c(pct_cols, col_name)
+          }
         }
       }
     }
@@ -2792,7 +2797,8 @@ server <- function(input, output, session) {
     build_label <- if (input$dk_build_label == "") {
       paste0("Build ", rv$dk_build_counter)
     } else {
-      input$dk_build_label
+      # Sanitize input to ensure valid UTF-8
+      iconv(input$dk_build_label, to = "UTF-8", sub = "")
     }
     
     sampled[, Build := build_label]
@@ -2808,19 +2814,19 @@ server <- function(input, output, session) {
     
     # Rate minimums (only show if > 0)
     if (!is.null(input$dk_min_win) && input$dk_min_win > 0) {
-      filter_parts <- c(filter_parts, paste0("Win≥", input$dk_min_win))
+      filter_parts <- c(filter_parts, paste0("Win>=", input$dk_min_win))
     }
     if (!is.null(input$dk_min_top1) && input$dk_min_top1 > 0) {
-      filter_parts <- c(filter_parts, paste0("Top1≥", input$dk_min_top1))
+      filter_parts <- c(filter_parts, paste0("Top1>=", input$dk_min_top1))
     }
     if (!is.null(input$dk_min_top5) && input$dk_min_top5 > 0) {
-      filter_parts <- c(filter_parts, paste0("Top5≥", input$dk_min_top5))
+      filter_parts <- c(filter_parts, paste0("Top5>=", input$dk_min_top5))
     }
     if (!is.null(input$dk_min_top10) && input$dk_min_top10 > 0) {
-      filter_parts <- c(filter_parts, paste0("Top10≥", input$dk_min_top10))
+      filter_parts <- c(filter_parts, paste0("Top10>=", input$dk_min_top10))
     }
     if (!is.null(input$dk_min_top20) && input$dk_min_top20 > 0) {
-      filter_parts <- c(filter_parts, paste0("Top20≥", input$dk_min_top20))
+      filter_parts <- c(filter_parts, paste0("Top20>=", input$dk_min_top20))
     }
     
     # Salary range (only if not full range)
@@ -3215,6 +3221,10 @@ server <- function(input, output, session) {
       req(rv$dk_portfolio)
       
       download_table <- copy(rv$dk_portfolio)
+      
+      # Randomize row order
+      download_table <- download_table[sample(nrow(download_table))]
+      
       player_cols <- grep("^Player", names(download_table), value = TRUE)
       
       for (col in player_cols) {
@@ -3500,7 +3510,8 @@ server <- function(input, output, session) {
     build_label <- if (input$fd_build_label == "") {
       paste0("Build ", rv$fd_build_counter)
     } else {
-      input$fd_build_label
+      # Sanitize input to ensure valid UTF-8
+      iconv(input$fd_build_label, to = "UTF-8", sub = "")
     }
     
     sampled[, Build := build_label]
@@ -3697,6 +3708,9 @@ server <- function(input, output, session) {
       
       download_table <- copy(rv$fd_portfolio)
       
+      # Randomize row order
+      download_table <- download_table[sample(nrow(download_table))]
+      
       # Detect column format
       if ("MVP" %in% names(download_table)) {
         download_table <- create_download_mvp(download_table, rv$sim_metadata)
@@ -3744,7 +3758,12 @@ server <- function(input, output, session) {
     content = function(file) {
       req(rv$sd_portfolio)
       
-      download_table <- create_download_showdown(rv$sd_portfolio, rv$sim_metadata)
+      download_table <- copy(rv$sd_portfolio)
+      
+      # Randomize row order
+      download_table <- download_table[sample(nrow(download_table))]
+      
+      download_table <- create_download_showdown(download_table, rv$sim_metadata)
       
       fwrite(download_table, file)
     }

@@ -83,7 +83,7 @@ run_nascar_simulation <- function(input_data, n_sims, config, progress_callback 
   all_finish_positions <- simulate_finish_positions_vectorized(driver_distributions, n_sims)
   
   elapsed <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
-  cat(sprintf("  ✓ Finish positions completed in %.1f seconds\n\n", elapsed))
+  cat(sprintf("  b Finish positions completed in %.1f seconds\n\n", elapsed))
   
   # ========================================================================
   # STEP 2: Calculate Fantasy Points (DK and FD)
@@ -166,7 +166,7 @@ run_nascar_simulation <- function(input_data, n_sims, config, progress_callback 
   
   cat("\n")
   elapsed <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
-  cat(sprintf("  ✓ Fantasy points completed in %.1f seconds\n\n", elapsed))
+  cat(sprintf("  b Fantasy points completed in %.1f seconds\n\n", elapsed))
   
   # ========================================================================
   # STEP 3: Combine Results
@@ -181,7 +181,7 @@ run_nascar_simulation <- function(input_data, n_sims, config, progress_callback 
   combined_results <- rbindlist(all_results)
   
   elapsed <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
-  cat(sprintf("  ✓ Results combined in %.1f seconds\n\n", elapsed))
+  cat(sprintf("  b Results combined in %.1f seconds\n\n", elapsed))
   
   if (!is.null(progress_callback)) {
     progress_callback(detail = "Simulation complete!", value = 1.0)
@@ -432,7 +432,7 @@ calculate_fantasy_points <- function(race_result, scoring_systems, has_fd = TRUE
     
     # Use set() instead of := to avoid internal reference warnings
     set(race_result, j = "FDFantasyPoints", 
-        value = fd_finish_points + race_result$FDDominatorPoints + fd_position_diff)
+        value = fd_finish_points + race_result$FDDominatorPoints + (fd_position_diff)*.5)
   } else {
     # Set FD fantasy points to 0 when not available
     set(race_result, j = "FDFantasyPoints", value = 0)
@@ -1024,8 +1024,9 @@ create_dominator_violin_by_position <- function(sim_results, platform = "DK",
 }
 
 
-#' Assign dominator points from profiles (CACHED VERSION - FASTER)
+#' Assign dominator points from profiles (CACHED VERSION - UNIQUE ASSIGNMENT)
 #' Uses pre-cached race profiles split by RaceID for faster lookup
+#' Each profile is assigned to exactly one driver (greedy best-match algorithm)
 assign_dominator_points_from_profiles_cached <- function(race_result, race_weights, 
                                                          race_profiles_by_race, platform) {
   
@@ -1061,6 +1062,10 @@ assign_dominator_points_from_profiles_cached <- function(race_result, race_weigh
     return(race_result)
   }
   
+  # Initialize dominator points to 0 for all drivers
+  n_drivers <- nrow(race_result)
+  dom_points <- rep(0, n_drivers)
+  
   # Calculate distances (vectorized)
   driver_finishes <- race_result$FinishPosition
   driver_starts <- race_result$Starting
@@ -1073,15 +1078,39 @@ assign_dominator_points_from_profiles_cached <- function(race_result, race_weigh
   start_diff_matrix <- outer(driver_starts, profile_starts, function(x, y) abs(x - y))
   distance_matrix <- sqrt(finish_diff_matrix^2 + start_diff_matrix^2)
   
-  # Find closest profile for each driver
-  closest_profile_idx <- apply(distance_matrix, 1, which.min)
+  # GREEDY ASSIGNMENT: Each profile assigned to exactly one driver
+  # Track which drivers and profiles have been assigned
+  available_drivers <- 1:n_drivers
+  available_profiles <- 1:nrow(profiles)
   
-  # Assign dominator points from closest profile
-  dom_points <- profiles[[dom_col]][closest_profile_idx]
-  
-  # Apply driver-specific ceiling (DKMax or FDMax)
-  max_allowed <- race_result[[max_col]]
-  dom_points <- pmin(dom_points, max_allowed)
+  # Assign profiles one at a time to their best available match
+  while (length(available_profiles) > 0 && length(available_drivers) > 0) {
+    
+    # Get submatrix of only available drivers/profiles
+    sub_matrix <- distance_matrix[available_drivers, available_profiles, drop = FALSE]
+    
+    # Find the overall best match (minimum distance)
+    min_idx <- which.min(sub_matrix)
+    
+    # Convert linear index to row/col
+    row_idx <- ((min_idx - 1) %% nrow(sub_matrix)) + 1
+    col_idx <- ((min_idx - 1) %/% nrow(sub_matrix)) + 1
+    
+    # Map back to original indices
+    driver_idx <- available_drivers[row_idx]
+    profile_idx <- available_profiles[col_idx]
+    
+    # Assign dominator points from this profile to this driver
+    profile_dom_points <- profiles[[dom_col]][profile_idx]
+    driver_max <- race_result[[max_col]][driver_idx]
+    
+    # Apply driver-specific ceiling
+    dom_points[driver_idx] <- min(profile_dom_points, driver_max)
+    
+    # Remove assigned driver and profile from available pools
+    available_drivers <- available_drivers[-row_idx]
+    available_profiles <- available_profiles[-col_idx]
+  }
   
   # Use set() instead of [[ to avoid allocation issues
   col_name <- paste0(platform, "DominatorPoints")
