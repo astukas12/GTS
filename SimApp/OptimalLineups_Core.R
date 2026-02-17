@@ -205,7 +205,7 @@ find_optimal_lineups_standard <- function(sim_results, config, k = 3, verbose = 
   # Sort by: Top1Count (ties → Top2Count, ties → Top3Count)
   # ============================================================================
   
-  target_lineups <- 25000
+  target_lineups <- 10000
   
   if (nrow(unique_lineups) > target_lineups) {
     if (verbose) cat(sprintf("\n  Phase 1.5: Ranking and filtering to top %s...\n", format(target_lineups, big.mark = ",")))
