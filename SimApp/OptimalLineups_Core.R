@@ -19,8 +19,10 @@ find_optimal_lineups <- function(sim_results, config, mode = "standard", k = 3, 
     return(find_optimal_lineups_mvp(sim_results, config, k, verbose))
   } else if (mode == "captain") {
     return(find_optimal_lineups_captain(sim_results, config, k, verbose))
+  } else if (mode == "win_based") {
+    return(find_optimal_lineups_winbased(sim_results, config, verbose))
   } else {
-    stop(paste("Unknown mode:", mode, "- must be 'standard', 'mvp', or 'captain'"))
+    stop(paste("Unknown mode:", mode, "- must be 'standard', 'mvp', 'captain', or 'win_based'"))
   }
 }
 
@@ -1158,4 +1160,117 @@ calculate_distribution_metrics <- function(score_matrix, lineup_data, config,
   }
   
   return(results)
+}
+
+
+
+
+# =============================================================================
+# MODE 4: WIN-BASED GENERATION (Tennis, MMA)
+# =============================================================================
+
+find_optimal_lineups_winbased <- function(sim_results, config, verbose = TRUE) {
+  
+  if (verbose) cat("\nPhase 1: Generating lineups (WIN-BASED mode)...\n")
+  
+  setDT(sim_results)
+  
+  roster_size <- config$roster_size
+  salary_cap <- config$salary_cap
+  target_lineups <- if (!is.null(config$max_lineups)) config$max_lineups else 5000
+  
+  players_dt <- unique(sim_results[, .(Player, Salary)])
+  players <- players_dt$Player
+  n_players <- length(players)
+  n_sims <- length(unique(sim_results$SimID))
+  
+  if (verbose) {
+    cat(sprintf("  %s players | Roster size: %s\n", n_players, roster_size))
+  }
+  
+  # Generate ALL valid combinations
+  if (verbose) cat("  Generating all valid lineups...\n")
+  
+  all_combos <- combn(players, roster_size, simplify = FALSE)
+  
+  if (verbose) {
+    cat(sprintf("    Total combinations: %s\n", format(length(all_combos), big.mark = ",")))
+    cat("    Filtering by salary...\n")
+  }
+  
+  # Vectorized salary calculation - MUCH faster than loop
+  # Create salary lookup vector
+  salary_lookup <- setNames(players_dt$Salary, players_dt$Player)
+  
+  # Calculate all lineup salaries at once
+  lineup_salaries <- sapply(all_combos, function(combo) sum(salary_lookup[combo]))
+  
+  # Filter by salary range (vectorized!)
+  min_salary <- salary_cap - 2500
+  valid_idx <- which(lineup_salaries >= min_salary & lineup_salaries <= salary_cap)
+  valid_lineups <- all_combos[valid_idx]
+  
+  if (verbose) {
+    cat(sprintf("    Valid ($%s-$%s): %s\n", 
+                format(min_salary, big.mark = ","),
+                format(salary_cap, big.mark = ","),
+                format(length(valid_lineups), big.mark = ",")))
+  }
+  
+  # Calculate win metrics
+  if (verbose) cat("  Calculating win metrics...\n")
+  
+  lineup_list <- lapply(valid_lineups, function(x) as.list(setNames(x, paste0("Player", 1:roster_size))))
+  lineups_dt <- rbindlist(lineup_list)
+  
+  win_matrix <- dcast(sim_results, Player ~ SimID, value.var = "Win", fill = 0)
+  setkey(win_matrix, Player)
+  sim_cols <- setdiff(names(win_matrix), "Player")
+  
+  player_cols <- paste0("Player", 1:roster_size)
+  
+  # Calculate win metrics (vectorized)
+  # Need to handle data.table scoping properly
+  sim_cols_env <- sim_cols  # Store in separate variable for scoping
+  
+  lineups_dt[, c("ExpectedWins", "Win6Pct", "Win5PlusPct") := {
+    lineup_players <- unlist(.SD)
+    
+    # Get win matrix rows for these players
+    lineup_win_rows <- win_matrix[lineup_players]
+    
+    # Extract just the sim columns (excluding Player column)
+    lineup_wins <- as.matrix(lineup_win_rows[, .SD, .SDcols = sim_cols_env])
+    
+    # Sum wins per sim (each column is a sim)
+    wins_per_sim <- colSums(lineup_wins)
+    
+    list(
+      ExpectedWins = mean(wins_per_sim),
+      Win6Pct = mean(wins_per_sim >= 6) * 100,
+      Win5PlusPct = mean(wins_per_sim >= 5) * 100
+    )
+  }, by = 1:nrow(lineups_dt), .SDcols = player_cols]
+  
+  # Keep top N by ExpectedWins
+  setorder(lineups_dt, -ExpectedWins)
+  final_lineups <- lineups_dt[1:min(target_lineups, nrow(lineups_dt))]
+  
+  if (verbose) {
+    cat(sprintf("  ✓ Top %s lineups by ExpectedWins\n", format(nrow(final_lineups), big.mark = ",")))
+    cat(sprintf("    ExpectedWins: %.2f to %.2f\n", 
+                min(final_lineups$ExpectedWins), max(final_lineups$ExpectedWins)))
+    cat(sprintf("    Win6Pct: %.1f%% to %.1f%%\n\n",
+                min(final_lineups$Win6Pct), max(final_lineups$Win6Pct)))
+  }
+  
+  lineup_only <- final_lineups[, ..player_cols]
+  win_metrics <- final_lineups[, .(ExpectedWins, Win6Pct, Win5PlusPct)]
+  
+  return(list(
+    unique_lineups = lineup_only,
+    win_metrics = win_metrics,
+    n_sims = n_sims,
+    mode = "win_based"
+  ))
 }
