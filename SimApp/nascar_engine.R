@@ -216,12 +216,64 @@ run_nascar_simulation <- function(input_data, n_sims, config, progress_callback 
   
   cat("[SIMULATION COMPLETE]\n\n")
   
+  # ========================================================================
+  # PREPARE SPORT-SPECIFIC VISUALIZATIONS
+  # ========================================================================
+  
+  cat("Preparing NASCAR-specific visualizations...\n")
+  
+  # Visualization data is all in combined_results, just pass it organized
+  sport_visuals <- list(
+    # Full simulation results for all visualizations
+    full_results = combined_results,
+    
+    # Metadata about platforms
+    has_fd = has_fd
+  )
+  
+  cat("NASCAR visualizations prepared\n\n")
+  
   return(list(
     sim_results = sim_results,      # Summary for optimization
     metadata = metadata,             # Player metadata  
-    full_results = combined_results, # Full data for visualizations
-    has_fd = has_fd                  # Flag indicating if FD data was present
+    full_results = combined_results, # Full data for visualizations (LEGACY - keeping for compatibility)
+    has_fd = has_fd,                 # Flag indicating if FD data was present
+    sport_visuals = sport_visuals    # NEW: Sport-specific visualization data
   ))
+}
+
+
+# ============================================================================
+# NASCAR-SPECIFIC LINEUP METRICS
+# ============================================================================
+
+#' Calculate NASCAR Lineup Metrics (TotalStart, AvgStart)
+#' Called by app after standard distribution metrics are calculated
+#' @param scored_lineups Data.table with lineups and standard metrics
+#' @param sim_results Simulation results (not used for NASCAR)
+#' @param metadata Player metadata with Starting position
+#' @return scored_lineups with added nascar-specific columns
+calculate_nascar_lineup_metrics <- function(scored_lineups, sim_results, metadata) {
+  
+  cat("Calculating NASCAR-specific lineup metrics...\n")
+  
+  setDT(scored_lineups)
+  setDT(metadata)
+  
+  # Get player columns
+  player_cols <- grep("^Player[0-9]", names(scored_lineups), value = TRUE)
+  
+  # Calculate TotalStart and AvgStart
+  scored_lineups[, TotalStart := {
+    players <- unlist(.SD)
+    sum(metadata[Player %in% players, Starting], na.rm = TRUE)
+  }, by = 1:nrow(scored_lineups), .SDcols = player_cols]
+  
+  scored_lineups[, AvgStart := TotalStart / length(player_cols)]
+  
+  cat("NASCAR metrics calculated\n\n")
+  
+  return(scored_lineups)
 }
 
 

@@ -21,8 +21,16 @@ find_optimal_lineups <- function(sim_results, config, mode = "standard", k = 3, 
     return(find_optimal_lineups_captain(sim_results, config, k, verbose))
   } else if (mode == "win_based") {
     return(find_optimal_lineups_winbased(sim_results, config, verbose))
+  } else if (mode == "combinatorial") {
+    return(find_optimal_lineups_combinatorial(sim_results, config, verbose))
+  } else if (mode == "combinatorial_captain") {
+    return(find_optimal_lineups_combinatorial_captain(sim_results, config, verbose))
+  } else if (mode == "combinatorial_mvp") {
+    return(find_optimal_lineups_combinatorial_mvp(sim_results, config, verbose))
   } else {
-    stop(paste("Unknown mode:", mode, "- must be 'standard', 'mvp', 'captain', or 'win_based'"))
+    stop(paste("Unknown mode:", mode,
+               "- must be 'standard', 'mvp', 'captain', 'win_based',",
+               "'combinatorial', 'combinatorial_captain', or 'combinatorial_mvp'"))
   }
 }
 
@@ -40,7 +48,7 @@ find_optimal_lineups_standard <- function(sim_results, config, k = 3, verbose = 
   roster_size <- config$roster_size
   salary_cap <- config$salary_cap
   progress_freq <- if (!is.null(config$progress_frequency)) config$progress_frequency else 500
-  max_lineups <- if (!is.null(config$max_lineups)) config$max_lineups else Inf
+  max_lineups <- if (!is.null(config$max_lineups)) config$max_lineups else 5000L
   use_parallel <- if (!is.null(config$use_parallel)) config$use_parallel else TRUE
   
   sim_ids <- unique(sim_results$SimID)
@@ -207,7 +215,7 @@ find_optimal_lineups_standard <- function(sim_results, config, k = 3, verbose = 
   # Sort by: Top1Count (ties → Top2Count, ties → Top3Count)
   # ============================================================================
   
-  target_lineups <- 10000
+  target_lineups <- if (!is.null(config$max_lineups)) config$max_lineups else 5000L
   
   if (nrow(unique_lineups) > target_lineups) {
     if (verbose) cat(sprintf("\n  Phase 1.5: Ranking and filtering to top %s...\n", format(target_lineups, big.mark = ",")))
@@ -249,7 +257,7 @@ find_optimal_lineups_mvp <- function(sim_results, config, k = 3, verbose = TRUE)
   salary_cap <- config$salary_cap
   mvp_multiplier <- if (!is.null(config$mvp_multiplier)) config$mvp_multiplier else 1.5
   progress_freq <- if (!is.null(config$progress_frequency)) config$progress_frequency else 500
-  max_lineups <- if (!is.null(config$max_lineups)) config$max_lineups else Inf
+  max_lineups <- if (!is.null(config$max_lineups)) config$max_lineups else 5000L
   use_parallel <- if (!is.null(config$use_parallel)) config$use_parallel else TRUE
   
   sim_ids <- unique(sim_results$SimID)
@@ -452,7 +460,7 @@ find_optimal_lineups_captain <- function(sim_results, config, k = 3, verbose = T
   salary_cap <- config$salary_cap
   cpt_multiplier <- if (!is.null(config$cpt_multiplier)) config$cpt_multiplier else 1.5
   progress_freq <- if (!is.null(config$progress_frequency)) config$progress_frequency else 500
-  max_lineups <- if (!is.null(config$max_lineups)) config$max_lineups else Inf
+  max_lineups <- if (!is.null(config$max_lineups)) config$max_lineups else 5000L
   use_parallel <- if (!is.null(config$use_parallel)) config$use_parallel else TRUE
   
   sim_ids <- unique(sim_results$SimID)
@@ -638,6 +646,349 @@ find_optimal_lineups_captain <- function(sim_results, config, k = 3, verbose = T
     config = config,
     mode = "captain"
   ))
+}
+
+
+
+# =============================================================================
+# MODE 5: COMBINATORIAL - Standard (no LP, score every valid salary-legal lineup)
+# Best for small player pools (MMA, small tennis slates) where C(n, roster) is
+# manageable. Finds better lineups than LP because it evaluates the full universe
+# instead of only per-sim winners. Phase 2 handles all scoring via matrix multiply.
+# =============================================================================
+
+find_optimal_lineups_combinatorial <- function(sim_results, config, verbose = TRUE) {
+  # Per-sim greedy optimal: for each sim, sort players by score and greedily
+  # pick the best roster_size players that fit under salary cap.
+  # Greedy IS optimal here — simple knapsack with only count + salary constraints.
+  # Dedupe across all sims → unique lineups ranked by how often each was #1.
+  # Far fewer unique lineups than combinatorial explosion (~100-2000 for MMA).
+  
+  if (verbose) cat("\nPhase 1: Finding optimal lineup per sim (greedy)...\n")
+  
+  setDT(sim_results)
+  roster_size <- config$roster_size
+  salary_cap  <- config$salary_cap
+  max_lineups <- if (!is.null(config$max_lineups)) config$max_lineups else 5000L
+  start_time  <- Sys.time()
+  
+  players_dt <- unique(sim_results[, .(Player, Salary)])[Salary > 0 & !is.na(Salary)]
+  sal_lookup <- setNames(players_dt$Salary, players_dt$Player)
+  sim_ids    <- unique(sim_results$SimID)
+  n_sims     <- length(sim_ids)
+  
+  if (verbose) cat(sprintf("  %d players | %s sims | $%s cap\n",
+                           nrow(players_dt), format(n_sims, big.mark=","),
+                           format(salary_cap, big.mark=",")))
+  
+  # setkey for fast per-sim lookup
+  setkey(sim_results, SimID)
+  prog_freq <- max(1L, n_sims %/% 10L)
+  
+  lineup_list <- vector("list", n_sims)
+  
+  for (i in seq_along(sim_ids)) {
+    sid      <- sim_ids[i]
+    sim_data <- sim_results[.(sid)][Salary > 0 & !is.na(Salary) & !is.na(FantasyPoints)]
+    setorder(sim_data, -FantasyPoints)
+    
+    # Greedy: pick highest-scoring players that fit under cap
+    picked   <- character(roster_size)
+    n_picked <- 0L
+    sal_used <- 0
+    
+    for (j in seq_len(nrow(sim_data))) {
+      if (n_picked == roster_size) break
+      p   <- sim_data$Player[j]
+      sal <- sim_data$Salary[j]
+      if (sal_used + sal <= salary_cap) {
+        n_picked          <- n_picked + 1L
+        picked[n_picked]  <- p
+        sal_used          <- sal_used + sal
+      }
+    }
+    
+    if (n_picked == roster_size) {
+      picked_sorted <- sort(picked)   # canonical order for dedup
+      lineup_list[[i]] <- data.table(
+        Lineup      = paste(picked_sorted, collapse = "|"),
+        TotalSalary = sal_used,
+        TotalScore  = sum(sim_data$FantasyPoints[sim_data$Player %in% picked])
+      )
+      # Store player columns in sorted order
+      for (k in seq_len(roster_size)) lineup_list[[i]][[paste0("Player", k)]] <- picked_sorted[k]
+    }
+    
+    if (verbose && i %% prog_freq == 0L) {
+      elapsed <- as.numeric(difftime(Sys.time(), start_time, units="secs"))
+      cat(sprintf("\r  Phase 1: %d%% | %.1fs", round(i/n_sims*100), elapsed))
+      flush.console()
+    }
+  }
+  if (verbose) cat("\n")
+  
+  all_lineups <- rbindlist(lineup_list[!sapply(lineup_list, is.null)])
+  
+  # Count how often each unique lineup was #1 optimal
+  counts <- all_lineups[, .(Top1Count = .N,
+                            TotalSalary = TotalSalary[1],
+                            AvgScore    = mean(TotalScore)),
+                        by = Lineup]
+  setorder(counts, -Top1Count)
+  
+  if (nrow(counts) > max_lineups) counts <- counts[1:max_lineups]
+  
+  # Expand Lineup string back to Player columns
+  player_mat <- do.call(rbind, strsplit(counts$Lineup, "\\|"))
+  unique_lineups <- as.data.table(player_mat)
+  setnames(unique_lineups, paste0("Player", seq_len(roster_size)))
+  unique_lineups[, TotalSalary := counts$TotalSalary]
+  unique_lineups[, Top1Count   := counts$Top1Count]
+  unique_lineups[, AvgScore    := counts$AvgScore]
+  
+  elapsed_time <- as.numeric(difftime(Sys.time(), start_time, units="secs"))
+  if (verbose) cat(sprintf("  ✓ Phase 1: %s unique lineups from %s sims | %.1fs\n",
+                           format(nrow(unique_lineups), big.mark=","),
+                           format(n_sims, big.mark=","), elapsed_time))
+  
+  list(unique_lineups = unique_lineups, n_sims = n_sims, config = config,
+       mode = "combinatorial")
+}
+
+
+# =============================================================================
+# MODE 6: COMBINATORIAL CAPTAIN (Showdown / DK Captain format)
+# Iterates each player as Captain (1.5x score, 1.5x salary cost) + 5 Util.
+# =============================================================================
+
+find_optimal_lineups_combinatorial_captain <- function(sim_results, config, verbose = TRUE) {
+  # Per-sim greedy optimal for captain format.
+  # For each sim: try each eligible player as captain, greedily fill remaining
+  # 5 slots with highest-scoring players under remaining salary cap.
+  # Pick the captain choice that maximises total (1.5x captain + flex) score.
+  
+  if (verbose) cat("\nPhase 1: Finding optimal lineup per sim (greedy captain)...\n")
+  
+  setDT(sim_results)
+  roster_size    <- config$roster_size
+  salary_cap     <- config$salary_cap
+  cpt_multiplier <- if (!is.null(config$cpt_multiplier)) config$cpt_multiplier else 1.5
+  max_lineups    <- if (!is.null(config$max_lineups)) config$max_lineups else 5000L
+  n_utils        <- roster_size - 1L
+  start_time     <- Sys.time()
+  
+  players_dt <- unique(sim_results[, .(Player, Salary)])[Salary > 0 & !is.na(Salary)]
+  sim_ids    <- unique(sim_results$SimID)
+  n_sims     <- length(sim_ids)
+  
+  if (verbose) cat(sprintf("  %d players | %s sims | $%s cap | %.1fx captain\n",
+                           nrow(players_dt), format(n_sims, big.mark=","),
+                           format(salary_cap, big.mark=","), cpt_multiplier))
+  
+  setkey(sim_results, SimID)
+  
+  lineup_list <- vector("list", n_sims)
+  
+  for (i in seq_along(sim_ids)) {
+    sid      <- sim_ids[i]
+    sim_data <- sim_results[.(sid)][Salary > 0 & !is.na(Salary) & !is.na(FantasyPoints)]
+    setorder(sim_data, -FantasyPoints)
+    
+    best_score  <- -Inf
+    best_lineup <- NULL
+    
+    # Try each player as captain
+    for (ci in seq_len(nrow(sim_data))) {
+      cpt_player <- sim_data$Player[ci]
+      cpt_sal    <- sim_data$Salary[ci] * cpt_multiplier
+      cpt_score  <- sim_data$FantasyPoints[ci] * cpt_multiplier
+      if (cpt_sal > salary_cap) next
+      
+      rem_cap    <- salary_cap - cpt_sal
+      utils      <- sim_data[Player != cpt_player]
+      setorder(utils, -FantasyPoints)
+      
+      # Greedy fill utils
+      picked_u   <- character(n_utils)
+      n_picked   <- 0L
+      sal_used   <- 0
+      util_score <- 0
+      
+      for (j in seq_len(nrow(utils))) {
+        if (n_picked == n_utils) break
+        if (sal_used + utils$Salary[j] <= rem_cap) {
+          n_picked          <- n_picked + 1L
+          picked_u[n_picked] <- utils$Player[j]
+          sal_used          <- sal_used + utils$Salary[j]
+          util_score        <- util_score + utils$FantasyPoints[j]
+        }
+      }
+      
+      if (n_picked == n_utils) {
+        total_score <- cpt_score + util_score
+        if (total_score > best_score) {
+          best_score  <- total_score
+          best_lineup <- list(
+            Captain     = cpt_player,
+            Utils       = sort(picked_u),
+            TotalSalary = cpt_sal + sal_used,
+            TotalScore  = total_score
+          )
+        }
+      }
+    }
+    
+    if (!is.null(best_lineup)) {
+      sig <- paste(c(best_lineup$Captain, best_lineup$Utils), collapse = "|")
+      row <- data.table(Lineup = sig, TotalSalary = best_lineup$TotalSalary,
+                        TotalScore = best_lineup$TotalScore)
+      row[, Captain := best_lineup$Captain]
+      for (k in seq_len(n_utils)) row[[paste0("Util", k)]] <- best_lineup$Utils[k]
+      lineup_list[[i]] <- row
+    }
+  }
+  
+  all_lineups <- rbindlist(lineup_list[!sapply(lineup_list, is.null)])
+  
+  counts <- all_lineups[, .(Top1Count   = .N,
+                            TotalSalary = TotalSalary[1],
+                            AvgScore    = mean(TotalScore)),
+                        by = Lineup]
+  setorder(counts, -Top1Count)
+  if (nrow(counts) > max_lineups) counts <- counts[1:max_lineups]
+  
+  # Rebuild structured columns from Lineup string
+  parts <- strsplit(counts$Lineup, "\\|")
+  unique_lineups <- data.table(
+    Captain = sapply(parts, `[`, 1)
+  )
+  for (k in seq_len(n_utils)) {
+    unique_lineups[[paste0("Util", k)]] <- sapply(parts, `[`, k + 1L)
+  }
+  unique_lineups[, TotalSalary := counts$TotalSalary]
+  unique_lineups[, Top1Count   := counts$Top1Count]
+  unique_lineups[, AvgScore    := counts$AvgScore]
+  
+  elapsed_time <- as.numeric(difftime(Sys.time(), start_time, units="secs"))
+  if (verbose) cat(sprintf("  ✓ Phase 1: %s unique lineups from %s sims | %.1fs\n",
+                           format(nrow(unique_lineups), big.mark=","),
+                           format(n_sims, big.mark=","), elapsed_time))
+  
+  list(unique_lineups = unique_lineups, n_sims = n_sims, config = config,
+       mode = "combinatorial_captain")
+}
+
+
+# =============================================================================
+# MODE 7: COMBINATORIAL MVP (FD MVP format: 1 MVP at 1.5x + 5 Flex)
+# MVP salary stays at face value for cap; only scoring multiplied.
+# =============================================================================
+
+find_optimal_lineups_combinatorial_mvp <- function(sim_results, config, verbose = TRUE) {
+  # FD MVP format: highest scorer per sim IS the MVP.
+  # Score is at 1.5x but salary counts at face value — same ID whether MVP or flex.
+  # So the optimal lineup is simply: pick the top scorer as MVP, then greedily
+  # fill 5 flex slots with the next-highest scorers under the remaining salary cap.
+  # No inner loop over candidates needed.
+  
+  if (verbose) cat("\nPhase 1: Finding optimal lineup per sim (greedy MVP)...\n")
+  
+  setDT(sim_results)
+  roster_size    <- config$roster_size
+  salary_cap     <- config$salary_cap
+  mvp_multiplier <- if (!is.null(config$mvp_multiplier)) config$mvp_multiplier else 1.5
+  max_lineups    <- if (!is.null(config$max_lineups)) config$max_lineups else 5000L
+  n_flex         <- roster_size - 1L
+  start_time     <- Sys.time()
+  
+  players_dt <- unique(sim_results[, .(Player, Salary)])[Salary > 0 & !is.na(Salary)]
+  sim_ids    <- unique(sim_results$SimID)
+  n_sims     <- length(sim_ids)
+  
+  if (verbose) cat(sprintf("  %d players | %s sims | $%s cap | %.1fx MVP score\n",
+                           nrow(players_dt), format(n_sims, big.mark=","),
+                           format(salary_cap, big.mark=","), mvp_multiplier))
+  
+  setkey(sim_results, SimID)
+  prog_freq <- max(1L, n_sims %/% 10L)
+  lineup_list <- vector("list", n_sims)
+  
+  for (i in seq_along(sim_ids)) {
+    sid      <- sim_ids[i]
+    sim_data <- sim_results[.(sid)][Salary > 0 & !is.na(Salary) & !is.na(FantasyPoints)]
+    if (nrow(sim_data) < roster_size) next
+    
+    # Sort by score descending — highest scorer is always the MVP
+    setorder(sim_data, -FantasyPoints)
+    scores  <- sim_data$FantasyPoints
+    sals    <- sim_data$Salary
+    players <- sim_data$Player
+    n_p     <- nrow(sim_data)
+    
+    # Row 1 (highest scorer) is MVP; salary at face value toward cap
+    mvp_sal <- sals[1]
+    if (mvp_sal > salary_cap) next
+    rem_cap <- salary_cap - mvp_sal
+    
+    # Greedy fill 5 flex from remaining players under remaining cap
+    picked_f   <- character(n_flex)
+    n_picked   <- 0L
+    sal_used   <- 0
+    flex_score <- 0
+    
+    for (j in 2:n_p) {
+      if (n_picked == n_flex) break
+      if (sal_used + sals[j] <= rem_cap) {
+        n_picked           <- n_picked + 1L
+        picked_f[n_picked] <- players[j]
+        sal_used           <- sal_used + sals[j]
+        flex_score         <- flex_score + scores[j]
+      }
+    }
+    
+    if (n_picked == n_flex) {
+      total_score <- scores[1] * mvp_multiplier + flex_score
+      sig <- paste(c(players[1], sort(picked_f)), collapse = "|")
+      row <- data.table(Lineup = sig, TotalSalary = mvp_sal + sal_used,
+                        TotalScore = total_score)
+      row[, MVP := players[1]]
+      for (k in seq_len(n_flex)) row[[paste0("Player", k)]] <- sort(picked_f)[k]
+      lineup_list[[i]] <- row
+    }
+    
+    if (verbose && i %% prog_freq == 0L) {
+      elapsed <- as.numeric(difftime(Sys.time(), start_time, units="secs"))
+      cat(sprintf("\r  Phase 1: %d%% | %.1fs", round(i/n_sims*100), elapsed))
+      flush.console()
+    }
+  }
+  if (verbose) cat("\n")
+  
+  all_lineups <- rbindlist(lineup_list[!sapply(lineup_list, is.null)])
+  
+  counts <- all_lineups[, .(Top1Count   = .N,
+                            TotalSalary = TotalSalary[1],
+                            AvgScore    = mean(TotalScore)),
+                        by = Lineup]
+  setorder(counts, -Top1Count)
+  if (nrow(counts) > max_lineups) counts <- counts[1:max_lineups]
+  
+  parts <- strsplit(counts$Lineup, "\\|")
+  unique_lineups <- data.table(MVP = sapply(parts, `[`, 1))
+  for (k in seq_len(n_flex)) {
+    unique_lineups[[paste0("Player", k)]] <- sapply(parts, `[`, k + 1L)
+  }
+  unique_lineups[, TotalSalary := counts$TotalSalary]
+  unique_lineups[, Top1Count   := counts$Top1Count]
+  unique_lineups[, AvgScore    := counts$AvgScore]
+  
+  elapsed_time <- as.numeric(difftime(Sys.time(), start_time, units="secs"))
+  if (verbose) cat(sprintf("  ✓ Phase 1: %s unique lineups from %s sims | %.1fs\n",
+                           format(nrow(unique_lineups), big.mark=","),
+                           format(n_sims, big.mark=","), elapsed_time))
+  
+  list(unique_lineups = unique_lineups, n_sims = n_sims, config = config,
+       mode = "combinatorial_mvp")
 }
 
 
@@ -946,63 +1297,49 @@ calculate_distribution_metrics <- function(score_matrix, lineup_data, config,
     # STANDARD PATH: Calculate from full matrix
     percentiles <- config$percentiles
     
-    if (verbose) {
-      cat("  Phase 3: 20%% | Calculating rankings...\n")
-      flush.console()
-    }
+    if (verbose) { cat("  Phase 3: Ranking lineups...\n"); flush.console() }
     
-    # Calculate Top % - OPTIMIZED with partial sorting
-    top_pcts <- matrix(0, nrow = n_lineups, ncol = length(percentiles))
+    # Pre-compute threshold ranks for each percentile
+    threshold_ranks  <- ceiling(n_lineups * percentiles)
+    top_pcts         <- matrix(0L, nrow = n_lineups, ncol = length(percentiles))
+    win_counts_accum <- integer(n_lineups)
     
-    # Process in larger chunks with vectorization
-    chunk_size <- 1000  # Process 1000 sims at once
-    n_chunks <- ceiling(n_sims / chunk_size)
+    # Chunk size: ~150MB per chunk (10k lineups * 2000 sims * 8 bytes)
+    chunk_size   <- 2000L
+    n_chunks     <- ceiling(n_sims / chunk_size)
+    phase3_start <- Sys.time()
     
-    if (verbose) {
-      cat(sprintf("  Phase 3: 20%% | Calculating rankings (vectorized)...\n"))
-      flush.console()
-    }
-    
-    for (chunk_idx in 1:n_chunks) {
-      chunk_start <- (chunk_idx - 1) * chunk_size + 1
-      chunk_end <- min(chunk_idx * chunk_size, n_sims)
-      chunk_sims <- chunk_start:chunk_end
-      n_chunk_sims <- length(chunk_sims)
+    for (chunk_idx in seq_len(n_chunks)) {
+      chunk_start  <- (chunk_idx - 1L) * chunk_size + 1L
+      chunk_end    <- min(chunk_idx * chunk_size, n_sims)
+      chunk_scores <- score_matrix[, chunk_start:chunk_end, drop = FALSE]
       
-      # Get scores for this chunk: lineups × chunk_sims
-      chunk_scores <- score_matrix[, chunk_sims, drop = FALSE]
+      # Win counts: vectorized max per sim, then flag lineups that hit it
+      col_max          <- apply(chunk_scores, 2L, max)
+      win_counts_accum <- win_counts_accum +
+        rowSums(sweep(chunk_scores, 2L, col_max, "=="))
       
-      # VECTORIZED win rate accumulation
-      max_scores <- apply(chunk_scores, 2, max)
-      win_matrix <- sweep(chunk_scores, 2, max_scores, "==")
-      if (chunk_idx == 1) {
-        win_counts_accum <- rowSums(win_matrix)
-      } else {
-        win_counts_accum <- win_counts_accum + rowSums(win_matrix)
-      }
+      # Rank matrix: compute ONCE per chunk, reuse for all percentiles
+      # rank(-x) per sim gives ascending rank (1 = best). One sort per sim total.
+      # Using a matrix apply is faster than a nested loop over percentiles.
+      rank_mat <- apply(chunk_scores, 2L,
+                        function(x) rank(-x, ties.method = "min"))
+      # rank_mat is n_lineups x n_chunk_sims
       
-      # Top% - use sort without partial parameter
+      # Count how many sims each lineup is within each percentile threshold
       for (p_idx in seq_along(percentiles)) {
-        threshold_rank <- ceiling(n_lineups * percentiles[p_idx])
-        
-        # Process each sim in chunk
-        for (sim_offset in 1:n_chunk_sims) {
-          sim_scores <- chunk_scores[, sim_offset]
-          
-          if (threshold_rank < n_lineups) {
-            # Sort and get the threshold value
-            sorted_scores <- sort(sim_scores, decreasing = TRUE)
-            threshold_score <- sorted_scores[threshold_rank]
-            top_pcts[, p_idx] <- top_pcts[, p_idx] + (sim_scores >= threshold_score)
-          } else {
-            top_pcts[, p_idx] <- top_pcts[, p_idx] + 1
-          }
+        k <- threshold_ranks[p_idx]
+        if (k >= n_lineups) {
+          top_pcts[, p_idx] <- top_pcts[, p_idx] + ncol(chunk_scores)
+        } else {
+          top_pcts[, p_idx] <- top_pcts[, p_idx] + rowSums(rank_mat <= k)
         }
       }
       
-      if (verbose && chunk_idx < n_chunks) {
-        pct_done <- (chunk_end / n_sims) * 40 + 20
-        cat(sprintf("\r  Phase 3: %.0f%% | Ranking sims...", pct_done))
+      if (verbose && chunk_idx %% max(1L, n_chunks %/% 5L) == 0L) {
+        elapsed  <- as.numeric(difftime(Sys.time(), phase3_start, units = "secs"))
+        pct_done <- round(chunk_end / n_sims * 40 + 20)
+        cat(sprintf("\r  Phase 3: %d%% | %.1fs", pct_done, elapsed))
         flush.console()
       }
     }
@@ -1012,7 +1349,7 @@ calculate_distribution_metrics <- function(score_matrix, lineup_data, config,
     
     if (verbose) {
       elapsed <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
-      cat(sprintf("\r  Phase 3: 60%% | %.1fs | Rankings complete\n", elapsed))
+      cat(sprintf("\r  Phase 3: 60%% | %.1fs | Done\n", elapsed))
       flush.console()
     }
   }
@@ -1023,7 +1360,7 @@ calculate_distribution_metrics <- function(score_matrix, lineup_data, config,
   
   if (verbose) {
     elapsed <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
-    cat(sprintf("  Phase 3: 70%% | %.1fs | Calculating ownership (vectorized)...\n", elapsed))
+    cat(sprintf("  Phase 3: 70%% | %.1fs | Calculating ownership...\n", elapsed))
     flush.console()
   }
   

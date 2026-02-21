@@ -16,14 +16,16 @@ SPORT_CONFIGS <- list(
     
     detection = list(
       required_sheets   = c("Race_Weights", "Race_Profiles"),
-      required_columns  = c("Starting", "Team", "Car"),
+      required_columns  = c("Starting", "team", "car"),   # lowercase as they appear in the Excel file
       min_sheet_matches = 2,
       min_column_matches = 2
     ),
     
-    platforms    = c("DK", "FD"),
-    roster_sizes = list(DK = 6, FD = 5),
-    salary_caps  = list(DK = 50000, FD = 50000),
+    platforms          = c("DK", "FD"),
+    roster_sizes       = list(DK = 6, FD = 5),
+    salary_caps        = list(DK = 50000, FD = 50000),
+    optimization_modes = list(DK = "combinatorial", FD = "combinatorial"),  # greedy per-sim, no LP
+    max_lineups        = 5000,
     
     standard_metrics = c(
       "WinRate", "Top1Rate", "Top5Rate", "Top10Rate", "Top20Rate",
@@ -80,10 +82,9 @@ SPORT_CONFIGS <- list(
     simulation = list(
       function_name = "run_nascar_simulation",
       output_format = list(
-        sim_results = c("SimID", "Player", "DKScore", "FDScore"),
+        sim_results = c("SimID", "Player", "DKScore"),   # FDScore present only when has_fd=TRUE
         metadata    = c("Player", "DKSalary", "DKID", "DKOwn",
-                        "FDSalary", "FDID", "FDName", "FDOwn",
-                        "Starting", "Team", "Car")
+                        "Starting", "Team", "Car")             # FD columns validated at runtime via has_fd
       )
     ),
     
@@ -110,14 +111,28 @@ SPORT_CONFIGS <- list(
     platforms    = c("DK", "FD", "SD"),
     roster_sizes = list(DK = 6, FD = 6, SD = 6),
     salary_caps  = list(DK = 50000, FD = 100, SD = 50000),
+    # Small player pool: greedy optimal per sim, dedupe → ranked by Top1Count
+    optimization_modes = list(DK = "combinatorial", FD = "combinatorial_mvp", SD = "combinatorial_captain"),
+    max_lineups        = 5000,
     
     standard_metrics = c(
       "WinRate", "Top1Rate", "Top5Rate", "Top10Rate", "Top20Rate",
-      "TotalSalary", "TotalOwn", "AvgOwn"
+      "TotalSalary", "TotalOwn", "AvgOwn",
+      "TotalEW", "Win6Pct", "Win5PlusPct"
     ),
     
-    custom_metrics   = NULL,
-    metadata_columns = NULL,
+    custom_metrics = list(
+      list(name = "TotalEW",     source_column = "TotalEW",     calculation = "custom", label = "Total EW",  display_name = "Total EW",  decimals = 2, format = "decimal"),
+      list(name = "Win6Pct",     source_column = "Win6Pct",     calculation = "custom", label = "Win 6 %",   display_name = "Win 6 %",   decimals = 1, format = "percentage"),
+      list(name = "Win5PlusPct", source_column = "Win5PlusPct", calculation = "custom", label = "Win 5+ %",  display_name = "Win 5+ %",  decimals = 1, format = "percentage")
+    ),
+    
+    metadata_columns = list(
+      list(name = "WinProb", label = "Win Prob", type = "numeric", display = TRUE, filter = FALSE),
+      list(name = "Opponent", label = "Opponent", type = "text",    display = TRUE, filter = FALSE)
+    ),
+    
+    lineup_metrics_function = "calculate_mma_lineup_metrics",
     
     portfolio_filters = list(
       rate_minimums = list(
@@ -138,15 +153,17 @@ SPORT_CONFIGS <- list(
       DK = list(salary = "DKSalary", id = "DKID", ownership = "DKOwn", score = "DKScore"),
       FD = list(salary = "FDSalary", id = "FDID", ownership = "FDOwn", score = "FDScore",
                 has_mvp = TRUE, mvp_multiplier = 1.5, mvp_salary_multiplier = 1.0),
+      # SD = DK Showdown: uses DK scoring and salaries, captain mode (1.5x)
       SD = list(salary = "SDSalary", id = "SDID", cpt_id = "CPTID",
-                ownership = "DKOwn", score = "DKScore", cpt_multiplier = 1.5)
+                ownership = "DKOwn", score = "DKScore", cpt_multiplier = 1.5,
+                platform_label = "DK Showdown")
     ),
     
     download_formats = list(
       DK     = "{Name} ({DKID})",
       FD     = "{FDID}:{Name}",
-      SD     = "{Name} ({SDID})",
-      SD_CPT = "{Name} ({CPTID})"
+      SD     = "{Name} ({SDID})",      # Showdown utility slot
+      SD_CPT = "{Name} ({CPTID})"      # Showdown captain slot
     ),
     
     input_file = list(
@@ -356,7 +373,8 @@ SPORT_CONFIGS <- list(
                         "DKSalary", "DKID", "DKOwn",
                         "FDSalary", "FDID", "FDOwn")
       )
-    )
+    ),
+    max_lineups = 5000
   ),
   
   
@@ -385,7 +403,8 @@ SPORT_CONFIGS <- list(
     
     # Golf-specific Phase 1 settings
     phase1_n_sample  = 25000L,   # random salary-valid lineups to draw
-    phase1_target    = 10000L,   # top N by ExpectedCuts to keep
+    max_lineups      = 5000,
+    phase1_target    = 5000L,    # top N by ExpectedCuts to keep
     
     standard_metrics = c(
       "WinRate", "Top1Pct", "Top5Pct", "Top10Pct", "Top20Pct",
