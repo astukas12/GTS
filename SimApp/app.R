@@ -132,6 +132,7 @@ ui <- dashboardPage(
         else if (p==='FanDuel')   Shiny.setInputValue('fd_delete_build', b, {priority:'event'});
         else if (p==='Showdown')  Shiny.setInputValue('sd_delete_build', b, {priority:'event'});
       });
+      // Track selected rows per platform so delete preserves highlights
       $(document).on('click', '.delete-lineup', function(e) {
         e.stopPropagation(); e.preventDefault();
         var r = $(this).data('row'), p = null;
@@ -618,7 +619,7 @@ server <- function(input, output, session) {
             n_sample=rv$config$phase1_n_sample, target_pool=rv$config$phase1_target, verbose=TRUE)
         } else {
           progress$set(detail="Phase 1: Finding optimal lineups...", value=0.1)
-          lineup_data <- find_optimal_lineups(opt_data, dk_opt_cfg, mode="standard", k=3, verbose=TRUE)
+          lineup_data <- find_optimal_lineups(opt_data, dk_opt_cfg, mode="standard", k=1, verbose=TRUE)
         }
         progress$set(detail="Phase 2: Scoring lineups...", value=0.45)
         score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
@@ -659,7 +660,7 @@ server <- function(input, output, session) {
                            percentiles=c(0.01,0.05,0.10,0.20), platform_col="DKScore",
                            progress_frequency=500, use_parallel=TRUE, max_lineups=5000)
         progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
-        lineup_data <- find_optimal_lineups(opt_data, opt_config, mode=dk_mode, k=3, verbose=TRUE)
+        lineup_data <- find_optimal_lineups(opt_data, opt_config, mode=dk_mode, k=1, verbose=TRUE)
         progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
                                     format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
         score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
@@ -710,7 +711,7 @@ server <- function(input, output, session) {
             n_sample=rv$config$phase1_n_sample, target_pool=rv$config$phase1_target, verbose=TRUE)
         } else {
           progress$set(message="Finding optimal FD Golf lineups...", value=0, detail="Phase 1...")
-          lineup_data <- find_optimal_lineups(opt_data, fd_opt_cfg, mode="standard", k=3, verbose=TRUE)
+          lineup_data <- find_optimal_lineups(opt_data, fd_opt_cfg, mode="standard", k=1, verbose=TRUE)
         }
         progress$set(detail="Phase 2...", value=0.45)
         score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
@@ -734,7 +735,7 @@ server <- function(input, output, session) {
                            percentiles=c(0.01,0.05,0.10,0.20), platform_col="FDScore",
                            mvp_multiplier=1.5, progress_frequency=500, use_parallel=TRUE, max_lineups=5000)
         progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
-        lineup_data <- find_optimal_lineups(opt_data, opt_config, mode=fd_mode, k=3, verbose=TRUE)
+        lineup_data <- find_optimal_lineups(opt_data, opt_config, mode=fd_mode, k=1, verbose=TRUE)
         progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
                                     format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
         score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
@@ -772,7 +773,7 @@ server <- function(input, output, session) {
                          cpt_multiplier=1.5, progress_frequency=500, use_parallel=TRUE, max_lineups=5000)
       progress$set(message="Finding optimal Showdown lineups...",
                    detail="Phase 1: Building lineup pool...", value=0.05)
-      lineup_data  <- find_optimal_lineups(opt_data, opt_config, mode=sd_mode, k=3, verbose=TRUE)
+      lineup_data  <- find_optimal_lineups(opt_data, opt_config, mode=sd_mode, k=1, verbose=TRUE)
       progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
                                   format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
       score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
@@ -840,7 +841,7 @@ server <- function(input, output, session) {
                  uiOutput("download_buttons_ui"),
                  hr(),
                  div(style="margin-bottom:15px;", uiOutput("view_platform_ui")),
-                 DTOutput("lineup_results_table")
+                 DTOutput("lineup_results_table")   # static DTOutput - must live outside renderUI to avoid DIV warning
     ))
   })
   

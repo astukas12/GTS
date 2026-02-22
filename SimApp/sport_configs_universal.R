@@ -33,8 +33,8 @@ SPORT_CONFIGS <- list(
     ),
     
     custom_metrics = list(
-      list(name = "TotalStart", source = "Starting", calculation = "sum",  label = "Total Start", decimals = 0),
-      list(name = "AvgStart",   source = "Starting", calculation = "mean", label = "Avg Start",   decimals = 1)
+      list(name = "CumulativeStarting",    source = "Starting", calculation = "sum",  label = "Total Start", decimals = 0),
+      list(name = "GeometricMeanStarting", source = "Starting", calculation = "mean", label = "Avg Start",   decimals = 1)
     ),
     
     metadata_columns = list(
