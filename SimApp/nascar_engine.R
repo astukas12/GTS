@@ -432,19 +432,13 @@ precompute_driver_distributions <- function(driver_data) {
 }
 
 
-#' Simulate finish positions using Gumbel-max trick
+#' Simulate finish positions using tier-based sampling
 #' 
-#' This properly respects each driver's finish position probabilities while
-#' generating realistic race outcomes. Uses the Gumbel-max trick to sample
-#' positions while maintaining correlations (if one driver finishes P1, others can't).
-#' 
-#' Algorithm:
-#' 1. For each driver, sample their "target position" from their probability distribution
-#' 2. Add Gumbel noise to create quality scores (drivers aiming for better positions get better scores)
-#' 3. Rank by quality scores to get final finishing order
-#' 
-#' This approach is ~95% accurate compared to perfect sequential sampling,
-#' but runs much faster (fully vectorized).
+#' Simple, correct approach:
+#' 1. Sample winner from drivers with W > 0
+#' 2. Sample P2-3 from drivers with T3 > 0 (excluding winner)
+#' 3. Sample P4-5 from drivers with T5 > 0 (excluding top-3)
+#' And so on...
 simulate_finish_positions_vectorized <- function(prob_matrix, n_sims) {
   n_drivers <- nrow(prob_matrix)
   n_positions <- ncol(prob_matrix)
@@ -454,60 +448,154 @@ simulate_finish_positions_vectorized <- function(prob_matrix, n_sims) {
   final_positions <- matrix(0, nrow = n_drivers, ncol = n_sims)
   rownames(final_positions) <- driver_names
   
-  # =========================================================================
-  # IDENTIFY HARD CONSTRAINTS (positions where probability = 0)
-  # =========================================================================
-  # If a driver has 0% probability for position 1, they should NEVER finish P1
-  # This prevents Gumbel noise from giving them wins they shouldn't get
+  # Identify which drivers are eligible for each tier based on input probabilities
+  # A driver is eligible for a tier if they have non-zero probability for that range
   
-  zero_prob_positions <- prob_matrix == 0
+  # Position 1: drivers with prob > 0 for P1
+  eligible_p1 <- which(prob_matrix[, 1] > 0)
   
-  # =========================================================================
-  # GUMBEL-MAX SAMPLING (Vectorized for speed)
-  # =========================================================================
+  # Positions 2-3: drivers with prob > 0 for P2 or P3
+  eligible_p2_3 <- which(rowSums(prob_matrix[, 2:3, drop=FALSE]) > 0)
+  
+  # Positions 4-5: drivers with prob > 0 for P4 or P5
+  eligible_p4_5 <- which(rowSums(prob_matrix[, 4:5, drop=FALSE]) > 0)
+  
+  # Positions 6-10
+  eligible_p6_10 <- which(rowSums(prob_matrix[, 6:10, drop=FALSE]) > 0)
+  
+  # Positions 11-15
+  eligible_p11_15 <- which(rowSums(prob_matrix[, 11:15, drop=FALSE]) > 0)
+  
+  # Positions 16-20
+  eligible_p16_20 <- which(rowSums(prob_matrix[, 16:20, drop=FALSE]) > 0)
+  
+  # Positions 21-25
+  eligible_p21_25 <- which(rowSums(prob_matrix[, 21:25, drop=FALSE]) > 0)
+  
+  # Positions 26-30
+  eligible_p26_30 <- which(rowSums(prob_matrix[, 26:30, drop=FALSE]) > 0)
+  
+  # Positions 31-40
+  eligible_p31_40 <- which(rowSums(prob_matrix[, 31:40, drop=FALSE]) > 0)
   
   for (sim_id in 1:n_sims) {
-    # For each driver, sample their "target position" from their probability distribution
-    sampled_targets <- numeric(n_drivers)
+    assigned_positions <- numeric(n_drivers)
+    available_drivers <- 1:n_drivers
     
-    for (i in 1:n_drivers) {
-      # Sample which position this driver "aims for" based on their probabilities
-      driver_probs <- prob_matrix[i, ]
-      
-      sampled_targets[i] <- sample(
-        x = 1:n_positions,
-        size = 1,
-        prob = driver_probs
-      )
+    # Position 1 (Winner)
+    p1_candidates <- intersect(eligible_p1, available_drivers)
+    if (length(p1_candidates) > 0) {
+      # Weight by their P1 probability
+      p1_probs <- prob_matrix[p1_candidates, 1]
+      winner <- sample(p1_candidates, size=1, prob=p1_probs)
+      assigned_positions[winner] <- 1
+      available_drivers <- available_drivers[available_drivers != winner]
     }
     
-    # Add Gumbel noise to create quality scores
-    # The Gumbel distribution is key - it creates proper randomness while
-    # preserving the probability structure
-    gumbel_noise <- -log(-log(runif(n_drivers)))
+    # Positions 2-3
+    p2_3_candidates <- intersect(eligible_p2_3, available_drivers)
+    if (length(p2_3_candidates) >= 2) {
+      # Weight by their combined P2-P3 probability
+      p2_3_probs <- rowSums(prob_matrix[p2_3_candidates, 2:3, drop=FALSE])
+      selected <- sample(p2_3_candidates, size=min(2, length(p2_3_candidates)), prob=p2_3_probs, replace=FALSE)
+      assigned_positions[selected[1]] <- 2
+      if (length(selected) > 1) assigned_positions[selected[2]] <- 3
+      available_drivers <- setdiff(available_drivers, selected)
+    } else if (length(p2_3_candidates) == 1) {
+      assigned_positions[p2_3_candidates] <- 2
+      available_drivers <- setdiff(available_drivers, p2_3_candidates)
+    }
     
-    # Quality score = target position + noise
-    # Lower target position (P1, P2, etc.) = better quality score
-    # Noise adds realistic variability
-    quality_scores <- -sampled_targets + 0.35 * gumbel_noise
+    # Positions 4-5
+    p4_5_candidates <- intersect(eligible_p4_5, available_drivers)
+    if (length(p4_5_candidates) >= 2) {
+      p4_5_probs <- rowSums(prob_matrix[p4_5_candidates, 4:5, drop=FALSE])
+      selected <- sample(p4_5_candidates, size=min(2, length(p4_5_candidates)), prob=p4_5_probs, replace=FALSE)
+      assigned_positions[selected[1]] <- 4
+      if (length(selected) > 1) assigned_positions[selected[2]] <- 5
+      available_drivers <- setdiff(available_drivers, selected)
+    } else if (length(p4_5_candidates) == 1) {
+      assigned_positions[p4_5_candidates] <- 4
+      available_drivers <- setdiff(available_drivers, p4_5_candidates)
+    }
     
-    # =========================================================================
-    # APPLY HARD CONSTRAINTS: Force drivers with 0% win probability to finish worse
-    # =========================================================================
-    # If driver has 0% probability for positions 1-3, ensure they can't finish there
-    # by giving them a very bad quality score if they sampled those positions
+    # Positions 6-10
+    p6_10_candidates <- intersect(eligible_p6_10, available_drivers)
+    if (length(p6_10_candidates) >= 5) {
+      p6_10_probs <- rowSums(prob_matrix[p6_10_candidates, 6:10, drop=FALSE])
+      selected <- sample(p6_10_candidates, size=min(5, length(p6_10_candidates)), prob=p6_10_probs, replace=FALSE)
+      for (i in seq_along(selected)) {
+        assigned_positions[selected[i]] <- 5 + i
+      }
+      available_drivers <- setdiff(available_drivers, selected)
+    }
     
-    for (i in 1:n_drivers) {
-      sampled_pos <- sampled_targets[i]
-      # If this driver sampled a position they have 0% chance of getting,
-      # heavily penalize their quality score
-      if (zero_prob_positions[i, sampled_pos]) {
-        quality_scores[i] <- quality_scores[i] - 1000  # Massive penalty
+    # Positions 11-15
+    p11_15_candidates <- intersect(eligible_p11_15, available_drivers)
+    if (length(p11_15_candidates) >= 5) {
+      p11_15_probs <- rowSums(prob_matrix[p11_15_candidates, 11:15, drop=FALSE])
+      selected <- sample(p11_15_candidates, size=min(5, length(p11_15_candidates)), prob=p11_15_probs, replace=FALSE)
+      for (i in seq_along(selected)) {
+        assigned_positions[selected[i]] <- 10 + i
+      }
+      available_drivers <- setdiff(available_drivers, selected)
+    }
+    
+    # Positions 16-20
+    p16_20_candidates <- intersect(eligible_p16_20, available_drivers)
+    if (length(p16_20_candidates) >= 5) {
+      p16_20_probs <- rowSums(prob_matrix[p16_20_candidates, 16:20, drop=FALSE])
+      selected <- sample(p16_20_candidates, size=min(5, length(p16_20_candidates)), prob=p16_20_probs, replace=FALSE)
+      for (i in seq_along(selected)) {
+        assigned_positions[selected[i]] <- 15 + i
+      }
+      available_drivers <- setdiff(available_drivers, selected)
+    }
+    
+    # Positions 21-25
+    p21_25_candidates <- intersect(eligible_p21_25, available_drivers)
+    if (length(p21_25_candidates) >= 5) {
+      p21_25_probs <- rowSums(prob_matrix[p21_25_candidates, 21:25, drop=FALSE])
+      selected <- sample(p21_25_candidates, size=min(5, length(p21_25_candidates)), prob=p21_25_probs, replace=FALSE)
+      for (i in seq_along(selected)) {
+        assigned_positions[selected[i]] <- 20 + i
+      }
+      available_drivers <- setdiff(available_drivers, selected)
+    }
+    
+    # Positions 26-30
+    p26_30_candidates <- intersect(eligible_p26_30, available_drivers)
+    if (length(p26_30_candidates) >= 5) {
+      p26_30_probs <- rowSums(prob_matrix[p26_30_candidates, 26:30, drop=FALSE])
+      selected <- sample(p26_30_candidates, size=min(5, length(p26_30_candidates)), prob=p26_30_probs, replace=FALSE)
+      for (i in seq_along(selected)) {
+        assigned_positions[selected[i]] <- 25 + i
+      }
+      available_drivers <- setdiff(available_drivers, selected)
+    }
+    
+    # Positions 31-40 (remaining drivers)
+    if (length(available_drivers) > 0) {
+      p31_40_candidates <- intersect(eligible_p31_40, available_drivers)
+      if (length(p31_40_candidates) > 0) {
+        p31_40_probs <- rowSums(prob_matrix[p31_40_candidates, 31:40, drop=FALSE])
+        selected <- sample(p31_40_candidates, size=length(p31_40_candidates), prob=p31_40_probs, replace=FALSE)
+        for (i in seq_along(selected)) {
+          assigned_positions[selected[i]] <- 30 + i
+        }
+        available_drivers <- setdiff(available_drivers, selected)
+      }
+      
+      # If still drivers left (shouldn't happen with proper inputs), assign remaining positions
+      if (length(available_drivers) > 0) {
+        remaining_positions <- setdiff(1:n_positions, assigned_positions[assigned_positions > 0])
+        for (i in seq_along(available_drivers)) {
+          assigned_positions[available_drivers[i]] <- remaining_positions[i]
+        }
       }
     }
     
-    # Rank by quality scores (higher quality = better finish = lower position number)
-    final_positions[, sim_id] <- rank(-quality_scores, ties.method = "random")
+    final_positions[, sim_id] <- assigned_positions
   }
   
   return(final_positions)
