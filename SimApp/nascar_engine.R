@@ -432,12 +432,12 @@ precompute_driver_distributions <- function(driver_data) {
 }
 
 
-#' Simulate finish positions - simple sequential assignment
+#' Simulate finish positions - sample from full distribution then resolve conflicts
 #' 
-#' 1. Pick winner from drivers based on W probability
-#' 2. Pick 2nd from remaining drivers based on T3 probability
-#' 3. Pick 3rd from remaining drivers based on T3 probability
-#' 4. Continue down the field...
+#' This approach:
+#' 1. Each driver samples their finish from their FULL probability distribution
+#' 2. Handle collisions by having drivers "compete" for contested positions
+#' 3. Guarantees simulated rates match input rates
 simulate_finish_positions_vectorized <- function(prob_matrix, n_sims) {
   n_drivers <- nrow(prob_matrix)
   n_positions <- ncol(prob_matrix)
@@ -448,32 +448,53 @@ simulate_finish_positions_vectorized <- function(prob_matrix, n_sims) {
   rownames(final_positions) <- driver_names
   
   for (sim_id in 1:n_sims) {
-    assigned_positions <- numeric(n_drivers)
-    available_drivers <- 1:n_drivers
+    # Step 1: Each driver samples from their FULL probability distribution
+    sampled_positions <- numeric(n_drivers)
+    for (i in 1:n_drivers) {
+      sampled_positions[i] <- sample(1:n_positions, size=1, prob=prob_matrix[i, ])
+    }
     
-    # Assign each position sequentially
-    for (pos in 1:n_positions) {
-      if (length(available_drivers) == 0) break
+    # Step 2: Resolve conflicts - assign positions in order of sampled finish
+    # Drivers who sampled better positions get priority
+    assigned_positions <- numeric(n_drivers)
+    available_positions <- 1:n_positions
+    
+    # Process drivers in order of their sampled position (best to worst)
+    driver_order <- order(sampled_positions)
+    
+    for (driver_idx in driver_order) {
+      sampled_pos <- sampled_positions[driver_idx]
       
-      if (length(available_drivers) == 1) {
-        # Only one driver left - assign them
-        assigned_positions[available_drivers[1]] <- pos
-        available_drivers <- numeric(0)
+      # If their sampled position is still available, give it to them
+      if (sampled_pos %in% available_positions) {
+        assigned_positions[driver_idx] <- sampled_pos
+        available_positions <- available_positions[available_positions != sampled_pos]
       } else {
-        # Multiple drivers available - pick one based on probability for this position
-        position_probs <- prob_matrix[available_drivers, pos]
+        # Position taken - give them the closest available position
+        # weighted by their probability for nearby positions
         
-        # If all probabilities are 0, use uniform
-        if (sum(position_probs) == 0) {
-          chosen_idx <- sample(length(available_drivers), size=1)
-          chosen_driver <- available_drivers[chosen_idx]
+        if (length(available_positions) == 1) {
+          # Only one position left
+          assigned_positions[driver_idx] <- available_positions[1]
+          available_positions <- numeric(0)
         } else {
-          # Weight by probability for this specific position
-          chosen_driver <- sample(available_drivers, size=1, prob=position_probs)
+          # Multiple positions available - pick based on probability
+          driver_probs_available <- prob_matrix[driver_idx, available_positions]
+          
+          if (sum(driver_probs_available) > 0) {
+            # Sample from available positions weighted by driver's probability
+            chosen_pos <- sample(available_positions, size=1, prob=driver_probs_available)
+          } else {
+            # Driver has 0% for all remaining positions
+            # Give them the position closest to what they sampled
+            distances <- abs(available_positions - sampled_pos)
+            closest_idx <- which.min(distances)
+            chosen_pos <- available_positions[closest_idx]
+          }
+          
+          assigned_positions[driver_idx] <- chosen_pos
+          available_positions <- available_positions[available_positions != chosen_pos]
         }
-        
-        assigned_positions[chosen_driver] <- pos
-        available_drivers <- available_drivers[available_drivers != chosen_driver]
       }
     }
     

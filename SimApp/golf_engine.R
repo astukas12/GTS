@@ -50,6 +50,11 @@ process_golf_players <- function(player_dt) {
     if (col %in% names(dt)) dt[, (col) := as.numeric(get(col))]
   }
   
+  # ID columns - coerce to character to preserve leading zeros / alphanumeric FD IDs
+  for (col in c("DKID","FDID")) {
+    if (col %in% names(dt)) dt[, (col) := as.character(get(col))]
+  }
+  
   # Ownership - strip % if present
   for (col in c("DKOP","FDOP")) {
     if (col %in% names(dt)) {
@@ -336,10 +341,12 @@ run_golf_simulation <- function(input_data, n_sims = 10000,
   if (has_dk) {
     sim_metadata[, DKSalary := players_dt$DKSalary]
     sim_metadata[, DKOwn    := if ("DKOP" %in% names(players_dt)) players_dt$DKOP else 0]
+    sim_metadata[, DKID     := if ("DKID" %in% names(players_dt)) as.character(players_dt$DKID) else NA_character_]
   }
   if (has_fd) {
     sim_metadata[, FDSalary := players_dt$FDSalary]
     sim_metadata[, FDOwn    := if ("FDOP" %in% names(players_dt)) players_dt$FDOP else 0]
+    sim_metadata[, FDID     := if ("FDID" %in% names(players_dt)) as.character(players_dt$FDID) else NA_character_]
   }
   
   cat(sprintf("Golf sim done | %.1fs | %s rows\n",

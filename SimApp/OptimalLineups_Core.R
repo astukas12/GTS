@@ -1379,7 +1379,6 @@ calculate_distribution_metrics <- function(score_matrix, lineup_data, config,
     multipliers <- rep(1, length(player_cols))
   }
   
-  cumulative_own <- rep(0, n_lineups)
   geometric_own <- rep(0, n_lineups)
   
   if (!is.null(ownership_data) && nrow(ownership_data) > 0) {
@@ -1429,9 +1428,6 @@ calculate_distribution_metrics <- function(score_matrix, lineup_data, config,
       # Apply multipliers (for Captain/MVP modes)
       multiplier_matrix <- matrix(rep(multipliers, each = n_lineups), nrow = n_lineups)
       weighted_ownership <- ownership_matrix * multiplier_matrix
-      
-      # CUMULATIVE OWNERSHIP: Just sum across positions (vectorized!)
-      cumulative_own <- rowSums(weighted_ownership)
       
       # GEOMETRIC MEAN OWNERSHIP: 
       # Geometric mean = exp(mean(log(x))) for x > 0
@@ -1486,8 +1482,7 @@ calculate_distribution_metrics <- function(score_matrix, lineup_data, config,
     Top10Pct = top_pcts[, 3],
     Top20Pct = top_pcts[, 4],
     TotalSalary = total_salary,
-    CumulativeOwnership = cumulative_own * 100,
-    GeometricMeanOwnership = geometric_own * 100
+    AvgOwn = geometric_own * 100
   )
   
   elapsed_time <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))

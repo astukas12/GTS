@@ -466,8 +466,8 @@ SPORT_CONFIGS <- list(
       player_sheet    = "Player",
       required_columns = list(
         base     = c("Name", "W", "T5", "T10", "Cut"),
-        DK       = c("DKSalary", "DKOP"),
-        FD       = c("FDSalary", "FDOP"),
+        DK       = c("DKSalary", "DKID", "DKOP"),
+        FD       = c("FDSalary", "FDID", "FDOP"),
         metadata = c("Pool")
       )
     ),

@@ -465,11 +465,11 @@ server <- function(input, output, session) {
     }
     display_cols <- intersect(
       c(player_cols, "WinRate","Top1Pct","Top5Pct","Top10Pct","Top20Pct",
-        "TotalSalary","CumulativeOwnership","GeometricMeanOwnership"),
+        "TotalSalary","AvgOwn"),
       names(optimal_lineups))
     display_table <- optimal_lineups[, ..display_cols]
     rename_map <- c("WinRate"="Win","Top1Pct"="Top1","Top5Pct"="Top5","Top10Pct"="Top10","Top20Pct"="Top20",
-                    "TotalSalary"="Salary","CumulativeOwnership"="TotalOwn","GeometricMeanOwnership"="AvgOwn")
+                    "TotalSalary"="Salary")
     for (o in names(rename_map)) if (o %in% names(display_table)) setnames(display_table, o, rename_map[[o]])
     display_table
   }
@@ -478,7 +478,7 @@ server <- function(input, output, session) {
     display_table <- copy(portfolio_data); setDT(display_table)
     display_table[, RowID := .I]
     rename_map <- c("WinRate"="Win","Top1Pct"="Top1","Top5Pct"="Top5","Top10Pct"="Top10","Top20Pct"="Top20",
-                    "TotalSalary"="Salary","CumulativeOwnership"="TotalOwn","GeometricMeanOwnership"="AvgOwn")
+                    "TotalSalary"="Salary")
     for (o in names(rename_map)) if (o %in% names(display_table)) setnames(display_table, o, rename_map[[o]])
     if (!is.null(sport_config$custom_metrics)) {
       for (m in sport_config$custom_metrics) {
@@ -495,7 +495,7 @@ server <- function(input, output, session) {
   }
   
   get_format_columns <- function(display_table, sport_config) {
-    pct_cols <- c("Win","Top1","Top5","Top10","Top20","TotalOwn","AvgOwn")
+    pct_cols <- c("Win","Top1","Top5","Top10","Top20","AvgOwn")
     if (!is.null(sport_config$custom_metrics)) {
       for (m in sport_config$custom_metrics) {
         if (!is.null(m$format) && m$format == "percentage") {
@@ -882,10 +882,10 @@ server <- function(input, output, session) {
                     options=list(pageLength=50, searching=FALSE, lengthChange=FALSE, scrollX=TRUE, dom='tp',
                                  order=list(list(which(names(display_table)=="Win")-1,'desc'))),
                     rownames=FALSE) %>%
-      formatRound(intersect(c("Win","Top1","Top5","Top10","Top20","TotalOwn","AvgOwn"),
+      formatRound(intersect(c("Win","Top1","Top5","Top10","Top20","AvgOwn"),
                             names(display_table)), 1)
     if ("Salary" %in% names(display_table)) dt <- dt %>% formatCurrency("Salary","$",digits=0)
-    if ("TotalStart" %in% names(display_table)) dt <- dt %>% formatRound(c("TotalStart","AvgStart"),1)
+    if ("AvgStart" %in% names(display_table)) dt <- dt %>% formatRound("AvgStart", 1)
     for (gc in intersect(c("ExpectedCuts","AtLeast6","AtLeast5","EarlyLateCount"), names(display_table)))
       dt <- dt %>% formatRound(gc, 1)
     dt
@@ -1025,10 +1025,8 @@ server <- function(input, output, session) {
       range_cols <- setdiff(num_cols, c("WinRate","Top1Pct","Top5Pct","Top10Pct","Top20Pct","ExpectedCuts"))
       cfg_map <- list(
         TotalSalary=list(label="Salary",format="k",step=0.1),
-        CumulativeOwnership=list(label="Total Own",format="whole",step=1),
-        GeometricMeanOwnership=list(label="Avg Own",format="decimal",step=0.1),
-        CumulativeStarting=list(label="Total Start",format="whole",step=1),
-        GeometricMeanStarting=list(label="Avg Start",format="decimal",step=0.1),
+        AvgOwn=list(label="Avg Own",format="decimal",step=0.1),
+        AvgStart=list(label="Avg Start",format="decimal",step=0.1),
         AtLeast6=list(label="All 6 Cut%",format="decimal",step=1),
         AtLeast5=list(label="5+ Cut%",format="decimal",step=1),
         EarlyLateCount=list(label="Early/Late Golfers",format="whole",step=1)
