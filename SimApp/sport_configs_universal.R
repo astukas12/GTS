@@ -29,7 +29,7 @@ SPORT_CONFIGS <- list(
     
     standard_metrics = c(
       "WinRate", "Top1Rate", "Top5Rate", "Top10Rate", "Top20Rate",
-      "TotalSalary", "TotalOwn", "AvgOwn"
+      "TotalSalary", "AvgOwn"
     ),
     
     custom_metrics = list(
@@ -53,10 +53,9 @@ SPORT_CONFIGS <- list(
       ),
       range_filters = list(
         list(name = "Salary",    label = "Salary (K)",  column = "TotalSalary",           step = 0.1, format = "salary_k"),
-        list(name = "TotalOwn",  label = "Total Own",   column = "CumulativeOwnership",   step = 1,   format = "number"),
-        list(name = "AvgOwn",    label = "Avg Own",     column = "GeometricMeanOwnership",step = 0.1, format = "decimal"),
+        list(name = "AvgOwn",    label = "Avg Own",     column = "AvgOwn",                step = 0.1, format = "decimal"),
         list(name = "TotalStart",label = "Total Start", column = "CumulativeStarting",    step = 1,   format = "number"),
-        list(name = "AvgStart",  label = "Avg Start",   column = "GeometricMeanStarting", step = 0.1, format = "decimal")
+        list(name = "AvgStart",  label = "Avg Start",   column = "AvgStart",              step = 0.1, format = "decimal")
       )
     ),
     
@@ -117,7 +116,7 @@ SPORT_CONFIGS <- list(
     
     standard_metrics = c(
       "WinRate", "Top1Rate", "Top5Rate", "Top10Rate", "Top20Rate",
-      "TotalSalary", "TotalOwn", "AvgOwn",
+      "TotalSalary", "AvgOwn",
       "TotalEW", "Win6Pct", "Win5PlusPct"
     ),
     
@@ -144,8 +143,7 @@ SPORT_CONFIGS <- list(
       ),
       range_filters = list(
         list(name = "Salary",   label = "Salary (K)", column = "TotalSalary",            step = 0.1, format = "salary_k"),
-        list(name = "TotalOwn", label = "Total Own",  column = "CumulativeOwnership",    step = 1,   format = "number"),
-        list(name = "AvgOwn",   label = "Avg Own",    column = "GeometricMeanOwnership", step = 0.1, format = "decimal")
+        list(name = "AvgOwn",   label = "Avg Own",    column = "AvgOwn",                step = 0.1, format = "decimal")
       )
     ),
     
@@ -221,13 +219,14 @@ SPORT_CONFIGS <- list(
     
     standard_metrics = c(
       "WinRate", "Top1Rate", "Top5Rate", "Top10Rate", "Top20Rate",
-      "TotalSalary", "TotalOwn", "AvgOwn",
+      "TotalSalary", "AvgOwn",
       "TotalEW", "Win6Pct", "Win5PlusPct"
     ),
     
     custom_metrics = list(
-      list(name = "TotalEW", calculation = "custom", label = "Total EW", decimals = 2),
-      list(name = "AvgEW",   calculation = "custom", label = "Avg EW",   decimals = 2)
+      list(name = "TotalEW",     source_column = "TotalEW",     calculation = "custom", label = "Total EW",  display_name = "Total EW",  decimals = 2, format = "decimal"),
+      list(name = "Win6Pct",     source_column = "Win6Pct",     calculation = "custom", label = "Win 6 %",   display_name = "Win 6 %",   decimals = 1, format = "percentage"),
+      list(name = "Win5PlusPct", source_column = "Win5PlusPct", calculation = "custom", label = "Win 5+ %",  display_name = "Win 5+ %",  decimals = 1, format = "percentage")
     ),
     
     metadata_columns = list(
@@ -239,24 +238,28 @@ SPORT_CONFIGS <- list(
     
     portfolio_filters = list(
       rate_minimums = list(
-        list(name = "Win",   label = "Win",   step = 0.1),
-        list(name = "Top1",  label = "Top 1", step = 0.1),
-        list(name = "Top5",  label = "Top 5", step = 0.1),
+        list(name = "Win",   label = "Win",    step = 0.1),
+        list(name = "Top1",  label = "Top 1",  step = 0.1),
+        list(name = "Top5",  label = "Top 5",  step = 0.1),
         list(name = "Top10", label = "Top 10", step = 0.1),
         list(name = "Top20", label = "Top 20", step = 0.1)
       ),
       range_filters = list(
-        list(name = "Salary",   label = "Salary (K)", column = "TotalSalary",            step = 0.1, format = "salary_k"),
-        list(name = "TotalOwn", label = "Total Own",  column = "CumulativeOwnership",    step = 1,   format = "number"),
-        list(name = "AvgOwn",   label = "Avg Own",    column = "GeometricMeanOwnership", step = 0.1, format = "decimal")
+        list(name = "Salary", label = "Salary (K)", column = "TotalSalary", step = 0.1, format = "salary_k"),
+        list(name = "AvgOwn", label = "Avg Own",    column = "AvgOwn",      step = 0.1, format = "decimal")
+      ),
+      custom_minimums = list(
+        list(name = "MinTotalEW",  label = "Min Exp Wins",  column = "TotalEW",     step = 0.1, default = 0),
+        list(name = "MinWin6",     label = "Min Win 6 %",   column = "Win6Pct",     step = 1,   default = 0),
+        list(name = "MinWin5Plus", label = "Min Win 5+ %",  column = "Win5PlusPct", step = 1,   default = 0)
       )
     ),
     
     platform_columns = list(
-      DK = list(salary = "Salary", id = "ID", ownership = "Own", score_column = "DKScore")
+      DK = list(salary = "DKSalary", id = "DKID", ownership = "DKOwn", score = "DKScore")
     ),
     
-    download_formats = list(DK = "{Name} ({ID})"),
+    download_formats = list(DK = "{Name} ({DKID})"),
     
     input_file = list(
       type            = "excel",
@@ -317,7 +320,7 @@ SPORT_CONFIGS <- list(
     
     standard_metrics = c(
       "WinRate", "Top1Rate", "Top5Rate", "Top10Rate", "Top20Rate",
-      "TotalSalary", "TotalOwn", "AvgOwn"
+      "TotalSalary", "AvgOwn"
     ),
     
     custom_metrics = list(
@@ -339,8 +342,7 @@ SPORT_CONFIGS <- list(
       ),
       range_filters = list(
         list(name = "Salary",   label = "Salary (K)", column = "TotalSalary",            step = 0.1, format = "salary_k"),
-        list(name = "TotalOwn", label = "Total Own",  column = "CumulativeOwnership",    step = 1,   format = "number"),
-        list(name = "AvgOwn",   label = "Avg Own",    column = "GeometricMeanOwnership", step = 0.1, format = "decimal")
+        list(name = "AvgOwn",   label = "Avg Own",    column = "AvgOwn",                step = 0.1, format = "decimal")
       )
     ),
     
@@ -402,13 +404,13 @@ SPORT_CONFIGS <- list(
     salary_caps  = list(DK = 50000, FD = 60000),
     
     # Golf-specific Phase 1 settings
-    phase1_n_sample  = 25000L,   # random salary-valid lineups to draw
+    phase1_n_sample  = 100000L,  # random salary-valid lineups to draw
     max_lineups      = 5000,
     phase1_target    = 5000L,    # top N by ExpectedCuts to keep
     
     standard_metrics = c(
       "WinRate", "Top1Pct", "Top5Pct", "Top10Pct", "Top20Pct",
-      "AvgScore", "TotalSalary", "CumulativeOwnership", "GeometricMeanOwnership"
+      "AvgScore", "TotalSalary", "AvgOwn"
     ),
     
     # Golf custom metrics added after Phase 3
@@ -434,8 +436,7 @@ SPORT_CONFIGS <- list(
       ),
       range_filters = list(
         list(name = "Salary",   label = "Salary (K)", column = "TotalSalary",            step = 0.1, format = "salary_k"),
-        list(name = "TotalOwn", label = "Total Own",  column = "CumulativeOwnership",    step = 1,   format = "number"),
-        list(name = "AvgOwn",   label = "Avg Own",    column = "GeometricMeanOwnership", step = 0.1, format = "decimal")
+        list(name = "AvgOwn",   label = "Avg Own",    column = "AvgOwn",                step = 0.1, format = "decimal")
       ),
       # Cut-specific filters (hidden when no_cut = TRUE)
       cut_filters = list(
@@ -466,8 +467,8 @@ SPORT_CONFIGS <- list(
       player_sheet    = "Player",
       required_columns = list(
         base     = c("Name", "W", "T5", "T10", "Cut"),
-        DK       = c("DKSalary", "DKID", "DKOP"),
-        FD       = c("FDSalary", "FDID", "FDOP"),
+        DK       = c("DKID", "DKOP"),
+        FD       = c("FDID", "FDOP"),
         metadata = c("Pool")
       )
     ),

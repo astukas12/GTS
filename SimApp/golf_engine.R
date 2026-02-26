@@ -50,11 +50,6 @@ process_golf_players <- function(player_dt) {
     if (col %in% names(dt)) dt[, (col) := as.numeric(get(col))]
   }
   
-  # ID columns - coerce to character to preserve leading zeros / alphanumeric FD IDs
-  for (col in c("DKID","FDID")) {
-    if (col %in% names(dt)) dt[, (col) := as.character(get(col))]
-  }
-  
   # Ownership - strip % if present
   for (col in c("DKOP","FDOP")) {
     if (col %in% names(dt)) {
@@ -341,12 +336,10 @@ run_golf_simulation <- function(input_data, n_sims = 10000,
   if (has_dk) {
     sim_metadata[, DKSalary := players_dt$DKSalary]
     sim_metadata[, DKOwn    := if ("DKOP" %in% names(players_dt)) players_dt$DKOP else 0]
-    sim_metadata[, DKID     := if ("DKID" %in% names(players_dt)) as.character(players_dt$DKID) else NA_character_]
   }
   if (has_fd) {
     sim_metadata[, FDSalary := players_dt$FDSalary]
     sim_metadata[, FDOwn    := if ("FDOP" %in% names(players_dt)) players_dt$FDOP else 0]
-    sim_metadata[, FDID     := if ("FDID" %in% names(players_dt)) as.character(players_dt$FDID) else NA_character_]
   }
   
   cat(sprintf("Golf sim done | %.1fs | %s rows\n",
@@ -373,84 +366,110 @@ run_golf_simulation <- function(input_data, n_sims = 10000,
 # uses the standard LP-per-sim path instead.
 
 generate_golf_candidate_pool <- function(sim_results, sim_metadata, config,
-                                         no_cut = FALSE,
-                                         n_sample  = 25000L,
+                                         no_cut      = FALSE,
+                                         n_sample    = 25000L,   # unused, kept for compat
                                          target_pool = 10000L,
-                                         verbose = TRUE) {
-  if (no_cut) return(NULL)  # caller falls back to LP mode
+                                         verbose     = TRUE) {
+  if (no_cut) return(NULL)
   
-  platform    <- config$platform     # "DK" or "FD"
+  platform    <- config$platform
   salary_col  <- paste0(platform, "Salary")
-  own_col     <- paste0(platform, "Own")
   salary_cap  <- config$salary_cap
-  salary_min  <- salary_cap - 1000L
+  salary_min  <- 48500L
   roster_size <- config$roster_size
   
-  pool_meta <- sim_metadata[Pool == "Y" &
-                              !is.na(get(salary_col)) &
-                              get(salary_col) > 0]
+  # ------------------------------------------------------------------
+  # PRE-FILTER: determine eligible players
+  # If POOL column exists with Y values -> use only those players
+  # Otherwise -> top 70 by CutProb
+  # ------------------------------------------------------------------
+  has_pool <- "Pool" %in% names(sim_metadata) &&
+    any(sim_metadata$Pool == "Y", na.rm = TRUE)
   
-  if (nrow(pool_meta) < roster_size)
-    stop("Not enough Pool=Y players with ", salary_col, " to build lineups.")
+  # Start with salary-feasible players (must be affordable in a 6-player lineup)
+  # Max individual salary = cap - (5 * min_salary_of_others), but simpler:
+  # just exclude anyone whose salary alone exceeds cap - (roster_size-1)*min_sal
+  all_valid <- sim_metadata[!is.na(get(salary_col)) & get(salary_col) > 0]
+  min_sal   <- min(all_valid[[salary_col]])
+  max_afford <- salary_cap - (roster_size - 1L) * min_sal
+  all_valid <- all_valid[get(salary_col) <= max_afford]
   
-  salaries  <- pool_meta[[salary_col]]
-  cut_probs <- pool_meta$CutProb
-  players   <- pool_meta$Player
-  n_pool    <- nrow(pool_meta)
+  if (has_pool) {
+    eligible <- all_valid[Pool == "Y"]
+    if (verbose) cat(sprintf("\nGolf Phase 1 [%s]: POOL filter -> %d players (after salary feasibility)\n",
+                             platform, nrow(eligible)))
+  } else {
+    eligible <- all_valid
+    if (verbose) cat(sprintf("\nGolf Phase 1 [%s]: No POOL — %d salary-feasible players\n",
+                             platform, nrow(eligible)))
+  }
   
-  if (verbose)
-    cat(sprintf("\nGolf Phase 1 [%s]: %d pool players, sampling %s combos\n",
-                platform, n_pool, format(n_sample, big.mark = ",")))
+  # Trim to top 70 by CutProb if still too large to enumerate
+  if (nrow(eligible) > 70L) {
+    setorder(eligible, -CutProb)
+    eligible <- eligible[1:70L]
+    if (verbose) cat(sprintf("  Trimmed to top 70 by CutProb: %.0f%% - %.0f%%\n",
+                             min(eligible$CutProb)*100, max(eligible$CutProb)*100))
+  }
   
-  # Pre-allocate storage
-  found_players <- vector("list", n_sample)
-  found_sal     <- numeric(n_sample)
-  found_ec      <- numeric(n_sample)
-  n_found  <- 0L
-  n_tried  <- 0L
-  max_try  <- n_sample * 30L
+  if (nrow(eligible) < roster_size)
+    stop("Not enough eligible players with ", salary_col, " to build lineups.")
   
-  while (n_found < n_sample && n_tried < max_try) {
-    n_tried <- n_tried + 1L
-    idx <- sort(sample.int(n_pool, roster_size, replace = FALSE))
+  # ------------------------------------------------------------------
+  # SAMPLE valid salary combos — run until target_pool found or max_iter hit
+  # Much faster than enumerating 100M+ combos when salary window is tight
+  # ------------------------------------------------------------------
+  n_pool     <- nrow(eligible)
+  salaries   <- eligible[[salary_col]]
+  cut_probs  <- eligible$CutProb
+  players    <- eligible$Player
+  
+  if (verbose) cat(sprintf("  Sampling from %d players ($%.0fk-$%.0fk window)...\n",
+                           n_pool, salary_min/1000, salary_cap/1000))
+  
+  target_sample <- 25000L
+  max_iter      <- target_sample * 200L
+  found_idx     <- vector("list", target_sample)
+  found_sal     <- numeric(target_sample)
+  found_ec      <- numeric(target_sample)
+  n_found       <- 0L
+  
+  for (iter in seq_len(max_iter)) {
+    idx <- sample.int(n_pool, roster_size, replace = FALSE)
     ts  <- sum(salaries[idx])
     if (ts >= salary_min && ts <= salary_cap) {
       n_found <- n_found + 1L
-      found_players[[n_found]] <- players[idx]
-      found_sal[n_found]       <- ts
-      found_ec[n_found]        <- sum(cut_probs[idx])
+      found_idx[[n_found]] <- sort(idx)
+      found_sal[n_found]   <- ts
+      found_ec[n_found]    <- sum(cut_probs[idx])
+      if (n_found >= target_sample) break
     }
   }
   
-  if (n_found == 0) stop("No valid salary-range lineups found. Check Pool=Y and salary data.")
-  found_players <- found_players[seq_len(n_found)]
-  found_sal     <- found_sal[seq_len(n_found)]
-  found_ec      <- found_ec[seq_len(n_found)]
+  if (n_found == 0) stop("No salary-valid lineups found. Check salary data and cap.")
   
-  if (verbose)
-    cat(sprintf("  Found %s valid from %s attempts\n",
-                format(n_found, big.mark = ","), format(n_tried, big.mark = ",")))
+  found_idx <- found_idx[seq_len(n_found)]
+  found_sal <- found_sal[seq_len(n_found)]
+  found_ec  <- found_ec[seq_len(n_found)]
   
-  # Build data.table
-  player_mat <- do.call(rbind, found_players)
+  if (verbose) cat(sprintf("  Found %s valid combos\n", format(n_found, big.mark = ",")))
+  
+  # Build data.table, deduplicate, keep top by ExpectedCuts
+  player_mat <- do.call(rbind, lapply(found_idx, function(i) players[i]))
   lineup_dt  <- as.data.table(player_mat)
   setnames(lineup_dt, paste0("Player", seq_len(roster_size)))
   lineup_dt[, TotalSalary  := found_sal]
   lineup_dt[, ExpectedCuts := found_ec]
   
-  # Deduplicate
   key_cols  <- paste0("Player", seq_len(roster_size))
   lineup_dt <- unique(lineup_dt, by = key_cols)
-  
-  # Sort by ExpectedCuts descending, keep top target_pool
   setorder(lineup_dt, -ExpectedCuts)
-  if (nrow(lineup_dt) > target_pool) lineup_dt <- lineup_dt[seq_len(target_pool)]
+  if (nrow(lineup_dt) > 5000L) lineup_dt <- lineup_dt[seq_len(5000L)]
   
-  if (verbose) {
+  if (verbose)
     cat(sprintf("  Candidate pool: %s lineups | ExpCuts %.2f - %.2f\n",
                 format(nrow(lineup_dt), big.mark = ","),
                 min(lineup_dt$ExpectedCuts), max(lineup_dt$ExpectedCuts)))
-  }
   
   # Add analytical cut probability metrics
   lineup_dt <- add_golf_cut_metrics(lineup_dt, sim_metadata, roster_size)
