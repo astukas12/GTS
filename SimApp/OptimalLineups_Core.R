@@ -1038,8 +1038,10 @@ score_all_lineups <- function(lineup_data, sim_results, verbose = TRUE, sims_per
     multipliers <- rep(1, length(player_cols))
   }
   
-  # Get score column from config
-  platform_col <- config$platform_col
+  # Get score column — check lineup_data directly first, then nested config
+  platform_col <- if (!is.null(lineup_data$platform_col)) lineup_data$platform_col
+  else if (!is.null(config$platform_col)) config$platform_col
+  else "DKScore"
   
   # Create player-to-index mapping
   all_players <- unique(unlist(unique_lineups[, ..player_cols]))
@@ -1379,6 +1381,7 @@ calculate_distribution_metrics <- function(score_matrix, lineup_data, config,
     multipliers <- rep(1, length(player_cols))
   }
   
+  cumulative_own <- rep(0, n_lineups)
   geometric_own <- rep(0, n_lineups)
   
   if (!is.null(ownership_data) && nrow(ownership_data) > 0) {
@@ -1428,6 +1431,9 @@ calculate_distribution_metrics <- function(score_matrix, lineup_data, config,
       # Apply multipliers (for Captain/MVP modes)
       multiplier_matrix <- matrix(rep(multipliers, each = n_lineups), nrow = n_lineups)
       weighted_ownership <- ownership_matrix * multiplier_matrix
+      
+      # CUMULATIVE OWNERSHIP: Just sum across positions (vectorized!)
+      cumulative_own <- rowSums(weighted_ownership)
       
       # GEOMETRIC MEAN OWNERSHIP: 
       # Geometric mean = exp(mean(log(x))) for x > 0
@@ -1482,7 +1488,8 @@ calculate_distribution_metrics <- function(score_matrix, lineup_data, config,
     Top10Pct = top_pcts[, 3],
     Top20Pct = top_pcts[, 4],
     TotalSalary = total_salary,
-    AvgOwn = geometric_own * 100
+    CumulativeOwnership = cumulative_own * 100,
+    GeometricMeanOwnership = geometric_own * 100
   )
   
   elapsed_time <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
@@ -1516,6 +1523,9 @@ find_optimal_lineups_winbased <- function(sim_results, config, verbose = TRUE) {
   n_players <- length(players)
   n_sims <- length(unique(sim_results$SimID))
   
+  # Analytical individual win probabilities (simulated win rate per player)
+  ind_ew <- sim_results[, .(WinProb = mean(Win)), by = Player]
+  
   if (verbose) {
     cat(sprintf("  %s players | Roster size: %s\n", n_players, roster_size))
   }
@@ -1538,7 +1548,7 @@ find_optimal_lineups_winbased <- function(sim_results, config, verbose = TRUE) {
   lineup_salaries <- sapply(all_combos, function(combo) sum(salary_lookup[combo]))
   
   # Filter by salary range (vectorized!)
-  min_salary <- salary_cap - 2500
+  min_salary <- salary_cap - 1000
   valid_idx <- which(lineup_salaries >= min_salary & lineup_salaries <= salary_cap)
   valid_lineups <- all_combos[valid_idx]
   
@@ -1549,48 +1559,64 @@ find_optimal_lineups_winbased <- function(sim_results, config, verbose = TRUE) {
                 format(length(valid_lineups), big.mark = ",")))
   }
   
-  # Calculate win metrics
-  if (verbose) cat("  Calculating win metrics...\n")
+  # -----------------------------------------------------------------------
+  # PHASE 1A: Analytical ExpectedWins — simple sum of individual win probs
+  # Same-match pairs are self-capping (devigged ML probs already sum to 1.0)
+  # Fast: no matrix ops, runs on all valid lineups instantly
+  # -----------------------------------------------------------------------
+  if (verbose) cat("  Calculating analytical ExpectedWins...\n")
   
   lineup_list <- lapply(valid_lineups, function(x) as.list(setNames(x, paste0("Player", 1:roster_size))))
-  lineups_dt <- rbindlist(lineup_list)
-  
-  win_matrix <- dcast(sim_results, Player ~ SimID, value.var = "Win", fill = 0)
-  setkey(win_matrix, Player)
-  sim_cols <- setdiff(names(win_matrix), "Player")
-  
+  lineups_dt  <- rbindlist(lineup_list)
   player_cols <- paste0("Player", 1:roster_size)
   
-  # Calculate win metrics (vectorized)
-  # Need to handle data.table scoping properly
-  sim_cols_env <- sim_cols  # Store in separate variable for scoping
+  ew_lookup <- setNames(ind_ew$WinProb, ind_ew$Player)
   
-  lineups_dt[, c("ExpectedWins", "Win6Pct", "Win5PlusPct") := {
-    lineup_players <- unlist(.SD)
-    
-    # Get win matrix rows for these players
-    lineup_win_rows <- win_matrix[lineup_players]
-    
-    # Extract just the sim columns (excluding Player column)
-    lineup_wins <- as.matrix(lineup_win_rows[, .SD, .SDcols = sim_cols_env])
-    
-    # Sum wins per sim (each column is a sim)
-    wins_per_sim <- colSums(lineup_wins)
-    
-    list(
-      ExpectedWins = mean(wins_per_sim),
-      Win6Pct = mean(wins_per_sim >= 6) * 100,
-      Win5PlusPct = mean(wins_per_sim >= 5) * 100
-    )
-  }, by = 1:nrow(lineups_dt), .SDcols = player_cols]
+  # Vectorized: matrix of win probs, rowSums gives EW per lineup
+  ew_mat <- matrix(ew_lookup[as.matrix(lineups_dt[, ..player_cols])],
+                   nrow = nrow(lineups_dt), ncol = roster_size)
+  lineups_dt[, ExpectedWins := rowSums(ew_mat, na.rm = TRUE)]
   
-  # Keep top N by ExpectedWins
+  # Take top target_lineups by analytical EW
   setorder(lineups_dt, -ExpectedWins)
-  final_lineups <- lineups_dt[1:min(target_lineups, nrow(lineups_dt))]
+  candidates <- lineups_dt[1:min(target_lineups, nrow(lineups_dt))]
+  setorder(candidates, -ExpectedWins)
   
   if (verbose) {
-    cat(sprintf("  ✓ Top %s lineups by ExpectedWins\n", format(nrow(final_lineups), big.mark = ",")))
-    cat(sprintf("    ExpectedWins: %.2f to %.2f\n", 
+    cat(sprintf("  ✓ Top %s candidates | EW range: %.2f to %.2f\n",
+                format(nrow(candidates), big.mark = ","),
+                min(candidates$ExpectedWins), max(candidates$ExpectedWins)))
+    cat("  Calculating Win6Pct / Win5PlusPct on candidates (matrix)...\n")
+  }
+  
+  # -----------------------------------------------------------------------
+  # PHASE 1B: Sim-based Win6/Win5+ on candidates only
+  # Matrix multiply on 10k lineups instead of 54k — fits in memory
+  # -----------------------------------------------------------------------
+  win_matrix <- dcast(sim_results, Player ~ SimID, value.var = "Win", fill = 0)
+  setkey(win_matrix, Player)
+  sim_cols   <- setdiff(names(win_matrix), "Player")
+  
+  all_players <- win_matrix$Player
+  n_cands     <- nrow(candidates)
+  
+  player_idx  <- match(as.matrix(candidates[, ..player_cols]), all_players)
+  member_mat  <- matrix(0L, nrow = n_cands, ncol = length(all_players))
+  member_mat[cbind(rep(seq_len(n_cands), times = roster_size), player_idx)] <- 1L
+  
+  win_mat     <- as.matrix(win_matrix[, ..sim_cols])
+  wins_mat    <- member_mat %*% win_mat
+  
+  candidates[, Win6Pct     := rowMeans(wins_mat >= roster_size) * 100]
+  candidates[, Win5PlusPct := rowMeans(wins_mat >= (roster_size - 1L)) * 100]
+  
+  # Final sort: EW primary, Win6Pct secondary, take top target_lineups
+  setorder(candidates, -ExpectedWins, -Win6Pct)
+  final_lineups <- candidates[1:min(target_lineups, nrow(candidates))]
+  
+  if (verbose) {
+    cat(sprintf("  ✓ Top %s lineups selected\n", format(nrow(final_lineups), big.mark = ",")))
+    cat(sprintf("    ExpectedWins: %.2f to %.2f\n",
                 min(final_lineups$ExpectedWins), max(final_lineups$ExpectedWins)))
     cat(sprintf("    Win6Pct: %.1f%% to %.1f%%\n\n",
                 min(final_lineups$Win6Pct), max(final_lineups$Win6Pct)))

@@ -465,11 +465,11 @@ server <- function(input, output, session) {
     }
     display_cols <- intersect(
       c(player_cols, "WinRate","Top1Pct","Top5Pct","Top10Pct","Top20Pct",
-        "TotalSalary","AvgOwn"),
+        "TotalSalary","CumulativeOwnership","GeometricMeanOwnership"),
       names(optimal_lineups))
     display_table <- optimal_lineups[, ..display_cols]
     rename_map <- c("WinRate"="Win","Top1Pct"="Top1","Top5Pct"="Top5","Top10Pct"="Top10","Top20Pct"="Top20",
-                    "TotalSalary"="Salary")
+                    "TotalSalary"="Salary","CumulativeOwnership"="TotalOwn","GeometricMeanOwnership"="AvgOwn")
     for (o in names(rename_map)) if (o %in% names(display_table)) setnames(display_table, o, rename_map[[o]])
     display_table
   }
@@ -478,7 +478,7 @@ server <- function(input, output, session) {
     display_table <- copy(portfolio_data); setDT(display_table)
     display_table[, RowID := .I]
     rename_map <- c("WinRate"="Win","Top1Pct"="Top1","Top5Pct"="Top5","Top10Pct"="Top10","Top20Pct"="Top20",
-                    "TotalSalary"="Salary")
+                    "TotalSalary"="Salary","CumulativeOwnership"="TotalOwn","GeometricMeanOwnership"="AvgOwn")
     for (o in names(rename_map)) if (o %in% names(display_table)) setnames(display_table, o, rename_map[[o]])
     if (!is.null(sport_config$custom_metrics)) {
       for (m in sport_config$custom_metrics) {
@@ -495,7 +495,7 @@ server <- function(input, output, session) {
   }
   
   get_format_columns <- function(display_table, sport_config) {
-    pct_cols <- c("Win","Top1","Top5","Top10","Top20","AvgOwn")
+    pct_cols <- c("Win","Top1","Top5","Top10","Top20","TotalOwn","AvgOwn")
     if (!is.null(sport_config$custom_metrics)) {
       for (m in sport_config$custom_metrics) {
         if (!is.null(m$format) && m$format == "percentage") {
@@ -640,7 +640,8 @@ server <- function(input, output, session) {
         progress$set(detail="Generating lineups (win-based)...", value=0.1)
         lineup_result    <- find_optimal_lineups(opt_data, opt_config, mode="win_based", verbose=TRUE)
         lineup_data      <- list(unique_lineups=lineup_result$unique_lineups,
-                                 n_sims=lineup_result$n_sims, mode=lineup_result$mode)
+                                 n_sims=lineup_result$n_sims, mode=lineup_result$mode,
+                                 platform_col="DKScore")
         tennis_precalc   <- lineup_result$win_metrics
         progress$set(detail="Phase 2: Scoring...", value=0.4)
         score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
@@ -882,10 +883,10 @@ server <- function(input, output, session) {
                     options=list(pageLength=50, searching=FALSE, lengthChange=FALSE, scrollX=TRUE, dom='tp',
                                  order=list(list(which(names(display_table)=="Win")-1,'desc'))),
                     rownames=FALSE) %>%
-      formatRound(intersect(c("Win","Top1","Top5","Top10","Top20","AvgOwn"),
+      formatRound(intersect(c("Win","Top1","Top5","Top10","Top20","TotalOwn","AvgOwn"),
                             names(display_table)), 1)
     if ("Salary" %in% names(display_table)) dt <- dt %>% formatCurrency("Salary","$",digits=0)
-    if ("AvgStart" %in% names(display_table)) dt <- dt %>% formatRound("AvgStart", 1)
+    if ("TotalStart" %in% names(display_table)) dt <- dt %>% formatRound(c("TotalStart","AvgStart"),1)
     for (gc in intersect(c("ExpectedCuts","AtLeast6","AtLeast5","EarlyLateCount"), names(display_table)))
       dt <- dt %>% formatRound(gc, 1)
     dt
@@ -1025,8 +1026,10 @@ server <- function(input, output, session) {
       range_cols <- setdiff(num_cols, c("WinRate","Top1Pct","Top5Pct","Top10Pct","Top20Pct","ExpectedCuts"))
       cfg_map <- list(
         TotalSalary=list(label="Salary",format="k",step=0.1),
-        AvgOwn=list(label="Avg Own",format="decimal",step=0.1),
-        AvgStart=list(label="Avg Start",format="decimal",step=0.1),
+        CumulativeOwnership=list(label="Total Own",format="whole",step=1),
+        GeometricMeanOwnership=list(label="Avg Own",format="decimal",step=0.1),
+        CumulativeStarting=list(label="Total Start",format="whole",step=1),
+        GeometricMeanStarting=list(label="Avg Start",format="decimal",step=0.1),
         AtLeast6=list(label="All 6 Cut%",format="decimal",step=1),
         AtLeast5=list(label="5+ Cut%",format="decimal",step=1),
         EarlyLateCount=list(label="Early/Late Golfers",format="whole",step=1)
@@ -1504,9 +1507,7 @@ server <- function(input, output, session) {
               class="stripe hover compact nowrap") %>%
       formatCurrency("Salary","$",digits=0) %>%
       formatPercentage(c("ImpliedWin","SimWin","ImpliedSS","SimSS"), 1) %>%
-      formatRound(c("WinDiff","AvgWinPts"), 1) %>%
-      formatStyle("WinDiff",
-                  backgroundColor=styleInterval(c(-5,5), c("#ffcccc","#ffffff","#ccffcc")))
+      formatRound(c("WinDiff","AvgWinPts"), 1)
   })
   
   make_tennis_box_plot <- function(data_path, title, color_hex) {
@@ -1515,9 +1516,10 @@ server <- function(input, output, session) {
       plot_data <- rv$sport_visuals$score_distributions[[data_path]]
       req(plot_data)
       setDT(plot_data)
-      top_players <- plot_data[, .(Avg=mean(Score)), by=Player][order(-Avg)][1:min(10,.N)]$Player
-      plot_data   <- as.data.frame(plot_data[Player %in% top_players])
-      plot_data$Player <- factor(plot_data$Player, levels=rev(top_players))
+      player_order <- plot_data[, .(Avg=mean(Score)), by=Player][order(-Avg)]$Player
+      plot_data    <- as.data.frame(plot_data)
+      plot_data$Player <- factor(plot_data$Player, levels=rev(player_order))
+      plot_height  <- max(400, length(player_order) * 35)
       plot_ly(data=plot_data, x=~Score, y=~Player, type="box", orientation="h",
               marker=list(color=color_hex), line=list(color=color_hex),
               fillcolor=paste0(substr(color_hex,1,7),"4D")) %>%
@@ -1526,12 +1528,12 @@ server <- function(input, output, session) {
           xaxis=list(title="DK Fantasy Points", gridcolor="#404040", color="#FFFFFF"),
           yaxis=list(title="", color="#FFFFFF"),
           paper_bgcolor="#121212", plot_bgcolor="#1e1e1e",
-          font=list(color="#FFFFFF",size=12), showlegend=FALSE, height=600)
+          font=list(color="#FFFFFF",size=12), showlegend=FALSE, height=plot_height)
     }
   }
-  output$tennis_all_wins_plot    <- renderPlotly(make_tennis_box_plot("all_wins","All Winning Scores (Top 10)","#FFE500")())
-  output$tennis_ss_wins_plot     <- renderPlotly(make_tennis_box_plot("ss_wins","Straight Sets Wins (Top 10)","#00FF00")())
-  output$tennis_nss_wins_plot    <- renderPlotly(make_tennis_box_plot("nss_wins","Non-Straight Sets Wins (Top 10)","#FF8C00")())
+  output$tennis_all_wins_plot    <- renderPlotly(make_tennis_box_plot("all_wins","All Winning Scores",  "#FFE500")())
+  output$tennis_ss_wins_plot     <- renderPlotly(make_tennis_box_plot("ss_wins", "Straight Sets Wins",  "#00FF00")())
+  output$tennis_nss_wins_plot    <- renderPlotly(make_tennis_box_plot("nss_wins","Non-Straight Sets Wins","#FF8C00")())
   
   output$tennis_salary_analysis_plot <- renderPlotly({
     req(rv$sport=="TENNIS", rv$sport_visuals$score_distributions$all_wins,

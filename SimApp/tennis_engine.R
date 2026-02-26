@@ -7,602 +7,469 @@ library(data.table)
 library(readxl)
 
 # ============================================================================
-# HELPER FUNCTIONS
+# HELPER: American odds -> devigged probability
 # ============================================================================
 
-# Convert American odds to probability
 odds_to_probability <- function(odds) {
   if (is.na(odds)) return(0.5)
-  
-  if (odds > 0) {
-    # Positive odds: +150 means bet $100 to win $150
-    prob <- 100 / (odds + 100)
-  } else {
-    # Negative odds: -150 means bet $150 to win $100
-    prob <- abs(odds) / (abs(odds) + 100)
-  }
-  
-  return(prob)
+  if (odds > 0) 100 / (odds + 100)
+  else          abs(odds) / (abs(odds) + 100)
 }
 
 # ============================================================================
-# MAIN ENGINE FUNCTION (Called by app)
+# MAIN ENGINE
 # ============================================================================
 
 run_tennis_engine <- function(input_data, n_sims, config, progress_callback = NULL) {
   
   cat("\n=== TENNIS ENGINE STARTED ===\n")
-  cat("Simulations:", format(n_sims, big.mark = ","), "\n")
-  cat("Platform: DK\n\n")
+  cat("Simulations:", format(n_sims, big.mark = ","), "\n\n")
   
   overall_start <- Sys.time()
-  
-  # Load historical database
-  hist_file <- "tennis_clean_database.xlsx"
-  
-  if (!file.exists(hist_file)) {
-    stop("Historical database not found: ", hist_file, 
-         "\nPlease ensure tennis_clean_database.xlsx is in the working directory")
+  cb <- function(val, msg) {
+    if (!is.null(progress_callback)) progress_callback(msg, val)
   }
   
-  cat("Loading historical database:", hist_file, "\n")
-  historical_data <- read_excel(hist_file, sheet = "Clean_Data")
-  setDT(historical_data)
+  # --------------------------------------------------------------------------
+  # LOAD HISTORICAL DATABASE
+  # --------------------------------------------------------------------------
+  hist_file <- "tennis_clean_database.xlsx"
+  if (!file.exists(hist_file))
+    stop("Historical database not found: ", hist_file)
+  
+  cat("Loading historical database...\n")
+  historical_data <- as.data.table(read_excel(hist_file, sheet = "Clean_Data"))
   cat("Loaded", nrow(historical_data), "historical matches\n\n")
   
-  # Index historical data for speed
-  setkey(historical_data, tour, surface, best_of, w_straight_sets)
-  
-  # Extract player data (tennis has single sheet)
-  # Check if input_data is a list of data frames or a single data frame
-  if (is.data.frame(input_data)) {
-    player_data <- input_data
-  } else if (is.list(input_data)) {
-    # If it's a list, try to get first element or first non-NULL element
-    if (length(input_data) > 0) {
-      player_data <- input_data[[1]]
-    } else {
-      stop("input_data is empty list")
-    }
-  } else {
-    stop("input_data must be a data.frame or list of data.frames")
+  # Derive w_favorite if not present (winner was favourite when winner_prob_pct >= 50)
+  if (!"w_favorite" %in% names(historical_data)) {
+    historical_data[, w_favorite := winner_prob_pct >= 50]
   }
   
+  setkey(historical_data, tour, surface, best_of, w_favorite, w_straight_sets)
+  
+  # --------------------------------------------------------------------------
+  # PARSE INPUT
+  # --------------------------------------------------------------------------
+  player_data <- if (is.data.frame(input_data)) input_data
+  else if (is.list(input_data) && length(input_data) > 0) input_data[[1]]
+  else stop("input_data must be a data.frame or non-empty list")
   setDT(player_data)
   
-  # Add opponent column (extract from Game Info)
+  # Derive Opponent and Match columns
   player_data[, Opponent := {
-    match_players <- player_data[`Game Info` == `Game Info`]
-    sapply(Name, function(n) {
-      opponents <- match_players[Name != n, Name]
-      if (length(opponents) > 0) opponents[1] else NA_character_
+    sapply(seq_len(.N), function(i) {
+      others <- .SD[`Game Info` == `Game Info`[i] & Name != Name[i], Name]
+      if (length(others) > 0) others[1] else NA_character_
     })
-  }, by = `Game Info`]
-  
-  # Add Match column (cleaner display)
+  }]
   player_data[, Match := `Game Info`]
   
-  # Get unique matches
-  matches <- unique(player_data$`Game Info`)
+  matches       <- unique(player_data[["Game Info"]])
   total_matches <- length(matches)
   
   cat("Processing", total_matches, "matches:\n")
-  for(i in seq_along(matches)) {
-    match_players <- player_data[`Game Info` == matches[i]]
-    if(nrow(match_players) == 2) {
-      cat(sprintf("  %d. %s vs %s\n", i, match_players$Name[1], match_players$Name[2]))
-    }
+  for (i in seq_along(matches)) {
+    mp <- player_data[`Game Info` == matches[i]]
+    if (nrow(mp) == 2) cat(sprintf("  %d. %s vs %s\n", i, mp$Name[1], mp$Name[2]))
   }
   cat("\n")
   
-  # ========================================================================
-  # PRE-COMPUTATION PHASE
-  # ========================================================================
-  
-  cat("=== PRE-COMPUTING MATCH PROBABILITIES ===\n")
+  # --------------------------------------------------------------------------
+  # PRE-COMPUTATION: 4 separate score pools per match
+  # --------------------------------------------------------------------------
+  cat("=== PRE-COMPUTING MATCH POOLS ===\n")
   precomp_start <- Sys.time()
+  cb(0.05, "Pre-computing match pools...")
+  
+  ODDS_THRESHOLD <- 5    # +/- 5 pct points on winner prob (combined diff <= 10)
+  POOL_FLOOR     <- 10   # minimum pool size; expand beyond threshold if needed
   
   match_cache <- list()
   
   for (match_idx in seq_along(matches)) {
-    match_name <- matches[match_idx]
+    match_name    <- matches[match_idx]
+    match_players <- player_data[`Game Info` == match_name]
     
     cat(sprintf("Match %d/%d: %s", match_idx, total_matches, match_name))
     
-    match_players <- player_data[`Game Info` == match_name]
-    
     if (nrow(match_players) != 2) {
-      cat(" - SKIPPED (invalid player count)\n")
-      next
+      cat(" - SKIPPED (not 2 players)\n"); next
     }
     
     p1 <- match_players[1]
     p2 <- match_players[2]
-    
     cat(sprintf(" (%s vs %s)", p1$Name, p2$Name))
     
-    # Check for walkover
-    is_walkover <- any(c(p1$Tour, p2$Tour) %in% c("WD", "WO"))
+    # ---- WALKOVER: missing ML or explicit WD/WO tour flag ----
+    is_walkover <- any(c(p1$Tour, p2$Tour) %in% c("WD", "WO")) ||
+      is.na(suppressWarnings(as.numeric(p1$ML))) ||
+      is.na(suppressWarnings(as.numeric(p2$ML)))
     
     if (is_walkover) {
       cat(" - WALKOVER\n")
-      
-      # Determine winner/loser
-      if (p1$Tour %in% c("WD")) {
-        winner_name <- p2$Name
-        loser_name <- p1$Name
-      } else {
-        winner_name <- p1$Name
-        loser_name <- p2$Name
-      }
-      
+      winner_name <- if (p1$Tour %in% c("WD", "WO") ||
+                         is.na(suppressWarnings(as.numeric(p1$ML)))) p2$Name else p1$Name
+      loser_name  <- if (winner_name == p1$Name) p2$Name else p1$Name
       match_cache[[match_name]] <- list(
-        type = "walkover",
-        p1_name = p1$Name,
-        p2_name = p2$Name,
-        winner = winner_name,
-        loser = loser_name,
-        winner_score = 30,
-        loser_score = 0
+        type         = "walkover",
+        p1_name      = p1$Name, p2_name = p2$Name,
+        winner       = winner_name, loser = loser_name,
+        winner_score = 30, loser_score = 0
       )
-      
-    } else {
-      # NORMAL MATCH
-      
-      # Calculate ML probabilities (devigged)
-      p1_ml_raw <- odds_to_probability(as.numeric(p1$ML))
-      p2_ml_raw <- odds_to_probability(as.numeric(p2$ML))
-      total_ml <- p1_ml_raw + p2_ml_raw
-      p1_ml_prob <- (p1_ml_raw / total_ml) * 100  # Convert to percentage
-      p2_ml_prob <- (p2_ml_raw / total_ml) * 100
-      
-      # Calculate SS probabilities
-      p1_ss_raw <- odds_to_probability(as.numeric(p1$SS))
-      p2_ss_raw <- odds_to_probability(as.numeric(p2$SS))
-      
-      # Ensure SS doesn't exceed ML
-      p1_ss_raw <- min(p1_ss_raw, p1_ml_raw)
-      p2_ss_raw <- min(p2_ss_raw, p2_ml_raw)
-      
-      # Devig SS probabilities
-      p1_ss_prob <- (p1_ss_raw / total_ml) * 100
-      p2_ss_prob <- (p2_ss_raw / total_ml) * 100
-      
-      # Calculate NSS probabilities
-      p1_nss_prob <- p1_ml_prob - p1_ss_prob
-      p2_nss_prob <- p2_ml_prob - p2_ss_prob
-      
-      # Cumulative probabilities for sampling
-      cum_probs <- cumsum(c(p1_ss_prob, p1_nss_prob, p2_ss_prob, p2_nss_prob)) / 100
-      
-      # ====================================================================
-      # QUERY HISTORICAL DATA - 2 QUERIES PER MATCH (NOT 4!)
-      # ====================================================================
-      
-      # SS POOL (for both players)
-      ss_pool <- historical_data[
-        tour == p1$Tour & 
-          surface == p1$Surface & 
-          best_of == p1$BO & 
-          w_straight_sets == TRUE
-      ]
-      
-      if (nrow(ss_pool) > 0) {
-        # Calculate odds difference
-        ss_pool[, odds_diff := abs(winner_prob_pct - p1_ml_prob) + 
-                  abs(loser_prob_pct - p2_ml_prob)]
-        
-        # Sort and take top 100
-        setorder(ss_pool, odds_diff)
-        ss_pool <- ss_pool[1:min(100, .N)]
-      } else {
-        ss_pool <- NULL
-      }
-      
-      # NSS POOL (for both players)
-      nss_pool <- historical_data[
-        tour == p1$Tour & 
-          surface == p1$Surface & 
-          best_of == p1$BO & 
-          w_straight_sets == FALSE
-      ]
-      
-      if (nrow(nss_pool) > 0) {
-        # Calculate odds difference
-        nss_pool[, odds_diff := abs(winner_prob_pct - p1_ml_prob) + 
-                   abs(loser_prob_pct - p2_ml_prob)]
-        
-        # Sort and take top 100
-        setorder(nss_pool, odds_diff)
-        nss_pool <- nss_pool[1:min(100, .N)]
-      } else {
-        nss_pool <- NULL
-      }
-      
-      match_cache[[match_name]] <- list(
-        type = "normal",
-        p1_name = p1$Name,
-        p2_name = p2$Name,
-        cum_probs = cum_probs,
-        ss_pool = ss_pool,
-        nss_pool = nss_pool
-      )
+      next
     }
     
-    cat(" - COMPLETED\n")
+    # ---- NORMAL MATCH ----
+    
+    # Devig ML
+    p1_ml_raw  <- odds_to_probability(as.numeric(p1$ML))
+    p2_ml_raw  <- odds_to_probability(as.numeric(p2$ML))
+    total_ml   <- p1_ml_raw + p2_ml_raw
+    p1_ml_prob <- (p1_ml_raw / total_ml) * 100
+    p2_ml_prob <- (p2_ml_raw / total_ml) * 100
+    
+    # Devig SS (capped at ML prob)
+    p1_ss_raw  <- min(odds_to_probability(as.numeric(p1$SS)), p1_ml_raw)
+    p2_ss_raw  <- min(odds_to_probability(as.numeric(p2$SS)), p2_ml_raw)
+    p1_ss_prob <- (p1_ss_raw / total_ml) * 100
+    p2_ss_prob <- (p2_ss_raw / total_ml) * 100
+    
+    # NSS = ML - SS
+    p1_nss_prob <- p1_ml_prob - p1_ss_prob
+    p2_nss_prob <- p2_ml_prob - p2_ss_prob
+    
+    # Cumulative cutpoints: 1=P1_SS, 2=P1_NSS, 3=P2_SS, 4=P2_NSS
+    cum_probs <- cumsum(c(p1_ss_prob, p1_nss_prob, p2_ss_prob, p2_nss_prob)) / 100
+    
+    # Who is the favourite?
+    p1_is_fav <- p1_ml_prob >= 50
+    fav_prob  <- if (p1_is_fav) p1_ml_prob else p2_ml_prob
+    dog_prob  <- if (p1_is_fav) p2_ml_prob else p1_ml_prob
+    
+    # Build one pool for a given outcome bucket
+    # Build one pool for a given outcome bucket
+    # winner_is_fav: TRUE = historical winner was the favourite
+    # When TRUE:  winner_prob_pct ~ fav_prob, loser_prob_pct ~ dog_prob
+    # When FALSE: winner_prob_pct ~ dog_prob, loser_prob_pct ~ fav_prob
+    get_pool <- function(winner_is_fav, straight_sets) {
+      pool <- historical_data[
+        tour            == p1$Tour    &
+          surface         == p1$Surface &
+          best_of         == p1$BO      &
+          w_favorite      == winner_is_fav &
+          w_straight_sets == straight_sets
+      ]
+      if (nrow(pool) == 0) return(NULL)
+      
+      pool <- copy(pool)
+      
+      if (winner_is_fav) {
+        # Historical winner = favourite: compare winner_prob to fav_prob
+        pool[, odds_diff := abs(winner_prob_pct - fav_prob) +
+               abs(loser_prob_pct  - dog_prob)]
+      } else {
+        # Historical winner = underdog: compare winner_prob to dog_prob
+        pool[, odds_diff := abs(winner_prob_pct - dog_prob) +
+               abs(loser_prob_pct  - fav_prob)]
+      }
+      setorder(pool, odds_diff)
+      
+      # Use all matches within threshold; fall back to closest POOL_FLOOR if sparse
+      in_range <- pool[odds_diff <= (ODDS_THRESHOLD * 2)]
+      pool     <- if (nrow(in_range) >= POOL_FLOOR) in_range else pool[1:min(POOL_FLOOR, .N)]
+      
+      # Inverse-rank weights: closest match sampled most often
+      pool[, sample_weight := 1 / seq_len(.N)]
+      pool
+    }
+    
+    # Four pools — winner perspective:
+    #   Bucket 1 (P1_SS):  P1 wins SS  -> winner_is_fav = p1_is_fav
+    #   Bucket 2 (P1_NSS): P1 wins NSS -> winner_is_fav = p1_is_fav
+    #   Bucket 3 (P2_SS):  P2 wins SS  -> winner_is_fav = !p1_is_fav
+    #   Bucket 4 (P2_NSS): P2 wins NSS -> winner_is_fav = !p1_is_fav
+    pools <- list(
+      p1_ss  = get_pool(winner_is_fav = p1_is_fav,  straight_sets = TRUE),
+      p1_nss = get_pool(winner_is_fav = p1_is_fav,  straight_sets = FALSE),
+      p2_ss  = get_pool(winner_is_fav = !p1_is_fav, straight_sets = TRUE),
+      p2_nss = get_pool(winner_is_fav = !p1_is_fav, straight_sets = FALSE)
+    )
+    
+    match_cache[[match_name]] <- list(
+      type      = "normal",
+      p1_name   = p1$Name,  p2_name   = p2$Name,
+      p1_is_fav = p1_is_fav,
+      cum_probs = cum_probs,
+      pools     = pools
+    )
+    
+    pool_sizes <- sapply(pools, function(p) if (is.null(p)) 0L else nrow(p))
+    cat(sprintf(" - OK [pools: P1_SS=%d P1_NSS=%d P2_SS=%d P2_NSS=%d]\n",
+                pool_sizes[1], pool_sizes[2], pool_sizes[3], pool_sizes[4]))
   }
   
-  precomp_elapsed <- difftime(Sys.time(), precomp_start, units = "secs")
-  cat(sprintf("Pre-computation completed in %.2f seconds\n\n", as.numeric(precomp_elapsed)))
+  precomp_elapsed <- as.numeric(difftime(Sys.time(), precomp_start, units = "secs"))
+  cat(sprintf("Pre-computation: %.2fs\n\n", precomp_elapsed))
   
-  # ========================================================================
-  # SIMULATION PHASE
-  # ========================================================================
-  
+  # --------------------------------------------------------------------------
+  # SIMULATION — vectorized across all sims per match (no per-sim loop)
+  # --------------------------------------------------------------------------
   cat("=== RUNNING SIMULATIONS ===\n")
   sim_start <- Sys.time()
+  cb(0.15, "Running simulations...")
   
-  # Pre-allocate results
-  n_players <- nrow(player_data)
-  estimated_rows <- n_sims * n_players
+  pool_keys  <- c("p1_ss", "p1_nss", "p2_ss", "p2_nss")
+  all_results <- vector("list", length(match_cache))
+  result_idx  <- 0L
   
-  sim_results <- data.table(
-    SimID = integer(estimated_rows),
-    Player = character(estimated_rows),
-    DKScore = numeric(estimated_rows),
-    Result = character(estimated_rows),  # Winner/Loser
-    Outcome = character(estimated_rows), # SS/NSS/WO
-    Win = integer(estimated_rows)        # 1 if Winner, 0 if Loser
-  )
-  
-  row_idx <- 1
-  progress_interval <- max(1000, n_sims %/% 20)
-  
-  for (iter in 1:n_sims) {
-    for (match_name in names(match_cache)) {
-      match_info <- match_cache[[match_name]]
+  for (match_name in names(match_cache)) {
+    result_idx <- result_idx + 1L
+    info       <- match_cache[[match_name]]
+    
+    # ---- Walkover: replicate deterministic result across all sims ----
+    if (info$type == "walkover") {
+      all_results[[result_idx]] <- data.table(
+        SimID   = rep(seq_len(n_sims), 2),
+        Player  = c(rep(info$winner, n_sims), rep(info$loser,   n_sims)),
+        DKScore = c(rep(info$winner_score, n_sims), rep(info$loser_score, n_sims)),
+        Result  = c(rep("Winner", n_sims), rep("Loser",  n_sims)),
+        Outcome = rep("WO", n_sims * 2),
+        Win     = c(rep(1L, n_sims), rep(0L, n_sims))
+      )
+      next
+    }
+    
+    # ---- Normal match: sample all n_sims outcomes at once ----
+    rand_vals   <- runif(n_sims)
+    outcome_idx <- pmax(1L, pmin(4L, findInterval(rand_vals, info$cum_probs) + 1L))
+    
+    winner_vec    <- ifelse(outcome_idx <= 2, info$p1_name, info$p2_name)
+    loser_vec     <- ifelse(outcome_idx <= 2, info$p2_name, info$p1_name)
+    out_type      <- ifelse(outcome_idx %in% c(1L, 3L), "SS", "NSS")
+    
+    winner_scores <- numeric(n_sims)
+    loser_scores  <- numeric(n_sims)
+    
+    for (bucket in 1:4) {
+      idx  <- which(outcome_idx == bucket)
+      if (length(idx) == 0) next
+      pool <- info$pools[[pool_keys[bucket]]]
       
-      if (match_info$type == "walkover") {
-        # Deterministic outcome
-        sim_results[row_idx, `:=`(
-          SimID = iter,
-          Player = match_info$winner,
-          DKScore = match_info$winner_score,
-          Result = "Winner",
-          Outcome = "WO",
-          Win = 1L
-        )]
-        row_idx <- row_idx + 1
+      if (!is.null(pool) && nrow(pool) > 0) {
+        drawn <- sample(nrow(pool), size = length(idx), replace = TRUE,
+                        prob = pool$sample_weight)
         
-        sim_results[row_idx, `:=`(
-          SimID = iter,
-          Player = match_info$loser,
-          DKScore = match_info$loser_score,
-          Result = "Loser",
-          Outcome = "WO",
-          Win = 0L
-        )]
-        row_idx <- row_idx + 1
-        
+        # Historical data stores w_ = favourite's score, l_ = underdog's score.
+        # Bucket 1 & 2: P1 wins. Bucket 3 & 4: P2 wins.
+        # If the actual winner matches the historical "favourite" role, use w_ directly.
+        # w_dk_score is always the match winner's score in the database,
+        # l_dk_score is always the loser's — no swap needed regardless of who was favourite
+        winner_scores[idx] <- pool$w_dk_score[drawn]
+        loser_scores[idx]  <- pool$l_dk_score[drawn]
       } else {
-        # Sample outcome
-        random_val <- runif(1)
-        
-        # Determine outcome: 1=P1_SS, 2=P1_NSS, 3=P2_SS, 4=P2_NSS
-        outcome_idx <- findInterval(random_val, match_info$cum_probs) + 1
-        
-        # Get appropriate pool and determine winner
-        if (outcome_idx == 1) {
-          # P1 wins SS
-          pool <- match_info$ss_pool
-          winner <- match_info$p1_name
-          loser <- match_info$p2_name
-          outcome_type <- "SS"
-        } else if (outcome_idx == 2) {
-          # P1 wins NSS
-          pool <- match_info$nss_pool
-          winner <- match_info$p1_name
-          loser <- match_info$p2_name
-          outcome_type <- "NSS"
-        } else if (outcome_idx == 3) {
-          # P2 wins SS
-          pool <- match_info$ss_pool
-          winner <- match_info$p2_name
-          loser <- match_info$p1_name
-          outcome_type <- "SS"
-        } else {
-          # P2 wins NSS
-          pool <- match_info$nss_pool
-          winner <- match_info$p2_name
-          loser <- match_info$p1_name
-          outcome_type <- "NSS"
-        }
-        
-        # Sample score from pool
-        if (!is.null(pool) && nrow(pool) > 0) {
-          idx <- sample(nrow(pool), 1)
-          winner_score <- pool$w_dk_score[idx]
-          loser_score <- pool$l_dk_score[idx]
-        } else {
-          # Fallback if no historical data
-          winner_score <- runif(1, 50, 70)
-          loser_score <- runif(1, 20, 40)
-        }
-        
-        # Record results
-        sim_results[row_idx, `:=`(
-          SimID = iter,
-          Player = winner,
-          DKScore = winner_score,
-          Result = "Winner",
-          Outcome = outcome_type,
-          Win = 1L
-        )]
-        row_idx <- row_idx + 1
-        
-        sim_results[row_idx, `:=`(
-          SimID = iter,
-          Player = loser,
-          DKScore = loser_score,
-          Result = "Loser",
-          Outcome = outcome_type,
-          Win = 0L
-        )]
-        row_idx <- row_idx + 1
+        warning(sprintf(
+          "No historical pool: match='%s' bucket='%s' — using fallback scores",
+          match_name, pool_keys[bucket]
+        ))
+        winner_scores[idx] <- runif(length(idx), 50, 70)
+        loser_scores[idx]  <- runif(length(idx), 20, 40)
       }
     }
     
-    # Progress reporting
-    if (iter %% progress_interval == 0) {
-      elapsed <- difftime(Sys.time(), sim_start, units = "secs")
-      pct_complete <- (iter / n_sims) * 100
-      est_total <- elapsed * (n_sims / iter)
-      est_remaining <- est_total - elapsed
-      
-      msg <- sprintf("Progress: %d/%s (%.1f%%) - %.1fs elapsed, ~%.1fs remaining",
-                     iter, format(n_sims, big.mark = ","),
-                     pct_complete, as.numeric(elapsed), as.numeric(est_remaining))
-      cat(msg, "\n")
-      
-      if (!is.null(progress_callback)) {
-        progress_callback(msg, pct_complete / 100)
-      }
-    }
+    all_results[[result_idx]] <- data.table(
+      SimID   = c(seq_len(n_sims),   seq_len(n_sims)),
+      Player  = c(winner_vec,        loser_vec),
+      DKScore = c(winner_scores,     loser_scores),
+      Result  = c(rep("Winner", n_sims), rep("Loser", n_sims)),
+      Outcome = c(out_type,          out_type),
+      Win     = c(rep(1L, n_sims),   rep(0L, n_sims))
+    )
   }
   
-  # Trim to actual size
-  sim_results <- sim_results[1:(row_idx - 1)]
+  sim_results   <- rbindlist(all_results)
+  sim_elapsed   <- as.numeric(difftime(Sys.time(), sim_start,   units = "secs"))
+  total_elapsed <- as.numeric(difftime(Sys.time(), overall_start, units = "mins"))
   
-  sim_elapsed <- difftime(Sys.time(), sim_start, units = "secs")
-  total_elapsed <- difftime(Sys.time(), overall_start, units = "mins")
+  cat(sprintf("\nPre-computation : %.2fs\n", precomp_elapsed))
+  cat(sprintf("Simulation      : %.2fs\n",  sim_elapsed))
+  cat(sprintf("Total           : %.2f mins\n", total_elapsed))
+  cat(sprintf("Rows            : %s\n\n", format(nrow(sim_results), big.mark = ",")))
+  cb(0.80, "Simulation complete, preparing outputs...")
   
-  cat("\n=== SIMULATION COMPLETED ===\n")
-  cat(sprintf("Pre-computation: %.2f seconds\n", as.numeric(precomp_elapsed)))
-  cat(sprintf("Simulation: %.2f seconds\n", as.numeric(sim_elapsed)))
-  cat(sprintf("Total time: %.2f minutes\n", as.numeric(total_elapsed)))
-  cat(sprintf("Generated %s results\n\n", format(nrow(sim_results), big.mark = ",")))
-  
-  # ========================================================================
-  # PREPARE OUTPUTS
-  # ========================================================================
-  
-  # Calculate projections
-  cat("Calculating player projections...\n")
+  # --------------------------------------------------------------------------
+  # PROJECTIONS
+  # --------------------------------------------------------------------------
   projections <- sim_results[, .(
-    Mean = mean(DKScore),
+    Mean   = mean(DKScore),
     Median = median(DKScore),
     StdDev = sd(DKScore),
-    Min = min(DKScore),
-    Max = max(DKScore),
-    P10 = quantile(DKScore, 0.10),
-    P25 = quantile(DKScore, 0.25),
-    P75 = quantile(DKScore, 0.75),
-    P90 = quantile(DKScore, 0.90)
+    Min    = min(DKScore),
+    Max    = max(DKScore),
+    P10    = quantile(DKScore, 0.10),
+    P25    = quantile(DKScore, 0.25),
+    P75    = quantile(DKScore, 0.75),
+    P90    = quantile(DKScore, 0.90)
   ), by = Player]
   
-  # Merge with player metadata
   projections <- merge(
     projections,
-    player_data[, .(Player = Name, DKSalary = Salary, DKOwn = Own, Match, Opponent, Surface, Tour)],
+    player_data[, .(Player = Name, DKSalary = Salary, DKOwn = Own,
+                    Match, Opponent, Surface, Tour)],
     by = "Player"
   )
-  
-  # Calculate value metrics
   projections[, `:=`(
     PointsPerK = Mean / (DKSalary / 1000),
-    Ceiling = P90,
-    Floor = P10
+    Ceiling    = P90,
+    Floor      = P10
   )]
-  
   setorder(projections, -Mean)
   
-  # Prepare metadata (unique players)
+  # --------------------------------------------------------------------------
+  # METADATA — standardised column names (DKSalary, DKID, DKOwn)
+  # --------------------------------------------------------------------------
   metadata <- unique(player_data[, .(
-    Player = Name,
+    Player   = Name,
     DKSalary = Salary,
-    DKID = ID,
-    DKOwn = Own,
-    Match = Match,
+    DKID     = ID,
+    DKOwn    = Own,
+    Match    = Match,
     Opponent = Opponent,
-    Surface = Surface,
-    Tour = Tour
+    Surface  = Surface,
+    Tour     = Tour
   )])
   
-  # ========================================================================
-  # PREPARE SPORT-SPECIFIC VISUALIZATIONS
-  # ========================================================================
-  
-  cat("Preparing tennis-specific visualizations...\n")
-  
-  # 1. Match Analysis - Sim vs Implied Probabilities
+  # --------------------------------------------------------------------------
+  # MATCH ANALYSIS VISUALS
+  # --------------------------------------------------------------------------
+  cb(0.90, "Building match analysis...")
   match_analysis_data <- list()
   
   for (match_name in unique(player_data$Match)) {
-    match_players <- player_data[Match == match_name]
+    mp <- player_data[Match == match_name]
+    if (nrow(mp) != 2) next
+    p1 <- mp[1]; p2 <- mp[2]
     
-    if (nrow(match_players) != 2) next
-    
-    p1 <- match_players[1]
-    p2 <- match_players[2]
-    
-    # Calculate implied probabilities
     p1_ml_raw <- odds_to_probability(as.numeric(p1$ML))
     p2_ml_raw <- odds_to_probability(as.numeric(p2$ML))
-    total_ml <- p1_ml_raw + p2_ml_raw
-    p1_implied_win <- p1_ml_raw / total_ml
-    p2_implied_win <- p2_ml_raw / total_ml
+    total_ml  <- p1_ml_raw + p2_ml_raw
     
-    p1_ss_raw <- odds_to_probability(as.numeric(p1$SS))
-    p2_ss_raw <- odds_to_probability(as.numeric(p2$SS))
-    p1_implied_ss <- p1_ss_raw / total_ml
-    p2_implied_ss <- p2_ss_raw / total_ml
-    
-    # Get simulation results for this match
     p1_sims <- sim_results[Player == p1$Name]
     p2_sims <- sim_results[Player == p2$Name]
     
-    # Calculate sim win rates (head-to-head)
     h2h <- merge(
-      p1_sims[, .(SimID, P1_Score = DKScore, P1_Result = Result, P1_Outcome = Outcome)],
-      p2_sims[, .(SimID, P2_Score = DKScore, P2_Result = Result, P2_Outcome = Outcome)],
+      p1_sims[, .(SimID, P1_Result = Result, P1_Outcome = Outcome)],
+      p2_sims[, .(SimID, P2_Result = Result, P2_Outcome = Outcome)],
       by = "SimID"
     )
     
-    p1_sim_win <- mean(h2h$P1_Result == "Winner")
-    p2_sim_win <- mean(h2h$P2_Result == "Winner")
-    
-    # Calculate SS rates
-    p1_sim_ss <- mean(h2h$P1_Result == "Winner" & h2h$P1_Outcome == "SS")
-    p2_sim_ss <- mean(h2h$P2_Result == "Winner" & h2h$P2_Outcome == "SS")
-    
-    # Win-only average scores
-    p1_win_avg <- mean(p1_sims[Result == "Winner", DKScore])
-    p2_win_avg <- mean(p2_sims[Result == "Winner", DKScore])
-    
     match_analysis_data[[match_name]] <- data.table(
-      Match = match_name,
-      Player = c(p1$Name, p2$Name),
-      Salary = c(p1$Salary, p2$Salary),
-      ImpliedWin = c(p1_implied_win, p2_implied_win),
-      SimWin = c(p1_sim_win, p2_sim_win),
-      WinDiff = c((p1_sim_win - p1_implied_win) * 100, (p2_sim_win - p2_implied_win) * 100),
-      ImpliedSS = c(p1_implied_ss, p2_implied_ss),
-      SimSS = c(p1_sim_ss, p2_sim_ss),
-      AvgWinPts = c(p1_win_avg, p2_win_avg)  # Win-only average
+      Match      = match_name,
+      Player     = c(p1$Name, p2$Name),
+      Salary     = c(p1$Salary, p2$Salary),
+      ImpliedWin = c(p1_ml_raw / total_ml, p2_ml_raw / total_ml),
+      SimWin     = c(mean(h2h$P1_Result == "Winner"), mean(h2h$P2_Result == "Winner")),
+      WinDiff    = c((mean(h2h$P1_Result == "Winner") - p1_ml_raw / total_ml) * 100,
+                     (mean(h2h$P2_Result == "Winner") - p2_ml_raw / total_ml) * 100),
+      ImpliedSS  = c(odds_to_probability(as.numeric(p1$SS)) / total_ml,
+                     odds_to_probability(as.numeric(p2$SS)) / total_ml),
+      SimSS      = c(mean(h2h$P1_Result == "Winner" & h2h$P1_Outcome == "SS"),
+                     mean(h2h$P2_Result == "Winner" & h2h$P2_Outcome == "SS")),
+      AvgWinPts  = c(mean(p1_sims[Result == "Winner", DKScore]),
+                     mean(p2_sims[Result == "Winner", DKScore]))
     )
   }
   
-  match_analysis_table <- rbindlist(match_analysis_data)
+  cb(1.0, "Tennis simulation complete!")
   
-  # 2. Score Distribution Data (WINS ONLY with SS/NSS breakdown)
-  wins_only <- sim_results[Result == "Winner"]
-  
-  score_dist_data <- list(
-    all_wins = wins_only[, .(Player, SimID, Score = DKScore, Outcome)],
-    ss_wins = wins_only[Outcome == "SS", .(Player, SimID, Score = DKScore)],
-    nss_wins = wins_only[Outcome == "NSS", .(Player, SimID, Score = DKScore)]
-  )
-  
-  # Return results in expected format
-  cat("Returning results to app...\n\n")
-  
-  return(list(
-    sim_results = sim_results,
-    metadata = metadata,
-    projections = projections,
+  list(
+    sim_results  = sim_results,
+    metadata     = metadata,
+    projections  = projections,
     full_results = sim_results,
-    
-    # Sport-specific visualizations (NEW)
     sport_visuals = list(
-      match_analysis = match_analysis_table,
-      score_distributions = score_dist_data,
-      player_data = player_data  # For salary vs points plot
+      match_analysis = rbindlist(match_analysis_data),
+      score_distributions = list(
+        all_wins = sim_results[Result == "Winner",
+                               .(Player, SimID, Score = DKScore, Outcome)],
+        ss_wins  = sim_results[Result == "Winner" & Outcome == "SS",
+                               .(Player, SimID, Score = DKScore)],
+        nss_wins = sim_results[Result == "Winner" & Outcome == "NSS",
+                               .(Player, SimID, Score = DKScore)]
+      ),
+      player_data = player_data
     )
-  ))
+  )
 }
 
 # ============================================================================
-# TENNIS-SPECIFIC LINEUP METRICS
+# TENNIS LINEUP METRICS
+# Called by add_custom_metrics() for any non-win_based optimization path.
+# (win_based path pre-calculates these in OptimalLineups_Core directly.)
 # ============================================================================
 
-#' Calculate Tennis Lineup Metrics (TotalEW, Win6Pct, Win5PlusPct)
-#' Called by app after standard distribution metrics are calculated
-#' @param scored_lineups Data.table with lineups and standard metrics
-#' @param sim_results Simulation results with Win column
-#' @param metadata Player metadata with Match information
-#' @return scored_lineups with added tennis-specific columns
 calculate_tennis_lineup_metrics <- function(scored_lineups, sim_results, metadata) {
   
-  cat("Calculating tennis-specific lineup metrics...\n")
+  cat("Calculating tennis lineup metrics...\n")
+  setDT(scored_lineups); setDT(sim_results); setDT(metadata)
   
-  setDT(scored_lineups)
-  setDT(metadata)
-  setDT(sim_results)
+  if (!"Win" %in% names(sim_results)) {
+    warning("Win column not found — skipping tennis lineup metrics")
+    return(scored_lineups)
+  }
   
-  # Get player columns
   player_cols <- grep("^Player[0-9]", names(scored_lineups), value = TRUE)
-  n_lineups <- nrow(scored_lineups)
+  roster_size <- length(player_cols)
+  n_lineups   <- nrow(scored_lineups)
   
-  # ============================================================================
-  # VECTORIZED APPROACH - NO LOOPS!
-  # ============================================================================
-  
-  cat("  Calculating TotalEW (vectorized)...\n")
-  
-  # Pre-calculate individual EW from Win column
-  individual_ew <- sim_results[, .(IndividualEW = mean(Win)), by = Player]
-  setkey(individual_ew, Player)
-  
-  # Match mapping for constraint-aware EW
+  # Match map: player -> match label
   player_match_map <- setNames(metadata$Match, metadata$Player)
   
-  # Calculate TotalEW using vectorized operations
-  scored_lineups[, TotalEW := {
-    lineup_players <- unlist(.SD)
-    player_matches <- player_match_map[lineup_players]
-    match_counts <- table(player_matches)
+  # Individual EW lookup table
+  ind_ew <- sim_results[, .(IndividualEW = mean(Win)), by = Player]
+  setkey(ind_ew, Player)
+  
+  # Wide win matrix: players x sims
+  win_wide <- dcast(sim_results, Player ~ SimID, value.var = "Win", fill = 0L)
+  setkey(win_wide, Player)
+  sim_cols <- setdiff(names(win_wide), "Player")
+  win_mat  <- as.matrix(win_wide[, ..sim_cols])
+  rownames(win_mat) <- win_wide$Player
+  
+  total_ew     <- numeric(n_lineups)
+  win6_pct     <- numeric(n_lineups)
+  win5plus_pct <- numeric(n_lineups)
+  
+  for (i in seq_len(n_lineups)) {
+    players <- as.character(unlist(scored_lineups[i, ..player_cols]))
+    matches <- player_match_map[players]
     
-    # For matches with 1 player: sum their individual EWs
-    # For matches with 2+ players: add 1.0
-    sum(
-      ifelse(match_counts == 1, 
-             individual_ew[lineup_players[!duplicated(player_matches)], IndividualEW],
-             1.0)
-    )
-  }, by = 1:n_lineups, .SDcols = player_cols]
-  
-  cat("  Calculating Win6+ and Win5+ (vectorized)...\n")
-  
-  # ============================================================================
-  # SUPER FAST: Convert to wide format, then vectorized operations
-  # ============================================================================
-  
-  # Create a matrix: Player × SimID with Win values (0 or 1)
-  # This is MUCH faster than filtering per lineup
-  win_matrix <- dcast(sim_results, Player ~ SimID, value.var = "Win", fill = 0)
-  setkey(win_matrix, Player)
-  
-  sim_cols <- setdiff(names(win_matrix), "Player")
-  
-  # For each lineup, sum wins across all sims
-  # This is now just matrix operations!
-  scored_lineups[, c("Win6Pct", "Win5PlusPct") := {
-    lineup_players <- unlist(.SD)
+    # TotalEW: per match, sum individual EW if 1 player, add 1.0 if 2 players
+    ew <- 0
+    for (m in unique(matches[!is.na(matches)])) {
+      m_players <- players[!is.na(matches) & matches == m]
+      if (length(m_players) == 1) {
+        val <- ind_ew[.(m_players), IndividualEW]
+        ew  <- ew + ifelse(!is.na(val), val, 0)
+      } else {
+        ew <- ew + 1.0
+      }
+    }
+    total_ew[i] <- round(ew, 2)
     
-    # Get win matrix for these players (vectorized lookup!)
-    lineup_win_matrix <- as.matrix(win_matrix[lineup_players, ..sim_cols])
-    
-    # Sum wins per sim (column sums)
-    wins_per_sim <- colSums(lineup_win_matrix)
-    
-    # Calculate percentages
-    list(
-      Win6Pct = mean(wins_per_sim >= 6) * 100,
-      Win5PlusPct = mean(wins_per_sim >= 5) * 100
-    )
-  }, by = 1:n_lineups, .SDcols = player_cols]
+    # Win6/Win5+
+    valid <- players[players %in% rownames(win_mat)]
+    if (length(valid) > 0) {
+      wins_per_sim    <- colSums(win_mat[valid, , drop = FALSE])
+      win6_pct[i]    <- round(mean(wins_per_sim >= roster_size) * 100, 1)
+      win5plus_pct[i] <- round(mean(wins_per_sim >= (roster_size - 1L)) * 100, 1)
+    }
+  }
   
-  cat("Tennis metrics calculated\n\n")
+  scored_lineups[, TotalEW     := total_ew]
+  scored_lineups[, Win6Pct     := win6_pct]
+  scored_lineups[, Win5PlusPct := win5plus_pct]
   
-  return(scored_lineups)
+  cat("Tennis metrics done\n\n")
+  scored_lineups
 }
