@@ -336,10 +336,12 @@ run_golf_simulation <- function(input_data, n_sims = 10000,
   if (has_dk) {
     sim_metadata[, DKSalary := players_dt$DKSalary]
     sim_metadata[, DKOwn    := if ("DKOP" %in% names(players_dt)) players_dt$DKOP else 0]
+    sim_metadata[, DKID     := if ("DKID" %in% names(players_dt)) players_dt$DKID else NA_character_]
   }
   if (has_fd) {
     sim_metadata[, FDSalary := players_dt$FDSalary]
     sim_metadata[, FDOwn    := if ("FDOP" %in% names(players_dt)) players_dt$FDOP else 0]
+    sim_metadata[, FDID     := if ("FDID" %in% names(players_dt)) players_dt$FDID else NA_character_]
   }
   
   cat(sprintf("Golf sim done | %.1fs | %s rows\n",
