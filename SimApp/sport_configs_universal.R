@@ -485,6 +485,121 @@ SPORT_CONFIGS <- list(
     
     # Called by add_custom_metrics() after Phase 3
     lineup_metrics_function = "calculate_golf_lineup_metrics"
+  ),
+  
+  
+  # ==========================================================================
+  # F1 (Formula 1)
+  # ==========================================================================
+  F1 = list(
+    sport_name          = "F1",
+    sport_display_name  = "Formula 1",
+    player_label        = "Driver",
+    player_label_plural = "Drivers & Constructors",
+    detection = list(
+      required_sheets    = c("Drivers", "Constructors", "Classification"),
+      required_columns   = c("DKID_Driver", "DKID_Captain", "LLMax"),
+      min_sheet_matches  = 3,
+      min_column_matches = 2
+    ),
+    platforms          = c("DK"),
+    roster_sizes       = list(DK = 6),
+    salary_caps        = list(DK = 50000),
+    optimization_modes = list(DK = "combinatorial_captain"),
+    simulation = list(
+      function_name = "run_f1_simulation",
+      output_format = list(
+        sim_results = c("SimID", "Player", "DKScore"),
+        metadata    = c("Player", "DKSalary", "DKID", "Team")
+      )
+    ),
+    lineup_metrics_function = "calculate_f1_lineup_metrics"
+  ),
+  
+  # ==========================================================================
+  # CBB (College Basketball)
+  # ==========================================================================
+  CBB = list(
+    sport_name          = "CBB",
+    sport_display_name  = "College Basketball",
+    player_label        = "Player",
+    player_label_plural = "Players",
+    
+    detection = list(
+      # Sim_ sheets + Slate tab is the unique CBB fingerprint
+      required_sheets    = c("Slate"),
+      required_columns   = c("RosterPosition", "TeamAbbrev", "AvgPointsPerGame"),
+      min_sheet_matches  = 1,
+      min_column_matches = 2
+    ),
+    
+    platforms          = c("DK"),
+    roster_sizes       = list(DK = 8),
+    salary_caps        = list(DK = 50000),
+    # LP-based with position constraints (3G / 3F / 2UTIL)
+    optimization_modes = list(DK = "standard"),
+    max_lineups        = 5000,
+    
+    standard_metrics = c(
+      "WinRate", "Top1Rate", "Top5Rate", "Top10Rate", "Top20Rate",
+      "TotalSalary", "AvgOwn"
+    ),
+    
+    custom_metrics = list(),
+    
+    metadata_columns = list(
+      list(name = "Team",     label = "Team",     type = "text",    display = TRUE,  filter = TRUE),
+      list(name = "PosGroup", label = "Position", type = "text",    display = TRUE,  filter = TRUE),
+      list(name = "GameKey",  label = "Game",     type = "text",    display = FALSE, filter = FALSE)
+    ),
+    
+    portfolio_filters = list(
+      rate_minimums = list(
+        list(name = "Win",   label = "Win",    step = 0.1),
+        list(name = "Top1",  label = "Top 1",  step = 0.1),
+        list(name = "Top5",  label = "Top 5",  step = 0.5),
+        list(name = "Top10", label = "Top 10", step = 1),
+        list(name = "Top20", label = "Top 20", step = 2)
+      ),
+      range_filters = list(
+        list(name = "Salary", label = "Salary (K)", column = "TotalSalary", step = 0.1, format = "salary_k"),
+        list(name = "AvgOwn", label = "Avg Own",    column = "AvgOwn",      step = 0.1, format = "decimal")
+      )
+    ),
+    
+    platform_columns = list(
+      DK = list(salary = "DKSalary", id = "DKID", ownership = "DKOwn", score = "DKScore")
+    ),
+    
+    download_formats = list(DK = "{Name} ({DKID})"),
+    
+    input_file = list(
+      type             = "excel",
+      load_all_sheets  = TRUE,   # CBB needs Slate + all Sim_ + all team tabs
+      player_sheet     = "Slate",
+      required_columns = list(
+        base = c("Name", "Salary", "TeamAbbrev", "RosterPosition"),
+        DK   = c("ID", "AvgPointsPerGame")
+      )
+    ),
+    
+    simulation = list(
+      function_name = "run_cbb_simulation",
+      output_format = list(
+        sim_results = c("SimID", "Player", "DKScore"),
+        metadata    = c("Player", "DKID", "DKSalary", "DKOwn", "Team", "PosGroup")
+      )
+    ),
+    
+    # CBB-specific position slot structure for optimizer
+    # 3G + 3F + 2UTIL(G or F) = 8 players
+    position_slots = list(
+      G    = 3,
+      F    = 3,
+      UTIL = 2   # G or F eligible
+    ),
+    
+    lineup_metrics_function = "calculate_cbb_lineup_metrics"
   )
   
 )

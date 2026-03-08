@@ -223,6 +223,19 @@ ui <- dashboardPage(
                                               )
                                           )
                                    )
+                  ),
+                  conditionalPanel(condition="output.sport_detected == 'CBB'",
+                                   column(4,
+                                          box(width=NULL, title="EXPORT DATA", status="primary", solidHeader=TRUE,
+                                              div(style="padding:5px 0;",
+                                                  downloadButton("download_cbb_sim_results","Download Full Sim Results",
+                                                                 class="btn-primary",
+                                                                 style="width:100%;background-color:#FFE500;color:#000000;border:none;font-weight:600;"),
+                                                  p("CSV with all players, all sims + full statlines",
+                                                    style="font-size:11px;color:#999;margin-top:5px;margin-bottom:0;")
+                                              )
+                                          )
+                                   )
                   )
                 ),
                 fluidRow(column(12,
@@ -325,6 +338,12 @@ server <- function(input, output, session) {
       if (rv$sport == "GOLF") {
         source("golf_engine.R")
         rv$input_data <- read_golf_input(file_path)
+      } else if (rv$sport == "F1") {
+        source("f1_engine.R")
+        rv$input_data <- read_f1_input(file_path)
+      } else if (rv$sport == "CBB") {
+        source("cbb_engine.R")
+        rv$input_data <- read_cbb_input(file_path)
       } else if (!is.null(rv$config$input_file$load_all_sheets) &&
                  rv$config$input_file$load_all_sheets) {
         all_sheets    <- excel_sheets(file_path)
@@ -417,6 +436,10 @@ server <- function(input, output, session) {
           rv$has_fd           <- if (!is.null(result$has_fd)) result$has_fd else TRUE
           # Keep config$platforms in sync in case simulation disagrees with file-load detection
           if (!rv$has_fd) rv$config$platforms <- setdiff(rv$config$platforms, "FD")
+        } else if (rv$sport == "F1") {
+          rv$full_sim_results <- NULL
+          rv$has_fd           <- FALSE
+          rv$config$platforms <- "DK"
         } else {
           rv$full_sim_results <- NULL
           rv$has_fd           <- TRUE
@@ -532,6 +555,46 @@ server <- function(input, output, session) {
     dl
   }
   
+  create_download_f1 <- function(optimal_lineups, metadata) {
+    dl <- copy(optimal_lineups); setDT(metadata)
+    
+    fmt <- function(name, id) paste0(name, " (", id, ")")
+    
+    # Captain: Name (CptDFSID)
+    cpt_ids <- metadata[match(dl$Captain, metadata$Player), CptDFSID]
+    cpt_col <- fmt(dl$Captain, cpt_ids)
+    
+    # Flex drivers Util1-4: Name (DKID)
+    flex_cols <- lapply(paste0("Util", 1:4), function(col) {
+      ids <- metadata[match(dl[[col]], metadata$Player), DKID]
+      fmt(dl[[col]], ids)
+    })
+    
+    # Constructor Util5: Name (DKID)
+    con_ids <- metadata[match(dl$Util5, metadata$Player), DKID]
+    con_col <- fmt(dl$Util5, con_ids)
+    
+    # Lineup columns with DK upload names
+    lineup_cols <- data.table(
+      CPT   = cpt_col,
+      D     = flex_cols[[1]],
+      D2    = flex_cols[[2]],
+      D3    = flex_cols[[3]],
+      D4    = flex_cols[[4]],
+      CNSTR = con_col
+    )
+    setnames(lineup_cols, c("CPT", "D", "D", "D", "D", "CNSTR"))
+    
+    # Append metrics if present
+    metric_cols <- intersect(c("WinRate","Top1Pct","Top5Pct","Top10Pct","Top20Pct",
+                               "TotalSalary","AvgOwn","Top1Count","AvgScore"),
+                             names(dl))
+    if (length(metric_cols) > 0)
+      cbind(lineup_cols, dl[, ..metric_cols])
+    else
+      lineup_cols
+  }
+  
   create_download_mvp <- function(optimal_lineups, metadata) {
     dl <- copy(optimal_lineups); setDT(metadata)
     if ("MVP" %in% names(dl)) {
@@ -545,9 +608,13 @@ server <- function(input, output, session) {
     dl
   }
   
-  create_download_table <- function(optimal_lineups, metadata, platform) {
-    if ("Captain" %in% names(optimal_lineups)) return(create_download_showdown(optimal_lineups, metadata))
-    if ("MVP"     %in% names(optimal_lineups)) return(create_download_mvp(optimal_lineups, metadata))
+  create_download_table <- function(optimal_lineups, metadata, platform, sport = NULL) {
+    if ("Captain" %in% names(optimal_lineups)) {
+      if (identical(sport, "F1"))
+        return(create_download_f1(optimal_lineups, metadata))
+      return(create_download_showdown(optimal_lineups, metadata))
+    }
+    if ("MVP" %in% names(optimal_lineups)) return(create_download_mvp(optimal_lineups, metadata))
     create_download_standard(optimal_lineups, metadata, platform)
   }
   
@@ -650,6 +717,33 @@ server <- function(input, output, session) {
         final_results <- calculate_distribution_metrics(score_matrix, lineup_data, opt_config,
                                                         ownership_data=own_data, verbose=TRUE)
         final_results <- add_custom_metrics(final_results, rv$sim_metadata, rv$config, tennis_precalc)
+        rv$dk_optimal_lineups <- final_results
+        
+      } else if (rv$sport == "F1") {
+        source("f1_engine.R")
+        n_sims_total <- length(unique(rv$simulation_results$SimID))
+        progress$set(message="Finding optimal F1 lineups...", value=0)
+        opt_config <- list(
+          salary_cap     = rv$config$salary_caps$DK,
+          cpt_multiplier = 1.5,
+          max_lineups    = 3000L,
+          percentiles    = c(0.01, 0.05, 0.10, 0.20),
+          platform_col   = "DKScore"
+        )
+        progress$set(detail=sprintf("Phase 1: Finding optimal lineup per sim (%s sims)...",
+                                    format(n_sims_total, big.mark=",")), value=0.05)
+        lineup_data <- find_optimal_f1_lineups(
+          sim_results = rv$simulation_results,
+          metadata    = rv$sim_metadata,
+          config      = opt_config,
+          verbose     = TRUE
+        )
+        progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
+                                    format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
+        score_matrix <- score_all_lineups(lineup_data, rv$simulation_results, verbose=TRUE)
+        progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
+        final_results <- calculate_distribution_metrics(score_matrix, lineup_data, opt_config,
+                                                        ownership_data=NULL, verbose=TRUE)
         rv$dk_optimal_lineups <- final_results
         
       } else {
@@ -800,13 +894,13 @@ server <- function(input, output, session) {
   
   output$dk_download <- downloadHandler(
     filename=function() paste0("DK_Optimal_Lineups_",format(Sys.Date(),"%Y%m%d"),".csv"),
-    content=function(file) fwrite(create_download_table(rv$dk_optimal_lineups, rv$sim_metadata, "DK"), file))
+    content=function(file) fwrite(create_download_table(rv$dk_optimal_lineups, rv$sim_metadata, "DK", rv$sport), file))
   output$fd_download <- downloadHandler(
     filename=function() paste0("FD_Optimal_Lineups_",format(Sys.Date(),"%Y%m%d"),".csv"),
-    content=function(file) fwrite(create_download_table(rv$fd_optimal_lineups, rv$sim_metadata, "FD"), file))
+    content=function(file) fwrite(create_download_table(rv$fd_optimal_lineups, rv$sim_metadata, "FD", rv$sport), file))
   output$sd_download <- downloadHandler(
     filename=function() paste0("SD_Optimal_Lineups_",format(Sys.Date(),"%Y%m%d"),".csv"),
-    content=function(file) fwrite(create_download_table(rv$sd_optimal_lineups, rv$sim_metadata, "SD"), file))
+    content=function(file) fwrite(create_download_table(rv$sd_optimal_lineups, rv$sim_metadata, "SD", rv$sport), file))
   output$download_full_sim_results <- downloadHandler(
     filename=function() paste0("NASCAR_Full_Sim_Results_",format(Sys.Date(),"%Y%m%d"),".csv"),
     content=function(file) { req(rv$sport=="NASCAR", rv$sport_visuals$full_results)
@@ -820,6 +914,17 @@ server <- function(input, output, session) {
                   by="Player", all.x=TRUE)
       setcolorder(dl, c("Player","SimID","DKScore","FDScore","Win","Outcome",
                         "DKSalary","FDSalary","DKOwn","FDOwn","WinProb"))
+      fwrite(dl, file) })
+  
+  output$download_cbb_sim_results <- downloadHandler(
+    filename=function() paste0("CBB_Full_Sim_Results_",format(Sys.Date(),"%Y%m%d"),".csv"),
+    content=function(file) { req(rv$sport=="CBB", rv$simulation_results)
+      dl <- merge(copy(rv$simulation_results),
+                  rv$sim_metadata[, .(Player, DKSalary, DKOwn, Team, PosGroup)],
+                  by="Player", all.x=TRUE)
+      front  <- c("Player","Team","PosGroup","DKSalary","DKOwn","SimID","DKScore")
+      stats  <- intersect(c("pts","tpm","reb","ast","stl","blk","to"), names(dl))
+      setcolorder(dl, c(front, stats))
       fwrite(dl, file) })
   
   
@@ -949,28 +1054,51 @@ server <- function(input, output, session) {
                                                               uiOutput(paste0(lp,"_range_sliders"))
                                                           )
                                                    ),
-                                                   # Col 3: Lock / Exclude players (always shown)
+                                                   # Col 3: Lock / Exclude players (always shown; F1 gets split captain/driver/constructor)
                                                    column(3,
                                                           div(style="background-color:#2d2d2d;padding:8px;border-radius:4px;border:1px solid #404040;",
-                                                              h6("Players", style="color:#FFE500;font-weight:bold;margin:0 0 8px 0;font-size:13px;"),
-                                                              selectizeInput(paste0(lp,"_locked_players"), "Lock:",
-                                                                             choices=if(!is.null(rv[[paste0(lp,"_optimal_lineups")]])){
-                                                                               pc <- grep("^Player|^Captain|^MVP", names(rv[[paste0(lp,"_optimal_lineups")]]),value=TRUE)
-                                                                               ap <- unique(unlist(rv[[paste0(lp,"_optimal_lineups")]][,..pc]))
-                                                                               sort(ap[!is.na(ap)&ap!=""])
-                                                                             } else NULL,
-                                                                             multiple=TRUE, selected=character(0),
-                                                                             options=list(plugins=list('remove_button'),placeholder='Lock players',maxItems=6),
-                                                                             width="100%"),
-                                                              selectizeInput(paste0(lp,"_excluded_players"), "Exclude:",
-                                                                             choices=if(!is.null(rv[[paste0(lp,"_optimal_lineups")]])){
-                                                                               pc <- grep("^Player|^Captain|^MVP", names(rv[[paste0(lp,"_optimal_lineups")]]),value=TRUE)
-                                                                               ap <- unique(unlist(rv[[paste0(lp,"_optimal_lineups")]][,..pc]))
-                                                                               sort(ap[!is.na(ap)&ap!=""])
-                                                                             } else NULL,
-                                                                             multiple=TRUE, selected=character(0),
-                                                                             options=list(plugins=list('remove_button'),placeholder='Exclude players'),
-                                                                             width="100%")
+                                                              h6("Lock / Exclude", style="color:#FFE500;font-weight:bold;margin:0 0 8px 0;font-size:13px;"),
+                                                              if (isTRUE(rv$sport == "F1")) {
+                                                                # F1: three separate captain / driver / constructor controls
+                                                                lu <- rv[[paste0(lp,"_optimal_lineups")]]
+                                                                drv_choices  <- if (!is.null(lu)) sort(unique(unlist(lu[, grep("^Captain|^Util[1-4]$", names(lu), value=TRUE), with=FALSE]))) else NULL
+                                                                con_choices  <- if (!is.null(lu)) sort(unique(unlist(lu[, grep("^Util5$",             names(lu), value=TRUE), with=FALSE]))) else NULL
+                                                                tagList(
+                                                                  tags$label("Captain Lock:", style="color:#aaa;font-size:11px;"),
+                                                                  selectizeInput(paste0(lp,"_locked_captain"),  NULL, choices=drv_choices, multiple=TRUE, selected=character(0),
+                                                                                 options=list(plugins=list('remove_button'),placeholder='Lock captain',maxItems=1), width="100%"),
+                                                                  tags$label("Captain Exclude:", style="color:#aaa;font-size:11px;"),
+                                                                  selectizeInput(paste0(lp,"_excluded_captain"), NULL, choices=drv_choices, multiple=TRUE, selected=character(0),
+                                                                                 options=list(plugins=list('remove_button'),placeholder='Exclude captain'), width="100%"),
+                                                                  tags$label("Driver Lock:", style="color:#aaa;font-size:11px;"),
+                                                                  selectizeInput(paste0(lp,"_locked_players"),  NULL, choices=drv_choices, multiple=TRUE, selected=character(0),
+                                                                                 options=list(plugins=list('remove_button'),placeholder='Lock flex driver',maxItems=4), width="100%"),
+                                                                  tags$label("Driver Exclude:", style="color:#aaa;font-size:11px;"),
+                                                                  selectizeInput(paste0(lp,"_excluded_players"), NULL, choices=drv_choices, multiple=TRUE, selected=character(0),
+                                                                                 options=list(plugins=list('remove_button'),placeholder='Exclude flex driver'), width="100%"),
+                                                                  tags$label("Constructor Lock:", style="color:#aaa;font-size:11px;"),
+                                                                  selectizeInput(paste0(lp,"_locked_constructor"),  NULL, choices=con_choices, multiple=TRUE, selected=character(0),
+                                                                                 options=list(plugins=list('remove_button'),placeholder='Lock constructor',maxItems=1), width="100%"),
+                                                                  tags$label("Constructor Exclude:", style="color:#aaa;font-size:11px;"),
+                                                                  selectizeInput(paste0(lp,"_excluded_constructor"), NULL, choices=con_choices, multiple=TRUE, selected=character(0),
+                                                                                 options=list(plugins=list('remove_button'),placeholder='Exclude constructor'), width="100%")
+                                                                )
+                                                              } else {
+                                                                # All other sports: single lock/exclude across all slots
+                                                                lu <- rv[[paste0(lp,"_optimal_lineups")]]
+                                                                all_players <- if (!is.null(lu)) {
+                                                                  pc <- grep("^Player|^Captain|^MVP|^Util", names(lu), value=TRUE)
+                                                                  sort(unique(unlist(lu[, ..pc]))[!is.na(unique(unlist(lu[, ..pc]))) & unique(unlist(lu[, ..pc])) != ""])
+                                                                } else NULL
+                                                                tagList(
+                                                                  selectizeInput(paste0(lp,"_locked_players"), "Lock:",
+                                                                                 choices=all_players, multiple=TRUE, selected=character(0),
+                                                                                 options=list(plugins=list('remove_button'),placeholder='Lock players',maxItems=6), width="100%"),
+                                                                  selectizeInput(paste0(lp,"_excluded_players"), "Exclude:",
+                                                                                 choices=all_players, multiple=TRUE, selected=character(0),
+                                                                                 options=list(plugins=list('remove_button'),placeholder='Exclude players'), width="100%")
+                                                                )
+                                                              }
                                                           )
                                                    ),
                                                    # Col 4: Add to portfolio (always shown, same for all sports)
@@ -1081,19 +1209,46 @@ server <- function(input, output, session) {
         if (!is.null(fv)) lineups <- lineups[get(col) >= fv[1] & get(col) <= fv[2]]
       }
       
-      # Locked players
-      locked <- input[[paste0(lp,"_locked_players")]]
-      locked <- locked[!is.null(locked) & locked != ""]
-      if (length(locked) > 0) {
-        pc <- grep("^Player|^Captain|^MVP",names(lineups),value=TRUE)
-        lineups <- lineups[apply(lineups[,..pc],1,function(r) all(locked %in% r))]
-      }
-      # Excluded players
-      excluded <- input[[paste0(lp,"_excluded_players")]]
-      excluded <- excluded[!is.null(excluded) & excluded != ""]
-      if (length(excluded) > 0) {
-        pc <- grep("^Player|^Captain|^MVP",names(lineups),value=TRUE)
-        lineups <- lineups[apply(lineups[,..pc],1,function(r) !any(excluded %in% r))]
+      if (isTRUE(rv$sport == "F1")) {
+        # F1: captain, flex driver, and constructor lock/exclude are separate
+        cpt_cols  <- grep("^Captain",    names(lineups), value=TRUE)
+        flex_cols <- grep("^Util[1-4]$", names(lineups), value=TRUE)
+        con_cols  <- grep("^Util5$",     names(lineups), value=TRUE)
+        
+        locked_cpt <- input[[paste0(lp,"_locked_captain")]];     locked_cpt  <- locked_cpt[!is.null(locked_cpt)  & locked_cpt  != ""]
+        excl_cpt   <- input[[paste0(lp,"_excluded_captain")]];   excl_cpt    <- excl_cpt[!is.null(excl_cpt)    & excl_cpt    != ""]
+        locked_drv <- input[[paste0(lp,"_locked_players")]];     locked_drv  <- locked_drv[!is.null(locked_drv)  & locked_drv  != ""]
+        excl_drv   <- input[[paste0(lp,"_excluded_players")]];   excl_drv    <- excl_drv[!is.null(excl_drv)    & excl_drv    != ""]
+        locked_con <- input[[paste0(lp,"_locked_constructor")]]; locked_con  <- locked_con[!is.null(locked_con)  & locked_con  != ""]
+        excl_con   <- input[[paste0(lp,"_excluded_constructor")]]; excl_con  <- excl_con[!is.null(excl_con)    & excl_con    != ""]
+        
+        if (length(locked_cpt) > 0 && length(cpt_cols) > 0)
+          lineups <- lineups[apply(lineups[,..cpt_cols],1,function(r) all(locked_cpt %in% r))]
+        if (length(excl_cpt)   > 0 && length(cpt_cols) > 0)
+          lineups <- lineups[apply(lineups[,..cpt_cols],1,function(r) !any(excl_cpt %in% r))]
+        if (length(locked_drv) > 0 && length(flex_cols) > 0)
+          lineups <- lineups[apply(lineups[,..flex_cols],1,function(r) all(locked_drv %in% r))]
+        if (length(excl_drv)   > 0 && length(flex_cols) > 0)
+          lineups <- lineups[apply(lineups[,..flex_cols],1,function(r) !any(excl_drv %in% r))]
+        if (length(locked_con) > 0 && length(con_cols) > 0)
+          lineups <- lineups[apply(lineups[,..con_cols],1,function(r) all(locked_con %in% r))]
+        if (length(excl_con)   > 0 && length(con_cols) > 0)
+          lineups <- lineups[apply(lineups[,..con_cols],1,function(r) !any(excl_con %in% r))]
+        
+      } else {
+        # All other sports: unified lock/exclude across all slots
+        locked <- input[[paste0(lp,"_locked_players")]]
+        locked <- locked[!is.null(locked) & locked != ""]
+        if (length(locked) > 0) {
+          pc <- grep("^Player|^Captain|^MVP|^Util",names(lineups),value=TRUE)
+          lineups <- lineups[apply(lineups[,..pc],1,function(r) all(locked %in% r))]
+        }
+        excluded <- input[[paste0(lp,"_excluded_players")]]
+        excluded <- excluded[!is.null(excluded) & excluded != ""]
+        if (length(excluded) > 0) {
+          pc <- grep("^Player|^Captain|^MVP|^Util",names(lineups),value=TRUE)
+          lineups <- lineups[apply(lineups[,..pc],1,function(r) !any(excluded %in% r))]
+        }
       }
       lineups
     })
@@ -1117,35 +1272,66 @@ server <- function(input, output, session) {
       filtered   <- filtered_reactive()
       salary_col <- paste0(platform,"Salary")
       own_col    <- paste0(platform,"Own")
-      pc         <- grep("^Player|^Captain|^MVP",names(filtered),value=TRUE)
-      counts     <- table(unlist(filtered[,..pc]))
-      exp_tbl    <- data.table(Player=rv$sim_metadata$Player, Exposure=0)
+      is_f1      <- isTRUE(rv$sport == "F1")
+      
+      # Include all slot columns
+      cpt_cols   <- grep("^Captain", names(filtered), value=TRUE)
+      flex_cols  <- grep("^Util[1-4]$", names(filtered), value=TRUE)
+      con_cols   <- grep("^Util5$",     names(filtered), value=TRUE)
+      all_pc     <- grep("^Player|^Captain|^MVP|^Util", names(filtered), value=TRUE)
+      
+      n_lineups  <- nrow(filtered)
+      cpt_counts <- if (length(cpt_cols))  table(unlist(filtered[, ..cpt_cols]))  else table(character(0))
+      flex_counts <- if (length(flex_cols)) table(unlist(filtered[, ..flex_cols])) else table(character(0))
+      con_counts  <- if (length(con_cols))  table(unlist(filtered[, ..con_cols]))  else table(character(0))
+      all_counts  <- table(unlist(filtered[, ..all_pc]))
+      
+      exp_tbl <- data.table(Player = rv$sim_metadata$Player, Exposure = 0)
       for (i in seq_len(nrow(exp_tbl))) {
         p <- exp_tbl$Player[i]
-        if (p %in% names(counts)) exp_tbl$Exposure[i] <- as.numeric(counts[p])/nrow(filtered)*100
+        if (p %in% names(all_counts)) exp_tbl$Exposure[i] <- as.numeric(all_counts[p]) / n_lineups * 100
       }
-      meta_cols <- intersect(c("Player",salary_col,own_col,
+      
+      if (is_f1) {
+        exp_tbl[, CptExp  := 0]
+        exp_tbl[, FlexExp := 0]
+        for (i in seq_len(nrow(exp_tbl))) {
+          p <- exp_tbl$Player[i]
+          if (p %in% names(cpt_counts))  exp_tbl$CptExp[i]  <- as.numeric(cpt_counts[p])  / n_lineups * 100
+          if (p %in% names(flex_counts)) exp_tbl$FlexExp[i] <- as.numeric(flex_counts[p]) / n_lineups * 100
+        }
+        # Label constructor rows
+        exp_tbl[Player %in% rv$sim_metadata$Player[rv$sim_metadata$PlayerType == "Constructor"],
+                CptExp := NA_real_]
+        exp_tbl[Player %in% rv$sim_metadata$Player[rv$sim_metadata$PlayerType == "Constructor"],
+                FlexExp := NA_real_]
+      }
+      
+      meta_cols <- intersect(c("Player","PlayerType",salary_col,own_col,
                                "Starting","Team","Car","Position","Match","Opponent","Surface","Tour","TeeTimeGroup","CutProb"),
                              names(rv$sim_metadata))
-      exp_tbl <- merge(exp_tbl, rv$sim_metadata[,..meta_cols], by="Player", all.x=TRUE)
+      exp_tbl <- merge(exp_tbl, rv$sim_metadata[, ..meta_cols], by="Player", all.x=TRUE)
       if (salary_col %in% names(exp_tbl)) setnames(exp_tbl, salary_col, "Salary")
       if (own_col    %in% names(exp_tbl)) {
         setnames(exp_tbl, own_col, "OwnProj")
-        exp_tbl[, OwnProj  := OwnProj*100]
-        exp_tbl[, Leverage := round(Exposure-OwnProj,1)]
+        exp_tbl[, OwnProj  := OwnProj * 100]
+        exp_tbl[, Leverage := round(Exposure - OwnProj, 1)]
       }
-      # Column order: metadata left, exposure/own/leverage right
-      meta_order    <- intersect(c("Player","Salary","Starting","Team","Car",
-                                   "Position","Match","Opponent","Surface","Tour","TeeTimeGroup","CutProb"),
-                                 names(exp_tbl))
+      
+      base_meta <- c("Player", if (is_f1) "PlayerType" else NULL,
+                     "Salary", "Starting", "Team", "Car",
+                     "Position","Match","Opponent","Surface","Tour","TeeTimeGroup","CutProb")
+      meta_order    <- intersect(base_meta, names(exp_tbl))
+      f1_exp_cols   <- if (is_f1) intersect(c("CptExp","FlexExp"), names(exp_tbl)) else character(0)
       metrics_order <- intersect(c("Exposure","OwnProj","Leverage"), names(exp_tbl))
-      setcolorder(exp_tbl, c(meta_order, metrics_order))
-      exp_tbl <- exp_tbl[Exposure>0]; setorder(exp_tbl,-Exposure)
+      setcolorder(exp_tbl, c(meta_order, f1_exp_cols, metrics_order))
+      exp_tbl <- exp_tbl[Exposure > 0]; setorder(exp_tbl, -Exposure)
+      
       dt <- datatable(exp_tbl,
                       options=list(pageLength=50,scrollX=TRUE,searching=FALSE,lengthChange=FALSE,dom='tp'),
                       rownames=FALSE)
-      rc <- intersect(c("Exposure","OwnProj","Leverage","CutProb"),names(exp_tbl))
-      if (length(rc)>0) dt <- dt %>% formatRound(rc,1)
+      rc <- intersect(c("Exposure","CptExp","FlexExp","OwnProj","Leverage","CutProb"), names(exp_tbl))
+      if (length(rc) > 0) dt <- dt %>% formatRound(rc, 1)
       cap <- rv$config$salary_caps[[platform]] %||% 50000
       if ("Salary" %in% names(exp_tbl) && cap >= 1000) dt <- dt %>% formatCurrency("Salary","$",digits=0)
       dt
@@ -1263,14 +1449,38 @@ server <- function(input, output, session) {
       pn <- paste0(lp,"_portfolio"); port <- rv[[pn]]; req(port, rv$sim_metadata)
       salary_col <- if(platform=="SD") "SDSalary" else paste0(platform,"Salary")
       own_col    <- if(platform=="SD") "DKOwn"    else paste0(platform,"Own")
-      pc     <- grep("^Player|^Captain|^MVP",names(port),value=TRUE)
-      counts <- table(unlist(port[,..pc]))
+      is_f1      <- isTRUE(rv$sport == "F1")
+      
+      cpt_cols   <- grep("^Captain",    names(port), value=TRUE)
+      flex_cols  <- grep("^Util[1-4]$", names(port), value=TRUE)
+      con_cols   <- grep("^Util5$",     names(port), value=TRUE)
+      all_pc     <- grep("^Player|^Captain|^MVP|^Util", names(port), value=TRUE)
+      
+      n_lineups   <- nrow(port)
+      cpt_counts  <- if (length(cpt_cols))  table(unlist(port[, ..cpt_cols]))  else table(character(0))
+      flex_counts <- if (length(flex_cols)) table(unlist(port[, ..flex_cols])) else table(character(0))
+      con_counts  <- if (length(con_cols))  table(unlist(port[, ..con_cols]))  else table(character(0))
+      all_counts  <- table(unlist(port[, ..all_pc]))
+      
       exp_tbl <- data.table(Player=rv$sim_metadata$Player, Exposure=0)
       for (i in seq_len(nrow(exp_tbl))) {
         p <- exp_tbl$Player[i]
-        if (p %in% names(counts)) exp_tbl$Exposure[i] <- as.numeric(counts[p])/nrow(port)*100
+        if (p %in% names(all_counts)) exp_tbl$Exposure[i] <- as.numeric(all_counts[p]) / n_lineups * 100
       }
-      mc <- intersect(c("Player",salary_col,own_col,
+      
+      if (is_f1) {
+        exp_tbl[, CptExp  := 0]
+        exp_tbl[, FlexExp := 0]
+        for (i in seq_len(nrow(exp_tbl))) {
+          p <- exp_tbl$Player[i]
+          if (p %in% names(cpt_counts))  exp_tbl$CptExp[i]  <- as.numeric(cpt_counts[p])  / n_lineups * 100
+          if (p %in% names(flex_counts)) exp_tbl$FlexExp[i] <- as.numeric(flex_counts[p]) / n_lineups * 100
+        }
+        exp_tbl[Player %in% rv$sim_metadata$Player[rv$sim_metadata$PlayerType == "Constructor"],
+                c("CptExp","FlexExp") := NA_real_]
+      }
+      
+      mc <- intersect(c("Player","PlayerType",salary_col,own_col,
                         "Starting","Team","Car","Position","Match","Opponent","TeeTimeGroup","CutProb"),
                       names(rv$sim_metadata))
       exp_tbl <- merge(exp_tbl, rv$sim_metadata[,..mc], by="Player", all.x=TRUE)
@@ -1280,15 +1490,18 @@ server <- function(input, output, session) {
         exp_tbl[,OwnProj:=OwnProj*100]
         exp_tbl[,Leverage:=round(Exposure-OwnProj,1)]
       }
-      # Column order: metadata left, exposure/own/leverage right
-      meta_order    <- intersect(c("Player","Salary","Starting","Team","Car",
-                                   "Position","Match","Opponent","Surface","Tour","TeeTimeGroup","CutProb"),
-                                 names(exp_tbl))
+      
+      base_meta <- c("Player", if (is_f1) "PlayerType" else NULL,
+                     "Salary","Starting","Team","Car",
+                     "Position","Match","Opponent","Surface","Tour","TeeTimeGroup","CutProb")
+      meta_order    <- intersect(base_meta, names(exp_tbl))
+      f1_exp_cols   <- if (is_f1) intersect(c("CptExp","FlexExp"), names(exp_tbl)) else character(0)
       metrics_order <- intersect(c("Exposure","OwnProj","Leverage"), names(exp_tbl))
-      setcolorder(exp_tbl, c(meta_order, metrics_order))
+      setcolorder(exp_tbl, c(meta_order, f1_exp_cols, metrics_order))
       exp_tbl <- exp_tbl[Exposure>0]; setorder(exp_tbl,-Exposure)
+      
       dt <- datatable(exp_tbl, options=list(pageLength=50,scrollX=TRUE,searching=FALSE,lengthChange=FALSE,dom='tp'), rownames=FALSE)
-      rc <- intersect(c("Exposure","OwnProj","Leverage","CutProb"),names(exp_tbl))
+      rc <- intersect(c("Exposure","CptExp","FlexExp","OwnProj","Leverage","CutProb"),names(exp_tbl))
       if(length(rc)>0) dt <- dt %>% formatRound(rc,1)
       cap <- rv$config$salary_caps[[platform]] %||% 50000
       if("Salary" %in% names(exp_tbl) && cap>=1000) dt <- dt %>% formatCurrency("Salary","$",digits=0)
@@ -1329,7 +1542,9 @@ server <- function(input, output, session) {
         port <- rv[[paste0(lp,"_portfolio")]]; req(port)
         dl <- copy(port)[sample(nrow(port))]
         id_col <- paste0(platform,"ID")
-        if ("Captain" %in% names(dl)) {
+        if ("Captain" %in% names(dl) && isTRUE(rv$sport == "F1")) {
+          dl <- create_download_f1(dl, rv$sim_metadata)
+        } else if ("Captain" %in% names(dl)) {
           dl <- create_download_showdown(dl, rv$sim_metadata)
         } else if ("MVP" %in% names(dl)) {
           dl <- create_download_mvp(dl, rv$sim_metadata)
@@ -1463,6 +1678,8 @@ server <- function(input, output, session) {
     else if (rv$sport == "NASCAR")  render_nascar_visuals(rv$sport_visuals, input$sim_results_platform)
     else if (rv$sport == "GOLF")    render_golf_visuals(rv$sport_visuals)
     else if (rv$sport == "MMA")     render_mma_visuals(rv$sport_visuals)
+    else if (rv$sport == "CBB")     render_cbb_visuals()
+    else if (rv$sport == "F1")      render_f1_visuals(rv$sport_visuals)
     else NULL
   })
   
@@ -1896,7 +2113,345 @@ server <- function(input, output, session) {
         font=list(color="#FFFFFF"), height=500)
   })
   
-}
+  # ---------- CBB ----------
+  
+  render_cbb_visuals <- function() {
+    fluidRow(column(12,
+                    box(width=NULL, title="COLLEGE BASKETBALL SIMULATION ANALYSIS",
+                        status="primary", solidHeader=TRUE,
+                        tabsetPanel(id="cbb_visuals_tabs", type="tabs",
+                                    tabPanel("Score Distribution by Team", div(style="margin-top:15px;"),
+                                             uiOutput("cbb_team_plot_ui")),
+                                    tabPanel("Stat Breakdown", div(style="margin-top:15px;"),
+                                             DTOutput("cbb_stat_breakdown_table") %>%
+                                               shinycssloaders::withSpinner(color="#FFE500", type=6))
+                        )
+                    )
+    ))
+  }
+  
+  # Per-team box plots: one subplot per team, stacked vertically
+  output$cbb_team_plot_ui <- renderUI({
+    req(rv$sport=="CBB", rv$sim_metadata)
+    teams   <- unique(rv$sim_metadata$Team)
+    n_teams <- length(teams)
+    # Each team gets ~250px height; minimum 400px
+    total_h <- max(400, n_teams * 260)
+    plotlyOutput("cbb_team_score_plot", height = paste0(total_h, "px")) %>%
+      shinycssloaders::withSpinner(color="#FFE500", type=6)
+  })
+  
+  output$cbb_team_score_plot <- renderPlotly({
+    req(rv$sport=="CBB", rv$simulation_results, rv$sim_metadata)
+    tryCatch({
+      sim  <- copy(rv$simulation_results); setDT(sim)
+      meta <- copy(rv$sim_metadata);       setDT(meta)
+      
+      # Join team info
+      sim_t <- merge(sim, meta[, .(Player, Team, DKSalary)], by="Player", all.x=TRUE)
+      
+      teams      <- sort(unique(sim_t$Team))
+      n_teams    <- length(teams)
+      n_cols     <- min(2, n_teams)
+      n_rows     <- ceiling(n_teams / n_cols)
+      
+      # Build one subplot per team
+      plots <- lapply(teams, function(tm) {
+        td <- as.data.frame(sim_t[Team == tm])
+        
+        # Order players by average DK score descending
+        avg_ord <- td[, .(avg=mean(DKScore, na.rm=TRUE)), by=Player]
+        avg_ord <- avg_ord[order(-avg)]
+        td$Player <- factor(td$Player, levels=rev(avg_ord$Player))
+        
+        plot_ly(data=td, x=~DKScore, y=~Player,
+                type="box", orientation="h",
+                name=tm,
+                marker    = list(color="#FFE500"),
+                line      = list(color="#FFE500"),
+                fillcolor = "rgba(255,229,0,0.20)") %>%
+          layout(
+            annotations = list(list(
+              text=tm, x=0.5, y=1.05, xref="paper", yref="paper",
+              showarrow=FALSE, font=list(color="#FFE500", size=13, family="Inter"),
+              xanchor="center"
+            )),
+            xaxis = list(title="DK Points", gridcolor="#404040", color="#FFFFFF",
+                         zeroline=FALSE),
+            yaxis = list(title="", color="#FFFFFF", tickfont=list(size=10))
+          )
+      })
+      
+      # Stack all subplots in a 2-column grid
+      subplot(plots,
+              nrows   = n_rows,
+              shareX  = FALSE,
+              shareY  = FALSE,
+              margin  = 0.06) %>%
+        layout(
+          title        = list(text="DK Score Distribution by Team",
+                              font=list(color="#FFE500", size=16)),
+          paper_bgcolor = "#121212",
+          plot_bgcolor  = "#1e1e1e",
+          font          = list(color="#FFFFFF", size=11),
+          showlegend    = FALSE
+        )
+    }, error=function(e) {
+      plotly_empty() %>% layout(
+        title=list(text=paste("Error:", e$message), font=list(color="#FFE500")),
+        paper_bgcolor="#121212", plot_bgcolor="#1e1e1e")
+    })
+  })
+  
+  output$cbb_stat_breakdown_table <- renderDT({
+    req(rv$sport=="CBB", rv$simulation_results, rv$sim_metadata)
+    sim  <- copy(rv$simulation_results); setDT(sim)
+    meta <- copy(rv$sim_metadata);       setDT(meta)
+    
+    # Per-player averages across all stats
+    stat_cols <- intersect(c("pts","tpm","reb","ast","stl","blk","to"), names(sim))
+    agg_exprs <- c(
+      list(AvgDK  = quote(round(mean(DKScore, na.rm=TRUE), 1)),
+           MedDK  = quote(round(median(DKScore, na.rm=TRUE), 1)),
+           P90DK  = quote(round(quantile(DKScore, .90, na.rm=TRUE), 1))),
+      setNames(lapply(stat_cols, function(s)
+        bquote(round(mean(.(as.name(s)), na.rm=TRUE), 1))), paste0("Avg_", stat_cols))
+    )
+    avg_stats <- sim[, lapply(agg_exprs, eval), by=Player]
+    
+    avg_stats <- merge(avg_stats,
+                       meta[, .(Player, DKSalary, Team, PosGroup, DKOwn)],
+                       by="Player", all.x=TRUE)
+    avg_stats[, Value := round(AvgDK / (DKSalary / 1000), 2)]
+    setorder(avg_stats, -AvgDK)
+    
+    datatable(avg_stats,
+              options=list(pageLength=30, scrollX=TRUE, searching=TRUE,
+                           lengthChange=FALSE, dom="ftp"),
+              rownames=FALSE) %>%
+      formatCurrency("DKSalary", "$", digits=0) %>%
+      formatStyle(c("AvgDK","MedDK"), color="#FFE500", fontWeight="bold") %>%
+      formatStyle("Value",
+                  backgroundColor=styleInterval(c(4,5), c("#1e1e1e","#2a3a1e","#1a4a1a")))
+  })
+  
+  
+  # ============================================================================
+  # F1 VISUALS
+  # ============================================================================
+  
+  render_f1_visuals <- function(visuals) {
+    fluidRow(column(12,
+                    box(width=NULL, title="F1 SIMULATION ANALYSIS", status="primary", solidHeader=TRUE,
+                        tabsetPanel(id="f1_visuals_tabs", type="tabs",
+                                    tabPanel("Finishing Position", div(style="margin-top:15px;"),
+                                             plotlyOutput("f1_finish_dist_plot", height="600px") %>%
+                                               shinycssloaders::withSpinner(color="#FFE500", type=6)),
+                                    tabPanel("Fantasy Points", div(style="margin-top:15px;"),
+                                             plotlyOutput("f1_fp_dist_plot", height="600px") %>%
+                                               shinycssloaders::withSpinner(color="#FFE500", type=6)),
+                                    tabPanel("Laps Led", div(style="margin-top:15px;"),
+                                             plotlyOutput("f1_dominator_plot", height="500px") %>%
+                                               shinycssloaders::withSpinner(color="#FFE500", type=6)),
+                                    tabPanel("Constructors", div(style="margin-top:15px;"),
+                                             plotlyOutput("f1_constructor_plot", height="600px") %>%
+                                               shinycssloaders::withSpinner(color="#FFE500", type=6)),
+                                    tabPanel("Driver Stats", div(style="margin-top:15px;"),
+                                             DTOutput("f1_driver_stats_table") %>%
+                                               shinycssloaders::withSpinner(color="#FFE500", type=6)),
+                                    tabPanel("Constructor Stats", div(style="margin-top:15px;"),
+                                             DTOutput("f1_constructor_stats_table") %>%
+                                               shinycssloaders::withSpinner(color="#FFE500", type=6))
+                        )
+                    )
+    ))
+  }
+  
+  output$f1_finish_dist_plot <- renderPlotly({
+    req(rv$sport == "F1", rv$sport_visuals$driver_results, rv$sport_visuals$driver_meta)
+    tryCatch({
+      drv_res  <- rv$sport_visuals$driver_results
+      drv_meta <- rv$sport_visuals$driver_meta
+      grid_order   <- drv_meta[order(Starting), Player]
+      plot_data    <- as.data.frame(drv_res)
+      plot_data$Player <- factor(plot_data$Player, levels = rev(grid_order))
+      plot_height  <- max(600, length(grid_order) * 28)
+      plot_ly(data = plot_data, x = ~Finish, y = ~Player, type = "box", orientation = "h",
+              marker  = list(color = "#FFE500"), line = list(color = "#FFE500"),
+              fillcolor = "rgba(255,229,0,0.3)",
+              hovertemplate = "<b>%{y}</b><br>Median: %{x}<br><extra></extra>") %>%
+        layout(
+          title  = list(text = "Finishing Position Distribution (Grid Order)",
+                        font = list(color = "#FFE500", size = 16)),
+          xaxis  = list(title = "Finish Position", gridcolor = "#404040", color = "#FFFFFF",
+                        autorange = "reversed", dtick = 2),
+          yaxis  = list(title = "", color = "#FFFFFF",
+                        categoryorder = "array", categoryarray = rev(grid_order)),
+          paper_bgcolor = "#121212", plot_bgcolor = "#1e1e1e",
+          font = list(color = "#FFFFFF", size = 12), showlegend = FALSE,
+          height = plot_height, margin = list(l = 160, r = 50, t = 50, b = 50)) %>%
+        config(displayModeBar = TRUE,
+               modeBarButtonsToRemove = c("select2d", "lasso2d", "autoScale2d"),
+               displaylogo = FALSE)
+    }, error = function(e) {
+      plotly_empty() %>% layout(
+        title = list(text = paste("Error:", e$message), font = list(color = "#FFE500")),
+        paper_bgcolor = "#121212", plot_bgcolor = "#1e1e1e")
+    })
+  })
+  
+  output$f1_fp_dist_plot <- renderPlotly({
+    req(rv$sport == "F1", rv$sport_visuals$driver_results, rv$sport_visuals$driver_meta)
+    tryCatch({
+      drv_res  <- rv$sport_visuals$driver_results
+      drv_meta <- rv$sport_visuals$driver_meta
+      sal_order  <- drv_meta[order(-DKSalary), Player]
+      plot_data  <- as.data.frame(drv_res)
+      plot_data$Player <- factor(plot_data$Player, levels = rev(sal_order))
+      plot_height <- max(600, length(sal_order) * 28)
+      plot_ly(data = plot_data, x = ~DKScore, y = ~Player, type = "box", orientation = "h",
+              marker  = list(color = "#FFE500"), line = list(color = "#FFE500"),
+              fillcolor = "rgba(255,229,0,0.3)",
+              hovertemplate = "<b>%{y}</b><br>Median: %{x:.1f}<br><extra></extra>") %>%
+        layout(
+          title  = list(text = "DK Fantasy Points Distribution (Salary Order)",
+                        font = list(color = "#FFE500", size = 16)),
+          xaxis  = list(title = "DK Fantasy Points (Flex)", gridcolor = "#404040", color = "#FFFFFF"),
+          yaxis  = list(title = "", color = "#FFFFFF",
+                        categoryorder = "array", categoryarray = rev(sal_order)),
+          paper_bgcolor = "#121212", plot_bgcolor = "#1e1e1e",
+          font = list(color = "#FFFFFF", size = 12), showlegend = FALSE,
+          height = plot_height, margin = list(l = 160, r = 50, t = 50, b = 50)) %>%
+        config(displayModeBar = TRUE,
+               modeBarButtonsToRemove = c("select2d", "lasso2d", "autoScale2d"),
+               displaylogo = FALSE)
+    }, error = function(e) {
+      plotly_empty() %>% layout(
+        title = list(text = paste("Error:", e$message), font = list(color = "#FFE500")),
+        paper_bgcolor = "#121212", plot_bgcolor = "#1e1e1e")
+    })
+  })
+  
+  output$f1_dominator_plot <- renderPlotly({
+    req(rv$sport == "F1", rv$sport_visuals$driver_results)
+    tryCatch({
+      drv_res <- rv$sport_visuals$driver_results
+      ll_avg  <- drv_res[, .(Avg_LL = mean(LapsLed)), by = Player]
+      ll_avg  <- ll_avg[Avg_LL > 0.01]
+      if (nrow(ll_avg) == 0) {
+        return(plotly_empty() %>% layout(
+          title = list(text = "No laps led data", font = list(color = "#FFE500")),
+          paper_bgcolor = "#121212", plot_bgcolor = "#1e1e1e"))
+      }
+      setorder(ll_avg, -Avg_LL)
+      plot_data <- as.data.frame(ll_avg)
+      plot_data$Player <- factor(plot_data$Player, levels = rev(ll_avg$Player))
+      plot_ly(data = plot_data, x = ~Avg_LL, y = ~Player, type = "bar", orientation = "h",
+              marker = list(color = "#FFE500", line = list(color = "#FFE500", width = 1)),
+              hovertemplate = "<b>%{y}</b><br>Avg Laps Led: %{x:.1f}<br><extra></extra>") %>%
+        layout(
+          title  = list(text = "Laps Led - Average Per Driver",
+                        font = list(color = "#FFE500", size = 16)),
+          xaxis  = list(title = "Avg Laps Led", gridcolor = "#404040", color = "#FFFFFF"),
+          yaxis  = list(title = "", color = "#FFFFFF",
+                        categoryorder = "array", categoryarray = rev(ll_avg$Player)),
+          paper_bgcolor = "#121212", plot_bgcolor = "#1e1e1e",
+          font = list(color = "#FFFFFF", size = 12), showlegend = FALSE,
+          height = 500, margin = list(l = 160, r = 50, t = 50, b = 50)) %>%
+        config(displayModeBar = TRUE,
+               modeBarButtonsToRemove = c("select2d", "lasso2d", "autoScale2d"),
+               displaylogo = FALSE)
+    }, error = function(e) {
+      plotly_empty() %>% layout(
+        title = list(text = paste("Error:", e$message), font = list(color = "#FFE500")),
+        paper_bgcolor = "#121212", plot_bgcolor = "#1e1e1e")
+    })
+  })
+  
+  output$f1_constructor_plot <- renderPlotly({
+    req(rv$sport == "F1", rv$sport_visuals$constructor_results)
+    tryCatch({
+      cnstr_res  <- rv$sport_visuals$constructor_results
+      med_order  <- cnstr_res[, .(med = median(DKScore)), by = Player][order(-med), Player]
+      plot_data  <- as.data.frame(cnstr_res)
+      plot_data$Player <- factor(plot_data$Player, levels = rev(med_order))
+      plot_height <- max(400, length(med_order) * 50)
+      plot_ly(data = plot_data, x = ~DKScore, y = ~Player, type = "box", orientation = "h",
+              marker  = list(color = "#FFE500"), line = list(color = "#FFE500"),
+              fillcolor = "rgba(255,229,0,0.3)",
+              hovertemplate = "<b>%{y}</b><br>Median: %{x:.1f}<br><extra></extra>") %>%
+        layout(
+          title  = list(text = "Constructor DK Points Distribution",
+                        font = list(color = "#FFE500", size = 16)),
+          xaxis  = list(title = "DK Fantasy Points", gridcolor = "#404040", color = "#FFFFFF"),
+          yaxis  = list(title = "", color = "#FFFFFF",
+                        categoryorder = "array", categoryarray = rev(med_order)),
+          paper_bgcolor = "#121212", plot_bgcolor = "#1e1e1e",
+          font = list(color = "#FFFFFF", size = 12), showlegend = FALSE,
+          height = plot_height, margin = list(l = 160, r = 50, t = 50, b = 50)) %>%
+        config(displayModeBar = TRUE,
+               modeBarButtonsToRemove = c("select2d", "lasso2d", "autoScale2d"),
+               displaylogo = FALSE)
+    }, error = function(e) {
+      plotly_empty() %>% layout(
+        title = list(text = paste("Error:", e$message), font = list(color = "#FFE500")),
+        paper_bgcolor = "#121212", plot_bgcolor = "#1e1e1e")
+    })
+  })
+  
+  output$f1_driver_stats_table <- renderDT({
+    req(rv$sport == "F1", rv$sport_visuals$driver_analysis, rv$sport_visuals$driver_meta)
+    tryCatch({
+      da   <- copy(rv$sport_visuals$driver_analysis)
+      meta <- rv$sport_visuals$driver_meta[, .(Player, DKSalary, CptSalary, Starting)]
+      da   <- merge(da, meta, by = "Player", all.x = TRUE)
+      want_cols <- c("Player","Team","Starting","DKSalary","CptSalary",
+                     "Avg_DKScore","Median_DKScore","Avg_CptScore","Median_CptScore",
+                     "Win_Rate","Podium_Rate","Points_Rate","Classified_Rate",
+                     "Beat_TM_Rate","FL_Rate","Avg_LL",
+                     "Avg_FinishPts","Avg_GridPts","Avg_FL_Pts","Avg_LL_Pts",
+                     "Avg_BeatTM_Pts","Avg_Cls_Pts","Median_Finish")
+      setcolorder(da, intersect(want_cols, names(da)))
+      setorder(da, -Avg_DKScore)
+      datatable(da, rownames = FALSE,
+                options = list(pageLength = 25, scrollX = TRUE, scrollY = "500px",
+                               searching = FALSE, lengthChange = FALSE, dom = "t"),
+                class = "stripe hover compact") %>%
+        formatCurrency(intersect(c("DKSalary","CptSalary"), names(da)), "$", digits = 0) %>%
+        formatRound(intersect(c("Avg_DKScore","Median_DKScore","Avg_CptScore","Median_CptScore",
+                                "Avg_FinishPts","Avg_GridPts","Avg_FL_Pts","Avg_LL_Pts",
+                                "Avg_BeatTM_Pts","Avg_Cls_Pts","Median_Finish","Avg_LL"), names(da)), 1) %>%
+        formatStyle("Avg_DKScore",
+                    background = styleColorBar(range(da$Avg_DKScore, na.rm = TRUE), "#FFE500"),
+                    backgroundSize = "90% 70%", backgroundRepeat = "no-repeat",
+                    backgroundPosition = "left")
+    }, error = function(e) {
+      datatable(data.table(Error = e$message), rownames = FALSE)
+    })
+  })
+  
+  output$f1_constructor_stats_table <- renderDT({
+    req(rv$sport == "F1", rv$sport_visuals$constructor_analysis)
+    tryCatch({
+      ca <- copy(rv$sport_visuals$constructor_analysis)
+      setorder(ca, -Median_Score)
+      datatable(ca, rownames = FALSE,
+                options = list(pageLength = 15, scrollX = TRUE,
+                               searching = FALSE, lengthChange = FALSE, dom = "t"),
+                class = "stripe hover compact") %>%
+        formatCurrency("DKSalary", "$", digits = 0) %>%
+        formatRound(c("Avg_Score","Median_Score","P75_Score","P90_Score"), 1) %>%
+        formatStyle("Median_Score",
+                    background = styleColorBar(range(ca$Median_Score, na.rm = TRUE), "#FFE500"),
+                    backgroundSize = "90% 70%", backgroundRepeat = "no-repeat",
+                    backgroundPosition = "left")
+    }, error = function(e) {
+      datatable(data.table(Error = e$message), rownames = FALSE)
+    })
+  })
+  
+  
+} # end server
 
 
 # ============================================================================
