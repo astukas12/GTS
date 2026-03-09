@@ -40,7 +40,11 @@ read_cbb_input <- function(file_path) {
   for (old in names(rename_map))
     if (old %in% names(slate)) setnames(slate, old, rename_map[[old]])
   
-  slate[, PosGroup := fifelse(grepl("^G", RosterPosition), "G", "F")]
+  slate[, PosGroup := fcase(
+    grepl("G", RosterPosition) & grepl("F", RosterPosition), "G/F",
+    grepl("G", RosterPosition), "G",
+    default = "F"
+  )]
   slate[, GameKey  := {
     raw   <- sub(" .*", "", GameInfo)
     parts <- strsplit(raw, "@")[[1]]
@@ -50,6 +54,9 @@ read_cbb_input <- function(file_path) {
   if (!"DKSalary" %in% names(slate) && "Salary" %in% names(slate))
     setnames(slate, "Salary", "DKSalary")
   if (!"DKOwn" %in% names(slate)) slate[, DKOwn := 0]
+  # One row per player — DK lists each player once per eligible slot (G/UTIL, F/UTIL etc)
+  # PosGroup already captures G/F/both; dedup keeps the row with the most specific position
+  slate <- unique(slate, by = "Player")
   
   sim_sheets <- grep("^Sim_", sheets, value = TRUE)
   if (length(sim_sheets) == 0) stop("No Sim_ sheets found.")
@@ -300,16 +307,11 @@ run_cbb_simulation <- function(input_data, n_sims = 10000, config = NULL,
       # Interpolate draws to % shares: n_team x n_sims
       shares <- interp_shares(draws_s, pm[,1], pm[,2], pm[,3], pm[,4], pm[,5])
       
-      # Convert % shares to raw counts: each column k * totals[k]/100
-      raw    <- sweep(shares, 2, totals / 100, `*`)
-      
-      # Scale down any sim where shares sum > 100%
-      cs <- colSums(raw)
-      over <- cs > totals & cs > 0
-      if (any(over))
-        raw[, over] <- sweep(raw[, over, drop = FALSE], 2,
-                             totals[over] / cs[over], `*`)
-      
+      # Normalize shares so rostered players always account for 100% of stats.
+      cs          <- colSums(shares)
+      cs[cs == 0] <- 1
+      norm        <- sweep(shares, 2, cs, `/`)
+      raw         <- sweep(norm, 2, totals, `*`)
       stat_mats[[s]][pidx, ] <- as.integer(round(raw))
     }
   }
@@ -338,9 +340,13 @@ run_cbb_simulation <- function(input_data, n_sims = 10000, config = NULL,
   # ============================================================================
   cb("Assembling results...", 0.92)
   
+  # stat_mats / score_mat: n_players x n_sims
+  # as.vector() reads col-major: sim1_all_players, sim2_all_players...
+  # SimID = rep(1:n_sims, each=n_players) matches exactly
+  # Player = rep(names, times=n_sims): all players repeated per sim
   sim_results <- data.table(
-    SimID   = rep(seq_len(n_sims), times = n_players),
-    Player  = rep(player_names,    each  = n_sims),
+    SimID   = rep(seq_len(n_sims), each  = n_players),
+    Player  = rep(player_names,    times = n_sims),
     DKScore = as.vector(score_mat)
   )
   for (s in stat_names)
@@ -358,7 +364,7 @@ run_cbb_simulation <- function(input_data, n_sims = 10000, config = NULL,
     c("Name","DKID","DKSalary","DKOwn","Team","PosGroup","RosterPosition","GameKey"),
     names(player_list)
   )
-  metadata <- player_list[, ..keep_cols]
+  metadata <- unique(player_list[, ..keep_cols], by = "Name")
   setnames(metadata, "Name", "Player")
   sim_results <- sim_results[Player %in% metadata$Player]
   
@@ -375,4 +381,189 @@ run_cbb_simulation <- function(input_data, n_sims = 10000, config = NULL,
 
 calculate_cbb_lineup_metrics <- function(scored_lineups, sim_results, metadata) {
   scored_lineups
+}
+
+
+# ============================================================================
+# CBB LINEUP OPTIMIZER
+# Per-sim: filter top 25 G + top 25 F by PPD, run LP with position constraints,
+# assign UTIL slots to latest game-time players post-LP.
+# Output matches standard mode format for scoring/metrics pipeline.
+# ============================================================================
+
+find_optimal_lineups_cbb <- function(sim_results, metadata, config, verbose = TRUE) {
+  
+  if (verbose) cat("\nPhase 1: Finding optimal CBB lineups (per-sim LP)...\n")
+  
+  setDT(sim_results); setDT(metadata)
+  
+  salary_cap  <- config$salary_cap
+  max_lineups <- if (!is.null(config$max_lineups)) config$max_lineups else 5000L
+  top_n       <- 25L   # per position group per sim
+  
+  # ── Player eligibility & game time ────────────────────────────────────────
+  # PosGroup: "G", "F", "G/F"
+  meta <- unique(metadata[, .(Player, DKSalary, PosGroup, GameKey)], by = "Player")
+  meta[, g_elig := PosGroup %in% c("G", "G/F")]
+  meta[, f_elig := PosGroup %in% c("F", "G/F")]
+  
+  # Game time rank: parse from GameKey or use order of appearance
+  # GameKey format "TEX_vs_ARK" — use slate GameInfo if available, else fallback
+  # Use slate game order as proxy (later index = later game)
+  game_order <- setNames(seq_along(unique(meta$GameKey)), unique(meta$GameKey))
+  meta[, game_rank := game_order[GameKey]]
+  
+  # ── Merge salary into sim_results ─────────────────────────────────────────
+  opt_data <- merge(
+    sim_results[, .(SimID, Player, FantasyPoints = DKScore)],
+    meta[, .(Player, Salary = DKSalary, g_elig, f_elig, game_rank)],
+    by = "Player"
+  )
+  opt_data <- opt_data[Salary > 0 & !is.na(Salary) & !is.na(FantasyPoints)]
+  opt_data[, ppd := FantasyPoints / Salary * 1000]
+  
+  setkey(opt_data, SimID)
+  sim_ids  <- unique(opt_data$SimID)
+  n_sims   <- length(sim_ids)
+  start_t  <- Sys.time()
+  prog_freq <- max(1L, n_sims %/% 20L)
+  
+  if (verbose) cat(sprintf("  %s players | %s sims | $%s cap | top %d per pos\n",
+                           format(nrow(meta), big.mark=","), format(n_sims, big.mark=","),
+                           format(salary_cap, big.mark=","), top_n))
+  
+  lineup_list <- vector("list", n_sims)
+  
+  for (i in seq_along(sim_ids)) {
+    sid <- sim_ids[i]
+    sd  <- opt_data[.(sid)]
+    
+    # ── Per-sim PPD filter ─────────────────────────────────────────────────
+    g_pool <- sd[g_elig == TRUE][order(-ppd)][seq_len(min(top_n, .N))]
+    f_pool <- sd[f_elig == TRUE][order(-ppd)][seq_len(min(top_n, .N))]
+    pool   <- unique(rbind(g_pool, f_pool), by = "Player")
+    
+    n_p <- nrow(pool)
+    if (n_p < 8L) next
+    
+    # ── LP constraint matrix ───────────────────────────────────────────────
+    # Variables: one binary per player in pool
+    # Constraints:
+    #   1. sum == 8           (roster size)
+    #   2. sum(salary) <= cap
+    #   3. sum(G-elig) >= 3   (at least 3 G-eligible; UTIL absorbs extras)
+    #   4. sum(F-elig) >= 3   (at least 3 F-eligible; UTIL absorbs extras)
+    # G/F players contribute to BOTH G and F counts — using >= avoids
+    # infeasibility from double-counting. With 8 total and >=3G + >=3F,
+    # the remaining slots are naturally UTIL.
+    
+    const_mat <- rbind(
+      rep(1,    n_p),                          # total players
+      pool$Salary,                             # salary
+      as.integer(pool$g_elig),                 # G-eligible count
+      as.integer(pool$f_elig)                  # F-eligible count
+    )
+    const_dir <- c("==", "<=", ">=", ">=")
+    const_rhs <- c(8L, salary_cap, 3L, 3L)
+    
+    res <- tryCatch(
+      lp("max", pool$FantasyPoints, const_mat, const_dir, const_rhs, all.bin = TRUE),
+      error = function(e) list(status = 1L)
+    )
+    
+    if (res$status != 0L) next
+    selected <- which(res$solution == 1L)
+    if (length(selected) != 8L) next
+    
+    chosen <- pool[selected]
+    
+    # ── Assign positions post-LP ───────────────────────────────────────────
+    # Strategy: fill G and F slots first, then assign latest-game players to UTIL
+    # This avoids UTIL "stealing" the only player covering a position side.
+    #
+    # 1. Pure-G players fill G slots first
+    # 2. Pure-F players fill F slots first
+    # 3. G/F players fill whichever side still needs players
+    # 4. Remaining 2 players → UTIL (prefer latest game time)
+    
+    chosen_meta <- meta[Player %in% chosen$Player, .(Player, PosGroup, game_rank)]
+    pure_g  <- chosen_meta[PosGroup == "G"]$Player
+    pure_f  <- chosen_meta[PosGroup == "F"]$Player
+    dual_gf <- chosen_meta[PosGroup == "G/F"]$Player
+    
+    # Fill G: pure G first, then G/F
+    g_players <- c(pure_g, dual_gf)[seq_len(3L)]
+    
+    # Fill F: pure F first, then unused G/F
+    used_gf <- intersect(g_players, dual_gf)
+    f_players <- c(pure_f, setdiff(dual_gf, used_gf))[seq_len(3L)]
+    
+    # UTIL: whoever is left, sorted by game_rank desc (latest game first)
+    used <- c(g_players, f_players)
+    util_bench <- chosen_meta[!Player %in% used][order(-game_rank)]
+    util_players <- util_bench$Player[seq_len(2L)]
+    
+    # Final check — skip lineup if position assignment still invalid
+    all_assigned <- c(g_players, f_players, util_players)
+    if (length(all_assigned) != 8L || anyNA(all_assigned) ||
+        length(unique(all_assigned)) != 8L) next
+    
+    # ── Canonical lineup signature (sorted player set for dedup) ──────────
+    sig <- paste(sort(chosen$Player), collapse = "|")
+    
+    lineup_list[[i]] <- data.table(
+      Lineup      = sig,
+      TotalSalary = sum(chosen$Salary),
+      TotalScore  = sum(chosen$FantasyPoints),
+      G1 = g_players[1],    G2 = g_players[2],    G3 = g_players[3],
+      F1 = f_players[1],    F2 = f_players[2],    F3 = f_players[3],
+      UTIL1 = util_players[1], UTIL2 = util_players[2]
+    )
+    
+    if (verbose && i %% prog_freq == 0L) {
+      elapsed <- as.numeric(difftime(Sys.time(), start_t, units = "secs"))
+      cat(sprintf("\r  Phase 1: %d%% | %.1fs", round(i / n_sims * 100), elapsed))
+      flush.console()
+    }
+  }
+  if (verbose) cat("\n")
+  
+  valid <- lineup_list[!sapply(lineup_list, is.null)]
+  if (length(valid) == 0L) stop("No valid CBB lineups found")
+  
+  all_dt <- rbindlist(valid)
+  
+  # ── Dedup by player set, rank by frequency ────────────────────────────────
+  counts <- all_dt[, .(
+    Top1Count   = .N,
+    TotalSalary = TotalSalary[1],
+    AvgScore    = mean(TotalScore),
+    G1 = G1[1], G2 = G2[1], G3 = G3[1],
+    F1 = F1[1], F2 = F2[1], F3 = F3[1],
+    UTIL1 = UTIL1[1], UTIL2 = UTIL2[1]
+  ), by = Lineup]
+  
+  setorder(counts, -Top1Count)
+  if (nrow(counts) > max_lineups) counts <- counts[1:max_lineups]
+  
+  # Build unique_lineups in standard Player1..Player8 format
+  # Order: G1 G2 G3 F1 F2 F3 UTIL1 UTIL2
+  unique_lineups <- counts[, .(
+    TotalSalary, Top1Count, AvgScore,
+    Player1 = G1, Player2 = G2, Player3 = G3,
+    Player4 = F1, Player5 = F2, Player6 = F3,
+    Player7 = UTIL1, Player8 = UTIL2
+  )]
+  
+  elapsed <- as.numeric(difftime(Sys.time(), start_t, units = "secs"))
+  if (verbose) cat(sprintf("  \u2713 Phase 1: %s unique lineups from %s sims | %.1fs\n",
+                           format(nrow(unique_lineups), big.mark=","),
+                           format(n_sims, big.mark=","), elapsed))
+  
+  list(
+    unique_lineups = unique_lineups,
+    n_sims         = n_sims,
+    config         = config,
+    mode           = "cbb"
+  )
 }

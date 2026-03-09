@@ -1108,7 +1108,7 @@ score_all_lineups <- function(lineup_data, sim_results, verbose = TRUE, sims_per
         player_name <- all_players[player_idx]
         player_data <- sim_score_list[[player_name]]
         
-        matching_sims <- player_data[J(batch_sim_ids), nomatch = 0]
+        matching_sims <- player_data[list(batch_sim_ids), nomatch = 0]
         if (nrow(matching_sims) > 0) {
           row_indices <- matching_sims$SimID - sim_start + 1
           batch_score_matrix[row_indices, player_idx] <- matching_sims$Score
@@ -1220,7 +1220,7 @@ score_all_lineups <- function(lineup_data, sim_results, verbose = TRUE, sims_per
       player_name <- all_players[player_idx]
       player_data <- sim_score_list[[player_name]]
       
-      matching_sims <- player_data[J(batch_sim_ids), nomatch = 0]
+      matching_sims <- player_data[list(batch_sim_ids), nomatch = 0]
       if (nrow(matching_sims) > 0) {
         row_indices <- matching_sims$SimID - sim_start + 1
         batch_score_matrix[row_indices, player_idx] <- matching_sims$Score

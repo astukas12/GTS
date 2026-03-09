@@ -618,6 +618,29 @@ server <- function(input, output, session) {
     create_download_standard(optimal_lineups, metadata, platform)
   }
   
+  create_display_table_cbb <- function(optimal_lineups) {
+    slot_cols <- intersect(c("G1","G2","G3","F1","F2","F3","UTIL1","UTIL2"), names(optimal_lineups))
+    metric_cols <- intersect(c("WinRate","Top1Pct","Top5Pct","Top10Pct","Top20Pct","TotalSalary","AvgOwn"), names(optimal_lineups))
+    keep_cols <- c(slot_cols, metric_cols); dl <- optimal_lineups[, ..keep_cols]
+    rename_map <- c("WinRate"="Win","Top1Pct"="Top1","Top5Pct"="Top5","Top10Pct"="Top10","Top20Pct"="Top20","TotalSalary"="Salary")
+    for (o in names(rename_map)) if (o %in% names(dl)) setnames(dl, o, rename_map[[o]])
+    # Slot cols already named G1/G2/G3/F1/F2/F3/UTIL1/UTIL2 — no rename needed
+    dl
+  }
+  
+  create_download_cbb <- function(optimal_lineups, metadata) {
+    slot_cols <- intersect(c("G1","G2","G3","F1","F2","F3","UTIL1","UTIL2"), names(optimal_lineups))
+    dl <- copy(optimal_lineups)
+    for (col in slot_cols) {
+      ids <- metadata[match(dl[[col]], metadata$Player), DKID]
+      dl[[col]] <- paste0(dl[[col]], " (", ids, ")")
+    }
+    # Rename for clarity
+    rename_map <- c("WinRate"="Win","Top1Pct"="Top1","Top5Pct"="Top5","Top10Pct"="Top10","Top20Pct"="Top20","TotalSalary"="Salary")
+    for (o in names(rename_map)) if (o %in% names(dl)) setnames(dl, o, rename_map[[o]])
+    dl
+  }
+  
   
   # ==========================================================================
   # SPORT-SPECIFIC LINEUP METRICS
@@ -740,10 +763,33 @@ server <- function(input, output, session) {
         )
         progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
                                     format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
-        score_matrix <- score_all_lineups(lineup_data, rv$simulation_results, verbose=TRUE)
+        cbb_sim_for_scoring <- copy(rv$simulation_results)
+        setDT(cbb_sim_for_scoring)
+        score_matrix <- score_all_lineups(lineup_data, cbb_sim_for_scoring, verbose=TRUE)
         progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
         final_results <- calculate_distribution_metrics(score_matrix, lineup_data, opt_config,
                                                         ownership_data=NULL, verbose=TRUE)
+        rv$dk_optimal_lineups <- final_results
+        
+      } else if (rv$sport == "CBB") {
+        source("cbb_engine.R")
+        progress$set(message="Finding optimal CBB lineups...", value=0)
+        cbb_opt_config <- list(salary_cap=rv$config$salary_caps$DK,
+                               percentiles=c(0.01,0.05,0.10,0.20),
+                               platform_col="DKScore", max_lineups=5000)
+        progress$set(detail="Phase 1: Building lineup pool (per-sim LP)...", value=0.05)
+        lineup_data  <- find_optimal_lineups_cbb(rv$simulation_results, rv$sim_metadata,
+                                                 cbb_opt_config, verbose=TRUE)
+        progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
+                                    format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
+        cbb_sim_for_scoring <- copy(rv$simulation_results)
+        setDT(cbb_sim_for_scoring)
+        score_matrix <- score_all_lineups(lineup_data, cbb_sim_for_scoring, verbose=TRUE)
+        progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
+        own_data <- copy(rv$sim_metadata)
+        if ("DKOwn" %in% names(own_data)) setnames(own_data, "DKOwn", "Own")
+        final_results <- calculate_distribution_metrics(score_matrix, lineup_data, cbb_opt_config,
+                                                        ownership_data=own_data, verbose=TRUE)
         rv$dk_optimal_lineups <- final_results
         
       } else {
@@ -894,7 +940,7 @@ server <- function(input, output, session) {
   
   output$dk_download <- downloadHandler(
     filename=function() paste0("DK_Optimal_Lineups_",format(Sys.Date(),"%Y%m%d"),".csv"),
-    content=function(file) fwrite(create_download_table(rv$dk_optimal_lineups, rv$sim_metadata, "DK", rv$sport), file))
+    content=function(file) { dl <- if (isTRUE(rv$sport == "CBB")) create_download_cbb(rv$dk_optimal_lineups, rv$sim_metadata) else create_download_table(rv$dk_optimal_lineups, rv$sim_metadata, "DK", rv$sport); fwrite(dl, file) })
   output$fd_download <- downloadHandler(
     filename=function() paste0("FD_Optimal_Lineups_",format(Sys.Date(),"%Y%m%d"),".csv"),
     content=function(file) fwrite(create_download_table(rv$fd_optimal_lineups, rv$sim_metadata, "FD", rv$sport), file))
@@ -920,7 +966,7 @@ server <- function(input, output, session) {
     filename=function() paste0("CBB_Full_Sim_Results_",format(Sys.Date(),"%Y%m%d"),".csv"),
     content=function(file) { req(rv$sport=="CBB", rv$simulation_results)
       dl <- merge(copy(rv$simulation_results),
-                  rv$sim_metadata[, .(Player, DKSalary, DKOwn, Team, PosGroup)],
+                  unique(rv$sim_metadata[, .(Player, DKSalary, DKOwn, Team, PosGroup)], by="Player"),
                   by="Player", all.x=TRUE)
       front  <- c("Player","Team","PosGroup","DKSalary","DKOwn","SimID","DKScore")
       stats  <- intersect(c("pts","tpm","reb","ast","stl","blk","to"), names(dl))
@@ -982,7 +1028,7 @@ server <- function(input, output, session) {
     optimal <- switch(input$view_platform,
                       "DK"=rv$dk_optimal_lineups, "FD"=rv$fd_optimal_lineups, "SD"=rv$sd_optimal_lineups)
     req(optimal)
-    display_table <- create_display_table(optimal, rv$sim_metadata, input$view_platform)
+    display_table <- if (isTRUE(rv$sport == "CBB")) create_display_table_cbb(optimal) else create_display_table(optimal, rv$sim_metadata, input$view_platform)
     dt <- datatable(display_table,
                     options=list(pageLength=50, searching=FALSE, lengthChange=FALSE, scrollX=TRUE, dom='tp',
                                  order=list(list(which(names(display_table)=="Win")-1,'desc'))),
@@ -1278,7 +1324,7 @@ server <- function(input, output, session) {
       cpt_cols   <- grep("^Captain", names(filtered), value=TRUE)
       flex_cols  <- grep("^Util[1-4]$", names(filtered), value=TRUE)
       con_cols   <- grep("^Util5$",     names(filtered), value=TRUE)
-      all_pc     <- grep("^Player|^Captain|^MVP|^Util", names(filtered), value=TRUE)
+      all_pc     <- grep("^Player|^Captain|^MVP|^Util|^G[123]$|^F[123]$", names(filtered), value=TRUE)
       
       n_lineups  <- nrow(filtered)
       cpt_counts <- if (length(cpt_cols))  table(unlist(filtered[, ..cpt_cols]))  else table(character(0))
@@ -1308,7 +1354,7 @@ server <- function(input, output, session) {
       }
       
       meta_cols <- intersect(c("Player","PlayerType",salary_col,own_col,
-                               "Starting","Team","Car","Position","Match","Opponent","Surface","Tour","TeeTimeGroup","CutProb"),
+                               "PosGroup","Starting","Team","Car","Position","Match","Opponent","Surface","Tour","TeeTimeGroup","CutProb"),
                              names(rv$sim_metadata))
       exp_tbl <- merge(exp_tbl, rv$sim_metadata[, ..meta_cols], by="Player", all.x=TRUE)
       if (salary_col %in% names(exp_tbl)) setnames(exp_tbl, salary_col, "Salary")
@@ -1319,7 +1365,7 @@ server <- function(input, output, session) {
       }
       
       base_meta <- c("Player", if (is_f1) "PlayerType" else NULL,
-                     "Salary", "Starting", "Team", "Car",
+                     "PosGroup","Salary", "Starting", "Team", "Car",
                      "Position","Match","Opponent","Surface","Tour","TeeTimeGroup","CutProb")
       meta_order    <- intersect(base_meta, names(exp_tbl))
       f1_exp_cols   <- if (is_f1) intersect(c("CptExp","FlexExp"), names(exp_tbl)) else character(0)
@@ -1454,7 +1500,7 @@ server <- function(input, output, session) {
       cpt_cols   <- grep("^Captain",    names(port), value=TRUE)
       flex_cols  <- grep("^Util[1-4]$", names(port), value=TRUE)
       con_cols   <- grep("^Util5$",     names(port), value=TRUE)
-      all_pc     <- grep("^Player|^Captain|^MVP|^Util", names(port), value=TRUE)
+      all_pc     <- grep("^Player|^Captain|^MVP|^Util|^G[123]$|^F[123]$", names(port), value=TRUE)
       
       n_lineups   <- nrow(port)
       cpt_counts  <- if (length(cpt_cols))  table(unlist(port[, ..cpt_cols]))  else table(character(0))
@@ -1481,7 +1527,7 @@ server <- function(input, output, session) {
       }
       
       mc <- intersect(c("Player","PlayerType",salary_col,own_col,
-                        "Starting","Team","Car","Position","Match","Opponent","TeeTimeGroup","CutProb"),
+                        "PosGroup","Starting","Team","Car","Position","Match","Opponent","TeeTimeGroup","CutProb"),
                       names(rv$sim_metadata))
       exp_tbl <- merge(exp_tbl, rv$sim_metadata[,..mc], by="Player", all.x=TRUE)
       if(salary_col %in% names(exp_tbl)) setnames(exp_tbl, salary_col, "Salary")
@@ -1492,7 +1538,7 @@ server <- function(input, output, session) {
       }
       
       base_meta <- c("Player", if (is_f1) "PlayerType" else NULL,
-                     "Salary","Starting","Team","Car",
+                     "PosGroup","Salary","Starting","Team","Car",
                      "Position","Match","Opponent","Surface","Tour","TeeTimeGroup","CutProb")
       meta_order    <- intersect(base_meta, names(exp_tbl))
       f1_exp_cols   <- if (is_f1) intersect(c("CptExp","FlexExp"), names(exp_tbl)) else character(0)
