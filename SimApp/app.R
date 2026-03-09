@@ -619,25 +619,35 @@ server <- function(input, output, session) {
   }
   
   create_display_table_cbb <- function(optimal_lineups) {
-    slot_cols <- intersect(c("G1","G2","G3","F1","F2","F3","UTIL1","UTIL2"), names(optimal_lineups))
-    metric_cols <- intersect(c("WinRate","Top1Pct","Top5Pct","Top10Pct","Top20Pct","TotalSalary","AvgOwn"), names(optimal_lineups))
-    keep_cols <- c(slot_cols, metric_cols); dl <- optimal_lineups[, ..keep_cols]
-    rename_map <- c("WinRate"="Win","Top1Pct"="Top1","Top5Pct"="Top5","Top10Pct"="Top10","Top20Pct"="Top20","TotalSalary"="Salary")
-    for (o in names(rename_map)) if (o %in% names(dl)) setnames(dl, o, rename_map[[o]])
-    # Slot cols already named G1/G2/G3/F1/F2/F3/UTIL1/UTIL2 — no rename needed
+    # Player1-8 are stored internally; rename to position labels for display
+    dl <- copy(optimal_lineups)
+    pos_rename <- c(Player1="G1", Player2="G2", Player3="G3",
+                    Player4="F1", Player5="F2", Player6="F3",
+                    Player7="UTIL1", Player8="UTIL2")
+    for (o in names(pos_rename)) if (o %in% names(dl)) setnames(dl, o, pos_rename[o])
+    slot_cols   <- intersect(c("G1","G2","G3","F1","F2","F3","UTIL1","UTIL2"), names(dl))
+    metric_cols <- intersect(c("WinRate","Top1Pct","Top5Pct","Top10Pct","Top20Pct","TotalSalary","AvgOwn"), names(dl))
+    keep_cols   <- c(slot_cols, metric_cols)
+    dl <- dl[, ..keep_cols]
+    metric_rename <- c("WinRate"="Win","Top1Pct"="Top1","Top5Pct"="Top5","Top10Pct"="Top10","Top20Pct"="Top20","TotalSalary"="Salary")
+    for (o in names(metric_rename)) if (o %in% names(dl)) setnames(dl, o, metric_rename[o])
     dl
   }
   
   create_download_cbb <- function(optimal_lineups, metadata) {
-    slot_cols <- intersect(c("G1","G2","G3","F1","F2","F3","UTIL1","UTIL2"), names(optimal_lineups))
     dl <- copy(optimal_lineups)
+    # Rename Player1-8 to position labels
+    pos_rename <- c(Player1="G1", Player2="G2", Player3="G3",
+                    Player4="F1", Player5="F2", Player6="F3",
+                    Player7="UTIL1", Player8="UTIL2")
+    for (o in names(pos_rename)) if (o %in% names(dl)) setnames(dl, o, pos_rename[o])
+    slot_cols <- intersect(c("G1","G2","G3","F1","F2","F3","UTIL1","UTIL2"), names(dl))
     for (col in slot_cols) {
       ids <- metadata[match(dl[[col]], metadata$Player), DKID]
       dl[[col]] <- paste0(dl[[col]], " (", ids, ")")
     }
-    # Rename for clarity
-    rename_map <- c("WinRate"="Win","Top1Pct"="Top1","Top5Pct"="Top5","Top10Pct"="Top10","Top20Pct"="Top20","TotalSalary"="Salary")
-    for (o in names(rename_map)) if (o %in% names(dl)) setnames(dl, o, rename_map[[o]])
+    metric_rename <- c("WinRate"="Win","Top1Pct"="Top1","Top5Pct"="Top5","Top10Pct"="Top10","Top20Pct"="Top20","TotalSalary"="Salary")
+    for (o in names(metric_rename)) if (o %in% names(dl)) setnames(dl, o, metric_rename[o])
     dl
   }
   
