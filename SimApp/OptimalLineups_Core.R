@@ -1546,35 +1546,41 @@ find_optimal_lineups_winbased <- function(sim_results, config, verbose = TRUE) {
   # Calculate all lineup salaries at once
   lineup_salaries <- sapply(all_combos, function(combo) sum(salary_lookup[combo]))
   
-  # Filter by salary range (vectorized!)
-  min_salary <- salary_cap - 1000
-  valid_idx <- which(lineup_salaries >= min_salary & lineup_salaries <= salary_cap)
-  valid_lineups <- all_combos[valid_idx]
+  # Filter by salary range — start tight, expand if we don't have enough lineups
+  salary_buffers <- c(1000, 2000, 5000, 10000, salary_cap)  # fallback steps
+  player_cols <- paste0("Player", 1:roster_size)
+  lineups_dt  <- NULL
   
-  if (verbose) {
-    cat(sprintf("    Valid ($%s-$%s): %s\n", 
-                format(min_salary, big.mark = ","),
-                format(salary_cap, big.mark = ","),
-                format(length(valid_lineups), big.mark = ",")))
+  for (buf in salary_buffers) {
+    min_salary <- salary_cap - buf
+    valid_idx  <- which(lineup_salaries >= min_salary & lineup_salaries <= salary_cap)
+    valid_lineups <- all_combos[valid_idx]
+    
+    if (verbose) {
+      label <- if (buf == salary_cap) "no floor" else sprintf("$%s-$%s", format(min_salary, big.mark = ","), format(salary_cap, big.mark = ","))
+      cat(sprintf("    Salary filter (%s): %s lineups\n", label, format(length(valid_lineups), big.mark = ",")))
+    }
+    
+    if (length(valid_lineups) == 0) next
+    
+    # -----------------------------------------------------------------------
+    # PHASE 1A: Analytical ExpectedWins — simple sum of individual win probs
+    # Same-match pairs are self-capping (devigged ML probs already sum to 1.0)
+    # Fast: no matrix ops, runs on all valid lineups instantly
+    # -----------------------------------------------------------------------
+    lineup_list <- lapply(valid_lineups, function(x) as.list(setNames(x, paste0("Player", 1:roster_size))))
+    lineups_dt  <- rbindlist(lineup_list)
+    
+    ew_lookup <- setNames(ind_ew$WinProb, ind_ew$Player)
+    ew_mat <- matrix(ew_lookup[as.matrix(lineups_dt[, ..player_cols])],
+                     nrow = nrow(lineups_dt), ncol = roster_size)
+    lineups_dt[, ExpectedWins := rowSums(ew_mat, na.rm = TRUE)]
+    
+    if (nrow(lineups_dt) >= target_lineups) break
+    if (verbose) cat(sprintf("    Only %s lineups at this floor — expanding salary range...\n", format(nrow(lineups_dt), big.mark = ",")))
   }
   
-  # -----------------------------------------------------------------------
-  # PHASE 1A: Analytical ExpectedWins — simple sum of individual win probs
-  # Same-match pairs are self-capping (devigged ML probs already sum to 1.0)
-  # Fast: no matrix ops, runs on all valid lineups instantly
-  # -----------------------------------------------------------------------
   if (verbose) cat("  Calculating analytical ExpectedWins...\n")
-  
-  lineup_list <- lapply(valid_lineups, function(x) as.list(setNames(x, paste0("Player", 1:roster_size))))
-  lineups_dt  <- rbindlist(lineup_list)
-  player_cols <- paste0("Player", 1:roster_size)
-  
-  ew_lookup <- setNames(ind_ew$WinProb, ind_ew$Player)
-  
-  # Vectorized: matrix of win probs, rowSums gives EW per lineup
-  ew_mat <- matrix(ew_lookup[as.matrix(lineups_dt[, ..player_cols])],
-                   nrow = nrow(lineups_dt), ncol = roster_size)
-  lineups_dt[, ExpectedWins := rowSums(ew_mat, na.rm = TRUE)]
   
   # Take top target_lineups by analytical EW
   setorder(lineups_dt, -ExpectedWins)
