@@ -527,8 +527,10 @@ SPORT_CONFIGS <- list(
     
     detection = list(
       # Sim_ sheets + Slate tab is the unique CBB fingerprint
+      # Columns accept both dot and space variants; only need 1 of the position cols + TeamAbbrev
       required_sheets    = c("Slate"),
-      required_columns   = c("RosterPosition", "TeamAbbrev", "AvgPointsPerGame"),
+      required_columns   = c("TeamAbbrev", "RosterPosition", "Roster.Position",
+                             "AvgPointsPerGame", "RGProj", "RGMin"),
       min_sheet_matches  = 1,
       min_column_matches = 2
     ),

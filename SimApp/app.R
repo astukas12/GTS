@@ -1699,20 +1699,43 @@ server <- function(input, output, session) {
         "Match","Surface","Tour","TeeTimeGroup","CutProb","Pool"),
       names(projections))
     stats_cols <- c("Avg","Median","P90","P75","P25")
-    final_cols <- intersect(c(base_cols, sport_specific, stats_cols), names(projections))
+    
+    # CBB: inject RGProj/RGMin from metadata between identity cols and sim stats
+    rg_cols <- character(0)
+    if (isTRUE(rv$sport == "CBB")) {
+      rg_avail <- intersect(c("RGProj","RGMin"), names(meta))
+      if (length(rg_avail) > 0) {
+        projections <- merge(projections, meta[, c("Player", rg_avail), with=FALSE],
+                             by="Player", all.x=TRUE)
+        rg_cols <- rg_avail
+      }
+    }
+    
+    final_cols <- intersect(c(base_cols, sport_specific, rg_cols, stats_cols), names(projections))
     setcolorder(projections, final_cols)
     setorder(projections, -Avg)
     
+    is_cbb <- isTRUE(rv$sport == "CBB")
     dt <- datatable(projections,
-                    options = list(pageLength=50, scrollX=TRUE, scrollY="500px",
-                                   searching=FALSE, lengthChange=FALSE, dom="t",
-                                   order=list(list(which(names(projections)=="Avg")-1,"desc")),
-                                   columnDefs=list(list(className="dt-right",
-                                                        targets=which(names(projections) %in%
-                                                                        c(stats_cols,"Own","WinProb"))-1))),
+                    filter  = if (is_cbb) "top" else "none",
+                    options = list(
+                      pageLength   = if (is_cbb) 25 else 50,
+                      scrollX      = TRUE,
+                      scrollY      = if (is_cbb) NULL else "500px",
+                      searching    = is_cbb,
+                      lengthChange = is_cbb,
+                      lengthMenu   = if (is_cbb) list(c(25,50,100,200), c("25","50","100","200")) else NULL,
+                      dom          = if (is_cbb) "lftp" else "t",
+                      order        = list(list(which(names(projections)=="Avg")-1,"desc")),
+                      columnDefs   = list(list(className="dt-right",
+                                               targets=which(names(projections) %in%
+                                                               c(stats_cols,"Own","WinProb",rg_cols))-1))),
                     rownames=FALSE, class="stripe hover compact") %>%
       formatRound(intersect(c("Avg","Median","P90","P75","P25","Own","CutProb"),
                             names(projections)), 1)
+    
+    if (length(rg_cols) > 0)
+      dt <- dt %>% formatRound(rg_cols, 1)
     
     if (!is.null(winprob_col) && "WinProb" %in% names(projections))
       dt <- dt %>% formatPercentage("WinProb", digits = 1)
@@ -2275,20 +2298,38 @@ server <- function(input, output, session) {
     )
     avg_stats <- sim[, lapply(agg_exprs, eval), by=Player]
     
-    avg_stats <- merge(avg_stats,
-                       meta[, .(Player, DKSalary, Team, PosGroup, DKOwn)],
-                       by="Player", all.x=TRUE)
+    # Pull identity + RG columns from metadata
+    rg_meta_cols <- intersect(c("Player","DKSalary","Team","PosGroup","DKOwn","RGProj","RGMin"), names(meta))
+    avg_stats <- merge(avg_stats, meta[, ..rg_meta_cols], by="Player", all.x=TRUE)
     avg_stats[, Value := round(AvgDK / (DKSalary / 1000), 2)]
     setorder(avg_stats, -AvgDK)
     
-    datatable(avg_stats,
-              options=list(pageLength=30, scrollX=TRUE, searching=TRUE,
-                           lengthChange=FALSE, dom="ftp"),
-              rownames=FALSE) %>%
+    # Column order: identity → RG projections → our sim outputs
+    id_cols  <- intersect(c("Player","Team","PosGroup","DKSalary","DKOwn"), names(avg_stats))
+    rg_cols  <- intersect(c("RGProj","RGMin"), names(avg_stats))
+    sim_cols <- intersect(c("AvgDK","MedDK","P90DK","Value",
+                            paste0("Avg_", c("pts","tpm","reb","ast","stl","blk","to"))),
+                          names(avg_stats))
+    setcolorder(avg_stats, c(id_cols, rg_cols, sim_cols))
+    
+    dt <- datatable(avg_stats,
+                    filter = "top",
+                    options = list(
+                      pageLength = 25,
+                      scrollX    = TRUE,
+                      searching  = TRUE,
+                      lengthMenu = c(25, 50, 100, 200),
+                      lengthChange = TRUE,
+                      dom        = "lftp"
+                    ),
+                    rownames = FALSE) %>%
       formatCurrency("DKSalary", "$", digits=0) %>%
       formatStyle(c("AvgDK","MedDK"), color="#FFE500", fontWeight="bold") %>%
       formatStyle("Value",
                   backgroundColor=styleInterval(c(4,5), c("#1e1e1e","#2a3a1e","#1a4a1a")))
+    if (length(rg_cols) > 0)
+      dt <- dt %>% formatRound(rg_cols, 1)
+    dt
   })
   
   

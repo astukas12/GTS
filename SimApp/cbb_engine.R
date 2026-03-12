@@ -53,7 +53,9 @@ read_cbb_input <- function(file_path) {
   
   if (!"DKSalary" %in% names(slate) && "Salary" %in% names(slate))
     setnames(slate, "Salary", "DKSalary")
-  if (!"DKOwn" %in% names(slate)) slate[, DKOwn := 0]
+  if (!"DKOwn"  %in% names(slate)) slate[, DKOwn  := 0]
+  if (!"RGProj" %in% names(slate)) slate[, RGProj := NA_real_]
+  if (!"RGMin"  %in% names(slate)) slate[, RGMin  := NA_real_]
   # One row per player — DK lists each player once per eligible slot (G/UTIL, F/UTIL etc)
   # PosGroup already captures G/F/both; dedup keeps the row with the most specific position
   slate <- unique(slate, by = "Player")
@@ -176,8 +178,22 @@ run_cbb_simulation <- function(input_data, n_sims = 10000, config = NULL,
     matched <- tab[tab$Name %in% sl$Player]
     if (nrow(matched) == 0) return(NULL)
     merged  <- merge(matched,
-                     sl[, .(Player, DKID, DKSalary, DKOwn, PosGroup, GameKey)],
+                     sl[, .(Player, DKID, DKSalary, DKOwn, PosGroup, GameKey,
+                            SlateRGProj = RGProj, SlateRGMin = RGMin)],
                      by.x = "Name", by.y = "Player", all.x = TRUE)
+    # Team-tab RGProj/RGMin preferred; slate values fill any gaps
+    if ("RGProj" %in% names(merged)) {
+      merged[is.na(RGProj) & !is.na(SlateRGProj), RGProj := SlateRGProj]
+    } else if ("SlateRGProj" %in% names(merged)) {
+      setnames(merged, "SlateRGProj", "RGProj")
+    }
+    if ("RGMin" %in% names(merged)) {
+      merged[is.na(RGMin) & !is.na(SlateRGMin), RGMin := SlateRGMin]
+    } else if ("SlateRGMin" %in% names(merged)) {
+      setnames(merged, "SlateRGMin", "RGMin")
+    }
+    if ("SlateRGProj" %in% names(merged)) merged[, SlateRGProj := NULL]
+    if ("SlateRGMin"  %in% names(merged)) merged[, SlateRGMin  := NULL]
     merged[, Team := team]
     merged
   }), fill = TRUE)
@@ -361,7 +377,7 @@ run_cbb_simulation <- function(input_data, n_sims = 10000, config = NULL,
   cb("Building metadata...", 0.96)
   
   keep_cols <- intersect(
-    c("Name","DKID","DKSalary","DKOwn","Team","PosGroup","RosterPosition","GameKey"),
+    c("Name","DKID","DKSalary","DKOwn","Team","PosGroup","RosterPosition","GameKey","RGProj","RGMin"),
     names(player_list)
   )
   metadata <- unique(player_list[, ..keep_cols], by = "Name")
