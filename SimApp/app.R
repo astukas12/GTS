@@ -1403,7 +1403,7 @@ server <- function(input, output, session) {
       }
       
       base_meta <- c("Player", if (is_f1) "PlayerType" else NULL,
-                     "PosGroup","Salary","RGProj","RGMin","SimProj","GameTime","Starting","Team","Car",
+                     "Team","PosGroup","Salary","RGMin","RGProj","SimProj","GameTime","Starting","Car",
                      "Position","Match","Opponent","Surface","Tour","TeeTimeGroup","CutProb")
       meta_order    <- intersect(base_meta, names(exp_tbl))
       f1_exp_cols   <- if (is_f1) intersect(c("CptExp","FlexExp"), names(exp_tbl)) else character(0)
@@ -1411,13 +1411,17 @@ server <- function(input, output, session) {
       setcolorder(exp_tbl, c(meta_order, f1_exp_cols, metrics_order))
       exp_tbl <- exp_tbl[Exposure > 0]; setorder(exp_tbl, -Exposure)
       
+      # Rename columns for display
+      rename_map <- c(PosGroup="Pos", Salary="Sal", RGMin="Mins", RGProj="Proj", GameTime="Time", SimProj="Sim")
+      for (old in names(rename_map)) if (old %in% names(exp_tbl)) setnames(exp_tbl, old, rename_map[[old]])
+      
       dt <- datatable(exp_tbl,
                       options=list(pageLength=50,scrollX=TRUE,searching=FALSE,lengthChange=FALSE,dom='tp'),
                       rownames=FALSE)
-      rc <- intersect(c("Exposure","CptExp","FlexExp","OwnProj","Leverage","CutProb","RGProj","RGMin","SimProj"), names(exp_tbl))
+      rc <- intersect(c("Exposure","CptExp","FlexExp","OwnProj","Leverage","CutProb","Proj","Mins","Sim"), names(exp_tbl))
       if (length(rc) > 0) dt <- dt %>% formatRound(rc, 1)
       cap <- rv$config$salary_caps[[platform]] %||% 50000
-      if ("Salary" %in% names(exp_tbl) && cap >= 1000) dt <- dt %>% formatCurrency("Salary","$",digits=0)
+      if ("Sal" %in% names(exp_tbl) && cap >= 1000) dt <- dt %>% formatCurrency("Sal","$",digits=0)
       dt
     })
   }
@@ -1584,7 +1588,7 @@ server <- function(input, output, session) {
       }
       
       base_meta <- c("Player", if (is_f1) "PlayerType" else NULL,
-                     "PosGroup","Salary","RGProj","RGMin","SimProj","GameTime","Starting","Team","Car",
+                     "Team","PosGroup","Salary","RGMin","RGProj","SimProj","GameTime","Starting","Car",
                      "Position","Match","Opponent","Surface","Tour","TeeTimeGroup","CutProb")
       meta_order    <- intersect(base_meta, names(exp_tbl))
       f1_exp_cols   <- if (is_f1) intersect(c("CptExp","FlexExp"), names(exp_tbl)) else character(0)
@@ -1592,11 +1596,15 @@ server <- function(input, output, session) {
       setcolorder(exp_tbl, c(meta_order, f1_exp_cols, metrics_order))
       exp_tbl <- exp_tbl[Exposure>0]; setorder(exp_tbl,-Exposure)
       
+      # Rename columns for display
+      rename_map <- c(PosGroup="Pos", Salary="Sal", RGMin="Mins", RGProj="Proj", GameTime="Time", SimProj="Sim")
+      for (old in names(rename_map)) if (old %in% names(exp_tbl)) setnames(exp_tbl, old, rename_map[[old]])
+      
       dt <- datatable(exp_tbl, options=list(pageLength=50,scrollX=TRUE,searching=FALSE,lengthChange=FALSE,dom='tp'), rownames=FALSE)
-      rc <- intersect(c("Exposure","CptExp","FlexExp","OwnProj","Leverage","CutProb","RGProj","RGMin","SimProj"),names(exp_tbl))
+      rc <- intersect(c("Exposure","CptExp","FlexExp","OwnProj","Leverage","CutProb","Proj","Mins","Sim"),names(exp_tbl))
       if(length(rc)>0) dt <- dt %>% formatRound(rc,1)
       cap <- rv$config$salary_caps[[platform]] %||% 50000
-      if("Salary" %in% names(exp_tbl) && cap>=1000) dt <- dt %>% formatCurrency("Salary","$",digits=0)
+      if("Sal" %in% names(exp_tbl) && cap>=1000) dt <- dt %>% formatCurrency("Sal","$",digits=0)
       dt
     })
   }
