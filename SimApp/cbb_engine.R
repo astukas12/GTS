@@ -383,16 +383,19 @@ run_cbb_simulation <- function(input_data, n_sims = 10000, config = NULL,
   metadata <- unique(player_list[, ..keep_cols], by = "Name")
   setnames(metadata, "Name", "Player")
   
-  # Add parsed game start time to metadata for display
+  # Add parsed game start time to metadata for display + sorting
   if ("GameInfo" %in% names(slate)) {
     gtime_lu <- unique(slate[, .(GameKey, GameInfo)])
-    gtime_lu[, GameTime := {
+    gtime_lu[, c("GameTime","GameTimeSort") := {
       dt_str <- sub("^\\S+\\s+", "", GameInfo)
       dt_str <- sub("\\s+ET\\s*$", "", dt_str)
       parsed <- as.POSIXct(dt_str, format = "%m/%d/%Y %I:%M%p", tz = "America/New_York")
-      format(parsed, "%I:%M%p")
+      list(
+        sub("^0", "", format(parsed, "%I:%M %p")),  # display: "2:20 PM"
+        as.numeric(parsed)                           # sort: epoch seconds
+      )
     }]
-    metadata <- merge(metadata, gtime_lu[, .(GameKey, GameTime)],
+    metadata <- merge(metadata, gtime_lu[, .(GameKey, GameTime, GameTimeSort)],
                       by = "GameKey", all.x = TRUE)
   }
   
@@ -437,13 +440,12 @@ find_optimal_lineups_cbb <- function(sim_results, metadata, config, verbose = TR
   meta[, g_elig := PosGroup %in% c("G", "G/F")]
   meta[, f_elig := PosGroup %in% c("F", "G/F")]
   
-  # Game time rank: use GameTime from metadata (parsed during simulation, no slate needed)
-  # GameTime format: "03:20PM" -- rank 1=earliest, N=latest; UTIL gets highest rank players
-  if ("GameTime" %in% names(metadata)) {
-    game_times <- unique(metadata[, .(GameKey, GameTime)])
-    game_times[, game_time := as.POSIXct(GameTime, format = "%I:%M%p", tz = "America/New_York")]
-    game_times[is.na(game_time), game_time := as.POSIXct("12:00AM", format = "%I:%M%p", tz = "America/New_York")]
-    setorder(game_times, game_time)
+  # Game time rank: use GameTimeSort (epoch seconds) from metadata — no re-parsing needed
+  # rank 1=earliest, N=latest; UTIL assignment uses order(-game_rank) -> latest game first
+  if ("GameTimeSort" %in% names(metadata)) {
+    game_times <- unique(metadata[, .(GameKey, GameTimeSort)])
+    game_times[is.na(GameTimeSort), GameTimeSort := 0]
+    setorder(game_times, -GameTimeSort)
     game_order <- setNames(seq_len(nrow(game_times)), game_times$GameKey)
   } else {
     game_order <- setNames(seq_along(unique(meta$GameKey)), unique(meta$GameKey))
