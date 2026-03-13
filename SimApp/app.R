@@ -390,6 +390,17 @@ server <- function(input, output, session) {
   
   observeEvent(input$run_simulation, {
     req(rv$input_data, rv$config)
+    # Clear all downstream state so stale lineups/portfolio never bleed into new sim
+    rv$simulation_results <- NULL
+    rv$sim_metadata       <- NULL
+    rv$dk_optimal_lineups <- NULL
+    rv$fd_optimal_lineups <- NULL
+    rv$sd_optimal_lineups <- NULL
+    rv$dk_portfolio <- NULL; rv$dk_builds <- list(); rv$dk_build_counter <- 0
+    rv$fd_portfolio <- NULL; rv$fd_builds <- list(); rv$fd_build_counter <- 0
+    rv$sd_portfolio <- NULL; rv$sd_builds <- list(); rv$sd_build_counter <- 0
+    rv$sport_visuals      <- NULL
+    rv$full_sim_results   <- NULL
     engine_file <- paste0(tolower(rv$sport), "_engine.R")
     if (!file.exists(engine_file)) {
       showNotification(paste("Engine not found:", engine_file), type="error", duration=10)
@@ -697,6 +708,8 @@ server <- function(input, output, session) {
   
   observeEvent(input$run_dk_optimization, {
     req(rv$simulation_results, rv$sim_metadata, rv$config)
+    rv$dk_optimal_lineups <- NULL
+    rv$dk_portfolio <- NULL; rv$dk_builds <- list(); rv$dk_build_counter <- 0
     progress <- Progress$new(session); on.exit(progress$close())
     tryCatch({
       
@@ -839,6 +852,8 @@ server <- function(input, output, session) {
   
   observeEvent(input$run_fd_optimization, {
     req(rv$simulation_results, rv$sim_metadata, rv$config)
+    rv$fd_optimal_lineups <- NULL
+    rv$fd_portfolio <- NULL; rv$fd_builds <- list(); rv$fd_build_counter <- 0
     progress <- Progress$new(session); on.exit(progress$close())
     tryCatch({
       
@@ -914,6 +929,8 @@ server <- function(input, output, session) {
   
   observeEvent(input$run_sd_optimization, {
     req(rv$simulation_results, rv$sim_metadata, rv$config)
+    rv$sd_optimal_lineups <- NULL
+    rv$sd_portfolio <- NULL; rv$sd_builds <- list(); rv$sd_build_counter <- 0
     progress <- Progress$new(session); on.exit(progress$close())
     tryCatch({
       sd_mode    <- rv$config$optimization_modes$SD %||% "captain"
@@ -1149,10 +1166,12 @@ server <- function(input, output, session) {
                                                                 tagList(
                                                                   selectizeInput(paste0(lp,"_locked_players"), "Lock:",
                                                                                  choices=all_players, multiple=TRUE, selected=character(0),
-                                                                                 options=list(plugins=list('remove_button'),placeholder='Lock players',maxItems=6), width="100%"),
+                                                                                 options=list(plugins=list('remove_button'), placeholder='Search to lock players',
+                                                                                              maxItems=8), width="100%"),
                                                                   selectizeInput(paste0(lp,"_excluded_players"), "Exclude:",
                                                                                  choices=all_players, multiple=TRUE, selected=character(0),
-                                                                                 options=list(plugins=list('remove_button'),placeholder='Exclude players'), width="100%")
+                                                                                 options=list(plugins=list('remove_button'), placeholder='Search to exclude players'),
+                                                                                 width="100%")
                                                                 )
                                                               }
                                                           )
@@ -1313,6 +1332,8 @@ server <- function(input, output, session) {
   fd_filtered_lineups <- make_filtered_lineups("fd")
   sd_filtered_lineups <- make_filtered_lineups("sd")
   
+  
+  
   output$dk_filtered_count <- renderText({ paste0("Filtered Pool: ", nrow(dk_filtered_lineups()), " lineups") })
   output$fd_filtered_count <- renderText({ paste0("Filtered Pool: ", nrow(fd_filtered_lineups()), " lineups") })
   output$sd_filtered_count <- renderText({ paste0("Filtered Pool: ", nrow(sd_filtered_lineups()), " lineups") })
@@ -1364,9 +1385,16 @@ server <- function(input, output, session) {
       }
       
       meta_cols <- intersect(c("Player","PlayerType",salary_col,own_col,
-                               "PosGroup","Starting","Team","Car","Position","Match","Opponent","Surface","Tour","TeeTimeGroup","CutProb"),
+                               "PosGroup","RGProj","RGMin","GameTime","Starting","Team","Car","Position","Match","Opponent","Surface","Tour","TeeTimeGroup","CutProb"),
                              names(rv$sim_metadata))
       exp_tbl <- merge(exp_tbl, rv$sim_metadata[, ..meta_cols], by="Player", all.x=TRUE)
+      if (!is.null(rv$simulation_results)) {
+        score_col_sim <- if ("DKScore" %in% names(rv$simulation_results)) "DKScore" else paste0(platform, "Score")
+        if (score_col_sim %in% names(rv$simulation_results)) {
+          sim_proj <- rv$simulation_results[, .(SimProj = round(mean(get(score_col_sim), na.rm=TRUE), 1)), by=Player]
+          exp_tbl  <- merge(exp_tbl, sim_proj, by="Player", all.x=TRUE)
+        }
+      }
       if (salary_col %in% names(exp_tbl)) setnames(exp_tbl, salary_col, "Salary")
       if (own_col    %in% names(exp_tbl)) {
         setnames(exp_tbl, own_col, "OwnProj")
@@ -1375,7 +1403,7 @@ server <- function(input, output, session) {
       }
       
       base_meta <- c("Player", if (is_f1) "PlayerType" else NULL,
-                     "PosGroup","Salary", "Starting", "Team", "Car",
+                     "PosGroup","Salary","RGProj","RGMin","SimProj","GameTime","Starting","Team","Car",
                      "Position","Match","Opponent","Surface","Tour","TeeTimeGroup","CutProb")
       meta_order    <- intersect(base_meta, names(exp_tbl))
       f1_exp_cols   <- if (is_f1) intersect(c("CptExp","FlexExp"), names(exp_tbl)) else character(0)
@@ -1386,7 +1414,7 @@ server <- function(input, output, session) {
       dt <- datatable(exp_tbl,
                       options=list(pageLength=50,scrollX=TRUE,searching=FALSE,lengthChange=FALSE,dom='tp'),
                       rownames=FALSE)
-      rc <- intersect(c("Exposure","CptExp","FlexExp","OwnProj","Leverage","CutProb"), names(exp_tbl))
+      rc <- intersect(c("Exposure","CptExp","FlexExp","OwnProj","Leverage","CutProb","RGProj","RGMin","SimProj"), names(exp_tbl))
       if (length(rc) > 0) dt <- dt %>% formatRound(rc, 1)
       cap <- rv$config$salary_caps[[platform]] %||% 50000
       if ("Salary" %in% names(exp_tbl) && cap >= 1000) dt <- dt %>% formatCurrency("Salary","$",digits=0)
@@ -1537,9 +1565,17 @@ server <- function(input, output, session) {
       }
       
       mc <- intersect(c("Player","PlayerType",salary_col,own_col,
-                        "PosGroup","Starting","Team","Car","Position","Match","Opponent","TeeTimeGroup","CutProb"),
+                        "PosGroup","RGProj","RGMin","GameTime","Starting","Team","Car","Position","Match","Opponent","TeeTimeGroup","CutProb"),
                       names(rv$sim_metadata))
       exp_tbl <- merge(exp_tbl, rv$sim_metadata[,..mc], by="Player", all.x=TRUE)
+      if (!is.null(rv$simulation_results)) {
+        score_col_sim <- if ("DKScore" %in% names(rv$simulation_results)) "DKScore"
+        else paste0(platform, "Score")
+        if (score_col_sim %in% names(rv$simulation_results)) {
+          sim_proj <- rv$simulation_results[, .(SimProj = round(mean(get(score_col_sim), na.rm=TRUE), 1)), by=Player]
+          exp_tbl  <- merge(exp_tbl, sim_proj, by="Player", all.x=TRUE)
+        }
+      }
       if(salary_col %in% names(exp_tbl)) setnames(exp_tbl, salary_col, "Salary")
       if(own_col    %in% names(exp_tbl)) {
         setnames(exp_tbl, own_col, "OwnProj")
@@ -1548,7 +1584,7 @@ server <- function(input, output, session) {
       }
       
       base_meta <- c("Player", if (is_f1) "PlayerType" else NULL,
-                     "PosGroup","Salary","Starting","Team","Car",
+                     "PosGroup","Salary","RGProj","RGMin","SimProj","GameTime","Starting","Team","Car",
                      "Position","Match","Opponent","Surface","Tour","TeeTimeGroup","CutProb")
       meta_order    <- intersect(base_meta, names(exp_tbl))
       f1_exp_cols   <- if (is_f1) intersect(c("CptExp","FlexExp"), names(exp_tbl)) else character(0)
@@ -1557,7 +1593,7 @@ server <- function(input, output, session) {
       exp_tbl <- exp_tbl[Exposure>0]; setorder(exp_tbl,-Exposure)
       
       dt <- datatable(exp_tbl, options=list(pageLength=50,scrollX=TRUE,searching=FALSE,lengthChange=FALSE,dom='tp'), rownames=FALSE)
-      rc <- intersect(c("Exposure","CptExp","FlexExp","OwnProj","Leverage","CutProb"),names(exp_tbl))
+      rc <- intersect(c("Exposure","CptExp","FlexExp","OwnProj","Leverage","CutProb","RGProj","RGMin","SimProj"),names(exp_tbl))
       if(length(rc)>0) dt <- dt %>% formatRound(rc,1)
       cap <- rv$config$salary_caps[[platform]] %||% 50000
       if("Salary" %in% names(exp_tbl) && cap>=1000) dt <- dt %>% formatCurrency("Salary","$",digits=0)
@@ -1627,7 +1663,10 @@ server <- function(input, output, session) {
   outputOptions(output, "has_sim_results",   suspendWhenHidden=FALSE)
   output$sport_detected    <- reactive({ rv$sport %||% "" })
   outputOptions(output, "sport_detected",    suspendWhenHidden=FALSE)
-  output$has_sport_visuals <- reactive({ !is.null(rv$sport_visuals) })
+  output$has_sport_visuals <- reactive({
+    if (isTRUE(rv$sport == "CBB")) !is.null(rv$simulation_results)
+    else !is.null(rv$sport_visuals)
+  })
   outputOptions(output, "has_sport_visuals", suspendWhenHidden=FALSE)
   
   output$sim_results_platform_selector <- renderUI({
@@ -1752,12 +1791,17 @@ server <- function(input, output, session) {
   # ==========================================================================
   
   output$sport_specific_visuals_ui <- renderUI({
-    req(rv$sport, rv$sport_visuals)
+    req(rv$sport)
+    # CBB drives visuals from simulation_results directly, not sport_visuals
+    if (rv$sport == "CBB") {
+      req(rv$simulation_results)
+      return(render_cbb_visuals())
+    }
+    req(rv$sport_visuals)
     if      (rv$sport == "TENNIS")  render_tennis_visuals(rv$sport_visuals)
     else if (rv$sport == "NASCAR")  render_nascar_visuals(rv$sport_visuals, input$sim_results_platform)
     else if (rv$sport == "GOLF")    render_golf_visuals(rv$sport_visuals)
     else if (rv$sport == "MMA")     render_mma_visuals(rv$sport_visuals)
-    else if (rv$sport == "CBB")     render_cbb_visuals()
     else if (rv$sport == "F1")      render_f1_visuals(rv$sport_visuals)
     else NULL
   })
@@ -2195,90 +2239,81 @@ server <- function(input, output, session) {
   # ---------- CBB ----------
   
   render_cbb_visuals <- function() {
+    req(rv$sim_metadata)
+    teams <- sort(unique(rv$sim_metadata$Team))
+    tabs  <- lapply(teams, function(tm) {
+      tabPanel(tm,
+               div(style="margin-top:10px;"),
+               uiOutput(paste0("cbb_plot_ui_", tm))
+      )
+    })
     fluidRow(column(12,
                     box(width=NULL, title="COLLEGE BASKETBALL SIMULATION ANALYSIS",
                         status="primary", solidHeader=TRUE,
-                        tabsetPanel(id="cbb_visuals_tabs", type="tabs",
-                                    tabPanel("Score Distribution by Team", div(style="margin-top:15px;"),
-                                             uiOutput("cbb_team_plot_ui")),
-                                    tabPanel("Stat Breakdown", div(style="margin-top:15px;"),
-                                             DTOutput("cbb_stat_breakdown_table") %>%
-                                               shinycssloaders::withSpinner(color="#FFE500", type=6))
-                        )
+                        do.call(tabsetPanel, c(list(id="cbb_team_tabs", type="tabs"), tabs))
                     )
     ))
   }
   
-  # Per-team box plots: one subplot per team, stacked vertically
-  output$cbb_team_plot_ui <- renderUI({
-    req(rv$sport=="CBB", rv$sim_metadata)
-    teams   <- unique(rv$sim_metadata$Team)
-    n_teams <- length(teams)
-    # Each team gets ~250px height; minimum 400px
-    total_h <- max(400, n_teams * 260)
-    plotlyOutput("cbb_team_score_plot", height = paste0(total_h, "px")) %>%
-      shinycssloaders::withSpinner(color="#FFE500", type=6)
-  })
-  
-  output$cbb_team_score_plot <- renderPlotly({
+  # Register a plot output for each team dynamically
+  observe({
     req(rv$sport=="CBB", rv$simulation_results, rv$sim_metadata)
-    tryCatch({
-      sim  <- copy(rv$simulation_results); setDT(sim)
-      meta <- copy(rv$sim_metadata);       setDT(meta)
-      
-      # Join team info
-      sim_t <- merge(sim, meta[, .(Player, Team, DKSalary)], by="Player", all.x=TRUE)
-      
-      teams      <- sort(unique(sim_t$Team))
-      n_teams    <- length(teams)
-      n_cols     <- min(2, n_teams)
-      n_rows     <- ceiling(n_teams / n_cols)
-      
-      # Build one subplot per team
-      plots <- lapply(teams, function(tm) {
-        td <- as.data.frame(sim_t[Team == tm])
+    sim  <- isolate(rv$simulation_results)
+    meta <- isolate(rv$sim_metadata)
+    teams <- sort(unique(meta$Team))
+    
+    lapply(teams, function(tm) {
+      local({
+        local_tm <- tm
+        ui_id    <- paste0("cbb_plot_ui_", local_tm)
+        plot_id  <- paste0("cbb_plot_", local_tm)
         
-        # Order players by average DK score descending
-        avg_ord <- td[, .(avg=mean(DKScore, na.rm=TRUE)), by=Player]
-        avg_ord <- avg_ord[order(-avg)]
-        td$Player <- factor(td$Player, levels=rev(avg_ord$Player))
+        output[[ui_id]] <- renderUI({
+          n_players <- nrow(meta[meta$Team == local_tm, ])
+          height    <- max(300, n_players * 58)
+          plotlyOutput(plot_id, height=paste0(height, "px")) %>%
+            shinycssloaders::withSpinner(color="#FFE500", type=6)
+        })
         
-        plot_ly(data=td, x=~DKScore, y=~Player,
-                type="box", orientation="h",
-                name=tm,
-                marker    = list(color="#FFE500"),
-                line      = list(color="#FFE500"),
-                fillcolor = "rgba(255,229,0,0.20)") %>%
-          layout(
-            annotations = list(list(
-              text=tm, x=0.5, y=1.05, xref="paper", yref="paper",
-              showarrow=FALSE, font=list(color="#FFE500", size=13, family="Inter"),
-              xanchor="center"
-            )),
-            xaxis = list(title="DK Points", gridcolor="#404040", color="#FFFFFF",
-                         zeroline=FALSE),
-            yaxis = list(title="", color="#FFFFFF", tickfont=list(size=10))
-          )
+        output[[plot_id]] <- renderPlotly({
+          tryCatch({
+            setDT(sim); setDT(meta)
+            sim_t <- merge(sim, meta[, .(Player, Team)], by="Player", all.x=TRUE)
+            td    <- sim_t[Team == local_tm]
+            
+            if (nrow(td) == 0) return(plotly_empty() %>% layout(
+              paper_bgcolor="#121212", plot_bgcolor="#1e1e1e"))
+            
+            # Order by avg DK score ascending (highest at top of horizontal chart)
+            avg_ord <- td[, .(avg=mean(DKScore, na.rm=TRUE)), by=Player]
+            setorder(avg_ord, avg)
+            td[, Player := factor(Player, levels=avg_ord$Player)]
+            
+            plot_ly(data=as.data.frame(td),
+                    x=~DKScore, y=~Player,
+                    type="box", orientation="h",
+                    marker    = list(color="#FFE500"),
+                    line      = list(color="#FFE500"),
+                    fillcolor = "rgba(255,229,0,0.18)") %>%
+              layout(
+                title        = list(text=paste0(local_tm, " — DK Fantasy Points"),
+                                    font=list(color="#FFE500", size=14)),
+                xaxis        = list(title="DK Points", gridcolor="#404040",
+                                    color="#FFFFFF", zeroline=FALSE),
+                yaxis        = list(title="", color="#FFFFFF",
+                                    tickfont=list(size=11), automargin=TRUE),
+                paper_bgcolor = "#121212",
+                plot_bgcolor  = "#1e1e1e",
+                font          = list(color="#FFFFFF", size=11),
+                showlegend    = FALSE
+              )
+          }, error=function(e) {
+            plotly_empty() %>% layout(
+              title=list(text=paste("Error:", e$message), font=list(color="#FFE500")),
+              paper_bgcolor="#121212", plot_bgcolor="#1e1e1e")
+          })
+        })
       })
-      
-      # Stack all subplots in a 2-column grid
-      subplot(plots,
-              nrows   = n_rows,
-              shareX  = FALSE,
-              shareY  = FALSE,
-              margin  = 0.06) %>%
-        layout(
-          title        = list(text="DK Score Distribution by Team",
-                              font=list(color="#FFE500", size=16)),
-          paper_bgcolor = "#121212",
-          plot_bgcolor  = "#1e1e1e",
-          font          = list(color="#FFFFFF", size=11),
-          showlegend    = FALSE
-        )
-    }, error=function(e) {
-      plotly_empty() %>% layout(
-        title=list(text=paste("Error:", e$message), font=list(color="#FFE500")),
-        paper_bgcolor="#121212", plot_bgcolor="#1e1e1e")
     })
   })
   
