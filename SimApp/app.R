@@ -790,8 +790,14 @@ server <- function(input, output, session) {
         setDT(cbb_sim_for_scoring)
         score_matrix <- score_all_lineups(lineup_data, cbb_sim_for_scoring, verbose=TRUE)
         progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
+        own_data <- copy(rv$sim_metadata)
+        if ("DKOwn" %in% names(own_data)) setnames(own_data, "DKOwn", "Own")
         final_results <- calculate_distribution_metrics(score_matrix, lineup_data, opt_config,
-                                                        ownership_data=NULL, verbose=TRUE)
+                                                        ownership_data=own_data, verbose=TRUE)
+        # Override AvgOwn with captain-aware calculation (captain uses CptOwn, not flex Own)
+        if (exists("calculate_f1_lineup_metrics")) {
+          final_results <- calculate_f1_lineup_metrics(final_results, rv$simulation_results, rv$sim_metadata)
+        }
         rv$dk_optimal_lineups <- final_results
         
       } else if (rv$sport == "CBB") {
@@ -2600,7 +2606,7 @@ server <- function(input, output, session) {
   
   
 } 
- 
+
 
 # ============================================================================
 # RUN APP

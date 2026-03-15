@@ -12,18 +12,19 @@
 #                Finish | Grid | LapsLed | FastestLap | Classified | BeatTeammate | Team
 #   Constructors: SimID | Player | PlayerType | DKScore (component cols = NA)
 #
-# metadata — one row per entity, NO DKOwn:
-#   Drivers:     Player | PlayerType | DKSalary | CptSalary | DKID | CptDFSID | Team | Grid
-#   Constructors: Player | PlayerType | DKSalary | DKID
+# metadata — one row per entity:
+#   Drivers:     Player | PlayerType | DKSalary | CptSalary | DKID | CptDFSID | Team | Grid |
+#                DKOwn (flex Own %) | CaptainOwn (CptOwn %)
+#   Constructors: Player | PlayerType | DKSalary | DKID | DKOwn
+#
+# Ownership: optional columns Own / CptOwn in Drivers sheet; DKOwn in Constructors sheet.
+#            Defaults to 0 if absent. DKOwn in metadata = flex Own for drivers.
 #
 # DK Roster: 1 Captain (driver, 1.5x) + 4 Flex Drivers + 1 Constructor | $50k cap
-# No ownership data for F1.
 # ============================================================================
 
 library(data.table)
 library(readxl)
-library(ggplot2)
-library(plotly)
 
 # ============================================================================
 # TEAM COLORS
@@ -72,6 +73,17 @@ read_f1_input <- function(file_path) {
   constructors   <- as.data.table(read_excel(file_path, sheet = "Constructors"))
   
   drivers <- drivers[!is.na(Name) & Name != ""]
+  
+  # Ownership columns — optional; default to 0 if not present
+  # Ownership columns — optional; default to 0 if not present
+  # Drivers sheet:      Own (flex ownership), CptOwn (captain ownership)
+  # Constructors sheet: DKOwn (constructor ownership)
+  if (!"Own"    %in% names(drivers))      drivers[, Own    := 0]
+  if (!"CptOwn" %in% names(drivers))      drivers[, CptOwn := 0]
+  if (!"DKOwn"  %in% names(constructors)) constructors[, DKOwn := 0]
+  drivers[is.na(Own),    Own    := 0]
+  drivers[is.na(CptOwn), CptOwn := 0]
+  constructors[is.na(DKOwn), DKOwn := 0]
   
   pos_cols  <- as.character(1:22)
   missing_p <- setdiff(pos_cols, names(drivers))
@@ -450,7 +462,9 @@ run_f1_simulation <- function(input_data, n_sims, config,
     DKID       = DKID_Driver,
     CptDFSID   = DKID_Captain,
     Team,
-    Starting   = Grid
+    Starting   = Grid,
+    DKOwn      = Own,
+    CaptainOwn = CptOwn
   )])
   
   cnstr_meta <- unique(constructors[, .(
@@ -461,11 +475,12 @@ run_f1_simulation <- function(input_data, n_sims, config,
     DKID,
     CptDFSID   = NA_character_,
     Team       = Name,
-    Starting   = NA_integer_
+    Starting   = NA_integer_,
+    DKOwn      = DKOwn,
+    CaptainOwn = NA_real_
   )])
   
   metadata <- rbindlist(list(drv_meta, cnstr_meta), fill = TRUE)
-  metadata[, DKOwn := 0]
   
   pb(0.93, "Preparing visualizations...")
   
@@ -752,100 +767,47 @@ find_optimal_f1_lineups <- function(sim_results, metadata, config, verbose = TRU
 # ============================================================================
 
 calculate_f1_lineup_metrics <- function(scored_lineups, sim_results, metadata) {
+  # Recompute AvgOwn correctly for F1's mixed captain/flex/constructor lineup:
+  #   Captain slot  -> CaptainOwn (CptOwn from input)
+  #   Util1-4 slots -> DKOwn      (flex Own from input)
+  #   Util5 slot    -> DKOwn      (constructor DKOwn from input)
+  # calculate_distribution_metrics set AvgOwn using DKOwn for ALL slots (including
+  # the captain), so we override it here with the proper weighted average.
+  
+  if (!("CaptainOwn" %in% names(metadata)) || !("Captain" %in% names(scored_lineups)))
+    return(scored_lineups)
+  
+  setDT(scored_lineups)
+  setDT(metadata)
+  
+  # Build fast lookup vectors
+  cpt_own_lkp  <- setNames(metadata$CaptainOwn, metadata$Player)
+  flex_own_lkp <- setNames(metadata$DKOwn,      metadata$Player)
+  
+  # Identify columns: captain + 4 flex drivers (Util1-4) + constructor (Util5)
+  flex_cols <- paste0("Util", 1:4)   # drivers in flex slots
+  con_col   <- "Util5"               # constructor
+  
+  have_cpt  <- "Captain" %in% names(scored_lineups)
+  have_flex <- all(flex_cols %in% names(scored_lineups))
+  have_con  <- con_col %in% names(scored_lineups)
+  
+  if (!have_cpt || !have_flex || !have_con) return(scored_lineups)
+  
+  scored_lineups[, AvgOwn := {
+    cpt_o  <- cpt_own_lkp[Captain]
+    flex_o <- rowMeans(cbind(
+      flex_own_lkp[Util1], flex_own_lkp[Util2],
+      flex_own_lkp[Util3], flex_own_lkp[Util4]
+    ), na.rm = TRUE)
+    con_o  <- flex_own_lkp[Util5]
+    # 6 slots total: 1 cpt + 4 flex + 1 constructor
+    round((cpt_o + flex_o * 4 + con_o) / 6, 4)
+  }]
+  
   scored_lineups
 }
 
 
 
-f1_plot_finish_dist <- function(drv_results, drv_meta) {
-  setDT(drv_results); setDT(drv_meta)
-  grid_order <- drv_meta[order(Starting), Player]
-  pd         <- copy(drv_results)
-  pd[, PlayerF := factor(Player, levels = rev(grid_order))]
-  team_map   <- unique(pd[, .(Player, Team)])
-  clr_vec    <- setNames(sapply(team_map$Team, get_f1_color), team_map$Player)
-  
-  p <- ggplot(as.data.frame(pd), aes(x = Finish, y = PlayerF, fill = Player)) +
-    geom_violin(alpha = 0.75, trim = TRUE, width = 0.85, scale = "width") +
-    geom_boxplot(width = 0.12, alpha = 0.6, outlier.shape = NA, color = "white") +
-    scale_fill_manual(values = clr_vec) +
-    scale_x_reverse(breaks = c(1, 5, 10, 15, 20, 22)) +
-    labs(x = "Finish Position", y = NULL,
-         title = "Finish Position Distribution (Grid Order)") +
-    .f1_theme()
-  ggplotly(p) %>% layout(paper_bgcolor = "#1e1e1e", plot_bgcolor = "#1e1e1e")
-}
-
-f1_plot_fp_dist <- function(drv_results, drv_meta) {
-  setDT(drv_results); setDT(drv_meta)
-  sal_order <- drv_meta[order(-DKSalary), Player]
-  pd        <- copy(drv_results)
-  pd[, PlayerF := factor(Player, levels = rev(sal_order))]
-  team_map  <- unique(pd[, .(Player, Team)])
-  clr_vec   <- setNames(sapply(team_map$Team, get_f1_color), team_map$Player)
-  
-  p <- ggplot(as.data.frame(pd), aes(x = DKScore, y = PlayerF, fill = Player)) +
-    geom_violin(alpha = 0.75, trim = TRUE, width = 0.85, scale = "width") +
-    geom_boxplot(width = 0.12, alpha = 0.6, outlier.shape = NA, color = "white") +
-    scale_fill_manual(values = clr_vec) +
-    labs(x = "DK Fantasy Points (Flex Score)", y = NULL,
-         title = "Fantasy Points Distribution (Salary Order)") +
-    .f1_theme()
-  ggplotly(p) %>% layout(paper_bgcolor = "#1e1e1e", plot_bgcolor = "#1e1e1e")
-}
-
-f1_plot_dominators <- function(drv_results) {
-  setDT(drv_results)
-  ll_sum <- drv_results[, .(Avg_LL = mean(LapsLed), Team = first(Team)), by = Player]
-  ll_sum <- ll_sum[Avg_LL > 0.01]
-  
-  if (nrow(ll_sum) == 0)
-    return(plotly_empty() %>%
-             layout(title = list(text = "No laps led data", font = list(color = "#FFE500")),
-                    paper_bgcolor = "#1e1e1e", plot_bgcolor = "#1e1e1e"))
-  
-  setorder(ll_sum, -Avg_LL)
-  ll_sum[, PlayerF := factor(Player, levels = Player)]
-  clr_vec <- setNames(sapply(ll_sum$Team, get_f1_color), ll_sum$Player)
-  
-  p <- ggplot(as.data.frame(ll_sum),
-              aes(x = PlayerF, y = Avg_LL, fill = Player,
-                  text = paste0(Player, ": ", round(Avg_LL, 1), " avg laps led"))) +
-    geom_col(alpha = 0.85) +
-    scale_fill_manual(values = clr_vec) +
-    labs(x = NULL, y = "Avg Laps Led", title = "Dominator - Average Laps Led") +
-    .f1_theme() +
-    theme(axis.text.x = element_text(angle = 45, hjust = 1))
-  ggplotly(p, tooltip = "text") %>%
-    layout(paper_bgcolor = "#1e1e1e", plot_bgcolor = "#1e1e1e")
-}
-
-f1_plot_constructor_dist <- function(cnstr_results) {
-  setDT(cnstr_results)
-  med_order <- cnstr_results[, .(med = median(DKScore)), by = Player][order(-med), Player]
-  pd        <- copy(cnstr_results)
-  pd[, PlayerF := factor(Player, levels = rev(med_order))]
-  clr_vec   <- setNames(sapply(med_order, get_f1_color), med_order)
-  
-  p <- ggplot(as.data.frame(pd), aes(x = DKScore, y = PlayerF, fill = Player)) +
-    geom_violin(alpha = 0.75, trim = TRUE, width = 0.85, scale = "width") +
-    geom_boxplot(width = 0.2, alpha = 0.6, outlier.shape = NA, color = "white") +
-    scale_fill_manual(values = clr_vec) +
-    labs(x = "DK Fantasy Points", y = NULL,
-         title = "Constructor Points Distribution") +
-    .f1_theme()
-  ggplotly(p) %>% layout(paper_bgcolor = "#1e1e1e", plot_bgcolor = "#1e1e1e")
-}
-
-.f1_theme <- function() {
-  theme_minimal(base_size = 11) +
-    theme(
-      legend.position  = "none",
-      panel.grid.minor = element_blank(),
-      axis.text        = element_text(color = "#FFE500"),
-      axis.title       = element_text(color = "#FFE500"),
-      plot.title       = element_text(color = "#FFE500", face = "bold"),
-      plot.background  = element_rect(fill = "#1e1e1e", color = NA),
-      panel.background = element_rect(fill = "#1e1e1e", color = NA)
-    )
-}
+# (Plot functions removed — all F1 visuals are rendered natively in app.R via plot_ly)
