@@ -961,7 +961,7 @@ create_finish_violin_plot <- function(sim_results, selected_drivers = NULL,
   }
   
   if (nrow(plot_data) == 0) {
-    return(plotly_empty() %>% layout(title = "No data to display"))
+    return(plotly_empty())
   }
   
   # Get unique drivers ordered by starting position
@@ -1024,7 +1024,6 @@ create_finish_violin_plot <- function(sim_results, selected_drivers = NULL,
         x = 1.02,
         y = 1
       ),
-      height = 600,
       margin = list(l = 150, r = 100, t = 50, b = 50)
     )
   
@@ -1052,7 +1051,7 @@ create_dominator_violin_by_driver <- function(sim_results, platform = "DK",
   }
   
   if (nrow(plot_data) == 0) {
-    return(plotly_empty() %>% layout(title = "No data to display"))
+    return(plotly_empty())
   }
   
   # Calculate median for ordering
@@ -1109,7 +1108,6 @@ create_dominator_violin_by_driver <- function(sim_results, platform = "DK",
       font = list(color = '#FFFFFF', size = 12),
       showlegend = TRUE,
       legend = list(orientation = "v", x = 1.02, y = 1),
-      height = 500,
       margin = list(l = 150, r = 100, t = 50, b = 50)
     )
   
@@ -1195,7 +1193,6 @@ create_dominator_violin_by_position <- function(sim_results, platform = "DK",
       plot_bgcolor = '#1e1e1e',
       font = list(color = '#FFFFFF', size = 12),
       showlegend = FALSE,
-      height = 400,
       margin = list(l = 100, r = 50, t = 50, b = 50)
     )
   
@@ -1587,12 +1584,7 @@ create_nascar_accuracy_plot <- function(accuracy_data, metric = "win") {
   plot_data <- plot_data[plot_data[[input_col]] > min_threshold, ]
   
   if (nrow(plot_data) == 0) {
-    return(plotly_empty() %>%
-             layout(
-               title = list(text = "No drivers with sufficient probability", font = list(color = "#FFE500")),
-               paper_bgcolor = "#121212",
-               plot_bgcolor = "#1e1e1e"
-             ))
+    return(plotly_empty())
   }
   
   # Sort by input column - use order() instead of setorder with get()
@@ -1658,7 +1650,6 @@ create_nascar_accuracy_plot <- function(accuracy_data, metric = "win") {
         borderwidth = 1,
         font = list(color = '#FFFFFF')
       ),
-      height = max(400, 25 * nrow(plot_data)),
       margin = list(l = 150, r = 50, t = 80, b = 50)
     )
   
@@ -1775,12 +1766,7 @@ create_nascar_fantasy_violin <- function(sim_results, platform = "DK",
   }
   
   if (nrow(plot_data) == 0) {
-    return(plotly_empty() %>% 
-             layout(
-               title = list(text = "No drivers match the selected filters", font = list(color = "#FFE500")),
-               paper_bgcolor = "#121212",
-               plot_bgcolor = "#1e1e1e"
-             ))
+    return(plotly_empty())
   }
   
   # Get unique drivers ordered by salary (highest to lowest)
@@ -1841,7 +1827,6 @@ create_nascar_fantasy_violin <- function(sim_results, platform = "DK",
       plot_bgcolor = '#1e1e1e',
       font = list(color = '#FFFFFF', size = 12),
       showlegend = FALSE,
-      height = plot_height,
       margin = list(l = 150, r = 50, t = 80, b = 50)
     )
   

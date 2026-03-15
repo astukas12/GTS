@@ -790,14 +790,8 @@ server <- function(input, output, session) {
         setDT(cbb_sim_for_scoring)
         score_matrix <- score_all_lineups(lineup_data, cbb_sim_for_scoring, verbose=TRUE)
         progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
-        own_data <- copy(rv$sim_metadata)
-        if ("DKOwn" %in% names(own_data)) setnames(own_data, "DKOwn", "Own")
         final_results <- calculate_distribution_metrics(score_matrix, lineup_data, opt_config,
-                                                        ownership_data=own_data, verbose=TRUE)
-        # Override AvgOwn with captain-aware calculation (captain uses CptOwn, not flex Own)
-        if (exists("calculate_f1_lineup_metrics")) {
-          final_results <- calculate_f1_lineup_metrics(final_results, rv$simulation_results, rv$sim_metadata)
-        }
+                                                        ownership_data=NULL, verbose=TRUE)
         rv$dk_optimal_lineups <- final_results
         
       } else if (rv$sport == "CBB") {
@@ -1890,7 +1884,7 @@ server <- function(input, output, session) {
           xaxis=list(title="DK Fantasy Points", gridcolor="#404040", color="#FFFFFF"),
           yaxis=list(title="", color="#FFFFFF"),
           paper_bgcolor="#121212", plot_bgcolor="#1e1e1e",
-          font=list(color="#FFFFFF",size=12), showlegend=FALSE, height=600)
+          font=list(color="#FFFFFF",size=12), showlegend=FALSE)
     }
   }
   output$tennis_all_wins_plot    <- renderPlotly(make_tennis_box_plot("all_wins","All Winning Scores (Top 10)","#FFE500")())
@@ -1912,18 +1906,24 @@ server <- function(input, output, session) {
         xaxis=list(title="Salary ($)", gridcolor="#404040", color="#FFFFFF"),
         yaxis=list(title="Avg Win Score (DK Points)", gridcolor="#404040", color="#FFFFFF"),
         paper_bgcolor="#121212", plot_bgcolor="#1e1e1e",
-        font=list(color="#FFFFFF"), height=500)
+        font=list(color="#FFFFFF"))
   })
   
   
   # ---------- NASCAR ----------
   
   render_nascar_visuals <- function(visuals, platform) {
+    n_drivers   <- if (!is.null(visuals$full_results)) length(unique(visuals$full_results$Name)) else 40
+    finish_h    <- paste0(max(600, n_drivers * 30), "px")
+    fantasy_h   <- paste0(max(600, n_drivers * 30), "px")
     fluidRow(column(12,
                     box(width=NULL, title="NASCAR SIMULATION ANALYSIS", status="primary", solidHeader=TRUE,
                         tabsetPanel(id="nascar_visuals_tabs", type="tabs",
                                     tabPanel("Finishing Position", div(style="margin-top:15px;"),
-                                             plotlyOutput("finish_distribution_plot",  height="600px") %>%
+                                             plotlyOutput("finish_distribution_plot", height=finish_h) %>%
+                                               shinycssloaders::withSpinner(color="#FFE500",type=6)),
+                                    tabPanel("Fantasy Points", div(style="margin-top:15px;"),
+                                             plotlyOutput("nascar_fantasy_plot", height=fantasy_h) %>%
                                                shinycssloaders::withSpinner(color="#FFE500",type=6)),
                                     tabPanel("Dominator by Driver", div(style="margin-top:15px;"),
                                              plotlyOutput("dominator_violin_driver",   height="600px") %>%
@@ -1949,7 +1949,6 @@ server <- function(input, output, session) {
       ordered_drivers <- driver_order$Name
       plot_data       <- as.data.frame(plot_data)
       plot_data$Name  <- factor(plot_data$Name, levels=rev(ordered_drivers))
-      plot_height     <- max(600, length(ordered_drivers)*25)
       plot_ly(data=plot_data, x=~FinishPosition, y=~Name, type="box", orientation="h",
               marker=list(color="#FFE500"), line=list(color="#FFE500"),
               fillcolor="rgba(255,229,0,0.3)",
@@ -1959,17 +1958,54 @@ server <- function(input, output, session) {
           xaxis=list(title="Finish Position",gridcolor="#404040",dtick=5,
                      showgrid=TRUE,range=c(0,41),color="#FFFFFF"),
           yaxis=list(title="",categoryorder="array",
-                     categoryarray=rev(ordered_drivers),color="#FFFFFF"),
+                     categoryarray=rev(ordered_drivers),color="#FFFFFF",
+                     automargin=TRUE),
           paper_bgcolor="#121212", plot_bgcolor="#1e1e1e",
           font=list(color="#FFFFFF",size=12), showlegend=FALSE,
-          height=plot_height, margin=list(l=150,r=50,t=50,b=50)) %>%
+          margin=list(l=160,r=50,t=50,b=50)) %>%
         config(displayModeBar=TRUE,
                modeBarButtonsToRemove=c("select2d","lasso2d","autoScale2d"),
                displaylogo=FALSE)
     }, error=function(e) {
-      plotly_empty() %>% layout(
-        title=list(text=paste("Error:",e$message),font=list(color="#FFE500")),
-        paper_bgcolor="#121212",plot_bgcolor="#1e1e1e")
+      plotly_empty()
+    })
+  })
+  
+  output$nascar_fantasy_plot <- renderPlotly({
+    req(rv$sport=="NASCAR", rv$sport_visuals$full_results, input$sim_results_platform)
+    tryCatch({
+      platform   <- input$sim_results_platform
+      score_col  <- if (platform == "DK") "DKScore" else "FDScore"
+      sal_col    <- if (platform == "DK") "DKSalary" else "FDSalary"
+      plot_data  <- copy(rv$sport_visuals$full_results)
+      # Check score column exists
+      if (!score_col %in% names(plot_data)) stop(paste(score_col, "not found in results"))
+      # Order by salary descending (highest salary at top)
+      meta       <- unique(plot_data[, .(Name, Salary = get(sal_col) %||% 0)])
+      sal_order  <- meta[order(-Salary), Name]
+      plot_data  <- as.data.frame(plot_data)
+      plot_data$Name      <- factor(plot_data$Name, levels=rev(sal_order))
+      plot_data$FPScore   <- plot_data[[score_col]]
+      plot_ly(data=plot_data, x=~FPScore, y=~Name, type="box", orientation="h",
+              marker=list(color="#FFE500"), line=list(color="#FFE500"),
+              fillcolor="rgba(255,229,0,0.3)",
+              hovertemplate="<b>%{y}</b><br>Median: %{x:.1f}<br><extra></extra>") %>%
+        layout(
+          title=list(text=paste(platform, "Fantasy Points Distribution"),
+                     font=list(color="#FFE500",size=16)),
+          xaxis=list(title=paste(platform,"Fantasy Points"),gridcolor="#404040",
+                     showgrid=TRUE,color="#FFFFFF"),
+          yaxis=list(title="",categoryorder="array",
+                     categoryarray=rev(sal_order),color="#FFFFFF",
+                     automargin=TRUE),
+          paper_bgcolor="#121212", plot_bgcolor="#1e1e1e",
+          font=list(color="#FFFFFF",size=12), showlegend=FALSE,
+          margin=list(l=160,r=50,t=50,b=50)) %>%
+        config(displayModeBar=TRUE,
+               modeBarButtonsToRemove=c("select2d","lasso2d","autoScale2d"),
+               displaylogo=FALSE)
+    }, error=function(e) {
+      plotly_empty()
     })
   })
   
@@ -1997,15 +2033,13 @@ server <- function(input, output, session) {
           yaxis=list(title="",categoryorder="array",
                      categoryarray=rev(medians$Name),color="#FFFFFF"),
           paper_bgcolor="#121212", plot_bgcolor="#1e1e1e",
-          font=list(color="#FFFFFF",size=12), showlegend=FALSE, height=600,
+          font=list(color="#FFFFFF",size=12), showlegend=FALSE,
           margin=list(l=150,r=50,t=50,b=50)) %>%
         config(displayModeBar=TRUE,
                modeBarButtonsToRemove=c("select2d","lasso2d","autoScale2d"),
                displaylogo=FALSE)
     }, error=function(e) {
-      plotly_empty() %>% layout(
-        title=list(text=paste("Error:",e$message),font=list(color="#FFE500")),
-        paper_bgcolor="#121212",plot_bgcolor="#1e1e1e")
+      plotly_empty()
     })
   })
   
@@ -2017,9 +2051,7 @@ server <- function(input, output, session) {
         platform = input$sim_results_platform,
         group_by = input$dominator_position_group)
     }, error=function(e) {
-      plotly_empty() %>% layout(
-        title=list(text=paste("Error:",e$message),font=list(color="#FFE500")),
-        paper_bgcolor="#121212",plot_bgcolor="#1e1e1e")
+      plotly_empty()
     })
   })
   
@@ -2089,7 +2121,7 @@ server <- function(input, output, session) {
       "Decision"    = "#DC143C"
     )
     
-    p <- plot_ly(height = 1100)
+    p <- plot_ly()
     for (oc in outcome_order) {
       d <- op[Outcome == oc]
       if (nrow(d) == 0) next
@@ -2143,9 +2175,7 @@ server <- function(input, output, session) {
     }
     
     wins <- sd_data[Win == 1L]
-    if (nrow(wins) == 0) return(plotly_empty() %>%
-                                  layout(title=list(text="No win data", font=list(color="#FFE500")),
-                                         paper_bgcolor="#121212", plot_bgcolor="#1e1e1e"))
+    if (nrow(wins) == 0) return(plotly_empty())
     
     # Sort by salary ascending (cheapest at bottom of horizontal chart)
     sal_col  <- cfg$sal_col
@@ -2154,7 +2184,7 @@ server <- function(input, output, session) {
     wins <- as.data.frame(wins)
     
     plot_ly(data = wins, x = wins[[cfg$score_col]], y = ~Player,
-            height = 800, type = "box", orientation = "h",
+            type = "box", orientation = "h",
             marker    = list(color = cfg$color),
             line      = list(color = cfg$color),
             fillcolor = paste0(substr(cfg$color, 1, 7), "40")) %>%
@@ -2208,12 +2238,10 @@ server <- function(input, output, session) {
           xaxis=list(title="DK Fantasy Points", gridcolor="#404040", color="#FFFFFF"),
           yaxis=list(title="", color="#FFFFFF"),
           paper_bgcolor="#121212", plot_bgcolor="#1e1e1e",
-          font=list(color="#FFFFFF",size=12), showlegend=FALSE, height=600,
+          font=list(color="#FFFFFF",size=12), showlegend=FALSE,
           margin=list(l=180,r=50,t=50,b=50))
     }, error=function(e) {
-      plotly_empty() %>% layout(
-        title=list(text=paste("Error:",e$message),font=list(color="#FFE500")),
-        paper_bgcolor="#121212",plot_bgcolor="#1e1e1e")
+      plotly_empty()
     })
   })
   
@@ -2255,7 +2283,7 @@ server <- function(input, output, session) {
         xaxis=list(title="DK Salary ($)", gridcolor="#404040", color="#FFFFFF"),
         yaxis=list(title="Cut Rate (%)", gridcolor="#404040", color="#FFFFFF"),
         paper_bgcolor="#121212", plot_bgcolor="#1e1e1e",
-        font=list(color="#FFFFFF"), height=500)
+        font=list(color="#FFFFFF"))
   })
   
   # ---------- CBB ----------
@@ -2303,8 +2331,7 @@ server <- function(input, output, session) {
             sim_t <- merge(sim, meta[, .(Player, Team)], by="Player", all.x=TRUE)
             td    <- sim_t[Team == local_tm]
             
-            if (nrow(td) == 0) return(plotly_empty() %>% layout(
-              paper_bgcolor="#121212", plot_bgcolor="#1e1e1e"))
+            plotly_empty()
             
             # Order by avg DK score ascending (highest at top of horizontal chart)
             avg_ord <- td[, .(avg=mean(DKScore, na.rm=TRUE)), by=Player]
@@ -2330,9 +2357,7 @@ server <- function(input, output, session) {
                 showlegend    = FALSE
               )
           }, error=function(e) {
-            plotly_empty() %>% layout(
-              title=list(text=paste("Error:", e$message), font=list(color="#FFE500")),
-              paper_bgcolor="#121212", plot_bgcolor="#1e1e1e")
+            plotly_empty()
           })
         })
       })
@@ -2426,10 +2451,10 @@ server <- function(input, output, session) {
     tryCatch({
       drv_res  <- rv$sport_visuals$driver_results
       drv_meta <- rv$sport_visuals$driver_meta
-      grid_order   <- drv_meta[order(Starting), Player]
-      plot_data    <- as.data.frame(drv_res)
+      grid_order  <- drv_meta[order(Starting), Player]
+      plot_data   <- as.data.frame(drv_res)
       plot_data$Player <- factor(plot_data$Player, levels = rev(grid_order))
-      plot_height  <- max(600, length(grid_order) * 28)
+      plot_height <- max(600, length(grid_order) * 28)
       plot_ly(data = plot_data, x = ~Finish, y = ~Player, type = "box", orientation = "h",
               marker  = list(color = "#FFE500"), line = list(color = "#FFE500"),
               fillcolor = "rgba(255,229,0,0.3)",
@@ -2443,14 +2468,12 @@ server <- function(input, output, session) {
                         categoryorder = "array", categoryarray = rev(grid_order)),
           paper_bgcolor = "#121212", plot_bgcolor = "#1e1e1e",
           font = list(color = "#FFFFFF", size = 12), showlegend = FALSE,
-          height = plot_height, margin = list(l = 160, r = 50, t = 50, b = 50)) %>%
+          margin = list(l = 160, r = 50, t = 50, b = 50)) %>%
         config(displayModeBar = TRUE,
                modeBarButtonsToRemove = c("select2d", "lasso2d", "autoScale2d"),
                displaylogo = FALSE)
     }, error = function(e) {
-      plotly_empty() %>% layout(
-        title = list(text = paste("Error:", e$message), font = list(color = "#FFE500")),
-        paper_bgcolor = "#121212", plot_bgcolor = "#1e1e1e")
+      plotly_empty()
     })
   })
   
@@ -2475,14 +2498,12 @@ server <- function(input, output, session) {
                         categoryorder = "array", categoryarray = rev(sal_order)),
           paper_bgcolor = "#121212", plot_bgcolor = "#1e1e1e",
           font = list(color = "#FFFFFF", size = 12), showlegend = FALSE,
-          height = plot_height, margin = list(l = 160, r = 50, t = 50, b = 50)) %>%
+          margin = list(l = 160, r = 50, t = 50, b = 50)) %>%
         config(displayModeBar = TRUE,
                modeBarButtonsToRemove = c("select2d", "lasso2d", "autoScale2d"),
                displaylogo = FALSE)
     }, error = function(e) {
-      plotly_empty() %>% layout(
-        title = list(text = paste("Error:", e$message), font = list(color = "#FFE500")),
-        paper_bgcolor = "#121212", plot_bgcolor = "#1e1e1e")
+      plotly_empty()
     })
   })
   
@@ -2493,9 +2514,7 @@ server <- function(input, output, session) {
       ll_avg  <- drv_res[, .(Avg_LL = mean(LapsLed)), by = Player]
       ll_avg  <- ll_avg[Avg_LL > 0.01]
       if (nrow(ll_avg) == 0) {
-        return(plotly_empty() %>% layout(
-          title = list(text = "No laps led data", font = list(color = "#FFE500")),
-          paper_bgcolor = "#121212", plot_bgcolor = "#1e1e1e"))
+        plotly_empty()
       }
       setorder(ll_avg, -Avg_LL)
       plot_data <- as.data.frame(ll_avg)
@@ -2511,14 +2530,12 @@ server <- function(input, output, session) {
                         categoryorder = "array", categoryarray = rev(ll_avg$Player)),
           paper_bgcolor = "#121212", plot_bgcolor = "#1e1e1e",
           font = list(color = "#FFFFFF", size = 12), showlegend = FALSE,
-          height = 500, margin = list(l = 160, r = 50, t = 50, b = 50)) %>%
+          margin = list(l = 160, r = 50, t = 50, b = 50)) %>%
         config(displayModeBar = TRUE,
                modeBarButtonsToRemove = c("select2d", "lasso2d", "autoScale2d"),
                displaylogo = FALSE)
     }, error = function(e) {
-      plotly_empty() %>% layout(
-        title = list(text = paste("Error:", e$message), font = list(color = "#FFE500")),
-        paper_bgcolor = "#121212", plot_bgcolor = "#1e1e1e")
+      plotly_empty()
     })
   })
   
@@ -2542,14 +2559,12 @@ server <- function(input, output, session) {
                         categoryorder = "array", categoryarray = rev(med_order)),
           paper_bgcolor = "#121212", plot_bgcolor = "#1e1e1e",
           font = list(color = "#FFFFFF", size = 12), showlegend = FALSE,
-          height = plot_height, margin = list(l = 160, r = 50, t = 50, b = 50)) %>%
+          margin = list(l = 160, r = 50, t = 50, b = 50)) %>%
         config(displayModeBar = TRUE,
                modeBarButtonsToRemove = c("select2d", "lasso2d", "autoScale2d"),
                displaylogo = FALSE)
     }, error = function(e) {
-      plotly_empty() %>% layout(
-        title = list(text = paste("Error:", e$message), font = list(color = "#FFE500")),
-        paper_bgcolor = "#121212", plot_bgcolor = "#1e1e1e")
+      plotly_empty()
     })
   })
   
