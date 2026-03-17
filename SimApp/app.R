@@ -2798,8 +2798,7 @@ server <- function(input, output, session) {
                     background = styleColorBar(range(ca$Median_Score, na.rm = TRUE), "#FFE500"),
                     backgroundSize = "90% 70%", backgroundRepeat = "no-repeat",
                     backgroundPosition = "left")
-    }, error = function(e) {
-      datatable(data.table(Error = e$message), rownames = FALSE)
+    }, error = function(e) {      datatable(data.table(Error = e$message), rownames = FALSE)
     })
   })
   
