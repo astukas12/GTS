@@ -526,20 +526,21 @@ SPORT_CONFIGS <- list(
     player_label_plural = "Players",
     
     detection = list(
-      # Sim_ sheets + Slate tab is the unique CBB fingerprint
-      # Columns accept both dot and space variants; only need 1 of the position cols + TeamAbbrev
-      required_sheets    = c("Slate"),
-      required_columns   = c("TeamAbbrev", "RosterPosition", "Roster.Position",
-                             "AvgPointsPerGame", "RGProj", "RGMin"),
-      min_sheet_matches  = 1,
-      min_column_matches = 2
+      # New format: IDs + Games + at least one Sim_ sheet
+      # Old format: Slate + at least one Sim_ sheet (kept for backward compat)
+      custom_detect = function(sheets) {
+        has_sim <- any(grepl("^Sim_", sheets))
+        new_fmt <- "IDs" %in% sheets && "Games" %in% sheets
+        old_fmt <- "Slate" %in% sheets
+        has_sim && (new_fmt || old_fmt)
+      }
     ),
     
-    platforms          = c("DK"),
-    roster_sizes       = list(DK = 8),
-    salary_caps        = list(DK = 50000),
+    platforms          = c("DK", "FD", "SD"),
+    roster_sizes       = list(DK = 8, FD = 8, SD = 6),
+    salary_caps        = list(DK = 50000, FD = 50000, SD = 50000),
     # LP-based with position constraints (3G / 3F / 2UTIL)
-    optimization_modes = list(DK = "standard"),
+    optimization_modes = list(DK = "standard", FD = "standard", SD = "captain"),
     max_lineups        = 5000,
     
     standard_metrics = c(
@@ -550,9 +551,9 @@ SPORT_CONFIGS <- list(
     custom_metrics = list(),
     
     metadata_columns = list(
-      list(name = "Team",     label = "Team",     type = "text",    display = TRUE,  filter = TRUE),
-      list(name = "PosGroup", label = "Position", type = "text",    display = TRUE,  filter = TRUE),
-      list(name = "GameKey",  label = "Game",     type = "text",    display = FALSE, filter = FALSE)
+      list(name = "Team",     label = "Team",     type = "text", display = TRUE,  filter = TRUE),
+      list(name = "PosGroup", label = "Position", type = "text", display = TRUE,  filter = TRUE),
+      list(name = "GameKey",  label = "Game",     type = "text", display = FALSE, filter = FALSE)
     ),
     
     portfolio_filters = list(
@@ -570,35 +571,38 @@ SPORT_CONFIGS <- list(
     ),
     
     platform_columns = list(
-      DK = list(salary = "DKSalary", id = "DKID", ownership = "DKOwn", score = "DKScore")
+      DK = list(salary = "DKSalary", id = "DKID", ownership = "DKOwn", score = "DKScore"),
+      FD = list(salary = "FDSalary", id = "FDID", ownership = "FDOwn", score = "FDScore")
     ),
     
-    download_formats = list(DK = "{Name} ({DKID})"),
+    download_formats = list(
+      DK = "{Name} ({DKID})",
+      FD = "{Name} ({FDID})"
+    ),
     
     input_file = list(
-      type             = "excel",
-      load_all_sheets  = TRUE,   # CBB needs Slate + all Sim_ + all team tabs
-      player_sheet     = "Slate",
-      required_columns = list(
-        base = c("Name", "Salary", "TeamAbbrev", "RosterPosition"),
-        DK   = c("ID", "AvgPointsPerGame")
-      )
+      type            = "excel",
+      load_all_sheets = TRUE,
+      player_sheet    = "IDs"   # new format; read_cbb_input() handles old Slate format too
     ),
     
     simulation = list(
       function_name = "run_cbb_simulation",
       output_format = list(
-        sim_results = c("SimID", "Player", "DKScore"),
-        metadata    = c("Player", "DKID", "DKSalary", "DKOwn", "Team", "PosGroup")
+        sim_results = c("SimID", "Player", "DKScore", "FDScore"),
+        metadata    = c("Player", "DKID", "FDID", "DKSalary", "FDSalary",
+                        "DKOwn", "FDOwn", "Team", "PosGroup", "FDPosGroup",
+                        "GameKey", "GameTime", "GameRank", "GameTimeSort",
+                        "RGProj", "RGFDProj", "CPTID", "CPTSalary")
       )
     ),
     
     # CBB-specific position slot structure for optimizer
-    # 3G + 3F + 2UTIL(G or F) = 8 players
+    # DK Classic: 3G + 3F + 2UTIL(G or F) = 8 players
     position_slots = list(
       G    = 3,
       F    = 3,
-      UTIL = 2   # G or F eligible
+      UTIL = 2
     ),
     
     lineup_metrics_function = "calculate_cbb_lineup_metrics"

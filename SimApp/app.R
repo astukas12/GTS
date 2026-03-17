@@ -453,7 +453,7 @@ server <- function(input, output, session) {
           rv$config$platforms <- "DK"
         } else {
           rv$full_sim_results <- NULL
-          rv$has_fd           <- TRUE
+          rv$has_fd           <- if (!is.null(result$has_fd)) result$has_fd else TRUE
         }
         if (!is.null(result$projections))   rv$projections   <- result$projections
         rv$sport_visuals <- if (!is.null(result$sport_visuals)) result$sport_visuals else NULL
@@ -629,33 +629,61 @@ server <- function(input, output, session) {
     create_download_standard(optimal_lineups, metadata, platform)
   }
   
-  create_display_table_cbb <- function(optimal_lineups) {
-    # Player1-8 are stored internally; rename to position labels for display
+  create_display_table_cbb <- function(optimal_lineups, platform = "DK") {
     dl <- copy(optimal_lineups)
-    pos_rename <- c(Player1="G1", Player2="G2", Player3="G3",
-                    Player4="F1", Player5="F2", Player6="F3",
-                    Player7="UTIL1", Player8="UTIL2")
-    for (o in names(pos_rename)) if (o %in% names(dl)) setnames(dl, o, pos_rename[o])
-    slot_cols   <- intersect(c("G1","G2","G3","F1","F2","F3","UTIL1","UTIL2"), names(dl))
+    if ("Captain" %in% names(dl)) {
+      # SD: already has Captain/Util columns
+      slot_cols <- c("Captain", grep("^Util", names(dl), value=TRUE))
+    } else if (platform == "FD") {
+      # FD: 4G / 3F / 1UTIL
+      pos_rename <- c(Player1="G1", Player2="G2", Player3="G3", Player4="G4",
+                      Player5="F1", Player6="F2", Player7="F3",
+                      Player8="UTIL1")
+      for (o in names(pos_rename)) if (o %in% names(dl)) setnames(dl, o, pos_rename[o])
+      slot_cols <- intersect(c("G1","G2","G3","G4","F1","F2","F3","UTIL1"), names(dl))
+    } else {
+      # DK Classic: 3G / 3F / 2UTIL
+      pos_rename <- c(Player1="G1", Player2="G2", Player3="G3",
+                      Player4="F1", Player5="F2", Player6="F3",
+                      Player7="UTIL1", Player8="UTIL2")
+      for (o in names(pos_rename)) if (o %in% names(dl)) setnames(dl, o, pos_rename[o])
+      slot_cols <- intersect(c("G1","G2","G3","F1","F2","F3","UTIL1","UTIL2"), names(dl))
+    }
     metric_cols <- intersect(c("WinRate","Top1Pct","Top5Pct","Top10Pct","Top20Pct","TotalSalary","AvgOwn"), names(dl))
-    keep_cols   <- c(slot_cols, metric_cols)
-    dl <- dl[, ..keep_cols]
+    keep <- c(slot_cols, metric_cols)
+    dl <- dl[, ..keep]
     metric_rename <- c("WinRate"="Win","Top1Pct"="Top1","Top5Pct"="Top5","Top10Pct"="Top10","Top20Pct"="Top20","TotalSalary"="Salary")
     for (o in names(metric_rename)) if (o %in% names(dl)) setnames(dl, o, metric_rename[o])
     dl
   }
   
-  create_download_cbb <- function(optimal_lineups, metadata) {
+  create_download_cbb <- function(optimal_lineups, metadata, platform = "DK") {
     dl <- copy(optimal_lineups)
-    # Rename Player1-8 to position labels
-    pos_rename <- c(Player1="G1", Player2="G2", Player3="G3",
-                    Player4="F1", Player5="F2", Player6="F3",
-                    Player7="UTIL1", Player8="UTIL2")
-    for (o in names(pos_rename)) if (o %in% names(dl)) setnames(dl, o, pos_rename[o])
-    slot_cols <- intersect(c("G1","G2","G3","F1","F2","F3","UTIL1","UTIL2"), names(dl))
-    for (col in slot_cols) {
-      ids <- metadata[match(dl[[col]], metadata$Player), DKID]
-      dl[[col]] <- paste0(dl[[col]], " (", ids, ")")
+    if ("Captain" %in% names(dl)) {
+      # SD Showdown — use existing universal showdown handler
+      return(create_download_showdown(dl, metadata))
+    } else if (platform == "FD") {
+      # FD: 4G / 3F / 1UTIL, FDID — format: ID:Name (matches FD upload format)
+      pos_rename <- c(Player1="G1", Player2="G2", Player3="G3", Player4="G4",
+                      Player5="F1", Player6="F2", Player7="F3",
+                      Player8="UTIL1")
+      for (o in names(pos_rename)) if (o %in% names(dl)) setnames(dl, o, pos_rename[o])
+      slot_cols <- intersect(c("G1","G2","G3","G4","F1","F2","F3","UTIL1"), names(dl))
+      for (col in slot_cols) {
+        ids <- metadata[match(dl[[col]], metadata$Player), FDID]
+        dl[[col]] <- paste0(ids, ":", dl[[col]])
+      }
+    } else {
+      # DK Classic: 3G / 3F / 2UTIL, DKID
+      pos_rename <- c(Player1="G1", Player2="G2", Player3="G3",
+                      Player4="F1", Player5="F2", Player6="F3",
+                      Player7="UTIL1", Player8="UTIL2")
+      for (o in names(pos_rename)) if (o %in% names(dl)) setnames(dl, o, pos_rename[o])
+      slot_cols <- intersect(c("G1","G2","G3","F1","F2","F3","UTIL1","UTIL2"), names(dl))
+      for (col in slot_cols) {
+        ids <- metadata[match(dl[[col]], metadata$Player), DKID]
+        dl[[col]] <- paste0(dl[[col]], " (", ids, ")")
+      }
     }
     metric_rename <- c("WinRate"="Win","Top1Pct"="Top1","Top5Pct"="Top5","Top10Pct"="Top10","Top20Pct"="Top20","TotalSalary"="Salary")
     for (o in names(metric_rename)) if (o %in% names(dl)) setnames(dl, o, metric_rename[o])
@@ -810,7 +838,10 @@ server <- function(input, output, session) {
         score_matrix <- score_all_lineups(lineup_data, cbb_sim_for_scoring, verbose=TRUE)
         progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
         own_data <- copy(rv$sim_metadata)
-        if ("DKOwn" %in% names(own_data)) setnames(own_data, "DKOwn", "Own")
+        if ("DKOwn" %in% names(own_data)) {
+          setnames(own_data, "DKOwn", "Own")
+          own_data[, Own := Own / 100]   # stored as 82.1, core expects 0.821
+        }
         final_results <- calculate_distribution_metrics(score_matrix, lineup_data, cbb_opt_config,
                                                         ownership_data=own_data, verbose=TRUE)
         rv$dk_optimal_lineups <- final_results
@@ -889,6 +920,30 @@ server <- function(input, output, session) {
         final_results <- add_golf_custom_metrics(final_results, no_cut)
         rv$fd_optimal_lineups <- final_results
         
+      } else if (rv$sport == "CBB") {
+        source("cbb_engine.R")
+        progress$set(message="Finding optimal CBB FD lineups...", value=0)
+        cbb_fd_config <- list(salary_cap  = rv$config$salary_caps$FD,
+                              max_lineups = 5000,
+                              percentiles = c(0.01, 0.05, 0.10, 0.20),
+                              platform_col = "FDScore")
+        lineup_data <- find_optimal_lineups_cbb_fd(rv$simulation_results, rv$sim_metadata,
+                                                   cbb_fd_config, verbose=TRUE)
+        progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
+                                    format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
+        # score_all_lineups needs FantasyPoints=FDScore — use prepare_optimization_data
+        opt_data_fd  <- prepare_optimization_data(rv$simulation_results, rv$sim_metadata, "FD")
+        score_matrix <- score_all_lineups(lineup_data, opt_data_fd, verbose=TRUE)
+        progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
+        own_data <- copy(rv$sim_metadata)
+        if ("FDOwn" %in% names(own_data)) {
+          setnames(own_data, "FDOwn", "Own")
+          own_data[, Own := Own / 100]   # stored as 82.1, core expects 0.821
+        }
+        final_results <- calculate_distribution_metrics(score_matrix, lineup_data, cbb_fd_config,
+                                                        ownership_data=own_data, verbose=TRUE)
+        rv$fd_optimal_lineups <- final_results
+        
       } else {
         if (!is.null(rv$has_fd) && !rv$has_fd) {
           showNotification("No FD salary data in this file.", type="warning"); return()
@@ -933,27 +988,57 @@ server <- function(input, output, session) {
     rv$sd_portfolio <- NULL; rv$sd_builds <- list(); rv$sd_build_counter <- 0
     progress <- Progress$new(session); on.exit(progress$close())
     tryCatch({
-      sd_mode    <- rv$config$optimization_modes$SD %||% "captain"
-      opt_data   <- prepare_optimization_data(rv$simulation_results, rv$sim_metadata, "SD")
-      opt_config <- list(roster_size=rv$config$roster_sizes$SD, salary_cap=rv$config$salary_caps$SD,
-                         percentiles=c(0.01,0.05,0.10,0.20), platform_col="DKScore",
-                         cpt_multiplier=1.5, progress_frequency=500, use_parallel=TRUE, max_lineups=5000)
-      progress$set(message="Finding optimal Showdown lineups...",
-                   detail="Phase 1: Building lineup pool...", value=0.05)
-      lineup_data  <- find_optimal_lineups(opt_data, opt_config, mode=sd_mode, k=1, verbose=TRUE)
-      progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
-                                  format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
-      score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
-      progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
-      own_data <- copy(rv$sim_metadata)
-      if ("DKOwn" %in% names(own_data)) setnames(own_data, "DKOwn", "Own")
-      final_results <- calculate_distribution_metrics(score_matrix, lineup_data, opt_config,
-                                                      ownership_data=own_data, verbose=TRUE)
-      progress$set(detail="Phase 3: Adding custom metrics...", value=0.90)
-      final_results <- add_custom_metrics(final_results, rv$sim_metadata, rv$config)
-      rv$sd_optimal_lineups <- final_results
+      if (rv$sport == "CBB") {
+        source("cbb_engine.R")
+        # Build SDSalary and SDID on metadata for the universal optimizer:
+        # flex players use DKSalary/DKID; captain slot uses CPTSalary/CPTID
+        sd_meta <- copy(rv$sim_metadata); setDT(sd_meta)
+        # SDSalary and SDID come from UTIL_Salary/UTIL_ID in the SD sheets (set by engine)
+        if (!"SDSalary" %in% names(sd_meta) || all(is.na(sd_meta$SDSalary)))
+          stop("No SD flex salary found in metadata. Check UTIL_Salary column in SD_IDs sheets.")
+        if (!"CPTID" %in% names(sd_meta) || all(is.na(sd_meta$CPTID)))
+          stop("No SD captain IDs found in metadata. Check CPT_ID column in SD_IDs sheets.")
+        
+        progress$set(message="Finding optimal CBB Showdown lineups...",
+                     detail="Phase 1: Building lineup pool...", value=0.05)
+        opt_data <- prepare_optimization_data(rv$simulation_results, sd_meta, "SD")
+        opt_config <- list(roster_size=rv$config$roster_sizes$SD, salary_cap=rv$config$salary_caps$SD,
+                           percentiles=c(0.01,0.05,0.10,0.20), platform_col="DKScore",
+                           cpt_multiplier=1.5, progress_frequency=500, use_parallel=TRUE, max_lineups=5000)
+        lineup_data <- find_optimal_lineups(opt_data, opt_config, mode="captain", k=1, verbose=TRUE)
+        progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
+                                    format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
+        score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
+        progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
+        own_data <- copy(sd_meta)
+        if ("DKOwn" %in% names(own_data)) setnames(own_data, "DKOwn", "Own")
+        final_results <- calculate_distribution_metrics(score_matrix, lineup_data, opt_config,
+                                                        ownership_data=own_data, verbose=TRUE)
+        rv$sd_optimal_lineups <- final_results
+        
+      } else {
+        sd_mode    <- rv$config$optimization_modes$SD %||% "captain"
+        opt_data   <- prepare_optimization_data(rv$simulation_results, rv$sim_metadata, "SD")
+        opt_config <- list(roster_size=rv$config$roster_sizes$SD, salary_cap=rv$config$salary_caps$SD,
+                           percentiles=c(0.01,0.05,0.10,0.20), platform_col="DKScore",
+                           cpt_multiplier=1.5, progress_frequency=500, use_parallel=TRUE, max_lineups=5000)
+        progress$set(message="Finding optimal Showdown lineups...",
+                     detail="Phase 1: Building lineup pool...", value=0.05)
+        lineup_data  <- find_optimal_lineups(opt_data, opt_config, mode=sd_mode, k=1, verbose=TRUE)
+        progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
+                                    format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
+        score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
+        progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
+        own_data <- copy(rv$sim_metadata)
+        if ("DKOwn" %in% names(own_data)) setnames(own_data, "DKOwn", "Own")
+        final_results <- calculate_distribution_metrics(score_matrix, lineup_data, opt_config,
+                                                        ownership_data=own_data, verbose=TRUE)
+        progress$set(detail="Phase 3: Adding custom metrics...", value=0.90)
+        final_results <- add_custom_metrics(final_results, rv$sim_metadata, rv$config)
+        rv$sd_optimal_lineups <- final_results
+      }
       progress$set(detail="Complete!", value=1.0)
-      showNotification(sprintf("Found %d optimal Showdown lineups!", nrow(final_results)), type="message")
+      showNotification(sprintf("Found %d optimal Showdown lineups!", nrow(rv$sd_optimal_lineups)), type="message")
     }, error=function(e) {
       showNotification(paste("SD error:", e$message), type="error", duration=NULL)
       cat("SD error:\n"); print(e)
@@ -967,10 +1052,10 @@ server <- function(input, output, session) {
   
   output$dk_download <- downloadHandler(
     filename=function() paste0("DK_Optimal_Lineups_",format(Sys.Date(),"%Y%m%d"),".csv"),
-    content=function(file) { dl <- if (isTRUE(rv$sport == "CBB")) create_download_cbb(rv$dk_optimal_lineups, rv$sim_metadata) else create_download_table(rv$dk_optimal_lineups, rv$sim_metadata, "DK", rv$sport); fwrite(dl, file) })
+    content=function(file) { dl <- if (isTRUE(rv$sport == "CBB")) create_download_cbb(rv$dk_optimal_lineups, rv$sim_metadata, "DK") else create_download_table(rv$dk_optimal_lineups, rv$sim_metadata, "DK", rv$sport); fwrite(dl, file) })
   output$fd_download <- downloadHandler(
     filename=function() paste0("FD_Optimal_Lineups_",format(Sys.Date(),"%Y%m%d"),".csv"),
-    content=function(file) fwrite(create_download_table(rv$fd_optimal_lineups, rv$sim_metadata, "FD", rv$sport), file))
+    content=function(file) { dl <- if (isTRUE(rv$sport == "CBB")) create_download_cbb(rv$fd_optimal_lineups, rv$sim_metadata, "FD") else create_download_table(rv$fd_optimal_lineups, rv$sim_metadata, "FD", rv$sport); fwrite(dl, file) })
   output$sd_download <- downloadHandler(
     filename=function() paste0("SD_Optimal_Lineups_",format(Sys.Date(),"%Y%m%d"),".csv"),
     content=function(file) fwrite(create_download_table(rv$sd_optimal_lineups, rv$sim_metadata, "SD", rv$sport), file))
@@ -1055,7 +1140,7 @@ server <- function(input, output, session) {
     optimal <- switch(input$view_platform,
                       "DK"=rv$dk_optimal_lineups, "FD"=rv$fd_optimal_lineups, "SD"=rv$sd_optimal_lineups)
     req(optimal)
-    display_table <- if (isTRUE(rv$sport == "CBB")) create_display_table_cbb(optimal) else create_display_table(optimal, rv$sim_metadata, input$view_platform)
+    display_table <- if (isTRUE(rv$sport == "CBB")) create_display_table_cbb(optimal, input$view_platform) else create_display_table(optimal, rv$sim_metadata, input$view_platform)
     dt <- datatable(display_table,
                     options=list(pageLength=50, searching=FALSE, lengthChange=FALSE, scrollX=TRUE, dom='tp',
                                  order=list(list(which(names(display_table)=="Win")-1,'desc'))),
@@ -1077,7 +1162,14 @@ server <- function(input, output, session) {
   output$portfolio_tabs_ui <- renderUI({
     req(rv$config)
     
-    tab_panels <- lapply(rv$config$platforms, function(platform) {
+    # Only render tabs for platforms that have lineups built
+    active_platforms <- Filter(function(p) {
+      lp <- tolower(p)
+      !is.null(rv[[paste0(lp, "_optimal_lineups")]])
+    }, rv$config$platforms)
+    if (length(active_platforms) == 0) active_platforms <- rv$config$platforms
+    
+    tab_panels <- lapply(active_platforms, function(platform) {
       lp    <- tolower(platform)
       pname <- switch(platform,"DK"="DraftKings","FD"="FanDuel","SD"="Showdown")
       
@@ -1741,9 +1833,8 @@ server <- function(input, output, session) {
     
     if (salary_col %in% names(projections)) setnames(projections, salary_col, "Salary")
     if (own_col    %in% names(projections)) {
-      setnames(projections, own_col, "OwnProj")
-      projections[, Own := round(OwnProj * 100, 1)]
-      projections[, OwnProj := NULL]
+      setnames(projections, own_col, "Own")
+      projections[, Own := round(Own, 1)]
     }
     
     base_cols      <- c("Player","Salary","Own")
@@ -1755,19 +1846,25 @@ server <- function(input, output, session) {
       names(projections))
     stats_cols <- c("Avg","Median","P90","P75","P25")
     
-    # CBB: inject RGProj/RGMin from metadata between identity cols and sim stats
+    # CBB: custom column order and display names
+    # Player, Team, Salary, Mins, Proj, Own, Sim Avg, Sim Median, P90
     rg_cols <- character(0)
     if (isTRUE(rv$sport == "CBB")) {
-      rg_avail <- intersect(c("RGProj","RGMin"), names(meta))
-      if (length(rg_avail) > 0) {
-        projections <- merge(projections, meta[, c("Player", rg_avail), with=FALSE],
+      cbb_extra <- intersect(c("RGProj","Mins"), names(meta))
+      if (length(cbb_extra) > 0) {
+        projections <- merge(projections, meta[, c("Player", cbb_extra), with=FALSE],
                              by="Player", all.x=TRUE)
-        rg_cols <- rg_avail
       }
+      if ("RGProj" %in% names(projections)) setnames(projections, "RGProj", "Proj")
+      # CBB shows only Avg, Median, P90 — drop P75/P25
+      stats_cols <- c("Avg","Median","P90")
+      cbb_cols <- intersect(c("Player","Team","Salary","Mins","Proj","Own","Avg","Median","P90"),
+                            names(projections))
+      setcolorder(projections, cbb_cols)
+    } else {
+      final_cols <- intersect(c(base_cols, sport_specific, rg_cols, stats_cols), names(projections))
+      setcolorder(projections, final_cols)
     }
-    
-    final_cols <- intersect(c(base_cols, sport_specific, rg_cols, stats_cols), names(projections))
-    setcolorder(projections, final_cols)
     setorder(projections, -Avg)
     
     is_cbb <- isTRUE(rv$sport == "CBB")
@@ -1789,8 +1886,8 @@ server <- function(input, output, session) {
       formatRound(intersect(c("Avg","Median","P90","P75","P25","Own","CutProb"),
                             names(projections)), 1)
     
-    if (length(rg_cols) > 0)
-      dt <- dt %>% formatRound(rg_cols, 1)
+    if ("Own" %in% names(projections))
+      dt <- dt %>% formatString("Own", suffix="%")
     
     if (!is.null(winprob_col) && "WinProb" %in% names(projections))
       dt <- dt %>% formatPercentage("WinProb", digits = 1)
@@ -2333,21 +2430,27 @@ server <- function(input, output, session) {
             
             plotly_empty()
             
-            # Order by avg DK score ascending (highest at top of horizontal chart)
-            avg_ord <- td[, .(avg=mean(DKScore, na.rm=TRUE)), by=Player]
+            # Reactive to platform selector — DK, FD, or SD (SD uses DKScore)
+            plot_platform  <- input$sim_results_platform %||% "DK"
+            plot_score_col <- if (plot_platform == "FD") "FDScore" else "DKScore"
+            plot_label     <- if (plot_platform == "FD") "FD" else "DK"
+            if (!plot_score_col %in% names(td)) plot_score_col <- "DKScore"
+            
+            # Order by avg score ascending (highest at top of horizontal chart)
+            avg_ord <- td[, .(avg=mean(get(plot_score_col), na.rm=TRUE)), by=Player]
             setorder(avg_ord, avg)
             td[, Player := factor(Player, levels=avg_ord$Player)]
             
             plot_ly(data=as.data.frame(td),
-                    x=~DKScore, y=~Player,
+                    x=~get(plot_score_col), y=~Player,
                     type="box", orientation="h",
                     marker    = list(color="#FFE500"),
                     line      = list(color="#FFE500"),
                     fillcolor = "rgba(255,229,0,0.18)") %>%
               layout(
-                title        = list(text=paste0(local_tm, " — DK Fantasy Points"),
+                title        = list(text=paste0(local_tm, " — ", plot_label, " Fantasy Points"),
                                     font=list(color="#FFE500", size=14)),
-                xaxis        = list(title="DK Points", gridcolor="#404040",
+                xaxis        = list(title=paste0(plot_label, " Points"), gridcolor="#404040",
                                     color="#FFFFFF", zeroline=FALSE),
                 yaxis        = list(title="", color="#FFFFFF",
                                     tickfont=list(size=11), automargin=TRUE),
