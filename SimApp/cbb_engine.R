@@ -377,7 +377,14 @@ run_cbb_simulation <- function(input_data, n_sims = 10000, config = NULL,
   cat(sprintf("CBB sim complete: %d sims | %d players | %d rows\n",
               n_sims, nrow(metadata), nrow(sim_results)))
   
-  list(sim_results = sim_results, metadata = metadata, has_fd = TRUE, sport_visuals = NULL)
+  # Detect which platforms actually have data
+  has_fd <- "FDSalary" %in% names(metadata) &&
+    any(!is.na(metadata$FDSalary) & metadata$FDSalary > 0)
+  has_sd <- "CPTSalary" %in% names(metadata) &&
+    any(!is.na(metadata$CPTSalary) & metadata$CPTSalary > 0)
+  
+  list(sim_results = sim_results, metadata = metadata,
+       has_fd = has_fd, has_sd = has_sd, sport_visuals = NULL)
 }
 
 

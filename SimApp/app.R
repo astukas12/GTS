@@ -453,7 +453,11 @@ server <- function(input, output, session) {
           rv$config$platforms <- "DK"
         } else {
           rv$full_sim_results <- NULL
-          rv$has_fd           <- if (!is.null(result$has_fd)) result$has_fd else TRUE
+          rv$has_fd <- if (!is.null(result$has_fd)) result$has_fd else TRUE
+          # Trim platforms based on actual data presence
+          if (!rv$has_fd) rv$config$platforms <- setdiff(rv$config$platforms, "FD")
+          has_sd <- if (!is.null(result$has_sd)) result$has_sd else FALSE
+          if (!has_sd) rv$config$platforms <- setdiff(rv$config$platforms, "SD")
         }
         if (!is.null(result$projections))   rv$projections   <- result$projections
         rv$sport_visuals <- if (!is.null(result$sport_visuals)) result$sport_visuals else NULL

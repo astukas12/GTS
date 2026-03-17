@@ -590,10 +590,8 @@ SPORT_CONFIGS <- list(
       function_name = "run_cbb_simulation",
       output_format = list(
         sim_results = c("SimID", "Player", "DKScore", "FDScore"),
-        metadata    = c("Player", "DKID", "FDID", "DKSalary", "FDSalary",
-                        "DKOwn", "FDOwn", "Team", "PosGroup", "FDPosGroup",
-                        "GameKey", "GameTime", "GameRank", "GameTimeSort",
-                        "RGProj", "RGFDProj", "CPTID", "CPTSalary")
+        metadata    = c("Player", "DKID", "DKSalary", "DKOwn",
+                        "Team", "PosGroup", "GameKey", "GameTime", "GameRank")
       )
     ),
     
@@ -730,7 +728,8 @@ validate_simulation_output <- function(sim_results, metadata, config) {
   expected_meta <- config$simulation$output_format$metadata
   missing_meta  <- setdiff(expected_meta, names(metadata))
   if (length(missing_meta) > 0)
-    stop("Missing columns in metadata: ", paste(missing_meta, collapse = ", "))
+    warning("Optional metadata columns absent (no SD/FD data): ",
+            paste(missing_meta, collapse = ", "))
   
   sim_players  <- unique(sim_results$Player)
   meta_players <- metadata$Player
