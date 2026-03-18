@@ -299,6 +299,10 @@ server <- function(input, output, session) {
     rv$dk_lock_v           <- 0L
     rv$fd_lock_v           <- 0L
     rv$sd_lock_v           <- 0L
+    # Reset slider version counters so versioned range slider widgets start fresh
+    rv$dk_slider_v         <- 0L
+    rv$fd_slider_v         <- 0L
+    rv$sd_slider_v         <- 0L
   }
   
   
@@ -315,6 +319,9 @@ server <- function(input, output, session) {
     dk_lock_v          = 0L,    # version counters — increment to force fresh selectize inputs
     fd_lock_v          = 0L,
     sd_lock_v          = 0L,
+    dk_slider_v        = 0L,    # version counters — increment to force fresh range slider inputs
+    fd_slider_v        = 0L,
+    sd_slider_v        = 0L,
     dk_portfolio       = NULL,
     fd_portfolio       = NULL,
     sd_portfolio       = NULL,
@@ -770,6 +777,7 @@ server <- function(input, output, session) {
     rv$dk_optimal_lineups <- NULL
     rv$dk_portfolio <- NULL; rv$dk_builds <- list(); rv$dk_build_counter <- 0
     rv$dk_lock_v <- 0L
+    rv$dk_slider_v <- 0L
     progress <- Progress$new(session); on.exit(progress$close())
     tryCatch({
       
@@ -919,6 +927,7 @@ server <- function(input, output, session) {
     rv$fd_optimal_lineups <- NULL
     rv$fd_portfolio <- NULL; rv$fd_builds <- list(); rv$fd_build_counter <- 0
     rv$fd_lock_v <- 0L
+    rv$fd_slider_v <- 0L
     progress <- Progress$new(session); on.exit(progress$close())
     tryCatch({
       
@@ -1022,6 +1031,7 @@ server <- function(input, output, session) {
     rv$sd_optimal_lineups <- NULL
     rv$sd_portfolio <- NULL; rv$sd_builds <- list(); rv$sd_build_counter <- 0
     rv$sd_lock_v <- 0L
+    rv$sd_slider_v <- 0L
     progress <- Progress$new(session); on.exit(progress$close())
     tryCatch({
       if (rv$sport == "CBB") {
@@ -1388,6 +1398,7 @@ server <- function(input, output, session) {
   make_range_sliders <- function(lp) {
     renderUI({
       optimal <- rv[[paste0(lp,"_optimal_lineups")]]; req(optimal)
+      ver <- rv[[paste0(lp,"_slider_v")]]
       num_cols  <- names(optimal)[sapply(optimal, is.numeric)]
       num_cols  <- setdiff(num_cols, grep("^Player|^Captain|^MVP", names(optimal), value=TRUE))
       range_cols <- setdiff(num_cols, c("WinRate","Top1Pct","Top5Pct","Top10Pct","Top20Pct","ExpectedCuts"))
@@ -1408,7 +1419,7 @@ server <- function(input, output, session) {
         if (cfg$format=="k")     { mn <- floor(mn/1000);  mx <- ceiling(mx/1000); lbl <- paste0(cfg$label," (K)") }
         else if (cfg$format=="whole") { mn <- floor(mn); mx <- ceiling(mx); lbl <- cfg$label }
         else { mn <- floor(mn*10)/10; mx <- ceiling(mx*10)/10; lbl <- cfg$label }
-        sliderInput(paste0(lp,"_filter_",col), lbl, min=mn, max=mx, value=c(mn,mx), step=cfg$step, width="100%")
+        sliderInput(paste0(lp,"_filter_",col,"_v",ver), lbl, min=mn, max=mx, value=c(mn,mx), step=cfg$step, width="100%")
       }))
       n <- length(sliders)
       fluidRow(column(6, sliders[seq(1,n,2)]),
@@ -1431,9 +1442,9 @@ server <- function(input, output, session) {
   # produce genuinely new input widgets with no recycled browser state.
   # ==========================================================================
   
-  observeEvent(rv$dk_optimal_lineups, { rv$dk_lock_v <- rv$dk_lock_v + 1L })
-  observeEvent(rv$fd_optimal_lineups, { rv$fd_lock_v <- rv$fd_lock_v + 1L })
-  observeEvent(rv$sd_optimal_lineups, { rv$sd_lock_v <- rv$sd_lock_v + 1L })
+  observeEvent(rv$dk_optimal_lineups, { rv$dk_lock_v <- rv$dk_lock_v + 1L; rv$dk_slider_v <- rv$dk_slider_v + 1L })
+  observeEvent(rv$fd_optimal_lineups, { rv$fd_lock_v <- rv$fd_lock_v + 1L; rv$fd_slider_v <- rv$fd_slider_v + 1L })
+  observeEvent(rv$sd_optimal_lineups, { rv$sd_lock_v <- rv$sd_lock_v + 1L; rv$sd_slider_v <- rv$sd_slider_v + 1L })
   
   make_filtered_lineups <- function(lp) {
     reactive({
@@ -1447,29 +1458,19 @@ server <- function(input, output, session) {
         if (!is.null(v) && v > 0 && rp[1] %in% names(lineups))
           lineups <- lineups[get(rp[1]) >= v]
       }
-      # Salary (K conversion)
-      # Guard: only apply if slider value is strictly inside the data's actual range
-      # (stale input values from a previous run can be out-of-range and wipe everything)
-      sv <- input[[paste0(lp,"_filter_TotalSalary")]]
-      if (!is.null(sv) && "TotalSalary" %in% names(lineups)) {
-        data_min_k <- floor(min(lineups$TotalSalary, na.rm=TRUE) / 1000)
-        data_max_k <- ceiling(max(lineups$TotalSalary, na.rm=TRUE) / 1000)
-        if (!(sv[1] <= data_min_k && sv[2] >= data_max_k))
-          lineups <- lineups[TotalSalary >= sv[1]*1000 & TotalSalary <= sv[2]*1000]
-      }
-      # Other range sliders — same stale-value guard
+      # Salary and range sliders — read versioned IDs to guarantee fresh values,
+      # never stale positions from a previous run on a different sport/slate.
+      slider_ver <- rv[[paste0(lp,"_slider_v")]]
+      sv <- input[[paste0(lp,"_filter_TotalSalary_v",slider_ver)]]
+      if (!is.null(sv) && "TotalSalary" %in% names(lineups))
+        lineups <- lineups[TotalSalary >= sv[1]*1000 & TotalSalary <= sv[2]*1000]
+      # Other range sliders
       num_cols   <- names(lineups)[sapply(lineups, is.numeric)]
       num_cols   <- setdiff(num_cols, grep("^Player|^Captain|^MVP",names(lineups),value=TRUE))
       range_cols <- setdiff(num_cols, c("WinRate","Top1Pct","Top5Pct","Top10Pct","Top20Pct","TotalSalary"))
       for (col in range_cols) {
-        fv <- input[[paste0(lp,"_filter_",col)]]
-        if (!is.null(fv)) {
-          data_min <- min(lineups[[col]], na.rm=TRUE)
-          data_max <- max(lineups[[col]], na.rm=TRUE)
-          # Only filter if the slider has actually been moved from full extent
-          if (!(fv[1] <= data_min && fv[2] >= data_max))
-            lineups <- lineups[get(col) >= fv[1] & get(col) <= fv[2]]
-        }
+        fv <- input[[paste0(lp,"_filter_",col,"_v",slider_ver)]]
+        if (!is.null(fv)) lineups <- lineups[get(col) >= fv[1] & get(col) <= fv[2]]
       }
       
       if (isTRUE(rv$sport == "F1")) {
