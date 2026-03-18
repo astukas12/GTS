@@ -423,9 +423,7 @@ server <- function(input, output, session) {
   observeEvent(input$run_simulation, {
     req(rv$input_data, rv$config)
     # Clear all downstream state so stale lineups/portfolio never bleed into new sim.
-    # Also re-pulls a clean config so platform stripping from a previous run never persists.
     reset_all_state()
-    rv$config <- get_sport_config(rv$sport)
     engine_file <- paste0(tolower(rv$sport), "_engine.R")
     if (!file.exists(engine_file)) {
       showNotification(paste("Engine not found:", engine_file), type="error", duration=10)
@@ -438,6 +436,9 @@ server <- function(input, output, session) {
     on.exit(progress$close())
     
     tryCatch({
+      # Restore platforms to the full set from global config — prevents bleed from a previous
+      # run that stripped FD/SD (e.g. NASCAR no-FD, F1 DK-only) carrying into this run.
+      rv$config$platforms <- SPORT_CONFIGS[[rv$sport]]$platforms
       
       if (rv$sport == "GOLF") {
         no_cut   <- if (!is.null(input$golf_no_cut))   input$golf_no_cut   else FALSE
@@ -1274,57 +1275,10 @@ server <- function(input, output, session) {
                                                               uiOutput(paste0(lp,"_range_sliders"))
                                                           )
                                                    ),
-                                                   # Col 3: Lock / Exclude players (always shown; F1 gets split captain/driver/constructor)
-                                                   column(3,
-                                                          div(style="background-color:#2d2d2d;padding:8px;border-radius:4px;border:1px solid #404040;",
-                                                              h6("Lock / Exclude", style="color:#FFE500;font-weight:bold;margin:0 0 8px 0;font-size:13px;"),
-                                                              if (isTRUE(rv$sport == "F1")) {
-                                                                # F1: three separate captain / driver / constructor controls
-                                                                lu <- rv[[paste0(lp,"_optimal_lineups")]]
-                                                                drv_choices  <- if (!is.null(lu)) sort(unique(unlist(lu[, grep("^Captain|^Util[1-4]$", names(lu), value=TRUE), with=FALSE]))) else NULL
-                                                                con_choices  <- if (!is.null(lu)) sort(unique(unlist(lu[, grep("^Util5$",             names(lu), value=TRUE), with=FALSE]))) else NULL
-                                                                tagList(
-                                                                  tags$label("Captain Lock:", style="color:#aaa;font-size:11px;"),
-                                                                  selectizeInput(paste0(lp,"_locked_captain"),  NULL, choices=drv_choices, multiple=TRUE, selected=character(0),
-                                                                                 options=list(plugins=list('remove_button'),placeholder='Lock captain',maxItems=1), width="100%"),
-                                                                  tags$label("Captain Exclude:", style="color:#aaa;font-size:11px;"),
-                                                                  selectizeInput(paste0(lp,"_excluded_captain"), NULL, choices=drv_choices, multiple=TRUE, selected=character(0),
-                                                                                 options=list(plugins=list('remove_button'),placeholder='Exclude captain'), width="100%"),
-                                                                  tags$label("Driver Lock:", style="color:#aaa;font-size:11px;"),
-                                                                  selectizeInput(paste0(lp,"_locked_players"),  NULL, choices=drv_choices, multiple=TRUE, selected=character(0),
-                                                                                 options=list(plugins=list('remove_button'),placeholder='Lock flex driver',maxItems=4), width="100%"),
-                                                                  tags$label("Driver Exclude:", style="color:#aaa;font-size:11px;"),
-                                                                  selectizeInput(paste0(lp,"_excluded_players"), NULL, choices=drv_choices, multiple=TRUE, selected=character(0),
-                                                                                 options=list(plugins=list('remove_button'),placeholder='Exclude flex driver'), width="100%"),
-                                                                  tags$label("Constructor Lock:", style="color:#aaa;font-size:11px;"),
-                                                                  selectizeInput(paste0(lp,"_locked_constructor"),  NULL, choices=con_choices, multiple=TRUE, selected=character(0),
-                                                                                 options=list(plugins=list('remove_button'),placeholder='Lock constructor',maxItems=1), width="100%"),
-                                                                  tags$label("Constructor Exclude:", style="color:#aaa;font-size:11px;"),
-                                                                  selectizeInput(paste0(lp,"_excluded_constructor"), NULL, choices=con_choices, multiple=TRUE, selected=character(0),
-                                                                                 options=list(plugins=list('remove_button'),placeholder='Exclude constructor'), width="100%")
-                                                                )
-                                                              } else {
-                                                                # All other sports: single lock/exclude across all slots
-                                                                # Version suffix ensures brand-new inputs on each lineup build (no recycled DOM state)
-                                                                lu  <- rv[[paste0(lp,"_optimal_lineups")]]
-                                                                ver <- rv[[paste0(lp,"_lock_v")]]
-                                                                all_players <- if (!is.null(lu)) {
-                                                                  pc <- grep("^Player|^Captain|^MVP|^Util", names(lu), value=TRUE)
-                                                                  sort(unique(unlist(lu[, ..pc]))[!is.na(unique(unlist(lu[, ..pc]))) & unique(unlist(lu[, ..pc])) != ""])
-                                                                } else NULL
-                                                                tagList(
-                                                                  selectizeInput(paste0(lp,"_locked_players_v",ver), "Lock:",
-                                                                                 choices=all_players, multiple=TRUE, selected=character(0),
-                                                                                 options=list(plugins=list('remove_button'), placeholder='Search to lock players',
-                                                                                              maxItems=8), width="100%"),
-                                                                  selectizeInput(paste0(lp,"_excluded_players_v",ver), "Exclude:",
-                                                                                 choices=all_players, multiple=TRUE, selected=character(0),
-                                                                                 options=list(plugins=list('remove_button'), placeholder='Search to exclude players'),
-                                                                                 width="100%")
-                                                                )
-                                                              }
-                                                          )
-                                                   ),
+                                                   # Col 3: Lock / Exclude — own renderUI so it re-renders independently
+                                                   # when lock_v increments (lineup data lands) without disturbing the
+                                                   # rest of the tab structure or destroying the scoring buttons.
+                                                   column(3, uiOutput(paste0(lp, "_lock_exclude_ui"))),
                                                    # Col 4: Add to portfolio (always shown, same for all sports)
                                                    column(3,
                                                           div(style="background-color:#2d2d2d;padding:8px;border-radius:4px;border:1px solid #FFE500;",
@@ -1363,6 +1317,68 @@ server <- function(input, output, session) {
   
   
   
+  
+  
+  # ==========================================================================
+  # LOCK / EXCLUDE UI
+  # Each platform gets its own renderUI so it can re-render independently when
+  # lock_v increments (i.e. when lineup data lands), without touching the rest
+  # of portfolio_tabs_ui or the scoring buttons.
+  # ==========================================================================
+  
+  make_lock_exclude_ui <- function(lp) {
+    renderUI({
+      lu  <- rv[[paste0(lp, "_optimal_lineups")]]
+      div(style="background-color:#2d2d2d;padding:8px;border-radius:4px;border:1px solid #404040;",
+          h6("Lock / Exclude", style="color:#FFE500;font-weight:bold;margin:0 0 8px 0;font-size:13px;"),
+          if (isTRUE(rv$sport == "F1")) {
+            drv_choices <- if (!is.null(lu)) sort(unique(unlist(lu[, grep("^Captain|^Util[1-4]$", names(lu), value=TRUE), with=FALSE]))) else NULL
+            con_choices <- if (!is.null(lu)) sort(unique(unlist(lu[, grep("^Util5$",             names(lu), value=TRUE), with=FALSE]))) else NULL
+            tagList(
+              tags$label("Captain Lock:",      style="color:#aaa;font-size:11px;"),
+              selectizeInput(paste0(lp,"_locked_captain"),      NULL, choices=drv_choices, multiple=TRUE, selected=character(0),
+                             options=list(plugins=list('remove_button'), placeholder='Lock captain', maxItems=1), width="100%"),
+              tags$label("Captain Exclude:",   style="color:#aaa;font-size:11px;"),
+              selectizeInput(paste0(lp,"_excluded_captain"),    NULL, choices=drv_choices, multiple=TRUE, selected=character(0),
+                             options=list(plugins=list('remove_button'), placeholder='Exclude captain'), width="100%"),
+              tags$label("Driver Lock:",       style="color:#aaa;font-size:11px;"),
+              selectizeInput(paste0(lp,"_locked_players"),      NULL, choices=drv_choices, multiple=TRUE, selected=character(0),
+                             options=list(plugins=list('remove_button'), placeholder='Lock flex driver', maxItems=4), width="100%"),
+              tags$label("Driver Exclude:",    style="color:#aaa;font-size:11px;"),
+              selectizeInput(paste0(lp,"_excluded_players"),    NULL, choices=drv_choices, multiple=TRUE, selected=character(0),
+                             options=list(plugins=list('remove_button'), placeholder='Exclude flex driver'), width="100%"),
+              tags$label("Constructor Lock:",  style="color:#aaa;font-size:11px;"),
+              selectizeInput(paste0(lp,"_locked_constructor"),  NULL, choices=con_choices, multiple=TRUE, selected=character(0),
+                             options=list(plugins=list('remove_button'), placeholder='Lock constructor', maxItems=1), width="100%"),
+              tags$label("Constructor Exclude:", style="color:#aaa;font-size:11px;"),
+              selectizeInput(paste0(lp,"_excluded_constructor"), NULL, choices=con_choices, multiple=TRUE, selected=character(0),
+                             options=list(plugins=list('remove_button'), placeholder='Exclude constructor'), width="100%")
+            )
+          } else {
+            # Versioned IDs: lock_v increments when lineups land, forcing brand-new
+            # selectize widgets with correct choices and no recycled browser state.
+            ver <- rv[[paste0(lp, "_lock_v")]]
+            all_players <- if (!is.null(lu)) {
+              pc <- grep("^Player|^Captain|^MVP|^Util", names(lu), value=TRUE)
+              sort(unique(unlist(lu[, ..pc]))[!is.na(unique(unlist(lu[, ..pc]))) & unique(unlist(lu[, ..pc])) != ""])
+            } else NULL
+            tagList(
+              selectizeInput(paste0(lp, "_locked_players_v",  ver), "Lock:",
+                             choices=all_players, multiple=TRUE, selected=character(0),
+                             options=list(plugins=list('remove_button'), placeholder='Search to lock players', maxItems=8),
+                             width="100%"),
+              selectizeInput(paste0(lp, "_excluded_players_v", ver), "Exclude:",
+                             choices=all_players, multiple=TRUE, selected=character(0),
+                             options=list(plugins=list('remove_button'), placeholder='Search to exclude players'),
+                             width="100%")
+            )
+          }
+      )
+    })
+  }
+  output$dk_lock_exclude_ui <- make_lock_exclude_ui("dk")
+  output$fd_lock_exclude_ui <- make_lock_exclude_ui("fd")
+  output$sd_lock_exclude_ui <- make_lock_exclude_ui("sd")
   
   
   # ==========================================================================
