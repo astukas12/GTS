@@ -274,6 +274,34 @@ server <- function(input, output, session) {
   
   `%||%` <- function(a, b) if (!is.null(a)) a else b
   
+  # ==========================================================================
+  # RESET ALL STATE
+  # Called on every new file upload AND at the start of every sim run.
+  # Wipes all downstream state (sim results, lineups, portfolios, lock counters)
+  # while preserving rv$sport, rv$config, rv$input_data (set by the caller).
+  # This ensures zero bleed between sports or between successive runs of the
+  # same sport.
+  # ==========================================================================
+  reset_all_state <- function() {
+    rv$simulation_results  <- NULL
+    rv$sim_metadata        <- NULL
+    rv$projections         <- NULL
+    rv$dk_optimal_lineups  <- NULL
+    rv$fd_optimal_lineups  <- NULL
+    rv$sd_optimal_lineups  <- NULL
+    rv$dk_portfolio        <- NULL;  rv$dk_builds <- list();  rv$dk_build_counter <- 0
+    rv$fd_portfolio        <- NULL;  rv$fd_builds <- list();  rv$fd_build_counter <- 0
+    rv$sd_portfolio        <- NULL;  rv$sd_builds <- list();  rv$sd_build_counter <- 0
+    rv$sport_visuals       <- NULL
+    rv$full_sim_results    <- NULL
+    rv$has_fd              <- TRUE
+    # Reset lock version counters so versioned selectize widgets start fresh
+    rv$dk_lock_v           <- 0L
+    rv$fd_lock_v           <- 0L
+    rv$sd_lock_v           <- 0L
+  }
+  
+  
   rv <- reactiveValues(
     sport              = NULL,
     config             = NULL,
@@ -284,6 +312,9 @@ server <- function(input, output, session) {
     dk_optimal_lineups = NULL,
     fd_optimal_lineups = NULL,
     sd_optimal_lineups = NULL,
+    dk_lock_v          = 0L,    # version counters — increment to force fresh selectize inputs
+    fd_lock_v          = 0L,
+    sd_lock_v          = 0L,
     dk_portfolio       = NULL,
     fd_portfolio       = NULL,
     sd_portfolio       = NULL,
@@ -308,6 +339,7 @@ server <- function(input, output, session) {
   observeEvent(input$input_file, {
     req(input$input_file)
     tryCatch({
+      reset_all_state()
       rv$sport  <- detect_sport(input$input_file$datapath)
       rv$config <- get_sport_config(rv$sport)
       
@@ -390,17 +422,10 @@ server <- function(input, output, session) {
   
   observeEvent(input$run_simulation, {
     req(rv$input_data, rv$config)
-    # Clear all downstream state so stale lineups/portfolio never bleed into new sim
-    rv$simulation_results <- NULL
-    rv$sim_metadata       <- NULL
-    rv$dk_optimal_lineups <- NULL
-    rv$fd_optimal_lineups <- NULL
-    rv$sd_optimal_lineups <- NULL
-    rv$dk_portfolio <- NULL; rv$dk_builds <- list(); rv$dk_build_counter <- 0
-    rv$fd_portfolio <- NULL; rv$fd_builds <- list(); rv$fd_build_counter <- 0
-    rv$sd_portfolio <- NULL; rv$sd_builds <- list(); rv$sd_build_counter <- 0
-    rv$sport_visuals      <- NULL
-    rv$full_sim_results   <- NULL
+    # Clear all downstream state so stale lineups/portfolio never bleed into new sim.
+    # Also re-pulls a clean config so platform stripping from a previous run never persists.
+    reset_all_state()
+    rv$config <- get_sport_config(rv$sport)
     engine_file <- paste0(tolower(rv$sport), "_engine.R")
     if (!file.exists(engine_file)) {
       showNotification(paste("Engine not found:", engine_file), type="error", duration=10)
@@ -743,6 +768,7 @@ server <- function(input, output, session) {
     req(rv$simulation_results, rv$sim_metadata, rv$config)
     rv$dk_optimal_lineups <- NULL
     rv$dk_portfolio <- NULL; rv$dk_builds <- list(); rv$dk_build_counter <- 0
+    rv$dk_lock_v <- 0L
     progress <- Progress$new(session); on.exit(progress$close())
     tryCatch({
       
@@ -891,6 +917,7 @@ server <- function(input, output, session) {
     req(rv$simulation_results, rv$sim_metadata, rv$config)
     rv$fd_optimal_lineups <- NULL
     rv$fd_portfolio <- NULL; rv$fd_builds <- list(); rv$fd_build_counter <- 0
+    rv$fd_lock_v <- 0L
     progress <- Progress$new(session); on.exit(progress$close())
     tryCatch({
       
@@ -993,6 +1020,7 @@ server <- function(input, output, session) {
     req(rv$simulation_results, rv$sim_metadata, rv$config)
     rv$sd_optimal_lineups <- NULL
     rv$sd_portfolio <- NULL; rv$sd_builds <- list(); rv$sd_build_counter <- 0
+    rv$sd_lock_v <- 0L
     progress <- Progress$new(session); on.exit(progress$close())
     tryCatch({
       if (rv$sport == "CBB") {
@@ -1277,17 +1305,19 @@ server <- function(input, output, session) {
                                                                 )
                                                               } else {
                                                                 # All other sports: single lock/exclude across all slots
-                                                                lu <- rv[[paste0(lp,"_optimal_lineups")]]
+                                                                # Version suffix ensures brand-new inputs on each lineup build (no recycled DOM state)
+                                                                lu  <- rv[[paste0(lp,"_optimal_lineups")]]
+                                                                ver <- rv[[paste0(lp,"_lock_v")]]
                                                                 all_players <- if (!is.null(lu)) {
                                                                   pc <- grep("^Player|^Captain|^MVP|^Util", names(lu), value=TRUE)
                                                                   sort(unique(unlist(lu[, ..pc]))[!is.na(unique(unlist(lu[, ..pc]))) & unique(unlist(lu[, ..pc])) != ""])
                                                                 } else NULL
                                                                 tagList(
-                                                                  selectizeInput(paste0(lp,"_locked_players"), "Lock:",
+                                                                  selectizeInput(paste0(lp,"_locked_players_v",ver), "Lock:",
                                                                                  choices=all_players, multiple=TRUE, selected=character(0),
                                                                                  options=list(plugins=list('remove_button'), placeholder='Search to lock players',
                                                                                               maxItems=8), width="100%"),
-                                                                  selectizeInput(paste0(lp,"_excluded_players"), "Exclude:",
+                                                                  selectizeInput(paste0(lp,"_excluded_players_v",ver), "Exclude:",
                                                                                  choices=all_players, multiple=TRUE, selected=character(0),
                                                                                  options=list(plugins=list('remove_button'), placeholder='Search to exclude players'),
                                                                                  width="100%")
@@ -1379,36 +1409,15 @@ server <- function(input, output, session) {
   # ==========================================================================
   
   # ==========================================================================
-  # RESET LOCK/EXCLUDE INPUTS WHEN NEW LINEUPS ARE BUILT
-  # Shiny recycles input state by ID — selectize retains prior selections
-  # even when the UI re-renders with selected=character(0). Explicitly
-  # clearing with updateSelectizeInput prevents stale locks bleeding through.
+  # VERSION-BASED LOCK/EXCLUDE RESET
+  # updateSelectizeInput fails when inputs don't exist in DOM yet (renderUI timing).
+  # Instead, version counters appended to input IDs make each new lineup build
+  # produce genuinely new input widgets with no recycled browser state.
   # ==========================================================================
   
-  observe({
-    rv$dk_optimal_lineups  # take dependency
-    for (id in c("dk_locked_players","dk_excluded_players",
-                 "dk_locked_captain","dk_excluded_captain",
-                 "dk_locked_constructor","dk_excluded_constructor")) {
-      updateSelectizeInput(session, id, selected=character(0))
-    }
-  })
-  
-  observe({
-    rv$fd_optimal_lineups
-    for (id in c("fd_locked_players","fd_excluded_players",
-                 "fd_locked_captain","fd_excluded_captain")) {
-      updateSelectizeInput(session, id, selected=character(0))
-    }
-  })
-  
-  observe({
-    rv$sd_optimal_lineups
-    for (id in c("sd_locked_players","sd_excluded_players",
-                 "sd_locked_captain","sd_excluded_captain")) {
-      updateSelectizeInput(session, id, selected=character(0))
-    }
-  })
+  observeEvent(rv$dk_optimal_lineups, { rv$dk_lock_v <- rv$dk_lock_v + 1L })
+  observeEvent(rv$fd_optimal_lineups, { rv$fd_lock_v <- rv$fd_lock_v + 1L })
+  observeEvent(rv$sd_optimal_lineups, { rv$sd_lock_v <- rv$sd_lock_v + 1L })
   
   make_filtered_lineups <- function(lp) {
     reactive({
@@ -1423,16 +1432,28 @@ server <- function(input, output, session) {
           lineups <- lineups[get(rp[1]) >= v]
       }
       # Salary (K conversion)
+      # Guard: only apply if slider value is strictly inside the data's actual range
+      # (stale input values from a previous run can be out-of-range and wipe everything)
       sv <- input[[paste0(lp,"_filter_TotalSalary")]]
-      if (!is.null(sv) && "TotalSalary" %in% names(lineups))
-        lineups <- lineups[TotalSalary >= sv[1]*1000 & TotalSalary <= sv[2]*1000]
-      # Other range sliders
+      if (!is.null(sv) && "TotalSalary" %in% names(lineups)) {
+        data_min_k <- floor(min(lineups$TotalSalary, na.rm=TRUE) / 1000)
+        data_max_k <- ceiling(max(lineups$TotalSalary, na.rm=TRUE) / 1000)
+        if (!(sv[1] <= data_min_k && sv[2] >= data_max_k))
+          lineups <- lineups[TotalSalary >= sv[1]*1000 & TotalSalary <= sv[2]*1000]
+      }
+      # Other range sliders — same stale-value guard
       num_cols   <- names(lineups)[sapply(lineups, is.numeric)]
       num_cols   <- setdiff(num_cols, grep("^Player|^Captain|^MVP",names(lineups),value=TRUE))
       range_cols <- setdiff(num_cols, c("WinRate","Top1Pct","Top5Pct","Top10Pct","Top20Pct","TotalSalary"))
       for (col in range_cols) {
         fv <- input[[paste0(lp,"_filter_",col)]]
-        if (!is.null(fv)) lineups <- lineups[get(col) >= fv[1] & get(col) <= fv[2]]
+        if (!is.null(fv)) {
+          data_min <- min(lineups[[col]], na.rm=TRUE)
+          data_max <- max(lineups[[col]], na.rm=TRUE)
+          # Only filter if the slider has actually been moved from full extent
+          if (!(fv[1] <= data_min && fv[2] >= data_max))
+            lineups <- lineups[get(col) >= fv[1] & get(col) <= fv[2]]
+        }
       }
       
       if (isTRUE(rv$sport == "F1")) {
@@ -1463,13 +1484,15 @@ server <- function(input, output, session) {
         
       } else {
         # All other sports: unified lock/exclude across all slots
-        locked <- input[[paste0(lp,"_locked_players")]]
+        # Read from versioned input ID — must match what portfolio_tabs_ui rendered
+        ver    <- rv[[paste0(lp,"_lock_v")]]
+        locked <- input[[paste0(lp,"_locked_players_v",ver)]]
         locked <- locked[!is.null(locked) & locked != ""]
         if (length(locked) > 0) {
           pc <- grep("^Player|^Captain|^MVP|^Util",names(lineups),value=TRUE)
           lineups <- lineups[apply(lineups[,..pc],1,function(r) all(locked %in% r))]
         }
-        excluded <- input[[paste0(lp,"_excluded_players")]]
+        excluded <- input[[paste0(lp,"_excluded_players_v",ver)]]
         excluded <- excluded[!is.null(excluded) & excluded != ""]
         if (length(excluded) > 0) {
           pc <- grep("^Player|^Captain|^MVP|^Util",names(lineups),value=TRUE)
@@ -1710,80 +1733,91 @@ server <- function(input, output, session) {
   make_portfolio_exposure <- function(lp, platform) {
     renderDT({
       pn <- paste0(lp,"_portfolio"); port <- rv[[pn]]; req(port, rv$sim_metadata)
-      salary_col <- if(platform=="SD") "SDSalary" else paste0(platform,"Salary")
-      own_col    <- if(platform=="SD") "DKOwn"    else paste0(platform,"Own")
-      is_f1      <- isTRUE(rv$sport == "F1")
+      is_f1  <- isTRUE(rv$sport == "F1")
+      is_cbb <- isTRUE(rv$sport == "CBB")
+      is_sd  <- platform == "SD"
+      salary_col <- if (is_sd) "DKSalary" else paste0(platform, "Salary")
+      own_col    <- if (is_sd) NULL        else paste0(platform, "Own")
       
-      cpt_cols   <- grep("^Captain",    names(port), value=TRUE)
-      flex_cols  <- grep("^Util[1-4]$", names(port), value=TRUE)
-      con_cols   <- grep("^Util5$",     names(port), value=TRUE)
-      all_pc     <- grep("^Player|^Captain|^MVP|^Util|^G[123]$|^F[123]$", names(port), value=TRUE)
+      cpt_cols  <- grep("^Captain", names(port), value=TRUE)
+      util_cols <- grep("^Util",    names(port), value=TRUE)
+      all_pc    <- grep("^Player|^Captain|^MVP|^Util|^G[1-4]$|^F[1-3]$|^C1$", names(port), value=TRUE)
+      has_captain <- length(cpt_cols) > 0
       
-      n_lineups   <- nrow(port)
-      cpt_counts  <- if (length(cpt_cols))  table(unlist(port[, ..cpt_cols]))  else table(character(0))
-      flex_counts <- if (length(flex_cols)) table(unlist(port[, ..flex_cols])) else table(character(0))
-      con_counts  <- if (length(con_cols))  table(unlist(port[, ..con_cols]))  else table(character(0))
-      all_counts  <- table(unlist(port[, ..all_pc]))
+      meta_players <- if (is_sd) {
+        rv$sim_metadata[!is.na(SDSalary) & SDSalary > 0, Player]
+      } else rv$sim_metadata$Player
       
-      exp_tbl <- data.table(Player=rv$sim_metadata$Player, Exposure=0)
+      n_lineups  <- nrow(port)
+      all_counts <- table(unlist(port[, ..all_pc]))
+      
+      exp_tbl <- data.table(Player = meta_players, Exposure = 0)
       for (i in seq_len(nrow(exp_tbl))) {
         p <- exp_tbl$Player[i]
         if (p %in% names(all_counts)) exp_tbl$Exposure[i] <- as.numeric(all_counts[p]) / n_lineups * 100
       }
       
-      if (is_f1) {
+      if (is_f1 || (is_cbb && has_captain)) {
+        cpt_counts  <- if (length(cpt_cols))  table(unlist(port[, ..cpt_cols]))  else table(character(0))
+        util_counts <- if (length(util_cols)) table(unlist(port[, ..util_cols])) else table(character(0))
         exp_tbl[, CptExp  := 0]
-        exp_tbl[, FlexExp := 0]
+        exp_tbl[, UtilExp := 0]
         for (i in seq_len(nrow(exp_tbl))) {
           p <- exp_tbl$Player[i]
           if (p %in% names(cpt_counts))  exp_tbl$CptExp[i]  <- as.numeric(cpt_counts[p])  / n_lineups * 100
-          if (p %in% names(flex_counts)) exp_tbl$FlexExp[i] <- as.numeric(flex_counts[p]) / n_lineups * 100
+          if (p %in% names(util_counts)) exp_tbl$UtilExp[i] <- as.numeric(util_counts[p]) / n_lineups * 100
         }
-        exp_tbl[Player %in% rv$sim_metadata$Player[rv$sim_metadata$PlayerType == "Constructor"],
-                c("CptExp","FlexExp") := NA_real_]
+        if (is_f1)
+          exp_tbl[Player %in% rv$sim_metadata$Player[rv$sim_metadata$PlayerType == "Constructor"],
+                  c("CptExp","UtilExp") := NA_real_]
       }
       
       mc <- intersect(c("Player","PlayerType",salary_col,own_col,
-                        "PosGroup","RGProj","RGMin","GameTime","Starting","Team","Car","Position","Match","Opponent","TeeTimeGroup","CutProb"),
+                        "PosGroup","RGProj","RGMin","GameTime","Starting","Team","Car",
+                        "Position","Match","Opponent","TeeTimeGroup","CutProb"),
                       names(rv$sim_metadata))
-      exp_tbl <- merge(exp_tbl, rv$sim_metadata[,..mc], by="Player", all.x=TRUE)
+      mc <- mc[!is.na(mc)]
+      exp_tbl <- merge(exp_tbl, rv$sim_metadata[Player %in% meta_players, ..mc], by="Player", all.x=TRUE)
+      
       if (!is.null(rv$simulation_results)) {
-        score_col_sim <- if ("DKScore" %in% names(rv$simulation_results)) "DKScore"
-        else paste0(platform, "Score")
+        score_col_sim <- if (platform == "FD") "FDScore" else "DKScore"
         if (score_col_sim %in% names(rv$simulation_results)) {
-          sim_proj <- rv$simulation_results[, .(SimProj = round(mean(get(score_col_sim), na.rm=TRUE), 1)), by=Player]
-          exp_tbl  <- merge(exp_tbl, sim_proj, by="Player", all.x=TRUE)
+          sim_proj <- rv$simulation_results[Player %in% meta_players,
+                                            .(SimProj = round(mean(get(score_col_sim), na.rm=TRUE), 1)),
+                                            by=Player]
+          exp_tbl <- merge(exp_tbl, sim_proj, by="Player", all.x=TRUE)
         }
       }
-      if(salary_col %in% names(exp_tbl)) setnames(exp_tbl, salary_col, "Salary")
-      if(own_col    %in% names(exp_tbl)) {
+      
+      if (salary_col %in% names(exp_tbl)) setnames(exp_tbl, salary_col, "Salary")
+      if (!is_sd && !is.null(own_col) && own_col %in% names(exp_tbl)) {
         setnames(exp_tbl, own_col, "OwnProj")
-        exp_tbl[,OwnProj:=OwnProj*100]
-        exp_tbl[,Leverage:=round(Exposure-OwnProj,1)]
+        if (!is_cbb) exp_tbl[, OwnProj := OwnProj * 100]
+        exp_tbl[, OwnProj  := round(OwnProj, 1)]
+        exp_tbl[, Leverage := round(Exposure - OwnProj, 1)]
       }
       
-      base_meta <- c("Player", if (is_f1) "PlayerType" else NULL,
-                     "PosGroup","Salary","RGProj","RGMin","SimProj","GameTime","Starting","Team","Car",
-                     "Position","Match","Opponent","Surface","Tour","TeeTimeGroup","CutProb")
+      base_meta  <- c("Player", if (is_f1) "PlayerType" else NULL,
+                      "PosGroup","Salary","RGProj","RGMin","SimProj","GameTime","Starting","Team","Car",
+                      "Position","Match","Opponent","Surface","Tour","TeeTimeGroup","CutProb")
       meta_order    <- intersect(base_meta, names(exp_tbl))
-      f1_exp_cols   <- if (is_f1) intersect(c("CptExp","FlexExp"), names(exp_tbl)) else character(0)
+      split_cols    <- intersect(c("CptExp","UtilExp","FlexExp"), names(exp_tbl))
       metrics_order <- intersect(c("Exposure","OwnProj","Leverage"), names(exp_tbl))
-      setcolorder(exp_tbl, c(meta_order, f1_exp_cols, metrics_order))
-      exp_tbl <- exp_tbl[Exposure>0]; setorder(exp_tbl,-Exposure)
+      setcolorder(exp_tbl, c(meta_order, split_cols, metrics_order))
+      exp_tbl <- exp_tbl[Exposure > 0]; setorder(exp_tbl, -Exposure)
       
-      # Rename columns for display (CBB only)
-      if (isTRUE(rv$sport == "CBB")) {
+      if (is_cbb) {
         rename_map <- c(PosGroup="Pos", Salary="Sal", RGMin="Mins", RGProj="Proj", GameTime="Time", SimProj="Sim")
         for (old in names(rename_map)) if (old %in% names(exp_tbl)) setnames(exp_tbl, old, rename_map[[old]])
       }
       
       dt <- datatable(exp_tbl, options=list(pageLength=50,scrollX=TRUE,searching=FALSE,lengthChange=FALSE,dom='tp'), rownames=FALSE)
-      rc <- intersect(c("Exposure","CptExp","FlexExp","OwnProj","Leverage","CutProb","RGProj","RGMin","SimProj",
-                        "Proj","Mins","Sim"),names(exp_tbl))
-      if(length(rc)>0) dt <- dt %>% formatRound(rc,1)
+      rc <- intersect(c("Exposure","CptExp","UtilExp","FlexExp","OwnProj","Leverage",
+                        "CutProb","RGProj","RGMin","SimProj","Proj","Mins","Sim"), names(exp_tbl))
+      if (length(rc) > 0) dt <- dt %>% formatRound(rc, 1)
       cap <- rv$config$salary_caps[[platform]] %||% 50000
-      sal_col <- if ("Sal" %in% names(exp_tbl)) "Sal" else if ("Salary" %in% names(exp_tbl)) "Salary" else NULL
-      if(!is.null(sal_col) && cap>=1000) dt <- dt %>% formatCurrency(sal_col,"$",digits=0)
+      sal_col_disp <- if ("Sal" %in% names(exp_tbl)) "Sal" else if ("Salary" %in% names(exp_tbl)) "Salary" else NULL
+      if (!is.null(sal_col_disp) && cap >= 1000) dt <- dt %>% formatCurrency(sal_col_disp,"$",digits=0)
       dt
     })
   }
@@ -2798,7 +2832,8 @@ server <- function(input, output, session) {
                     background = styleColorBar(range(ca$Median_Score, na.rm = TRUE), "#FFE500"),
                     backgroundSize = "90% 70%", backgroundRepeat = "no-repeat",
                     backgroundPosition = "left")
-    }, error = function(e) {      datatable(data.table(Error = e$message), rownames = FALSE)
+    }, error = function(e) {
+      datatable(data.table(Error = e$message), rownames = FALSE)
     })
   })
   
