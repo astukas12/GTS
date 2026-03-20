@@ -449,9 +449,15 @@ assign_cbb_slots <- function(cm, n_g, n_f, n_util) {
   list(g = g_players, f = f_players, util = u_players)
 }
 
-# CBB LINEUP OPTIMIZER
+
+# ============================================================================
+# CBB DK LINEUP OPTIMIZER
+# DK roster: 3G / 3F / 2UTIL = 8 players | $50K cap
 # Per-sim: filter top 25 G + top 25 F by PPD, LP with position constraints,
 # assign UTIL slots to latest game-time players post-LP.
+#
+# FIX: slot assignment attrition — cap to max_lineups AFTER slot assignment
+# so that failed assignments don't reduce the final pool below the target.
 # ============================================================================
 
 find_optimal_lineups_cbb <- function(sim_results, metadata, config, verbose = TRUE) {
@@ -540,12 +546,14 @@ find_optimal_lineups_cbb <- function(sim_results, metadata, config, verbose = TR
   valid <- lineup_list[!sapply(lineup_list, is.null)]
   if (length(valid) == 0L) stop("No valid CBB lineups found")
   
+  # Aggregate all unique lineups — do NOT cap before slot assignment.
+  # Slot assignment drops a small fraction of lineups; capping early causes the
+  # final pool to land below max_lineups. Cap AFTER slot assignment instead.
   all_dt <- rbindlist(valid)
   counts <- all_dt[, .(
     Top1Count=.N, TotalSalary=TotalSalary[1], AvgScore=mean(TotalScore)
   ), by=Lineup]
   setorder(counts, -Top1Count)
-  if (nrow(counts) > max_lineups) counts <- counts[1:max_lineups]
   
   # Slot assignment: done once per unique lineup on the canonical player set.
   # Deterministic: same 8 players always get the same slots regardless of sim order.
@@ -573,6 +581,9 @@ find_optimal_lineups_cbb <- function(sim_results, metadata, config, verbose = TR
     Player7=UTIL1, Player8=UTIL2
   )]
   
+  # Cap AFTER slot assignment — guarantees a full pool of max_lineups
+  if (nrow(unique_lineups) > max_lineups) unique_lineups <- unique_lineups[1:max_lineups]
+  
   elapsed <- as.numeric(difftime(Sys.time(), start_t, units="secs"))
   if (verbose) cat(sprintf("  \u2713 Phase 1: %s unique lineups from %s sims | %.1fs\n",
                            format(nrow(unique_lineups), big.mark=","),
@@ -587,6 +598,8 @@ find_optimal_lineups_cbb <- function(sim_results, metadata, config, verbose = TR
 # FD roster: 4G / 3F / 1UTIL = 8 players | $50K cap
 # Constraints: >=4 G-elig, >=3 F-elig, 8 total
 # Uses FDScore and FDSalary; UTIL assigned to latest-game player post-LP.
+#
+# FIX: same slot-assignment attrition fix as DK — cap AFTER slot assignment.
 # ============================================================================
 
 find_optimal_lineups_cbb_fd <- function(sim_results, metadata, config, verbose = TRUE) {
@@ -648,7 +661,7 @@ find_optimal_lineups_cbb_fd <- function(sim_results, metadata, config, verbose =
     n_p <- nrow(pool)
     if (n_p < 8L) next
     
-    # FD constraints: 8 total, <=50K, >=4 G-elig, >=3 F-elig, 1 UTIL
+    # FD constraints: 8 total, <=50K, >=4 G-elig, >=3 F-elig
     res <- tryCatch(
       lp("max", pool$FantasyPoints,
          rbind(rep(1,n_p), pool$Salary, as.integer(pool$g_elig), as.integer(pool$f_elig)),
@@ -679,12 +692,14 @@ find_optimal_lineups_cbb_fd <- function(sim_results, metadata, config, verbose =
   valid <- lineup_list[!sapply(lineup_list, is.null)]
   if (length(valid) == 0L) stop("No valid CBB FD lineups found")
   
+  # Aggregate all unique lineups — do NOT cap before slot assignment.
+  # Slot assignment drops a small fraction of lineups; capping early causes the
+  # final pool to land below max_lineups. Cap AFTER slot assignment instead.
   all_dt <- rbindlist(valid)
   counts <- all_dt[, .(
     Top1Count=.N, TotalSalary=TotalSalary[1], AvgScore=mean(TotalScore)
   ), by=Lineup]
   setorder(counts, -Top1Count)
-  if (nrow(counts) > max_lineups) counts <- counts[1:max_lineups]
   
   slot_list <- vector("list", nrow(counts))
   for (li in seq_len(nrow(counts))) {
@@ -710,6 +725,9 @@ find_optimal_lineups_cbb_fd <- function(sim_results, metadata, config, verbose =
     Player8=UTIL1
   )]
   
+  # Cap AFTER slot assignment — guarantees a full pool of max_lineups
+  if (nrow(unique_lineups) > max_lineups) unique_lineups <- unique_lineups[1:max_lineups]
+  
   elapsed <- as.numeric(difftime(Sys.time(), start_t, units="secs"))
   if (verbose) cat(sprintf("  \u2713 Phase 1: %s unique FD lineups from %s sims | %.1fs\n",
                            format(nrow(unique_lineups), big.mark=","),
@@ -726,6 +744,9 @@ find_optimal_lineups_cbb_fd <- function(sim_results, metadata, config, verbose =
 # FLEX: uses SDSalary (UTIL_Salary from SD sheet), scores at 1.0x DKScore
 # Both CPT and FLEX IDs are independent from DK Classic IDs.
 # Per-sim greedy: try each player as CPT, greedy-fill 5 FLEX by PPD.
+#
+# NOTE: SD has no slot assignment step, so no attrition issue here.
+# The max_lineups cap at the end is already in the correct position.
 # ============================================================================
 
 find_optimal_lineups_cbb_sd <- function(sim_results, metadata, config, verbose = TRUE) {
