@@ -762,15 +762,20 @@ find_optimal_lineups_cbb_sd <- function(sim_results, metadata, config, verbose =
   # Players must have both CPTSalary and SDSalary to be eligible
   meta <- unique(metadata[
     !is.na(CPTSalary) & CPTSalary > 0 & !is.na(SDSalary) & SDSalary > 0,
-    .(Player, CPTSalary, SDSalary, GameKey)
+    .(Player, Team, CPTSalary, SDSalary, GameKey)
   ], by = "Player")
   
   if (nrow(meta) == 0) stop("No SD-eligible players found. Check CPTSalary/SDSalary in metadata.")
   
-  # Merge scores into opt_data — one row per SimID x Player
+  # Confirm there are two distinct teams — required for the both-teams constraint
+  game_teams <- unique(meta$Team)
+  if (length(game_teams) < 2)
+    warning("find_optimal_lineups_cbb_sd: fewer than 2 teams found in SD pool — both-teams constraint will have no effect.")
+  
+  # Merge scores into opt_data — one row per SimID x Player (Team included for constraint)
   opt_data <- merge(
     sim_results[, .(SimID, Player, DKScore)],
-    meta[, .(Player, CPTSalary, SDSalary)],
+    meta[, .(Player, Team, CPTSalary, SDSalary)],
     by = "Player"
   )
   opt_data <- opt_data[!is.na(DKScore)]
@@ -822,6 +827,11 @@ find_optimal_lineups_cbb_sd <- function(sim_results, metadata, config, verbose =
       }
       
       if (n_picked == 5L) {
+        # Both-teams constraint: lineup must include at least one player from each team
+        all_players  <- c(cpt_player, picked_f[seq_len(n_picked)])
+        lineup_teams <- sd$Team[match(all_players, sd$Player)]
+        if (length(unique(lineup_teams)) < 2L) next
+        
         total <- cpt_score + flex_score
         if (total > best_score) {
           best_score  <- total
