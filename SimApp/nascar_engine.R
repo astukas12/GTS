@@ -434,10 +434,12 @@ precompute_driver_distributions <- function(driver_data) {
 
 #' Simulate finish positions - sample from full distribution then resolve conflicts
 #' 
-#' This approach:
-#' 1. Each driver samples their finish from their FULL probability distribution
-#' 2. Handle collisions by having drivers "compete" for contested positions
-#' 3. Guarantees simulated rates match input rates
+#' Collision resolution rules:
+#' 1. Process best-to-worst (front runners get priority for contested spots)
+#' 2. Bumped drivers move BACKWARD only (to a worse position than sampled)
+#' 3. When bumping, skip positions where the driver has zero input probability
+#'    (enforces hard range constraints — Hill can never finish top-30 if T30=0)
+#' 4. Fallback cascade if rules 2/3 can't be satisfied simultaneously
 simulate_finish_positions_vectorized <- function(prob_matrix, n_sims) {
   n_drivers <- nrow(prob_matrix)
   n_positions <- ncol(prob_matrix)
@@ -451,50 +453,52 @@ simulate_finish_positions_vectorized <- function(prob_matrix, n_sims) {
     # Step 1: Each driver samples from their FULL probability distribution
     sampled_positions <- numeric(n_drivers)
     for (i in 1:n_drivers) {
-      sampled_positions[i] <- sample(1:n_positions, size=1, prob=prob_matrix[i, ])
+      sampled_positions[i] <- sample(1:n_positions, size = 1, prob = prob_matrix[i, ])
     }
     
-    # Step 2: Resolve conflicts - assign positions in order of sampled finish
-    # Drivers who sampled better positions get priority
+    # Step 2: Resolve conflicts
+    # Best-to-worst: front runners claim their spots first
+    # Bumped drivers only move backward and only into positions they have
+    # non-zero input probability for — this hard-enforces the input ranges
     assigned_positions <- numeric(n_drivers)
     available_positions <- 1:n_positions
     
-    # Process drivers in order of their sampled position (best to worst)
-    driver_order <- order(sampled_positions)
+    driver_order <- order(sampled_positions)  # ascending = best first
     
     for (driver_idx in driver_order) {
       sampled_pos <- sampled_positions[driver_idx]
+      driver_probs <- prob_matrix[driver_idx, ]
       
-      # If their sampled position is still available, give it to them
       if (sampled_pos %in% available_positions) {
+        # Position is free — take it
         assigned_positions[driver_idx] <- sampled_pos
         available_positions <- available_positions[available_positions != sampled_pos]
       } else {
-        # Position taken - give them the closest available position
-        # weighted by their probability for nearby positions
+        # Position taken — bump backward, respecting zero-prob constraints
         
-        if (length(available_positions) == 1) {
-          # Only one position left
-          assigned_positions[driver_idx] <- available_positions[1]
-          available_positions <- numeric(0)
+        # Priority 1: available positions that are worse AND have non-zero probability
+        worse_valid <- available_positions[
+          available_positions >= sampled_pos & driver_probs[available_positions] > 0
+        ]
+        
+        if (length(worse_valid) > 0) {
+          chosen_pos <- worse_valid[1]  # closest valid worse position
         } else {
-          # Multiple positions available - pick based on probability
-          driver_probs_available <- prob_matrix[driver_idx, available_positions]
+          # Priority 2: any available position with non-zero probability
+          any_valid <- available_positions[driver_probs[available_positions] > 0]
           
-          if (sum(driver_probs_available) > 0) {
-            # Sample from available positions weighted by driver's probability
-            chosen_pos <- sample(available_positions, size=1, prob=driver_probs_available)
+          if (length(any_valid) > 0) {
+            distances <- abs(any_valid - sampled_pos)
+            chosen_pos <- any_valid[which.min(distances)]
           } else {
-            # Driver has 0% for all remaining positions
-            # Give them the position closest to what they sampled
+            # Priority 3: absolute last resort — closest available (no valid probs left)
             distances <- abs(available_positions - sampled_pos)
-            closest_idx <- which.min(distances)
-            chosen_pos <- available_positions[closest_idx]
+            chosen_pos <- available_positions[which.min(distances)]
           }
-          
-          assigned_positions[driver_idx] <- chosen_pos
-          available_positions <- available_positions[available_positions != chosen_pos]
         }
+        
+        assigned_positions[driver_idx] <- chosen_pos
+        available_positions <- available_positions[available_positions != chosen_pos]
       }
     }
     
