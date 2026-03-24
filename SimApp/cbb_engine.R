@@ -14,6 +14,17 @@
 #   IDs tab   -> DKID, FDID, DKSalary, FDSalary, DKPos, FDPos  (identity/salary)
 #   Team tab  -> DKOwn, FDOwn, RGProj, RGFDProj, Mins, p10-p90 (projections/pcts)
 #   Games tab -> SimKey, GameKey, GameTime, GameRank             (game context)
+#
+# Stat allocation model:
+#   - fgm, tpm, ftm, reb, ast, stl, blk, to allocated via percentile shares
+#   - pts DERIVED as tpm + 2*fgm + ftm  (never independently allocated)
+#   - tpm clamped to <= fgm after allocation
+#   - Assists reallocated post-allocation using shot-type assist rates:
+#       3PM assist rate: 0.862  |  2PM assist rate: 0.385  (from tournament DB)
+#     Each player's baskets generate assists for TEAMMATES only (scorer != assister)
+#     Final team assist total reconciled to sim-sheet value exactly.
+#   - pts_p* and tpa_p* columns removed from team tabs (pts derived; tpa unused)
+#   - fgm_p* and ftm_p* columns added to team tabs
 # ============================================================================
 
 library(data.table)
@@ -164,22 +175,31 @@ run_cbb_simulation <- function(input_data, n_sims = 10000, config = NULL,
   
   start_time   <- proc.time()
   team_abbrevs <- unique(slate$Team)
-  stat_names   <- c("pts", "tpm", "reb", "ast", "stl", "blk", "to")
+  
+  # pts is DERIVED (tpm + 2*fgm + ftm) — never independently allocated.
+  # tpa removed — redundant once fgm is simulated directly.
+  stat_names   <- c("fgm", "tpm", "ftm", "reb", "ast", "stl", "blk", "to")
+  
+  # Assist rates derived from 1,105 tournament games (2023-2025).
+  # assists = 3pm * ASSIST_RATE_3PM + 2pm * ASSIST_RATE_2PM  (R² ≈ 0.44)
+  ASSIST_RATE_3PM <- 0.862
+  ASSIST_RATE_2PM <- 0.385
   
   for (ta in team_abbrevs)
     if (!ta %in% names(team_data))
       stop(sprintf("No team percentile tab found for: %s", ta))
   
   pct_cols <- list(
-    pts = c("points_p10","points_p25","points_p50","points_p75","points_p90"),
+    fgm = c("fgm_p10","fgm_p25","fgm_p50","fgm_p75","fgm_p90"),
     tpm = c("tpm_p10","tpm_p25","tpm_p50","tpm_p75","tpm_p90"),
+    ftm = c("ftm_p10","ftm_p25","ftm_p50","ftm_p75","ftm_p90"),
     reb = c("reb_p10","reb_p25","reb_p50","reb_p75","reb_p90"),
     ast = c("ast_p10","ast_p25","ast_p50","ast_p75","ast_p90"),
     stl = c("stl_p10","stl_p25","stl_p50","stl_p75","stl_p90"),
     blk = c("blk_p10","blk_p25","blk_p50","blk_p75","blk_p90"),
     to  = c("to_p10","to_p25","to_p50","to_p75","to_p90")
   )
-  sim_col <- c(pts="score", tpm="3pm", reb="rebounds",
+  sim_col <- c(fgm="fgm", tpm="3pm", ftm="ftm", reb="rebounds",
                ast="assists", stl="steals", blk="blocks", to="turnovers")
   
   # ── Build active player list ───────────────────────────────────────────────
@@ -296,15 +316,138 @@ run_cbb_simulation <- function(input_data, n_sims = 10000, config = NULL,
       stat_mats[[s]][pidx, ] <- as.integer(round(raw))
     }
   }
-  stat_mats[["tpm"]] <- pmin(stat_mats[["tpm"]], stat_mats[["pts"]] %/% 3L)
   
-  # ── Score DK and FD from the same stat matrices ────────────────────────────
+  # ── Enforce tpm <= fgm elementwise ────────────────────────────────────────
+  # A player cannot have more 3-pointers than total field goals made.
+  stat_mats[["tpm"]] <- pmin(stat_mats[["tpm"]], stat_mats[["fgm"]])
+  
+  # ── Derive pts from shot components ───────────────────────────────────────
+  # pts = 3*tpm + 2*(fgm - tpm) + ftm = tpm + 2*fgm + ftm
+  # This guarantees pts/fgm/tpm/ftm are perfectly consistent at every player
+  # and team level — pts is never independently allocated.
+  pts_mat <- stat_mats[["tpm"]] + 2L * stat_mats[["fgm"]] + stat_mats[["ftm"]]
+  
+  # ── Assist reallocation — scorer != assister ───────────────────────────────
+  # For each team:
+  #   1. Compute each player's assistable FGMs using shot-type rates
+  #      (3PM assisted at 86.2%, 2PM at 38.5% — from tournament DB regression)
+  #   2. Working assist total = min(sim_sheet_assists, sum(assistable_fgm))
+  #      so we never assign more assists than there are assistable baskets
+  #   3. Scale down the percentile-allocated ast totals proportionally to hit
+  #      the working total exactly (integer rounding reconciled via adjustment)
+  #   4. Redistribute: each player i's assistable[i] baskets generate assists
+  #      for TEAMMATES only — player i is excluded from their own assister pool
+  cb("Reallocating assists...", 0.82)
+  
+  for (team in team_abbrevs) {
+    td   <- team_data_prepped[[team]]
+    pidx <- td$pidx
+    n_t  <- td$n_team
+    
+    tpm_t  <- stat_mats[["tpm"]][pidx, , drop = FALSE]   # n_t x n_sims
+    fgm_t  <- stat_mats[["fgm"]][pidx, , drop = FALSE]
+    twom_t <- pmax(fgm_t - tpm_t, 0L)
+    ast_t  <- stat_mats[["ast"]][pidx, , drop = FALSE]
+    
+    # Step 1 — assistable baskets per player per sim
+    assistable <- round(tpm_t * ASSIST_RATE_3PM + twom_t * ASSIST_RATE_2PM)
+    
+    # Step 2 — working assist total: can't exceed assistable basket count
+    team_assistable <- colSums(assistable)              # n_sims
+    team_sim_asts   <- colSums(ast_t)                   # n_sims
+    working_asts    <- pmin(team_sim_asts, team_assistable)
+    
+    # Step 3 — scale existing ast allocation to working total, reconcile integer
+    # a) proportional scale
+    scale <- ifelse(team_sim_asts > 0, working_asts / team_sim_asts, 1)
+    ast_scaled <- sweep(ast_t, 2, scale, `*`)           # real-valued
+    
+    # b) floor then fix rounding residual so colSums == working_asts exactly
+    ast_floor   <- matrix(as.integer(floor(ast_scaled)), n_t, n_sims)
+    residual    <- working_asts - colSums(ast_floor)    # n_sims, 0 <= residual < n_t
+    
+    # Distribute residual +1s to players with largest fractional parts
+    frac        <- ast_scaled - ast_floor               # n_t x n_sims
+    # For each sim, rank players by fractional part descending;
+    # the top `residual` players each get +1
+    for (s in seq_len(n_sims)) {
+      r <- as.integer(residual[s])
+      if (r > 0L) {
+        top_idx <- order(frac[, s], decreasing = TRUE)[seq_len(r)]
+        ast_floor[top_idx, s] <- ast_floor[top_idx, s] + 1L
+      }
+    }
+    # ast_floor colSums now equal working_asts exactly
+    
+    # Step 4 — redistribute assists so scorer != assister
+    # ast_weight[i,s] = player i's share of team assists in sim s
+    ast_weight <- sweep(ast_floor, 2,
+                        pmax(colSums(ast_floor), 1L), `/`)  # n_t x n_sims
+    
+    new_ast <- matrix(0L, n_t, n_sims)
+    
+    for (i in seq_len(n_t)) {
+      baskets_i <- assistable[i, ]           # n_sims — baskets player i scored
+      if (all(baskets_i == 0L)) next
+      
+      # Weight for assigning assists generated by player i's baskets
+      # to their TEAMMATES: zero out player i's own weight, renormalize
+      w <- ast_weight
+      w[i, ] <- 0
+      col_sums_w <- colSums(w)
+      # Avoid division by zero: if no teammates have ast weight, distribute evenly
+      zero_cols <- col_sums_w == 0
+      if (any(zero_cols)) {
+        w[, zero_cols] <- 1 / (n_t - 1L)
+        w[i, zero_cols] <- 0
+        col_sums_w[zero_cols] <- 1
+      }
+      w <- sweep(w, 2, col_sums_w, `/`)     # renormalized teammate weights
+      
+      # Distribute baskets_i assists to teammates proportionally (real-valued)
+      contrib_real <- sweep(w, 2, baskets_i, `*`)
+      
+      # Floor + reconcile so each sim's contributions sum to baskets_i exactly
+      contrib_floor <- matrix(as.integer(floor(contrib_real)), n_t, n_sims)
+      contrib_frac  <- contrib_real - contrib_floor
+      contrib_resid <- baskets_i - colSums(contrib_floor)  # n_sims
+      
+      for (s in seq_len(n_sims)) {
+        r <- as.integer(contrib_resid[s])
+        if (r > 0L) {
+          # Only non-self players eligible for +1
+          elig <- setdiff(order(contrib_frac[, s], decreasing = TRUE), i)
+          top_idx <- elig[seq_len(min(r, length(elig)))]
+          contrib_floor[top_idx, s] <- contrib_floor[top_idx, s] + 1L
+        }
+      }
+      
+      new_ast <- new_ast + contrib_floor
+    }
+    
+    # Final team assist total must equal working_asts exactly.
+    # Any residual from double rounding is absorbed by the top assister.
+    final_team_asts <- colSums(new_ast)
+    diff_asts       <- working_asts - final_team_asts   # should be 0 almost always
+    for (s in seq_len(n_sims)) {
+      d <- as.integer(diff_asts[s])
+      if (d != 0L) {
+        # Add/subtract from player with highest ast weight (most natural absorber)
+        top_p <- which.max(ast_weight[, s])
+        new_ast[top_p, s] <- max(0L, new_ast[top_p, s] + d)
+      }
+    }
+    
+    stat_mats[["ast"]][pidx, ] <- new_ast
+  }
+  
+  # ── Score DK and FD ────────────────────────────────────────────────────────
   cb("Scoring DK and FD...", 0.88)
   
-  dk_mat <- dk_score_cbb(stat_mats[["pts"]], stat_mats[["tpm"]], stat_mats[["reb"]],
+  dk_mat <- dk_score_cbb(pts_mat, stat_mats[["tpm"]], stat_mats[["reb"]],
                          stat_mats[["ast"]], stat_mats[["stl"]], stat_mats[["blk"]],
                          stat_mats[["to"]])
-  fd_mat <- fd_score_cbb(stat_mats[["pts"]], stat_mats[["tpm"]], stat_mats[["reb"]],
+  fd_mat <- fd_score_cbb(pts_mat, stat_mats[["tpm"]], stat_mats[["reb"]],
                          stat_mats[["ast"]], stat_mats[["stl"]], stat_mats[["blk"]],
                          stat_mats[["to"]])
   
@@ -317,8 +460,14 @@ run_cbb_simulation <- function(input_data, n_sims = 10000, config = NULL,
     DKScore = as.vector(dk_mat),
     FDScore = as.vector(fd_mat)
   )
+  # Simulated stat columns
   for (s in stat_names)
     sim_results[[s]] <- as.integer(as.vector(stat_mats[[s]]))
+  # Derived columns
+  sim_results[["pts"]]  <- as.integer(as.vector(pts_mat))
+  sim_results[["twom"]] <- as.integer(as.vector(
+    pmax(stat_mats[["fgm"]] - stat_mats[["tpm"]], 0L)
+  ))
   
   elapsed <- round((proc.time() - start_time)["elapsed"], 1)
   cat(sprintf("  Simulation core: %.1fs\n", elapsed))
