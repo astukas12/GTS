@@ -359,12 +359,16 @@ run_cbb_simulation <- function(input_data, n_sims = 10000, config = NULL,
     
     # Step 3 — scale existing ast allocation to working total, reconcile integer
     # a) proportional scale
-    scale <- ifelse(team_sim_asts > 0, working_asts / team_sim_asts, 1)
+    # Guard: if team_sim_asts is 0 or NA for a sim, scale = 1 (no change)
+    scale <- ifelse(!is.na(team_sim_asts) & team_sim_asts > 0,
+                    working_asts / team_sim_asts, 1)
+    scale[is.na(scale)] <- 1
     ast_scaled <- sweep(ast_t, 2, scale, `*`)           # real-valued
     
     # b) floor then fix rounding residual so colSums == working_asts exactly
     ast_floor   <- matrix(as.integer(floor(ast_scaled)), n_t, n_sims)
     residual    <- working_asts - colSums(ast_floor)    # n_sims, 0 <= residual < n_t
+    residual[is.na(residual)] <- 0L                     # NA-safe: treat as no residual
     
     # Distribute residual +1s to players with largest fractional parts
     frac        <- ast_scaled - ast_floor               # n_t x n_sims
@@ -372,7 +376,7 @@ run_cbb_simulation <- function(input_data, n_sims = 10000, config = NULL,
     # the top `residual` players each get +1
     for (s in seq_len(n_sims)) {
       r <- as.integer(residual[s])
-      if (r > 0L) {
+      if (!is.na(r) && r > 0L) {
         top_idx <- order(frac[, s], decreasing = TRUE)[seq_len(r)]
         ast_floor[top_idx, s] <- ast_floor[top_idx, s] + 1L
       }
@@ -411,10 +415,11 @@ run_cbb_simulation <- function(input_data, n_sims = 10000, config = NULL,
       contrib_floor <- matrix(as.integer(floor(contrib_real)), n_t, n_sims)
       contrib_frac  <- contrib_real - contrib_floor
       contrib_resid <- baskets_i - colSums(contrib_floor)  # n_sims
+      contrib_resid[is.na(contrib_resid)] <- 0L            # NA-safe
       
       for (s in seq_len(n_sims)) {
         r <- as.integer(contrib_resid[s])
-        if (r > 0L) {
+        if (!is.na(r) && r > 0L) {
           # Only non-self players eligible for +1
           elig <- setdiff(order(contrib_frac[, s], decreasing = TRUE), i)
           top_idx <- elig[seq_len(min(r, length(elig)))]
@@ -423,19 +428,6 @@ run_cbb_simulation <- function(input_data, n_sims = 10000, config = NULL,
       }
       
       new_ast <- new_ast + contrib_floor
-    }
-    
-    # Final team assist total must equal working_asts exactly.
-    # Any residual from double rounding is absorbed by the top assister.
-    final_team_asts <- colSums(new_ast)
-    diff_asts       <- working_asts - final_team_asts   # should be 0 almost always
-    for (s in seq_len(n_sims)) {
-      d <- as.integer(diff_asts[s])
-      if (d != 0L) {
-        # Add/subtract from player with highest ast weight (most natural absorber)
-        top_p <- which.max(ast_weight[, s])
-        new_ast[top_p, s] <- max(0L, new_ast[top_p, s] + d)
-      }
     }
     
     stat_mats[["ast"]][pidx, ] <- new_ast
