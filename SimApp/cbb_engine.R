@@ -337,7 +337,7 @@ run_cbb_simulation <- function(input_data, n_sims = 10000, config = NULL,
   #      the working total exactly (integer rounding reconciled via adjustment)
   #   4. Redistribute: each player i's assistable[i] baskets generate assists
   #      for TEAMMATES only — player i is excluded from their own assister pool
-  cb("Reallocating assists...", 0.82)
+  cb("Assigning assists...", 0.82)
   
   for (team in team_abbrevs) {
     td   <- team_data_prepped[[team]]
