@@ -694,7 +694,9 @@ find_optimal_lineups_cbb <- function(sim_results, metadata, config, verbose = TR
   counts <- all_dt[, .(
     Top1Count=.N, TotalSalary=TotalSalary[1], AvgScore=mean(TotalScore)
   ), by=Lineup]
-  setorder(counts, -Top1Count)
+  counts[, rand := runif(.N)]
+  setorder(counts, -Top1Count, rand)
+  counts[, rand := NULL]
   
   # Slot assignment: done once per unique lineup on the canonical player set.
   # Deterministic: same 8 players always get the same slots regardless of sim order.
@@ -840,7 +842,9 @@ find_optimal_lineups_cbb_fd <- function(sim_results, metadata, config, verbose =
   counts <- all_dt[, .(
     Top1Count=.N, TotalSalary=TotalSalary[1], AvgScore=mean(TotalScore)
   ), by=Lineup]
-  setorder(counts, -Top1Count)
+  counts[, rand := runif(.N)]
+  setorder(counts, -Top1Count, rand)
+  counts[, rand := NULL]
   
   slot_list <- vector("list", nrow(counts))
   for (li in seq_len(nrow(counts))) {
@@ -1020,7 +1024,9 @@ find_optimal_lineups_cbb_sd <- function(sim_results, metadata, config, verbose =
     Captain     = Captain[1],
     Util1=Util1[1], Util2=Util2[1], Util3=Util3[1], Util4=Util4[1], Util5=Util5[1]
   ), by = Lineup]
-  setorder(counts, -Top1Count)
+  counts[, rand := runif(.N)]
+  setorder(counts, -Top1Count, rand)
+  counts[, rand := NULL]
   if (nrow(counts) > max_lineups) counts <- counts[1:max_lineups]
   
   unique_lineups <- counts[, .(
