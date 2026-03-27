@@ -524,8 +524,57 @@ run_cbb_simulation <- function(input_data, n_sims = 10000, config = NULL,
   has_sd <- "CPTSalary" %in% names(metadata) &&
     any(!is.na(metadata$CPTSalary) & metadata$CPTSalary > 0)
   
+  # ── Pre-aggregate visuals data ────────────────────────────────────────────
+  # rowMeans on matrices — fast, no sim_results scan needed.
+  cb("Building visuals data...", 0.98)
+  
+  teams    <- sort(unique(metadata$Team))
+  twom_mat <- pmax(stat_mats[["fgm"]] - stat_mats[["tpm"]], 0L)
+  
+  player_means <- data.table(
+    Player = player_names,
+    Team   = player_teams,
+    AvgFP  = round(rowMeans(dk_mat),            1),
+    pts    = round(rowMeans(pts_mat),            1),
+    tpm    = round(rowMeans(stat_mats[["tpm"]]), 1),
+    twom   = round(rowMeans(twom_mat),           1),
+    ftm    = round(rowMeans(stat_mats[["ftm"]]), 1),
+    reb    = round(rowMeans(stat_mats[["reb"]]), 1),
+    ast    = round(rowMeans(stat_mats[["ast"]]), 1),
+    stl    = round(rowMeans(stat_mats[["stl"]]), 1),
+    blk    = round(rowMeans(stat_mats[["blk"]]), 1),
+    to     = round(rowMeans(stat_mats[["to"]]),  1)
+  )
+  setorder(player_means, Team, -AvgFP)
+  
+  # Team totals per sim — colSums of each team's rows in the matrices
+  # then mean across sims = true avg team total, not avg of player averages
+  team_means <- rbindlist(lapply(teams, function(tm) {
+    pidx <- which(player_teams == tm)
+    data.table(
+      Team  = tm,
+      AvgFP = round(mean(colSums(dk_mat[pidx, , drop=FALSE])),            1),
+      pts   = round(mean(colSums(pts_mat[pidx, , drop=FALSE])),           1),
+      tpm   = round(mean(colSums(stat_mats[["tpm"]][pidx, , drop=FALSE])),1),
+      twom  = round(mean(colSums(twom_mat[pidx, , drop=FALSE])),          1),
+      ftm   = round(mean(colSums(stat_mats[["ftm"]][pidx, , drop=FALSE])),1),
+      reb   = round(mean(colSums(stat_mats[["reb"]][pidx, , drop=FALSE])),1),
+      ast   = round(mean(colSums(stat_mats[["ast"]][pidx, , drop=FALSE])),1),
+      stl   = round(mean(colSums(stat_mats[["stl"]][pidx, , drop=FALSE])),1),
+      blk   = round(mean(colSums(stat_mats[["blk"]][pidx, , drop=FALSE])),1),
+      to    = round(mean(colSums(stat_mats[["to"]][pidx,  , drop=FALSE])),1)
+    )
+  }))
+  setorder(team_means, -AvgFP)
+  
+  sport_visuals <- list(
+    teams        = teams,
+    player_means = player_means,
+    team_means   = team_means
+  )
+  
   list(sim_results = sim_results, metadata = metadata,
-       has_fd = has_fd, has_sd = has_sd, sport_visuals = NULL)
+       has_fd = has_fd, has_sd = has_sd, sport_visuals = sport_visuals)
 }
 
 
@@ -609,7 +658,6 @@ find_optimal_lineups_cbb <- function(sim_results, metadata, config, verbose = TR
   
   salary_cap  <- config$salary_cap
   max_lineups <- if (!is.null(config$max_lineups)) config$max_lineups else 5000L
-  top_n       <- 25L
   
   meta <- unique(metadata[, .(Player, DKSalary, PosGroup, GameKey)], by = "Player")
   meta[, g_elig := PosGroup %in% c("G", "G/F")]
@@ -631,7 +679,6 @@ find_optimal_lineups_cbb <- function(sim_results, metadata, config, verbose = TR
     by = "Player"
   )
   opt_data <- opt_data[Salary > 0 & !is.na(Salary) & !is.na(FantasyPoints)]
-  opt_data[, ppd := FantasyPoints / Salary * 1000]
   setkey(opt_data, SimID)
   
   sim_ids   <- unique(opt_data$SimID)
@@ -639,20 +686,16 @@ find_optimal_lineups_cbb <- function(sim_results, metadata, config, verbose = TR
   start_t   <- Sys.time()
   prog_freq <- max(1L, n_sims %/% 20L)
   
-  if (verbose) cat(sprintf("  %s players | %s sims | $%s cap | top %d per pos\n",
+  if (verbose) cat(sprintf("  %s players | %s sims | $%s cap\n",
                            format(nrow(meta), big.mark=","),
                            format(n_sims, big.mark=","),
-                           format(salary_cap, big.mark=","), top_n))
+                           format(salary_cap, big.mark=",")))
   
   lineup_list <- vector("list", n_sims)
   
   for (i in seq_along(sim_ids)) {
     sid  <- sim_ids[i]
-    sd   <- opt_data[.(sid)]
-    pool <- unique(rbind(
-      sd[g_elig == TRUE][order(-ppd)][seq_len(min(top_n, .N))],
-      sd[f_elig == TRUE][order(-ppd)][seq_len(min(top_n, .N))]
-    ), by = "Player")
+    pool <- opt_data[.(sid)]
     
     n_p <- nrow(pool)
     if (n_p < 8L) next
@@ -753,7 +796,6 @@ find_optimal_lineups_cbb_fd <- function(sim_results, metadata, config, verbose =
   
   salary_cap  <- config$salary_cap
   max_lineups <- if (!is.null(config$max_lineups)) config$max_lineups else 5000L
-  top_n       <- 25L
   
   # Use FDPosGroup if available, fall back to PosGroup
   pos_col <- if ("FDPosGroup" %in% names(metadata)) "FDPosGroup" else "PosGroup"
@@ -778,7 +820,6 @@ find_optimal_lineups_cbb_fd <- function(sim_results, metadata, config, verbose =
     by = "Player"
   )
   opt_data <- opt_data[Salary > 0 & !is.na(Salary) & !is.na(FantasyPoints)]
-  opt_data[, ppd := FantasyPoints / Salary * 1000]
   setkey(opt_data, SimID)
   
   sim_ids   <- unique(opt_data$SimID)
@@ -786,20 +827,16 @@ find_optimal_lineups_cbb_fd <- function(sim_results, metadata, config, verbose =
   start_t   <- Sys.time()
   prog_freq <- max(1L, n_sims %/% 20L)
   
-  if (verbose) cat(sprintf("  %s players | %s sims | $%s cap | top %d per pos\n",
+  if (verbose) cat(sprintf("  %s players | %s sims | $%s cap\n",
                            format(nrow(meta), big.mark=","),
                            format(n_sims, big.mark=","),
-                           format(salary_cap, big.mark=","), top_n))
+                           format(salary_cap, big.mark=",")))
   
   lineup_list <- vector("list", n_sims)
   
   for (i in seq_along(sim_ids)) {
     sid  <- sim_ids[i]
-    sd   <- opt_data[.(sid)]
-    pool <- unique(rbind(
-      sd[g_elig == TRUE][order(-ppd)][seq_len(min(top_n, .N))],
-      sd[f_elig == TRUE][order(-ppd)][seq_len(min(top_n, .N))]
-    ), by = "Player")
+    pool <- opt_data[.(sid)]
     
     n_p <- nrow(pool)
     if (n_p < 8L) next
