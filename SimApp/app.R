@@ -81,8 +81,8 @@ ui <- dashboardPage(
   dashboardSidebar(
     width = 200,
     tags$div(
-      style = "padding: 15px; text-align: center; background-color: #000000; border-bottom: 2px solid #FFE500;",
-      tags$img(src = "logo.jpg", width = "160px")
+      style = "padding:15px;text-align:center;background:#000;border-bottom:2px solid #FFE500;",
+      tags$img(src = "logo.jpg", width = "160px", id = "gts_logo")
     ),
     sidebarMenu(
       id = "sidebar_menu",
@@ -159,10 +159,22 @@ ui <- dashboardPage(
       /* Remove AdminLTE header - logo is the brand */
       .main-header{display:none!important}
       .skin-black .wrapper,.skin-black .main-sidebar,.skin-black .left-side{padding-top:0!important;top:0!important}
-      .content-wrapper,.main-footer{margin-left:200px!important}
-      .skin-black .sidebar-mini.sidebar-collapse .content-wrapper{margin-left:50px!important}
-      .main-sidebar{top:0!important;height:100vh}
+      .content-wrapper,.main-footer{margin-left:200px!important;transition:margin-left .2s ease}
+      .sidebar-collapse .content-wrapper,.sidebar-collapse .main-footer{margin-left:50px!important}
+      .main-sidebar{top:0!important;height:100vh;transition:width .2s ease}
+      .sidebar-collapse .main-sidebar{width:50px!important;overflow:hidden}
+      .sidebar-collapse .sidebar-menu>li>a>span{display:none!important}
+      .sidebar-collapse .sidebar-menu>li>a{padding:12px 15px!important}
+      .sidebar-collapse #gts_logo{width:24px!important}
       .sidebar-menu>li>.treeview-menu{background:#0a0a0a}
+
+      /* Sidebar collapse tab — fixed to right edge of sidebar */
+      #gts_sb_tab{position:fixed;top:50%;left:200px;transform:translateY(-50%);z-index:9999;
+        background:#1a1a1a;border:1px solid #333;border-left:none;border-radius:0 4px 4px 0;
+        color:#555;font-size:11px;padding:10px 4px;cursor:pointer;line-height:1;
+        transition:left .2s ease,color .2s;writing-mode:vertical-lr}
+      #gts_sb_tab:hover{color:#FFE500;background:#222;border-color:#FFE500}
+      .sidebar-collapse #gts_sb_tab{left:50px}
 
       /* Platform pill selector — used in sim results and lineup scoring */
       .gts-platform-pills{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
@@ -2625,119 +2637,154 @@ server <- function(input, output, session) {
   
   render_mma_visuals <- function(visuals) {
     req(visuals)
-    all_fighters <- if (!is.null(visuals$fighter_summary)) sort(visuals$fighter_summary$Player) else character(0)
-    top15 <- if (!is.null(visuals$fighter_summary)) {
-      fs <- visuals$fighter_summary; setDT(fs)
-      head(fs[order(-DKSalary), Player], 15)
-    } else all_fighters
     fluidRow(column(12,
-                    box(width=NULL, title="MMA SIMULATION ANALYSIS", status="primary", solidHeader=TRUE,
-                        div(class="gts-chart-filter",
-                            span(class="gts-chart-filter-label", "Fighters:"),
-                            selectizeInput("mma_fighter_filter", NULL,
-                                           choices=all_fighters, selected=top15, multiple=TRUE,
-                                           options=list(plugins=list("remove_button"), placeholder="Select fighters"),
-                                           width="600px")
-                        ),
-                        tabsetPanel(id="mma_visuals_tabs", type="tabs",
-                                    tabPanel("Outcome Distribution", div(style="margin-top:15px;"),
-                                             plotlyOutput("mma_outcome_dist_plot", height="auto") %>%
-                                               shinycssloaders::withSpinner(color="#FFE500", type=6)),
-                                    tabPanel("Win Score Distribution", div(style="margin-top:15px;"),
-                                             plotlyOutput("mma_score_dist_plot", height="auto") %>%
-                                               shinycssloaders::withSpinner(color="#FFE500", type=6))
+                    box(width = NULL, title = "MMA Simulation Analysis",
+                        status = "primary", solidHeader = TRUE,
+                        tabsetPanel(id = "mma_visuals_tabs", type = "tabs",
+                                    tabPanel("Win Methods", div(style = "margin-top:15px;"),
+                                             plotlyOutput("mma_outcome_dist_plot", height = "auto") %>%
+                                               shinycssloaders::withSpinner(color = "#FFE500", type = 6)),
+                                    tabPanel("Win Score Range", div(style = "margin-top:15px;"),
+                                             plotlyOutput("mma_score_dist_plot", height = "auto") %>%
+                                               shinycssloaders::withSpinner(color = "#FFE500", type = 6)),
+                                    tabPanel("Fight Combined Score", div(style = "margin-top:15px;"),
+                                             plotlyOutput("mma_fight_score_plot", height = "auto") %>%
+                                               shinycssloaders::withSpinner(color = "#FFE500", type = 6))
                         )
                     )
     ))
   }
   
+  
+  # ── Win Methods stacked bar ──────────────────────────────────────────────
   output$mma_outcome_dist_plot <- renderPlotly({
-    req(rv$sport == "MMA", rv$sport_visuals$outcome_pct, rv$sport_visuals$fighter_summary,
-        input$sim_results_platform)
-    platform <- input$sim_results_platform
-    op  <- copy(rv$sport_visuals$outcome_pct)
-    fs  <- copy(rv$sport_visuals$fighter_summary)
-    setDT(op); setDT(fs)
-    sal_col <- switch(platform, "DK"="DKSalary", "FD"="FDSalary", "SD"="SDSalary")
+    req(rv$sport == "MMA", rv$sport_visuals$outcome_pct, rv$sport_visuals$fighter_summary)
+    platform <- if (!is.null(input$sim_results_platform)) input$sim_results_platform else "DK"
+    op  <- copy(rv$sport_visuals$outcome_pct);     setDT(op)
+    fs  <- copy(rv$sport_visuals$fighter_summary); setDT(fs)
+    
+    sal_col <- switch(platform, "DK" = "DKSalary", "FD" = "FDSalary", "SDSalary")
     if (platform == "SD") {
       eligible <- fs[!is.na(SDSalary) & SDSalary > 0, Player]
-      fs <- fs[Player %in% eligible]
-      op <- op[Player %in% eligible]
+      fs <- fs[Player %in% eligible]; op <- op[Player %in% eligible]
     }
     setorderv(fs, sal_col, order = -1L)
     fs[, Label := sprintf("%s ($%s)", Player, format(get(sal_col), big.mark = ","))]
     name_to_label <- setNames(fs$Label, fs$Player)
     op[, YLabel := name_to_label[Player]]
-    label_order <- fs$Label
+    label_order   <- fs$Label
+    
     outcome_order <- c("QuickWin_R1","R1 Finish","R2 Finish","R3 Finish","R4 Finish","R5 Finish","Decision")
-    win_colors <- c(
-      "QuickWin_R1" = "#9932CC",
-      "R1 Finish"   = "#1E90FF",
-      "R2 Finish"   = "#32CD32",
-      "R3 Finish"   = "#FF8C00",
-      "R4 Finish"   = "maroon",
-      "R5 Finish"   = "#FFFF00",
+    win_colors    <- c(
+      "QuickWin_R1" = "#9932CC", "R1 Finish" = "#1E90FF", "R2 Finish" = "#32CD32",
+      "R3 Finish"   = "#FF8C00", "R4 Finish" = "#8B0000", "R5 Finish" = "#FFE500",
       "Decision"    = "#DC143C"
     )
+    n_fighters <- length(label_order)
+    h_px       <- max(280, n_fighters * 44)
+    
     p <- plot_ly()
     for (oc in outcome_order) {
       d <- op[Outcome == oc]
       if (nrow(d) == 0) next
-      p <- add_trace(p, x=d$WinPct, y=d$YLabel, name=oc, type="bar", orientation="h",
-                     marker=list(color=win_colors[oc]),
-                     hovertemplate=paste0("<b>%{y}</b><br>", oc, ": %{x:.1f}%<extra></extra>"))
+      p <- add_trace(p, x = d$WinPct, y = d$YLabel, name = oc,
+                     type = "bar", orientation = "h",
+                     marker = list(color = win_colors[oc]),
+                     hovertemplate = paste0("<b>%{y}</b><br>", oc, ": %{x:.1f}%<extra></extra>"))
     }
     p %>% layout(
-      barmode="stack",
-      title=list(text="Win Method Distribution", font=list(color="#FFE500", size=16)),
-      xaxis=list(title="Win Percentage (%)", gridcolor="#2a2a2a", color="#FFFFFF"),
-      yaxis=list(title="", categoryorder="array", categoryarray=rev(label_order), color="#FFFFFF"),
-      paper_bgcolor="#121212", plot_bgcolor="#141414",
-      font=list(color="#FFFFFF", size=11),
-      legend=list(orientation="h", y=-0.12),
-      margin=list(l=220, r=30, t=60, b=80)
-    )
+      barmode = "stack",
+      xaxis   = list(title = "Win %", gridcolor = "#2a2a2a", color = "#888"),
+      yaxis   = list(title = "", categoryorder = "array",
+                     categoryarray = rev(label_order), color = "#ccc",
+                     tickfont = list(size = 11)),
+      paper_bgcolor = "#121212", plot_bgcolor = "#141414",
+      font          = list(color = "#FFFFFF", size = 11),
+      legend        = list(orientation = "h", y = -0.15, font = list(size = 11, color = "#ccc")),
+      height        = h_px,
+      margin        = list(l = 220, r = 30, t = 20, b = 80)
+    ) %>% config(displayModeBar = FALSE)
   })
   
+  
+  # ── Win Score Range box plot ─────────────────────────────────────────────
   output$mma_score_dist_plot <- renderPlotly({
-    req(rv$sport == "MMA", rv$sport_visuals$score_dist, rv$sport_visuals$player_data,
-        input$sim_results_platform)
-    platform <- input$sim_results_platform
-    cfg <- switch(platform,
-                  "DK" = list(score_col="DKScore", sal_col="DKSalary", color="#FFE500",
-                              title="DK Win Score Distribution"),
-                  "FD" = list(score_col="FDScore", sal_col="FDSalary", color="#FFE500",
-                              title="FD Win Score Distribution"),
-                  "SD" = list(score_col="DKScore", sal_col="SDSalary", color="#FFE500",
-                              title="Showdown Win Score Distribution (DK Scoring)")
-    )
-    sd_data <- copy(rv$sport_visuals$score_dist)
-    meta    <- copy(rv$sport_visuals$player_data)
-    setDT(sd_data); setDT(meta)
+    req(rv$sport == "MMA", rv$sport_visuals$score_dist, rv$sport_visuals$player_data)
+    platform <- if (!is.null(input$sim_results_platform)) input$sim_results_platform else "DK"
+    score_col <- if (platform == "FD") "FDScore" else "DKScore"
+    sal_col   <- switch(platform, "DK" = "DKSalary", "FD" = "FDSalary", "SDSalary")
+    
+    sd_data <- copy(rv$sport_visuals$score_dist); setDT(sd_data)
+    meta    <- copy(rv$sport_visuals$player_data); setDT(meta)
+    
     if (platform == "SD") {
       eligible <- meta[!is.na(SDSalary) & SDSalary > 0, Player]
-      sd_data  <- sd_data[Player %in% eligible]
-      meta     <- meta[Player %in% eligible]
+      sd_data <- sd_data[Player %in% eligible]; meta <- meta[Player %in% eligible]
     }
-    if (length(selected) > 0) { sd_data <- sd_data[Player %in% selected]; meta <- meta[Player %in% selected] }
-    wins <- sd_data[Win == 1L]
+    wins <- sd_data[as.integer(Win) == 1L]
     if (nrow(wins) == 0) return(plotly_empty())
-    sal_col  <- cfg$sal_col
-    sal_order <- meta[order(get(sal_col)), Player]
-    wins[, Player := factor(Player, levels = sal_order)]
-    wins <- as.data.frame(wins)
-    plot_ly(data=wins, x=wins[[cfg$score_col]], y=~Player, type="box", orientation="h",
-            marker=list(color=cfg$color), line=list(color=cfg$color),
-            fillcolor=paste0(substr(cfg$color,1,7),"40")) %>%
+    
+    # Order by median score descending
+    med_ord <- wins[, .(Med = median(get(score_col))), by = Player]
+    setorder(med_ord, Med)
+    wins[, Player := factor(Player, levels = med_ord$Player)]
+    
+    n_fighters <- length(unique(wins$Player))
+    h_px       <- max(280, n_fighters * 42)
+    
+    plot_ly(data = as.data.frame(wins),
+            x = wins[[score_col]], y = ~Player,
+            type = "box", orientation = "h",
+            marker    = list(color = "#FFE500", size = 3),
+            line      = list(color = "#FFE500"),
+            fillcolor = "rgba(255,229,0,0.18)") %>%
       layout(
-        title=list(text=cfg$title, font=list(color="#FFE500", size=16)),
-        xaxis=list(title="Fantasy Points (Wins Only)", gridcolor="#2a2a2a", color="#FFFFFF"),
-        yaxis=list(title="", color="#FFFFFF"),
-        paper_bgcolor="#121212", plot_bgcolor="#141414",
-        font=list(color="#FFFFFF", size=11),
-        showlegend=FALSE,
-        margin=list(l=160, r=30, t=60, b=50)
-      )
+        xaxis = list(title = "Fantasy Points (wins only)", gridcolor = "#2a2a2a",
+                     color = "#888", zeroline = FALSE),
+        yaxis = list(title = "", color = "#ccc", tickfont = list(size = 11),
+                     automargin = TRUE),
+        paper_bgcolor = "#121212", plot_bgcolor = "#141414",
+        font          = list(color = "#FFFFFF", size = 11),
+        showlegend    = FALSE, height = h_px,
+        margin        = list(l = 160, r = 30, t = 20, b = 50)
+      ) %>% config(displayModeBar = FALSE)
+  })
+  
+  
+  # ── Fight Combined Score box plot ────────────────────────────────────────
+  output$mma_fight_score_plot <- renderPlotly({
+    req(rv$sport == "MMA", rv$sport_visuals$fight_scores)
+    platform  <- if (!is.null(input$sim_results_platform)) input$sim_results_platform else "DK"
+    score_col <- if (platform == "FD") "CombinedFD" else "CombinedDK"
+    label     <- if (platform == "FD") "FD" else "DK"
+    
+    fs <- copy(rv$sport_visuals$fight_scores); setDT(fs)
+    if (nrow(fs) == 0) return(plotly_empty())
+    
+    # Order fights by median combined score descending
+    med_ord <- fs[, .(Med = median(get(score_col))), by = FightLabel]
+    setorder(med_ord, Med)
+    fs[, FightLabel := factor(FightLabel, levels = med_ord$FightLabel)]
+    
+    n_fights <- length(unique(fs$FightLabel))
+    h_px     <- max(200, n_fights * 60)
+    
+    plot_ly(data = as.data.frame(fs),
+            x = fs[[score_col]], y = ~FightLabel,
+            type = "box", orientation = "h",
+            marker    = list(color = "#4A90D9", size = 3),
+            line      = list(color = "#4A90D9"),
+            fillcolor = "rgba(74,144,217,0.18)") %>%
+      layout(
+        xaxis = list(title = paste(label, "Combined Fight Score"),
+                     gridcolor = "#2a2a2a", color = "#888", zeroline = FALSE),
+        yaxis = list(title = "", color = "#ccc", tickfont = list(size = 11),
+                     automargin = TRUE),
+        paper_bgcolor = "#121212", plot_bgcolor = "#141414",
+        font          = list(color = "#FFFFFF", size = 11),
+        showlegend    = FALSE, height = h_px,
+        margin        = list(l = 220, r = 30, t = 20, b = 50)
+      ) %>% config(displayModeBar = FALSE)
   })
   
   

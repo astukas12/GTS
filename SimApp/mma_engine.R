@@ -28,8 +28,8 @@ DK_WIN_BONUSES <- list(
   "R3"          = 45,
   "R4"          = 40,
   "R5"          = 40,
-  "Decision_R3" = 30,
-  "Decision_R5" = 30,
+  "Decision_R3" = 30, "Decision3" = 30,
+  "Decision_R5" = 30, "Decision5" = 30,
   "Decision"    = 30
 )
 
@@ -40,8 +40,8 @@ FD_WIN_BONUSES <- list(
   "R3"          = 50,
   "R4"          = 35,
   "R5"          = 25,
-  "Decision_R3" = 20,
-  "Decision_R5" = 20,
+  "Decision_R3" = 20, "Decision3" = 20,
+  "Decision_R5" = 20, "Decision5" = 20,
   "Decision"    = 20
 )
 
@@ -88,12 +88,13 @@ create_mma_metadata <- function(fights_data) {
   setDT(fights_data)
   meta <- unique(fights_data[, .(
     Player   = Name,
+    Opponent = as.character(Opponent),
     DKSalary = as.numeric(DKSalary),
     DKID     = as.character(DKID),
-    DKOwn    = as.numeric(DKOwn),
+    DKOwn    = as.numeric(DKOwn) * 100,
     FDSalary = as.numeric(FDSalary),
     FDID     = as.character(FDID),
-    FDOwn    = as.numeric(FDOwn),
+    FDOwn    = as.numeric(FDOwn) * 100,
     CPTID    = as.character(CPTID),
     SDID     = as.character(SDID),
     SDSalary = as.numeric(SDSal),
@@ -109,11 +110,11 @@ create_mma_metadata <- function(fights_data) {
 run_mma_simulation <- function(input_data, n_sims, config, progress_callback = NULL) {
   
   t_start <- proc.time()["elapsed"]
-  
-  cat("\n")
-  cat("============================================================\n")
-  cat("  MMA SIMULATION ENGINE\n")
-  cat("============================================================\n")
+  cb <- function(detail, value) {
+    if (!is.null(progress_callback)) progress_callback(detail, value)
+    cat(sprintf("  [%.0f%%] %s\n", value * 100, detail)); flush.console()
+  }
+  cb("Starting...", 0.0)
   
   # --------------------------------------------------------------------------
   # Load and coerce data
@@ -141,18 +142,7 @@ run_mma_simulation <- function(input_data, n_sims, config, progress_callback = N
   fight_pairs <- fight_pairs[Fighter1 < Fighter2]
   n_fights    <- nrow(fight_pairs)
   
-  cat(sprintf("  Fighters  : %d\n",  nrow(fights_data)))
-  cat(sprintf("  Fights    : %d\n",  n_fights))
-  cat(sprintf("  Sims      : %s\n",  format(n_sims, big.mark = ",")))
-  cat("------------------------------------------------------------\n\n")
-  
-  if (!is.null(progress_callback))
-    progress_callback("Allocating sims to outcomes...", 0.05)
-  
-  # --------------------------------------------------------------------------
-  # STEP 1: Allocate n_sims deterministically across outcomes per fight
-  # --------------------------------------------------------------------------
-  cat("[STEP 1/3] Allocating sims to outcomes...\n")
+  cb("Allocating outcomes...", 0.05)
   
   outcome_cols <- c("R1","QuickWin_R1","R2","R3","R4","R5","Decision")
   
@@ -186,6 +176,10 @@ run_mma_simulation <- function(input_data, n_sims, config, progress_callback = N
         # Exact outcome mapping: Fights col -> Scores Outcome value
         # MUST use exact match: grepl("R1") also hits "QuickWin_R1",
         # grepl("R3") also hits "Decision_R3" -> wrong base scores + wrong bonus
+        # Map engine outcome name -> Scores sheet outcome name
+        # Scores sheet uses Decision3/Decision5 (not Decision_R3/Decision_R5)
+        is_5r <- !is.null(fighter_row$Rounds) && !is.na(fighter_row$Rounds) &&
+          as.integer(fighter_row$Rounds) == 5L
         scores_outcome <- switch(oc,
                                  "R1"          = "R1",
                                  "QuickWin_R1" = "QuickWin_R1",
@@ -193,14 +187,18 @@ run_mma_simulation <- function(input_data, n_sims, config, progress_callback = N
                                  "R3"          = "R3",
                                  "R4"          = "R4",
                                  "R5"          = "R5",
-                                 "Decision"    = if (!is.null(fighter_row$Rounds) &&
-                                                     !is.na(fighter_row$Rounds) &&
-                                                     as.integer(fighter_row$Rounds) == 5L)
-                                   "Decision_R5" else "Decision_R3",
+                                 "Decision"    = if (is_5r) "Decision5" else "Decision3",
                                  oc
         )
         score_rows <- scores_data[Winner == winner & Loser == loser &
                                     Outcome == scores_outcome]
+        # Fallback: try alternate decision naming conventions
+        if (nrow(score_rows) == 0 && oc == "Decision") {
+          for (alt in c("Decision_R5","Decision_R3","Decision5","Decision3","Decision")) {
+            score_rows <- scores_data[Winner == winner & Loser == loser & Outcome == alt]
+            if (nrow(score_rows) > 0) break
+          }
+        }
         if (nrow(score_rows) == 0)
           score_rows <- scores_data[Winner == winner & Loser == loser]
         if (nrow(score_rows) == 0) next
@@ -239,20 +237,11 @@ run_mma_simulation <- function(input_data, n_sims, config, progress_callback = N
         plan_idx <- plan_idx + 1L
       }
     }
-    
-    cat(sprintf("  Fight %2d/%d : %-25s vs %s\n", fi, n_fights, f1, f2))
   }
   
   plan <- rbindlist(plan_list[1:(plan_idx - 1L)], fill = TRUE)
-  cat(sprintf("\n  Total outcome blocks : %d\n\n", nrow(plan)))
   
-  if (!is.null(progress_callback))
-    progress_callback("Generating scores...", 0.35)
-  
-  # --------------------------------------------------------------------------
-  # STEP 2: Generate scores for every outcome block (vectorized)
-  # --------------------------------------------------------------------------
-  cat("[STEP 2/3] Generating scores...\n")
+  cb("Generating scores...", 0.35)
   
   result_list <- vector("list", nrow(plan) * 2L)
   result_idx  <- 1L
@@ -294,17 +283,8 @@ run_mma_simulation <- function(input_data, n_sims, config, progress_callback = N
     )
     result_idx <- result_idx + 1L
     
-    # Progress every fight (2 blocks per fighter = ~2*n_outcomes per fight)
-    if (ri %% max(1L, floor(nrow(plan) / 20L)) == 0 || ri == nrow(plan)) {
-      pct <- ri / nrow(plan)
-      cat(sprintf("\r  Scoring: %d/%d blocks (%.0f%%)   ", ri, nrow(plan), pct * 100))
-      if (!is.null(progress_callback))
-        progress_callback(sprintf("Scoring outcomes... %.0f%%", pct * 100),
-                          0.35 + pct * 0.45)
-    }
+    
   }
-  cat("\n")
-  
   sim_results <- rbindlist(result_list[1:(result_idx - 1L)], use.names = TRUE)
   
   # Assign shared SimIDs 1..n_sims across all fights so each SimID = one full slate.
@@ -346,17 +326,9 @@ run_mma_simulation <- function(input_data, n_sims, config, progress_callback = N
   sim_results <- rbindlist(sim_results_list)
   sim_results[, FightIdx := NULL]
   
-  elapsed_scores <- proc.time()["elapsed"] - t_start
-  cat(sprintf("\n  Rows generated: %s in %.1fs\n\n",
-              format(nrow(sim_results), big.mark = ","), elapsed_scores))
   
-  if (!is.null(progress_callback))
-    progress_callback("Building metadata and visuals...", 0.82)
   
-  # --------------------------------------------------------------------------
-  # STEP 3: Metadata + sport_visuals
-  # --------------------------------------------------------------------------
-  cat("[STEP 3/3] Building metadata and visuals...\n")
+  cb("Building results...", 0.82)
   
   metadata <- create_mma_metadata(fights_data)
   
@@ -399,26 +371,58 @@ run_mma_simulation <- function(input_data, n_sims, config, progress_callback = N
   
   score_dist <- sim_results[, .(Player, DKScore, FDScore, Win)]
   
+  # Fight-level combined scores: both fighters summed per sim per fight
+  # Uses fight_pairs and metadata opponent lookup already built above
+  fight_scores <- sim_results[, .(
+    CombinedDK = sum(DKScore),
+    CombinedFD = sum(FDScore),
+    Outcome    = Outcome[Win == 1L][1],
+    Winner     = Player[Win == 1L][1]
+  ), by = .(SimID, FightIdx = {
+    # Map player back to fight index via opponent lookup
+    opp_lu <- unique(fights_data[, .(Name, Opponent)])
+    fi_lu  <- data.table(
+      Player   = fight_pairs$Fighter1,
+      FightIdx = seq_len(n_fights)
+    )
+    fi_lu2 <- data.table(
+      Player   = fight_pairs$Fighter2,
+      FightIdx = seq_len(n_fights)
+    )
+    all_fi <- rbind(fi_lu, fi_lu2)
+    all_fi[match(sim_results$Player, all_fi$Player), FightIdx]
+  })]
+  
+  # Simpler approach: build fight_scores directly from plan
+  fight_scores <- rbindlist(lapply(seq_len(n_fights), function(fi) {
+    f1 <- fight_pairs$Fighter1[fi]
+    f2 <- fight_pairs$Fighter2[fi]
+    fight_label <- paste0(f1, " vs ", f2)
+    block <- sim_results[Player %in% c(f1, f2)]
+    if (nrow(block) == 0) return(NULL)
+    block[, .(
+      FightLabel  = fight_label,
+      CombinedDK  = sum(DKScore),
+      CombinedFD  = sum(FDScore),
+      Outcome     = Outcome[Win == 1L][1] %||% Outcome[1],
+      Winner      = Player[Win == 1L][1]  %||% Player[1]
+    ), by = SimID]
+  }))
+  
   sport_visuals <- list(
     dk_fantasy      = dk_fantasy,
     fd_fantasy      = fd_fantasy,
     outcome_pct     = outcome_pct,
     fighter_summary = fighter_summary,
     score_dist      = score_dist,
+    fight_scores    = fight_scores,
     player_data     = metadata
   )
   
-  elapsed_total <- proc.time()["elapsed"] - t_start
-  cat(sprintf("  Metadata: %d fighters\n", nrow(metadata)))
-  cat("\n")
-  cat("============================================================\n")
-  cat(sprintf("  MMA SIMULATION COMPLETE in %.1fs\n", elapsed_total))
-  cat(sprintf("  %s result rows | %d fighters\n",
-              format(nrow(sim_results), big.mark = ","), nrow(metadata)))
-  cat("============================================================\n\n")
-  
-  if (!is.null(progress_callback))
-    progress_callback("Complete!", 1.0)
+  elapsed <- round((proc.time()["elapsed"] - t_start)[1], 1)
+  cat(sprintf("  MMA sim complete: %d fighters | %s rows | %.1fs\n",
+              nrow(metadata), format(nrow(sim_results), big.mark=","), elapsed))
+  cb("Complete", 1.0)
   
   return(list(
     sim_results   = sim_results,
