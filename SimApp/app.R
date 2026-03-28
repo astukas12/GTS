@@ -1854,7 +1854,7 @@ server <- function(input, output, session) {
       if (salary_col %in% names(exp_tbl)) setnames(exp_tbl, salary_col, "Salary")
       if (!is_sd && !is.null(own_col) && own_col %in% names(exp_tbl)) {
         setnames(exp_tbl, own_col, "OwnProj")
-        if (!is_cbb) exp_tbl[, OwnProj := OwnProj * 100]
+        if (max(exp_tbl$OwnProj, na.rm = TRUE) <= 1) exp_tbl[, OwnProj := OwnProj * 100]
         exp_tbl[, OwnProj  := round(OwnProj, 1)]
         exp_tbl[, Leverage := round(Exposure - OwnProj, 1)]
       }
@@ -2043,7 +2043,7 @@ server <- function(input, output, session) {
       if (salary_col %in% names(exp_tbl)) setnames(exp_tbl, salary_col, "Salary")
       if (!is_sd && !is.null(own_col) && own_col %in% names(exp_tbl)) {
         setnames(exp_tbl, own_col, "OwnProj")
-        if (!is_cbb) exp_tbl[, OwnProj := OwnProj * 100]
+        if (max(exp_tbl$OwnProj, na.rm = TRUE) <= 1) exp_tbl[, OwnProj := OwnProj * 100]
         exp_tbl[, OwnProj  := round(OwnProj, 1)]
         exp_tbl[, Leverage := round(Exposure - OwnProj, 1)]
       }
