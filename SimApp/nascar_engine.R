@@ -63,20 +63,19 @@ run_nascar_simulation <- function(input_data, n_sims, config, progress_callback 
   # After setnames, make a fresh copy to reset data.table reference
   driver_data <- copy(driver_data)
   
-  cat(sprintf("\n[NASCAR SIMULATION]\n"))
-  cat(sprintf("Drivers: %d\n", nrow(driver_data)))
-  cat(sprintf("Simulations: %s\n", format(n_sims, big.mark = ",")))
-  cat(sprintf("Race Profiles: %d\n", nrow(race_profiles)))
-  cat(sprintf("Platforms: DK%s\n\n", ifelse(has_fd, " + FD", " only")))
+  cb <- function(detail, value) {
+    if (!is.null(progress_callback)) progress_callback(detail = detail, value = value)
+    cat(sprintf("  [%.0f%%] %s\n", value * 100, detail)); flush.console()
+  }
+  cb("Starting...", 0.0)
+  cat(sprintf("  NASCAR: %d drivers | %s sims | %d race profiles\n",
+              nrow(driver_data), format(n_sims, big.mark=","), nrow(race_profiles)))
   
   # ========================================================================
   # STEP 1: Simulate Finish Positions
   # ========================================================================
   
-  cat("[STEP 1/3] Generating finish positions...\n")
-  if (!is.null(progress_callback)) {
-    progress_callback(detail = "Generating finish positions...", value = 0.1)
-  }
+  cb("Generating finish positions...", 0.10)
   start_time <- Sys.time()
   
   driver_distributions <- precompute_driver_distributions(driver_data)
@@ -89,10 +88,7 @@ run_nascar_simulation <- function(input_data, n_sims, config, progress_callback 
   # STEP 2: Calculate Fantasy Points (DK and FD)
   # ========================================================================
   
-  cat("[STEP 2/3] Calculating fantasy points...\n")
-  if (!is.null(progress_callback)) {
-    progress_callback(detail = "Calculating fantasy points...", value = 0.3)
-  }
+  cb("Calculating fantasy points...", 0.30)
   start_time <- Sys.time()
   
   scoring_systems <- create_scoring_system()
@@ -103,7 +99,6 @@ run_nascar_simulation <- function(input_data, n_sims, config, progress_callback 
   # This is done ONCE before the simulation loop instead of 10,000 times
   # Massive speedup: reduces 800M calculations to ~40K
   
-  cat("  Pre-computing race profile distance matrices...\n")
   
   race_distance_data <- list()
   
@@ -122,7 +117,6 @@ run_nascar_simulation <- function(input_data, n_sims, config, progress_callback 
     }
   }
   
-  cat(sprintf("  Pre-computed %d race profiles\n", length(race_distance_data)))
   
   # Split profiles by race for fast lookup (kept for compatibility)
   race_profiles_by_race <- split(race_profiles, race_profiles$RaceID)
@@ -193,26 +187,25 @@ run_nascar_simulation <- function(input_data, n_sims, config, progress_callback 
   
   cat("\n")
   elapsed <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
-  cat(sprintf("  b Fantasy points completed in %.1f seconds\n\n", elapsed))
   
   # ========================================================================
   # STEP 3: Combine Results
   # ========================================================================
   
-  cat("[STEP 3/3] Combining results...\n")
-  if (!is.null(progress_callback)) {
-    progress_callback(detail = "Combining results...", value = 0.95)
-  }
+  cb("Combining results...", 0.95)
   start_time <- Sys.time()
   
   combined_results <- rbindlist(all_results)
+  # Standardize score column names to match rest of platform
+  if ("DKScore" %in% names(combined_results))
+    setnames(combined_results, "DKScore", "DKScore")
+  if ("FDScore" %in% names(combined_results))
+    setnames(combined_results, "FDScore", "FDScore")
   
   elapsed <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
   cat(sprintf("  b Results combined in %.1f seconds\n\n", elapsed))
   
-  if (!is.null(progress_callback)) {
-    progress_callback(detail = "Simulation complete!", value = 1.0)
-  }
+  
   
   # ========================================================================
   # PREPARE OUTPUT (Match Universal Template Contract)
@@ -221,9 +214,9 @@ run_nascar_simulation <- function(input_data, n_sims, config, progress_callback 
   # Simulation results (long format)
   sim_results <- combined_results[, .(
     SimID,
-    Player = Name,  # Rename to standard "Player" column
-    DKScore = DKFantasyPoints,
-    FDScore = FDFantasyPoints
+    Player = Name,
+    DKScore,
+    FDScore
   )]
   
   # Player metadata (one row per player)
@@ -241,13 +234,11 @@ run_nascar_simulation <- function(input_data, n_sims, config, progress_callback 
     Car
   )])
   
-  cat("[SIMULATION COMPLETE]\n\n")
   
   # ========================================================================
   # PREPARE SPORT-SPECIFIC VISUALIZATIONS
   # ========================================================================
   
-  cat("Preparing NASCAR-specific visualizations...\n")
   
   # Calculate simulation accuracy metrics for ALL levels
   sim_stats <- combined_results[, .(
@@ -290,26 +281,77 @@ run_nascar_simulation <- function(input_data, n_sims, config, progress_callback 
     diff_top30 = sim_top30 - input_top30
   )]
   
-  # Visualization data is all in combined_results, just pass it organized
-  sport_visuals <- list(
-    # Full simulation results for all visualizations
-    full_results = combined_results,
-    
-    # Simulation accuracy validation data
-    accuracy_data = accuracy_data,
-    
-    # Metadata about platforms
-    has_fd = has_fd
+  # Pre-aggregate visualization data from combined_results.
+  # Box plots only need quantiles per driver — no need to pass 1.9M rows to Shiny.
+  # Compute once here: P5/P25/P50/P75/P95 + mean for each metric per driver.
+  
+  make_box_stats <- function(dt, val_col, group_col = "Name") {
+    dt[, .(
+      P5   = quantile(get(val_col), 0.05),
+      P25  = quantile(get(val_col), 0.25),
+      P50  = median(get(val_col)),
+      P75  = quantile(get(val_col), 0.75),
+      P95  = quantile(get(val_col), 0.95),
+      Mean = mean(get(val_col))
+    ), by = group_col]
+  }
+  
+  # Driver metadata (one row per driver — salary, starting pos)
+  driver_meta <- unique(combined_results[, .(Name, DKSalary, Starting)])
+  if (has_fd) driver_meta <- merge(
+    driver_meta,
+    unique(combined_results[, .(Name, FDSalary)]),
+    by = "Name", all.x = TRUE
   )
   
-  cat("NASCAR visualizations prepared\n\n")
+  # Pre-aggregated box stats for each chart
+  fp_dk   <- make_box_stats(combined_results, "DKScore")
+  fp_dk   <- merge(fp_dk, driver_meta, by = "Name")
+  
+  dom_dk  <- make_box_stats(combined_results, "DKDominatorPoints")
+  dom_dk  <- merge(dom_dk, driver_meta[, .(Name, DKSalary, Starting)], by = "Name")
+  
+  finish  <- make_box_stats(combined_results, "FinishPosition")
+  finish  <- merge(finish, driver_meta[, .(Name, Starting)], by = "Name")
+  
+  if (has_fd) {
+    fp_fd  <- make_box_stats(combined_results, "FDScore")
+    fp_fd  <- merge(fp_fd, driver_meta[, .(Name, FDSalary, Starting)], by = "Name")
+    dom_fd <- make_box_stats(combined_results, "FDDominatorPoints")
+    dom_fd <- merge(dom_fd, driver_meta[, .(Name, DKSalary, Starting)], by = "Name")
+  } else {
+    fp_fd  <- NULL
+    dom_fd <- NULL
+  }
+  
+  sport_visuals <- list(
+    fp_dk       = fp_dk,
+    fp_fd       = fp_fd,
+    dom_dk      = dom_dk,
+    dom_fd      = dom_fd,
+    finish      = finish,
+    driver_meta = driver_meta,
+    accuracy_data = accuracy_data,
+    has_fd      = has_fd,
+    # Keep full_results for optimizer/download — but only needed cols
+    full_results = combined_results[, intersect(
+      c("SimID","Name","Starting","FinishPosition","DKSalary","DKScore",
+        "FDScore","DKDominatorPoints","FDDominatorPoints"),
+      names(combined_results)), with = FALSE]
+  )
+  
+  cb("Complete", 1.0)
+  elapsed_total <- as.numeric(difftime(Sys.time(), start_time, units="secs"))
+  cat(sprintf("  NASCAR sim complete: %d drivers | %s sims | %.1fs
+",
+              nrow(driver_data), format(n_sims, big.mark=","), elapsed_total))
   
   return(list(
-    sim_results = sim_results,      # Summary for optimization
-    metadata = metadata,             # Player metadata  
-    full_results = combined_results, # Full data for visualizations (LEGACY - keeping for compatibility)
-    has_fd = has_fd,                 # Flag indicating if FD data was present
-    sport_visuals = sport_visuals    # NEW: Sport-specific visualization data
+    sim_results   = sim_results,
+    metadata      = metadata,
+    full_results  = combined_results,
+    has_fd        = has_fd,
+    sport_visuals = sport_visuals
   ))
 }
 
@@ -415,15 +457,26 @@ precompute_driver_distributions <- function(driver_data) {
     position_probs[31:40] <- prob_31_40 * weights_31_40
     
     # =========================================================================
+    # HARD-ZERO MASK: positions that had zero input probability stay zero
+    # after normalization — prevents floating-point leakage into excluded zones
+    # =========================================================================
+    zero_mask <- position_probs == 0
+    
+    # =========================================================================
     # NORMALIZE (ensure probabilities sum to 1.0)
     # =========================================================================
     total_prob <- sum(position_probs)
     if (total_prob > 0) {
       position_probs <- position_probs / total_prob
     } else {
-      # Fallback: uniform distribution (should never happen)
       position_probs <- rep(1/n_positions, n_positions)
     }
+    
+    # Re-apply hard zeros (normalization cannot create probability where none existed)
+    position_probs[zero_mask] <- 0
+    # Re-normalize after masking
+    total_prob2 <- sum(position_probs)
+    if (total_prob2 > 0) position_probs <- position_probs / total_prob2
     
     prob_matrix[i, ] <- position_probs
   }
@@ -432,75 +485,88 @@ precompute_driver_distributions <- function(driver_data) {
 }
 
 
-#' Simulate finish positions - sample from full distribution then resolve conflicts
-#' 
-#' Collision resolution rules:
-#' 1. Process best-to-worst (front runners get priority for contested spots)
-#' 2. Bumped drivers move BACKWARD only (to a worse position than sampled)
-#' 3. When bumping, skip positions where the driver has zero input probability
-#'    (enforces hard range constraints — Hill can never finish top-30 if T30=0)
-#' 4. Fallback cascade if rules 2/3 can't be satisfied simultaneously
+#' Simulate finish positions with hard zero-probability enforcement
+#'
+#' Zero-probability positions (e.g. W=0 means position 1 is impossible) are
+#' NEVER assigned, even as a last resort. Each driver's valid positions are
+#' pre-computed once. Collision resolution bumps displaced drivers to the closest
+#' valid available position, worst-to-best priority so front-runners always win
+#' contested spots. If no valid position remains (extremely rare edge case with
+#' many drivers fighting for few tail spots), the driver is placed at their
+#' closest boundary position — never outside their allowed range.
 simulate_finish_positions_vectorized <- function(prob_matrix, n_sims) {
-  n_drivers <- nrow(prob_matrix)
+  n_drivers   <- nrow(prob_matrix)
   n_positions <- ncol(prob_matrix)
   driver_names <- rownames(prob_matrix)
   
+  # Pre-compute valid positions per driver (non-zero prob only) — done once
+  valid_positions <- lapply(seq_len(n_drivers), function(i) {
+    which(prob_matrix[i, ] > 0)
+  })
+  names(valid_positions) <- driver_names
+  
   # Pre-allocate output matrix
-  final_positions <- matrix(0, nrow = n_drivers, ncol = n_sims)
+  final_positions <- matrix(0L, nrow = n_drivers, ncol = n_sims)
   rownames(final_positions) <- driver_names
   
-  for (sim_id in 1:n_sims) {
-    # Step 1: Each driver samples from their FULL probability distribution
-    sampled_positions <- numeric(n_drivers)
-    for (i in 1:n_drivers) {
-      sampled_positions[i] <- sample(1:n_positions, size = 1, prob = prob_matrix[i, ])
+  for (sim_id in seq_len(n_sims)) {
+    
+    # Step 1: Each driver samples ONLY from their valid (non-zero) positions
+    sampled_positions <- integer(n_drivers)
+    for (i in seq_len(n_drivers)) {
+      vp <- valid_positions[[i]]
+      sampled_positions[i] <- if (length(vp) == 1L) vp else
+        sample(vp, 1L, prob = prob_matrix[i, vp])
     }
     
-    # Step 2: Resolve conflicts
-    # Best-to-worst: front runners claim their spots first
-    # Bumped drivers only move backward and only into positions they have
-    # non-zero input probability for — this hard-enforces the input ranges
-    assigned_positions <- numeric(n_drivers)
-    available_positions <- 1:n_positions
+    # Step 2: Resolve conflicts — process best sampled position first
+    # (front-runners claim spots; bumped drivers move to next valid available)
+    assigned_positions <- integer(n_drivers)
+    occupied <- logical(n_positions)   # TRUE = position already taken
     
     driver_order <- order(sampled_positions)  # ascending = best first
     
     for (driver_idx in driver_order) {
       sampled_pos <- sampled_positions[driver_idx]
-      driver_probs <- prob_matrix[driver_idx, ]
+      vp          <- valid_positions[[driver_idx]]
       
-      if (sampled_pos %in% available_positions) {
+      if (!occupied[sampled_pos]) {
         # Position is free — take it
         assigned_positions[driver_idx] <- sampled_pos
-        available_positions <- available_positions[available_positions != sampled_pos]
+        occupied[sampled_pos] <- TRUE
       } else {
-        # Position taken — bump backward, respecting zero-prob constraints
+        # Position taken — find closest valid available position
+        # Prefer worse (higher number) to preserve ordering intent; if none, take better
+        available_valid <- vp[!occupied[vp]]
         
-        # Priority 1: available positions that are worse AND have non-zero probability
-        worse_valid <- available_positions[
-          available_positions >= sampled_pos & driver_probs[available_positions] > 0
-        ]
-        
-        if (length(worse_valid) > 0) {
-          chosen_pos <- worse_valid[1]  # closest valid worse position
-        } else {
-          # Priority 2: any available position with non-zero probability
-          any_valid <- available_positions[driver_probs[available_positions] > 0]
-          
-          if (length(any_valid) > 0) {
-            distances <- abs(any_valid - sampled_pos)
-            chosen_pos <- any_valid[which.min(distances)]
+        if (length(available_valid) > 0L) {
+          # Closest valid available to sampled (prefer worse if tie)
+          dists <- available_valid - sampled_pos
+          # Positive = worse (preferred), negative = better (fallback)
+          worse  <- available_valid[dists >= 0L]
+          better <- available_valid[dists <  0L]
+          if (length(worse) > 0L) {
+            chosen_pos <- worse[which.min(worse - sampled_pos)]
           } else {
-            # Priority 3: absolute last resort — closest available (no valid probs left)
-            distances <- abs(available_positions - sampled_pos)
-            chosen_pos <- available_positions[which.min(distances)]
+            chosen_pos <- better[which.max(better)]  # closest better
+          }
+        } else {
+          # No valid positions left — place at boundary of allowed range
+          # This preserves the zero-prob contract: never outside valid range
+          chosen_pos <- if (sampled_pos > max(vp)) max(vp) else min(vp)
+          # If even boundary is occupied, find nearest occupied-but-valid
+          # (shouldn't normally happen with 40 slots and <40 drivers)
+          if (occupied[chosen_pos]) {
+            candidates <- vp[order(abs(vp - sampled_pos))]
+            chosen_pos <- candidates[1L]
           }
         }
         
         assigned_positions[driver_idx] <- chosen_pos
-        available_positions <- available_positions[available_positions != chosen_pos]
+        occupied[chosen_pos] <- TRUE
       }
     }
+    
     
     final_positions[, sim_id] <- assigned_positions
   }
@@ -605,7 +671,7 @@ calculate_fantasy_points <- function(race_result, scoring_systems, has_fd = TRUE
   dk_position_diff <- race_result$Starting - race_result$FinishPosition
   
   # Use set() instead of := to avoid internal reference warnings
-  set(race_result, j = "DKFantasyPoints", 
+  set(race_result, j = "DKScore", 
       value = dk_finish_points + race_result$DKDominatorPoints + dk_position_diff)
   
   # FanDuel (only if has_fd is TRUE)
@@ -614,11 +680,11 @@ calculate_fantasy_points <- function(race_result, scoring_systems, has_fd = TRUE
     fd_position_diff <- race_result$Starting - race_result$FinishPosition
     
     # Use set() instead of := to avoid internal reference warnings
-    set(race_result, j = "FDFantasyPoints", 
+    set(race_result, j = "FDScore", 
         value = fd_finish_points + race_result$FDDominatorPoints + (fd_position_diff)*.5)
   } else {
     # Set FD fantasy points to 0 when not available
-    set(race_result, j = "FDFantasyPoints", value = 0)
+    set(race_result, j = "FDScore", value = 0)
   }
   
   return(race_result)
@@ -832,24 +898,24 @@ calculate_projections <- function(sim_results, driver_data) {
   
   # Calculate DK projections
   dk_proj <- sim_results[, .(
-    DK_Floor = quantile(DKFantasyPoints, 0.10),
-    DK_P25 = quantile(DKFantasyPoints, 0.25),
-    DK_Median = median(DKFantasyPoints),
-    DK_P75 = quantile(DKFantasyPoints, 0.75),
-    DK_Ceiling = quantile(DKFantasyPoints, 0.90),
-    DK_Mean = mean(DKFantasyPoints),
-    DK_StdDev = sd(DKFantasyPoints)
+    DK_Floor = quantile(DKScore, 0.10),
+    DK_P25 = quantile(DKScore, 0.25),
+    DK_Median = median(DKScore),
+    DK_P75 = quantile(DKScore, 0.75),
+    DK_Ceiling = quantile(DKScore, 0.90),
+    DK_Mean = mean(DKScore),
+    DK_StdDev = sd(DKScore)
   ), by = Name]
   
   # Calculate FD projections
   fd_proj <- sim_results[, .(
-    FD_Floor = quantile(FDFantasyPoints, 0.10),
-    FD_P25 = quantile(FDFantasyPoints, 0.25),
-    FD_Median = median(FDFantasyPoints),
-    FD_P75 = quantile(FDFantasyPoints, 0.75),
-    FD_Ceiling = quantile(FDFantasyPoints, 0.90),
-    FD_Mean = mean(FDFantasyPoints),
-    FD_StdDev = sd(FDFantasyPoints)
+    FD_Floor = quantile(FDScore, 0.10),
+    FD_P25 = quantile(FDScore, 0.25),
+    FD_Median = median(FDScore),
+    FD_P75 = quantile(FDScore, 0.75),
+    FD_Ceiling = quantile(FDScore, 0.90),
+    FD_Mean = mean(FDScore),
+    FD_StdDev = sd(FDScore)
   ), by = Name]
   
   # Merge projections
@@ -1534,6 +1600,11 @@ get_full_nascar_simulation_data <- function(input_data, n_sims, config) {
   
   # Return FULL combined results
   combined_results <- rbindlist(all_results)
+  # Standardize score column names to match rest of platform
+  if ("DKScore" %in% names(combined_results))
+    setnames(combined_results, "DKScore", "DKScore")
+  if ("FDScore" %in% names(combined_results))
+    setnames(combined_results, "FDScore", "FDScore")
   
   return(combined_results)
 }

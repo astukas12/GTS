@@ -170,10 +170,10 @@ ui <- dashboardPage(
 
       /* Sidebar collapse tab — fixed to right edge of sidebar */
       #gts_sb_tab{position:fixed;top:50%;left:200px;transform:translateY(-50%);z-index:9999;
-        background:#1a1a1a;border:1px solid #333;border-left:none;border-radius:0 4px 4px 0;
-        color:#555;font-size:11px;padding:10px 4px;cursor:pointer;line-height:1;
-        transition:left .2s ease,color .2s;writing-mode:vertical-lr}
-      #gts_sb_tab:hover{color:#FFE500;background:#222;border-color:#FFE500}
+        background:#111;border:1px solid #2a2a2a;border-left:none;border-radius:0 6px 6px 0;
+        color:#444;font-size:13px;width:16px;height:48px;padding:0;cursor:pointer;line-height:48px;
+        text-align:center;transition:left .2s ease,color .15s,background .15s,border-color .15s}
+      #gts_sb_tab:hover{color:#FFE500;background:#1a1a1a;border-color:#444}
       .sidebar-collapse #gts_sb_tab{left:50px}
 
       /* Platform pill selector — used in sim results and lineup scoring */
@@ -316,6 +316,43 @@ ui <- dashboardPage(
       }
     });
     
+    // ── Sidebar collapse toggle ──────────────────────────────────────────
+    // Injects a small ◄/► tab fixed to the right edge of the sidebar.
+    // State persists in localStorage across page refreshes.
+    (function() {
+      function applyState(collapsed) {
+        var body = document.querySelector('body');
+        var btn  = document.getElementById('gts_sb_tab');
+        if (collapsed) {
+          body.classList.add('sidebar-collapse');
+          if (btn) btn.textContent = '\u25BA';
+        } else {
+          body.classList.remove('sidebar-collapse');
+          if (btn) btn.textContent = '\u25C4';
+        }
+      }
+
+      var btn = document.createElement('button');
+      btn.id  = 'gts_sb_tab';
+      btn.title = 'Toggle sidebar (or press [)';
+      btn.onclick = function() {
+        var collapsed = !document.querySelector('body').classList.contains('sidebar-collapse');
+        applyState(collapsed);
+        localStorage.setItem('gts_sb', collapsed ? '1' : '0');
+      };
+      document.body.appendChild(btn);
+
+      // Restore saved state
+      applyState(localStorage.getItem('gts_sb') === '1');
+
+      // Keyboard shortcut: [ to toggle
+      document.addEventListener('keydown', function(e) {
+        if (e.key === '[' && !e.target.matches('input,textarea,select')) {
+          btn.click();
+        }
+      });
+    })();
+
     $(document).ready(function() {
       setTimeout(function() {
         $('select[multiple]').each(function() {
@@ -2194,8 +2231,10 @@ server <- function(input, output, session) {
     std_cols <- intersect(c("Player", salary_col, own_col), names(meta))
     proj <- merge(proj, meta[, ..std_cols], by = "Player", all.x = TRUE)
     if (salary_col %in% names(proj)) setnames(proj, salary_col, "Salary")
-    if (own_col    %in% names(proj)) {
+    if (own_col %in% names(proj)) {
       setnames(proj, own_col, "Own")
+      # Auto-detect decimal format (e.g. 0.25) vs percentage (25) — multiply if needed
+      if (max(proj$Own, na.rm = TRUE) <= 1) proj[, Own := Own * 100]
       proj[, Own := round(Own, 1)]
     }
     
@@ -2238,6 +2277,12 @@ server <- function(input, output, session) {
     stat_cols  <- intersect(c("Avg","Median","P90","P75","P20"), names(proj))
     skip_cols  <- c(base_cols, stat_cols, "Proj","Mins")
     sport_cols <- setdiff(names(proj), skip_cols)
+    # NASCAR: Car -> Starting -> Team order
+    if (rv$sport == "NASCAR") {
+      nascar_order <- c("Car","Starting","Team")
+      sport_cols <- c(intersect(nascar_order, sport_cols),
+                      setdiff(sport_cols, nascar_order))
+    }
     # Put CBB Proj/Mins after salary
     cbb_extra  <- intersect(c("Proj","Mins"), names(proj))
     display_order <- c(base_cols, cbb_extra, sport_cols, stat_cols)
@@ -2480,156 +2525,83 @@ server <- function(input, output, session) {
   # ---------- NASCAR ----------
   
   render_nascar_visuals <- function(visuals, platform) {
-    all_drivers <- if (!is.null(visuals$full_results)) {
-      avgs <- visuals$full_results[, .(Avg=mean(DKScore)), by=Name]
-      setorder(avgs, -Avg); head(avgs$Name, 15)
-    } else character(0)
-    all_driver_choices <- if (!is.null(visuals$full_results)) sort(unique(visuals$full_results$Name)) else character(0)
     fluidRow(column(12,
-                    box(width=NULL, title="NASCAR SIMULATION ANALYSIS", status="primary", solidHeader=TRUE,
-                        div(class="gts-chart-filter",
-                            span(class="gts-chart-filter-label", "Drivers:"),
-                            selectizeInput("nascar_driver_filter", NULL,
-                                           choices=all_driver_choices, selected=all_drivers, multiple=TRUE,
-                                           options=list(plugins=list("remove_button"), placeholder="Select drivers"),
-                                           width="600px")
-                        ),
-                        tabsetPanel(id="nascar_visuals_tabs", type="tabs",
-                                    tabPanel("Finishing Position", div(style="margin-top:15px;"),
-                                             plotlyOutput("finish_distribution_plot", height="auto") %>%
-                                               shinycssloaders::withSpinner(color="#FFE500",type=6)),
-                                    tabPanel("Fantasy Points", div(style="margin-top:15px;"),
-                                             plotlyOutput("nascar_fantasy_plot", height="auto") %>%
-                                               shinycssloaders::withSpinner(color="#FFE500",type=6)),
-                                    tabPanel("Dominator by Driver", div(style="margin-top:15px;"),
-                                             plotlyOutput("dominator_violin_driver", height="auto") %>%
-                                               shinycssloaders::withSpinner(color="#FFE500",type=6)),
-                                    tabPanel("Dominator by Position",
-                                             div(style="margin-top:15px; margin-bottom:15px;",
-                                                 div(class="gts-platform-pills",
-                                                     tags$button(class="gts-pill active", id="dom_grp_start",
-                                                                 onclick="Shiny.setInputValue('dominator_position_group','start',{priority:'event'});this.classList.add('active');document.getElementById('dom_grp_finish').classList.remove('active')",
-                                                                 "Starting Position"),
-                                                     tags$button(class="gts-pill", id="dom_grp_finish",
-                                                                 onclick="Shiny.setInputValue('dominator_position_group','finish',{priority:'event'});this.classList.add('active');document.getElementById('dom_grp_start').classList.remove('active')",
-                                                                 "Finish Position")
-                                                 )),
-                                             plotlyOutput("dominator_violin_position", height="450px") %>%
-                                               shinycssloaders::withSpinner(color="#FFE500",type=6))
+                    box(width = NULL, title = "NASCAR Simulation Analysis",
+                        status = "primary", solidHeader = TRUE,
+                        tabsetPanel(id = "nascar_visuals_tabs", type = "tabs",
+                                    tabPanel("Fantasy Points", div(style = "margin-top:15px;"),
+                                             plotlyOutput("nascar_fantasy_plot", height = "auto") %>%
+                                               shinycssloaders::withSpinner(color = "#FFE500", type = 6)),
+                                    tabPanel("Finishing Position", div(style = "margin-top:15px;"),
+                                             plotlyOutput("nascar_finish_plot", height = "auto") %>%
+                                               shinycssloaders::withSpinner(color = "#FFE500", type = 6)),
+                                    tabPanel("Dominator by Driver", div(style = "margin-top:15px;"),
+                                             plotlyOutput("dominator_violin_driver", height = "auto") %>%
+                                               shinycssloaders::withSpinner(color = "#FFE500", type = 6))
                         )
                     )
     ))
   }
   
-  output$finish_distribution_plot <- renderPlotly({
-    req(rv$sport=="NASCAR", rv$sport_visuals$full_results, input$sim_results_platform)
-    tryCatch({
-      selected <- input$nascar_driver_filter
-      plot_data <- copy(rv$sport_visuals$full_results)
-      if (length(selected) > 0) plot_data <- plot_data[Name %in% selected]
-      driver_order    <- plot_data[, .(Starting=unique(Starting)), by=Name]
-      setorder(driver_order, Starting)
-      ordered_drivers <- driver_order$Name
-      plot_data       <- as.data.frame(plot_data)
-      plot_data$Name  <- factor(plot_data$Name, levels=rev(ordered_drivers))
-      n_d <- length(ordered_drivers); h_px <- max(300, n_d * 34)
-      plot_ly(data=plot_data, x=~FinishPosition, y=~Name, type="box", orientation="h",
-              marker=list(color="#FFE500"), line=list(color="#FFE500"),
-              fillcolor="rgba(255,229,0,0.3)",
-              hovertemplate="<b>%{y}</b><br>Median: %{x}<br><extra></extra>") %>%
-        layout(
-          title=list(text="Finishing Position Distribution",font=list(color="#FFE500",size=14)),
-          xaxis=list(title="Finish Position",gridcolor="#2a2a2a",dtick=5,showgrid=TRUE,range=c(0,41),color="#888"),
-          yaxis=list(title="",categoryorder="array",categoryarray=rev(ordered_drivers),color="#ccc",automargin=TRUE,tickfont=list(size=11)),
-          paper_bgcolor="#121212", plot_bgcolor="#141414",
-          font=list(color="#FFFFFF",size=11), showlegend=FALSE,
-          height=h_px, margin=list(l=160,r=30,t=40,b=50)) %>%
-        config(displayModeBar=TRUE,
-               modeBarButtonsToRemove=c("select2d","lasso2d","autoScale2d"),
-               displaylogo=FALSE)
-    }, error=function(e) { plotly_empty() })
-  })
+  
+  # Helper: build a NASCAR box plot from precomputed quantile stats (P5/P25/P50/P75/P95)
+  nascar_box_plot <- function(dt, color, title_x, range_x = NULL) {
+    setDT(dt); setorder(dt, P50)
+    ordered <- dt$Name
+    h_px    <- max(300, nrow(dt) * 34)
+    p <- plot_ly()
+    for (i in seq_len(nrow(dt))) {
+      row <- dt[i]
+      p <- add_trace(p, type = "box", orientation = "h", name = row$Name,
+                     lowerfence = list(row$P5),  q1 = list(row$P25), median = list(row$P50),
+                     q3 = list(row$P75), upperfence = list(row$P95), y = list(row$Name),
+                     marker = list(color = color), line = list(color = color),
+                     fillcolor = paste0(color, "30"), showlegend = FALSE)
+    }
+    x_layout <- list(title = title_x, gridcolor = "#2a2a2a", color = "#888", zeroline = FALSE)
+    if (!is.null(range_x)) x_layout$range <- range_x
+    p %>% layout(
+      xaxis = x_layout,
+      yaxis = list(title = "", categoryorder = "array", categoryarray = ordered,
+                   color = "#ccc", automargin = TRUE, tickfont = list(size = 11)),
+      paper_bgcolor = "#121212", plot_bgcolor = "#141414",
+      font = list(color = "#FFFFFF", size = 11), showlegend = FALSE,
+      height = h_px, margin = list(l = 160, r = 30, t = 20, b = 50)
+    ) %>% config(displayModeBar = FALSE)
+  }
+  
   
   output$nascar_fantasy_plot <- renderPlotly({
-    req(rv$sport=="NASCAR", rv$sport_visuals$full_results, input$sim_results_platform)
+    req(rv$sport == "NASCAR", rv$sport_visuals$fp_dk)
     tryCatch({
-      platform  <- input$sim_results_platform
-      selected  <- input$nascar_driver_filter
-      score_col <- if (platform == "DK") "DKScore" else "FDScore"
-      sal_col   <- if (platform == "DK") "DKSalary" else "FDSalary"
-      plot_data <- copy(rv$sport_visuals$full_results)
-      if (length(selected) > 0) plot_data <- plot_data[Name %in% selected]
-      if (!score_col %in% names(plot_data)) stop(paste(score_col, "not found in results"))
-      meta       <- unique(plot_data[, .(Name, Salary = get(sal_col) %||% 0)])
-      sal_order  <- meta[order(-Salary), Name]
-      plot_data  <- as.data.frame(plot_data)
-      plot_data$Name      <- factor(plot_data$Name, levels=rev(sal_order))
-      plot_data$FPScore   <- plot_data[[score_col]]
-      plot_ly(data=plot_data, x=~FPScore, y=~Name, type="box", orientation="h",
-              marker=list(color="#FFE500"), line=list(color="#FFE500"),
-              fillcolor="rgba(255,229,0,0.3)",
-              hovertemplate="<b>%{y}</b><br>Median: %{x:.1f}<br><extra></extra>") %>%
-        layout(
-          title=list(text=paste(platform, "Fantasy Points Distribution"),
-                     font=list(color="#FFE500",size=16)),
-          xaxis=list(title=paste(platform,"Fantasy Points"),gridcolor="#2a2a2a",
-                     showgrid=TRUE,color="#FFFFFF"),
-          yaxis=list(title="",categoryorder="array",
-                     categoryarray=rev(sal_order),color="#FFFFFF",
-                     automargin=TRUE),
-          paper_bgcolor="#121212", plot_bgcolor="#141414",
-          font=list(color="#FFFFFF",size=11), showlegend=FALSE,
-          height=max(300,length(sal_order)*34),
-          margin=list(l=160,r=30,t=40,b=50)) %>%
-        config(displayModeBar=TRUE,
-               modeBarButtonsToRemove=c("select2d","lasso2d","autoScale2d"),
-               displaylogo=FALSE)
-    }, error=function(e) { plotly_empty() })
+      platform <- if (!is.null(input$sim_results_platform) && nchar(input$sim_results_platform) > 0) input$sim_results_platform else "DK"
+      dt <- if (platform == "FD" && !is.null(rv$sport_visuals$fp_fd)) copy(rv$sport_visuals$fp_fd) else copy(rv$sport_visuals$fp_dk)
+      sal_col <- if (platform == "FD" && "FDSalary" %in% names(dt)) "FDSalary" else "DKSalary"
+      setorder(dt, -get(sal_col))
+      dt[, Name := factor(Name, levels = rev(Name))]
+      nascar_box_plot(dt, color = "#FFE500", title_x = paste(platform, "Fantasy Points"))
+    }, error = function(e) { plotly_empty() })
   })
+  
+  
+  output$nascar_finish_plot <- renderPlotly({
+    req(rv$sport == "NASCAR", rv$sport_visuals$finish)
+    tryCatch({
+      dt <- copy(rv$sport_visuals$finish)
+      setorder(dt, Starting)
+      dt[, Name := factor(Name, levels = rev(Name))]
+      nascar_box_plot(dt, color = "#FFE500", title_x = "Finish Position", range_x = c(0, 41))
+    }, error = function(e) { plotly_empty() })
+  })
+  
   
   output$dominator_violin_driver <- renderPlotly({
-    req(rv$sport=="NASCAR", rv$sport_visuals$full_results, input$sim_results_platform)
+    req(rv$sport == "NASCAR", rv$sport_visuals$dom_dk)
     tryCatch({
-      dom_col  <- if (input$sim_results_platform=="DK") "DKDominatorPoints" else "FDDominatorPoints"
-      selected <- input$nascar_driver_filter
-      all_data <- rv$sport_visuals$full_results
-      if (length(selected) > 0) all_data <- all_data[Name %in% selected]
-      driver_avg <- all_data[, .(AvgDom=mean(get(dom_col))), by=Name]
-      setorder(driver_avg, -AvgDom)
-      plot_data  <- as.data.frame(all_data)
-      medians     <- rv$sport_visuals$full_results[Name %in% top_drivers,
-                                                   .(Median=median(get(dom_col))), by=Name]
-      setorder(medians, -Median)
-      plot_data$Name      <- factor(plot_data$Name, levels=rev(medians$Name))
-      plot_data$DomPoints <- plot_data[[dom_col]]
-      plot_ly(data=plot_data, x=~DomPoints, y=~Name, type="box", orientation="h",
-              marker=list(color="#FFE500"), line=list(color="#FFE500"),
-              fillcolor="rgba(255,229,0,0.3)",
-              hovertemplate="<b>%{y}</b><br>Median: %{x}<br><extra></extra>") %>%
-        layout(
-          title=list(text=paste(input$sim_results_platform,"Dominator - Top 15"),
-                     font=list(color="#FFE500",size=16)),
-          xaxis=list(title="Dominator Points",gridcolor="#2a2a2a",showgrid=TRUE,color="#FFFFFF"),
-          yaxis=list(title="",categoryorder="array",
-                     categoryarray=rev(medians$Name),color="#FFFFFF"),
-          paper_bgcolor="#121212", plot_bgcolor="#141414",
-          font=list(color="#FFFFFF",size=11), showlegend=FALSE,
-          height=max(300,nrow(driver_avg)*34),
-          margin=list(l=150,r=30,t=40,b=50)) %>%
-        config(displayModeBar=TRUE,
-               modeBarButtonsToRemove=c("select2d","lasso2d","autoScale2d"),
-               displaylogo=FALSE)
-    }, error=function(e) { plotly_empty() })
-  })
-  
-  output$dominator_violin_position <- renderPlotly({
-    req(rv$sport=="NASCAR", rv$sport_visuals$full_results, input$sim_results_platform)
-    tryCatch({
-      create_dominator_violin_by_position(
-        rv$sport_visuals$full_results,
-        platform = input$sim_results_platform,
-        group_by = input$dominator_position_group)
-    }, error=function(e) { plotly_empty() })
+      platform <- if (!is.null(input$sim_results_platform) && nchar(input$sim_results_platform) > 0) input$sim_results_platform else "DK"
+      dt <- if (platform == "FD" && !is.null(rv$sport_visuals$dom_fd)) copy(rv$sport_visuals$dom_fd) else copy(rv$sport_visuals$dom_dk)
+      nascar_box_plot(dt, color = "#4A90D9", title_x = paste(platform, "Dominator Points"))
+    }, error = function(e) { plotly_empty() })
   })
   
   
