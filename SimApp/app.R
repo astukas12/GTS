@@ -2545,21 +2545,23 @@ server <- function(input, output, session) {
   
   
   # Helper: build a NASCAR box plot from precomputed quantile stats (P5/P25/P50/P75/P95)
-  nascar_box_plot <- function(dt, color, title_x, range_x = NULL) {
-    setDT(dt); setorder(dt, P50)
-    ordered <- dt$Name
+  nascar_box_plot <- function(dt, color, title_x, range_x = NULL, sort_desc = FALSE, dtick_x = NULL) {
+    setDT(dt)
+    if (sort_desc) setorder(dt, -P50)
+    ordered <- as.character(dt$Name)
     h_px    <- max(300, nrow(dt) * 34)
     p <- plot_ly()
     for (i in seq_len(nrow(dt))) {
       row <- dt[i]
-      p <- add_trace(p, type = "box", orientation = "h", name = row$Name,
+      p <- add_trace(p, type = "box", orientation = "h", name = as.character(row$Name),
                      lowerfence = list(row$P5),  q1 = list(row$P25), median = list(row$P50),
-                     q3 = list(row$P75), upperfence = list(row$P95), y = list(row$Name),
+                     q3 = list(row$P75), upperfence = list(row$P95), y = list(as.character(row$Name)),
                      marker = list(color = color), line = list(color = color),
                      fillcolor = paste0(color, "30"), showlegend = FALSE)
     }
     x_layout <- list(title = title_x, gridcolor = "#2a2a2a", color = "#888", zeroline = FALSE)
-    if (!is.null(range_x)) x_layout$range <- range_x
+    if (!is.null(range_x))  x_layout$range <- range_x
+    if (!is.null(dtick_x))  x_layout$dtick <- dtick_x
     p %>% layout(
       xaxis = x_layout,
       yaxis = list(title = "", categoryorder = "array", categoryarray = ordered,
@@ -2576,10 +2578,8 @@ server <- function(input, output, session) {
     tryCatch({
       platform <- if (!is.null(input$sim_results_platform) && nchar(input$sim_results_platform) > 0) input$sim_results_platform else "DK"
       dt <- if (platform == "FD" && !is.null(rv$sport_visuals$fp_fd)) copy(rv$sport_visuals$fp_fd) else copy(rv$sport_visuals$fp_dk)
-      sal_col <- if (platform == "FD" && "FDSalary" %in% names(dt)) "FDSalary" else "DKSalary"
-      setorder(dt, -get(sal_col))
-      dt[, Name := factor(Name, levels = rev(Name))]
-      nascar_box_plot(dt, color = "#FFE500", title_x = paste(platform, "Fantasy Points"))
+      setorder(dt, -DKSalary)
+      nascar_box_plot(dt, color = "#FFE500", title_x = paste(platform, "Fantasy Points"), sort_desc = FALSE, dtick_x = 5)
     }, error = function(e) { plotly_empty() })
   })
   
@@ -2589,7 +2589,6 @@ server <- function(input, output, session) {
     tryCatch({
       dt <- copy(rv$sport_visuals$finish)
       setorder(dt, Starting)
-      dt[, Name := factor(Name, levels = rev(Name))]
       nascar_box_plot(dt, color = "#FFE500", title_x = "Finish Position", range_x = c(0, 41))
     }, error = function(e) { plotly_empty() })
   })
@@ -2600,7 +2599,7 @@ server <- function(input, output, session) {
     tryCatch({
       platform <- if (!is.null(input$sim_results_platform) && nchar(input$sim_results_platform) > 0) input$sim_results_platform else "DK"
       dt <- if (platform == "FD" && !is.null(rv$sport_visuals$dom_fd)) copy(rv$sport_visuals$dom_fd) else copy(rv$sport_visuals$dom_dk)
-      nascar_box_plot(dt, color = "#4A90D9", title_x = paste(platform, "Dominator Points"))
+      nascar_box_plot(dt, color = "#4A90D9", title_x = paste(platform, "Dominator Points"), sort_desc = TRUE)
     }, error = function(e) { plotly_empty() })
   })
   
