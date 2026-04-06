@@ -373,26 +373,7 @@ ui <- dashboardPage(
         }
       });
     });
-    $(document).on('click', '.delete-build', function(e) {
-      e.stopPropagation(); e.preventDefault();
-      var b = $(this).data('build'), p = null;
-      if ($('#portfolio_dk_tabs').is(':visible'))      p = 'DraftKings';
-      else if ($('#portfolio_fd_tabs').is(':visible')) p = 'FanDuel';
-      else if ($('#portfolio_sd_tabs').is(':visible')) p = 'Showdown';
-      if (p==='DraftKings') Shiny.setInputValue('dk_delete_build', b, {priority:'event'});
-      else if (p==='FanDuel')   Shiny.setInputValue('fd_delete_build', b, {priority:'event'});
-      else if (p==='Showdown')  Shiny.setInputValue('sd_delete_build', b, {priority:'event'});
-    });
-    $(document).on('click', '.delete-lineup', function(e) {
-      e.stopPropagation(); e.preventDefault();
-      var r = $(this).data('row'), p = null;
-      if ($('#portfolio_dk_tabs').is(':visible'))      p = 'DraftKings';
-      else if ($('#portfolio_fd_tabs').is(':visible')) p = 'FanDuel';
-      else if ($('#portfolio_sd_tabs').is(':visible')) p = 'Showdown';
-      if (p==='DraftKings') Shiny.setInputValue('dk_delete_lineup', r, {priority:'event'});
-      else if (p==='FanDuel')   Shiny.setInputValue('fd_delete_lineup', r, {priority:'event'});
-      else if (p==='Showdown')  Shiny.setInputValue('sd_delete_lineup', r, {priority:'event'});
-    });
+
     ))")),
     
     tabItems(
@@ -570,9 +551,12 @@ server <- function(input, output, session) {
     dk_builds          = list(),
     fd_builds          = list(),
     sd_builds          = list(),
-    dk_build_counter   = 0,
-    fd_build_counter   = 0,
-    sd_build_counter   = 0,
+    dk_build_counter        = 0,
+    fd_build_counter        = 0,
+    sd_build_counter        = 0,
+    dk_selected_builds      = character(0),
+    fd_selected_builds      = character(0),
+    sd_selected_builds      = character(0),
     golf_no_cut        = FALSE,
     golf_cut_line      = 65,
     has_fd             = TRUE,
@@ -870,7 +854,7 @@ server <- function(input, output, session) {
     display_table
   }
   
-  create_portfolio_display_table <- function(portfolio_data, sport_config) {
+  create_portfolio_display_table <- function(portfolio_data, sport_config, platform="") {
     display_table <- copy(portfolio_data); setDT(display_table)
     display_table[, RowID := .I]
     rename_map <- c("WinRate"="Win","Top1Pct"="Top1","Top5Pct"="Top5","Top10Pct"="Top10","Top20Pct"="Top20",
@@ -884,9 +868,6 @@ server <- function(input, output, session) {
           setnames(display_table, sc, dc)
       }
     }
-    display_table[, Delete := paste0(
-      '<button class="btn btn-danger btn-xs delete-lineup" data-row="', RowID, '">X</button>')]
-    setcolorder(display_table, c("Delete", setdiff(names(display_table), c("Delete","RowID"))))
     display_table
   }
   
@@ -1592,13 +1573,20 @@ server <- function(input, output, session) {
                            
                            tabPanel("Portfolio Summary",
                                     fluidRow(box(title="Portfolio Overview",status="warning",solidHeader=TRUE,width=12,
-                                                 hr(style="border-color:#FFE500;"), DTOutput(paste0(lp,"_builds_summary")))),
+                                                 hr(style="border-color:#FFE500;"),
+                                                 div(style="margin-bottom:8px;",
+                                                     actionButton(paste0(lp,"_delete_selected_builds"), "DELETE SELECTED BUILDS",
+                                                                  class="btn-danger btn-sm", style="font-weight:bold;")),
+                                                 DTOutput(paste0(lp,"_builds_summary")))),
                                     fluidRow(box(title="Portfolio Player Exposure",status="info",solidHeader=TRUE,width=12,
                                                  DTOutput(paste0(lp,"_portfolio_exposure"))))
                            ),
                            
                            tabPanel("Portfolio Lineups",
                                     fluidRow(box(title="All Portfolio Lineups",status="info",solidHeader=TRUE,width=12,
+                                                 div(style="margin-bottom:8px;",
+                                                     actionButton(paste0(lp,"_delete_selected_lineups"), "DELETE SELECTED LINEUPS",
+                                                                  class="btn-danger btn-sm", style="font-weight:bold;")),
                                                  DTOutput(paste0(lp,"_portfolio_lineups"))))
                            )
                )
@@ -1921,9 +1909,9 @@ server <- function(input, output, session) {
   # CLEAR / DELETE BUILDS / DELETE LINEUPS / COUNTS
   # ==========================================================================
   
-  observeEvent(input$dk_clear_portfolio,{rv$dk_portfolio<-NULL;rv$dk_builds<-list();rv$dk_build_counter<-0;showNotification("DK cleared",type="message")})
-  observeEvent(input$fd_clear_portfolio,{rv$fd_portfolio<-NULL;rv$fd_builds<-list();rv$fd_build_counter<-0;showNotification("FD cleared",type="message")})
-  observeEvent(input$sd_clear_portfolio,{rv$sd_portfolio<-NULL;rv$sd_builds<-list();rv$sd_build_counter<-0;showNotification("SD cleared",type="message")})
+  observeEvent(input$dk_clear_portfolio,{rv$dk_portfolio<-NULL;rv$dk_builds<-list();rv$dk_build_counter<-0;rv$dk_selected_builds<-character(0);showNotification("DK cleared",type="message")})
+  observeEvent(input$fd_clear_portfolio,{rv$fd_portfolio<-NULL;rv$fd_builds<-list();rv$fd_build_counter<-0;rv$fd_selected_builds<-character(0);showNotification("FD cleared",type="message")})
+  observeEvent(input$sd_clear_portfolio,{rv$sd_portfolio<-NULL;rv$sd_builds<-list();rv$sd_build_counter<-0;rv$sd_selected_builds<-character(0);showNotification("SD cleared",type="message")})
   
   make_delete_build <- function(lp) {
     observeEvent(input[[paste0(lp,"_delete_build")]], {
@@ -1935,6 +1923,7 @@ server <- function(input, output, session) {
           rv[[pn]] <- if(nrow(p)==0) NULL else p
         }
         rv[[bn]][[b]] <- NULL
+        rv[[paste0(lp,"_selected_builds")]] <- character(0)
         showNotification(paste0("Deleted: ",b),type="message")
       }
     })
@@ -1959,6 +1948,48 @@ server <- function(input, output, session) {
   }
   make_delete_lineup("dk"); make_delete_lineup("fd"); make_delete_lineup("sd")
   
+  # Delete selected builds via "DELETE SELECTED BUILDS" button
+  make_delete_selected_builds <- function(lp) {
+    observeEvent(input[[paste0(lp, "_delete_selected_builds")]], {
+      sel_rows <- input[[paste0(lp, "_builds_summary_rows_selected")]]
+      if (length(sel_rows) == 0) { showNotification("No builds selected.", type="warning"); return() }
+      bn <- paste0(lp, "_builds"); pn <- paste0(lp, "_portfolio")
+      builds_to_del <- names(rv[[bn]])[sel_rows]
+      for (b in builds_to_del) {
+        if (!is.null(rv[[pn]])) {
+          p <- rv[[pn]][!(Build %in% builds_to_del)]
+          rv[[pn]] <- if (nrow(p) == 0) NULL else p
+        }
+        rv[[bn]][[b]] <- NULL
+      }
+      rv[[paste0(lp, "_selected_builds")]] <- character(0)
+      showNotification(paste0("Deleted ", length(builds_to_del), " build(s)."), type="message")
+    })
+  }
+  make_delete_selected_builds("dk"); make_delete_selected_builds("fd"); make_delete_selected_builds("sd")
+  
+  # Delete selected lineups via "DELETE SELECTED LINEUPS" button
+  make_delete_selected_lineups <- function(lp) {
+    observeEvent(input[[paste0(lp, "_delete_selected_lineups")]], {
+      sel_rows <- input[[paste0(lp, "_portfolio_lineups_rows_selected")]]
+      if (length(sel_rows) == 0) { showNotification("No lineups selected.", type="warning"); return() }
+      pn <- paste0(lp, "_portfolio"); bn <- paste0(lp, "_builds")
+      port <- rv[[pn]]; req(port)
+      del_builds <- port[sel_rows, Build]
+      p <- port[-sel_rows]
+      # Update build lineup counts
+      for (b in names(rv[[bn]])) {
+        remaining <- if (nrow(p) > 0) sum(p$Build == b) else 0L
+        if (remaining == 0L) rv[[bn]][[b]] <- NULL
+        else rv[[bn]][[b]]$num_lineups <- remaining
+      }
+      rv[[pn]] <- if (nrow(p) == 0) NULL else p
+      if (is.null(rv[[pn]])) rv[[paste0(lp, "_build_counter")]] <- 0
+      showNotification(paste0("Deleted ", length(sel_rows), " lineup(s)."), type="message")
+    })
+  }
+  make_delete_selected_lineups("dk"); make_delete_selected_lineups("fd"); make_delete_selected_lineups("sd")
+  
   make_portfolio_count <- function(lp) {
     renderText({
       p <- rv[[paste0(lp,"_portfolio")]]
@@ -1979,10 +2010,9 @@ server <- function(input, output, session) {
     renderDT({
       builds <- rv[[paste0(lp,"_builds")]]; req(builds)
       builds_df <- data.table(Build=names(builds), Lineups=sapply(builds,function(b)b$num_lineups),
-                              Filters=sapply(builds,function(b) b$filters %||% ""),
-                              Delete=paste0('<button class="btn btn-danger btn-xs delete-build" data-build="',names(builds),'">Delete</button>'))
+                              Filters=sapply(builds,function(b) b$filters %||% ""))
       datatable(builds_df, options=list(dom='t',scrollX=TRUE,searching=FALSE,lengthChange=FALSE),
-                selection=list(mode='multiple',target='row'), escape=FALSE, rownames=FALSE)
+                selection=list(mode='multiple', target='row'), escape=FALSE, rownames=FALSE)
     })
   }
   output$dk_builds_summary <- make_builds_summary("dk")
@@ -2004,83 +2034,178 @@ server <- function(input, output, session) {
       meta_players <- if (is_sd) {
         rv$sim_metadata[!is.na(SDSalary) & SDSalary > 0, Player]
       } else rv$sim_metadata$Player
-      n_lineups  <- nrow(port)
-      all_counts <- table(unlist(port[, ..all_pc]))
-      exp_tbl <- data.table(Player = meta_players, Exposure = 0)
-      for (i in seq_len(nrow(exp_tbl))) {
-        p <- exp_tbl$Player[i]
-        if (p %in% names(all_counts)) exp_tbl$Exposure[i] <- as.numeric(all_counts[p]) / n_lineups * 100
+      
+      # Helper: compute per-player exposure % for a subset of lineups
+      compute_exp <- function(sub_port) {
+        n <- nrow(sub_port)
+        if (n == 0) return(setNames(rep(0, length(meta_players)), meta_players))
+        cnt <- table(unlist(sub_port[, ..all_pc]))
+        sapply(meta_players, function(p) if (p %in% names(cnt)) as.numeric(cnt[p]) / n * 100 else 0)
       }
-      if (is_f1 || (is_cbb && has_captain)) {
-        cpt_counts  <- if (length(cpt_cols))  table(unlist(port[, ..cpt_cols]))  else table(character(0))
-        util_counts <- if (length(util_cols)) table(unlist(port[, ..util_cols])) else table(character(0))
-        exp_tbl[, CptExp  := 0]
-        exp_tbl[, UtilExp := 0]
+      
+      # Check whether any builds are selected for in/out split
+      sel_builds <- rv[[paste0(lp, "_selected_builds")]]
+      in_out_mode <- length(sel_builds) > 0 && all(sel_builds %in% names(rv[[paste0(lp, "_builds")]]))
+      
+      if (in_out_mode) {
+        # ── IN / OUT split mode ──────────────────────────────────────────────
+        port_in  <- port[Build %in% sel_builds]
+        port_out <- port[!(Build %in% sel_builds)]
+        exp_tbl  <- data.table(
+          Player = meta_players,
+          ExpIN  = round(compute_exp(port_in),  1),
+          ExpOUT = round(compute_exp(port_out), 1),
+          ExpTOT = round(compute_exp(port),     1)
+        )
+        exp_tbl[, Diff := round(ExpIN - ExpOUT, 1)]
+        # Rename to friendlier display names
+        n_in  <- nrow(port_in);  n_out <- nrow(port_out)
+        setnames(exp_tbl, c("ExpIN","ExpOUT","ExpTOT","Diff"),
+                 c(paste0("IN (",  n_in,  "L)"),
+                   paste0("OUT (", n_out, "L)"),
+                   paste0("Total (", nrow(port), "L)"),
+                   "IN-OUT"))
+        
+        mc <- intersect(c("Player","PlayerType",salary_col,own_col,
+                          "PosGroup","RGProj","RGMin","GameTime","Starting","Team","Car",
+                          "Position","Match","Opponent","TeeTimeGroup","CutProb"),
+                        names(rv$sim_metadata))
+        mc <- mc[!is.na(mc)]
+        exp_tbl <- merge(exp_tbl, rv$sim_metadata[Player %in% meta_players, ..mc], by="Player", all.x=TRUE)
+        if (salary_col %in% names(exp_tbl)) setnames(exp_tbl, salary_col, "Salary")
+        
+        base_meta  <- c("Player", if (is_f1) "PlayerType" else NULL,
+                        "PosGroup","Salary","RGProj","RGMin","GameTime","Starting","Team","Car",
+                        "Position","Match","Opponent","TeeTimeGroup","CutProb")
+        meta_order <- intersect(base_meta, names(exp_tbl))
+        in_col  <- grep("^IN ",    names(exp_tbl), value=TRUE)
+        out_col <- grep("^OUT ",   names(exp_tbl), value=TRUE)
+        tot_col <- grep("^Total ", names(exp_tbl), value=TRUE)
+        diff_col <- "IN-OUT"
+        setcolorder(exp_tbl, c(meta_order, in_col, out_col, tot_col, diff_col))
+        exp_tbl <- exp_tbl[exp_tbl[[tot_col]] > 0]
+        setorderv(exp_tbl, in_col, order=-1L)
+        
+        if (is_cbb) {
+          rename_map <- c(PosGroup="Pos", Salary="Sal", RGProj="Proj", RGMin="Mins", GameTime="Time")
+          for (old in names(rename_map)) if (old %in% names(exp_tbl)) setnames(exp_tbl, old, rename_map[[old]])
+        }
+        
+        sel_label <- paste(sel_builds, collapse=", ")
+        cap_msg   <- paste0("IN = [", sel_label, "]  \u2502  OUT = all other builds  \u2502  Click a row to deselect")
+        
+        dt <- datatable(exp_tbl,
+                        caption  = htmltools::tags$caption(
+                          style="color:#FFE500;font-weight:bold;font-size:13px;padding:6px 0;", cap_msg),
+                        options  = list(pageLength=50, scrollX=TRUE, searching=FALSE,
+                                        lengthChange=FALSE, dom='tp'),
+                        rownames = FALSE)
+        rc <- intersect(c(in_col, out_col, tot_col, "IN-OUT"), names(exp_tbl))
+        if (length(rc)) dt <- dt %>% formatRound(rc, 1)
+        sal_disp <- intersect(c("Sal","Salary"), names(exp_tbl))
+        cap_val  <- rv$config$salary_caps[[platform]] %||% 50000
+        if (length(sal_disp) && cap_val >= 1000) dt <- dt %>% formatCurrency(sal_disp[1], "$", digits=0)
+        # Colour-code IN-OUT: green = overweight in selected builds, red = underweight
+        dt <- dt %>% formatStyle("IN-OUT",
+                                 color = styleInterval(c(-0.001, 0.001), c("#ff6b6b", "#888888", "#69db7c")))
+        dt
+        
+      } else {
+        # ── Normal full-portfolio exposure mode ──────────────────────────────
+        n_lineups  <- nrow(port)
+        all_counts <- table(unlist(port[, ..all_pc]))
+        exp_tbl <- data.table(Player = meta_players, Exposure = 0)
         for (i in seq_len(nrow(exp_tbl))) {
           p <- exp_tbl$Player[i]
-          if (p %in% names(cpt_counts))  exp_tbl$CptExp[i]  <- as.numeric(cpt_counts[p])  / n_lineups * 100
-          if (p %in% names(util_counts)) exp_tbl$UtilExp[i] <- as.numeric(util_counts[p]) / n_lineups * 100
+          if (p %in% names(all_counts)) exp_tbl$Exposure[i] <- as.numeric(all_counts[p]) / n_lineups * 100
         }
-        if (is_f1)
-          exp_tbl[Player %in% rv$sim_metadata$Player[rv$sim_metadata$PlayerType == "Constructor"],
-                  c("CptExp","UtilExp") := NA_real_]
-      }
-      mc <- intersect(c("Player","PlayerType",salary_col,own_col,
-                        "PosGroup","RGProj","RGMin","GameTime","Starting","Team","Car",
-                        "Position","Match","Opponent","TeeTimeGroup","CutProb"),
-                      names(rv$sim_metadata))
-      mc <- mc[!is.na(mc)]
-      exp_tbl <- merge(exp_tbl, rv$sim_metadata[Player %in% meta_players, ..mc], by="Player", all.x=TRUE)
-      if (!is.null(rv$simulation_results)) {
-        score_col_sim <- if (platform == "FD") "FDScore" else "DKScore"
-        if (score_col_sim %in% names(rv$simulation_results)) {
-          sim_proj <- rv$simulation_results[Player %in% meta_players,
-                                            .(SimProj = round(mean(get(score_col_sim), na.rm=TRUE), 1)),
-                                            by=Player]
-          exp_tbl <- merge(exp_tbl, sim_proj, by="Player", all.x=TRUE)
+        if (is_f1 || (is_cbb && has_captain)) {
+          cpt_counts  <- if (length(cpt_cols))  table(unlist(port[, ..cpt_cols]))  else table(character(0))
+          util_counts <- if (length(util_cols)) table(unlist(port[, ..util_cols])) else table(character(0))
+          exp_tbl[, CptExp  := 0]
+          exp_tbl[, UtilExp := 0]
+          for (i in seq_len(nrow(exp_tbl))) {
+            p <- exp_tbl$Player[i]
+            if (p %in% names(cpt_counts))  exp_tbl$CptExp[i]  <- as.numeric(cpt_counts[p])  / n_lineups * 100
+            if (p %in% names(util_counts)) exp_tbl$UtilExp[i] <- as.numeric(util_counts[p]) / n_lineups * 100
+          }
+          if (is_f1)
+            exp_tbl[Player %in% rv$sim_metadata$Player[rv$sim_metadata$PlayerType == "Constructor"],
+                    c("CptExp","UtilExp") := NA_real_]
         }
+        mc <- intersect(c("Player","PlayerType",salary_col,own_col,
+                          "PosGroup","RGProj","RGMin","GameTime","Starting","Team","Car",
+                          "Position","Match","Opponent","TeeTimeGroup","CutProb"),
+                        names(rv$sim_metadata))
+        mc <- mc[!is.na(mc)]
+        exp_tbl <- merge(exp_tbl, rv$sim_metadata[Player %in% meta_players, ..mc], by="Player", all.x=TRUE)
+        if (!is.null(rv$simulation_results)) {
+          score_col_sim <- if (platform == "FD") "FDScore" else "DKScore"
+          if (score_col_sim %in% names(rv$simulation_results)) {
+            sim_proj <- rv$simulation_results[Player %in% meta_players,
+                                              .(SimProj = round(mean(get(score_col_sim), na.rm=TRUE), 1)),
+                                              by=Player]
+            exp_tbl <- merge(exp_tbl, sim_proj, by="Player", all.x=TRUE)
+          }
+        }
+        if (salary_col %in% names(exp_tbl)) setnames(exp_tbl, salary_col, "Salary")
+        if (!is_sd && !is.null(own_col) && own_col %in% names(exp_tbl)) {
+          setnames(exp_tbl, own_col, "OwnProj")
+          if (max(exp_tbl$OwnProj, na.rm = TRUE) <= 1) exp_tbl[, OwnProj := OwnProj * 100]
+          exp_tbl[, OwnProj  := round(OwnProj, 1)]
+          exp_tbl[, Leverage := round(Exposure - OwnProj, 1)]
+        }
+        base_meta  <- c("Player", if (is_f1) "PlayerType" else NULL,
+                        "PosGroup","Salary","RGProj","RGMin","SimProj","GameTime","Starting","Team","Car",
+                        "Position","Match","Opponent","Surface","Tour","TeeTimeGroup","CutProb")
+        meta_order    <- intersect(base_meta, names(exp_tbl))
+        split_cols    <- intersect(c("CptExp","UtilExp","FlexExp"), names(exp_tbl))
+        metrics_order <- intersect(c("Exposure","OwnProj","Leverage"), names(exp_tbl))
+        setcolorder(exp_tbl, c(meta_order, split_cols, metrics_order))
+        exp_tbl <- exp_tbl[Exposure > 0]; setorder(exp_tbl, -Exposure)
+        if (is_cbb) {
+          rename_map <- c(PosGroup="Pos", Salary="Sal", RGMin="Mins", RGProj="Proj", GameTime="Time", SimProj="Sim")
+          for (old in names(rename_map)) if (old %in% names(exp_tbl)) setnames(exp_tbl, old, rename_map[[old]])
+        }
+        dt <- datatable(exp_tbl, options=list(pageLength=50,scrollX=TRUE,searching=FALSE,lengthChange=FALSE,dom='tp'), rownames=FALSE)
+        rc <- intersect(c("Exposure","CptExp","UtilExp","FlexExp","OwnProj","Leverage",
+                          "CutProb","RGProj","RGMin","SimProj","Proj","Mins","Sim"), names(exp_tbl))
+        if (length(rc) > 0) dt <- dt %>% formatRound(rc, 1)
+        cap <- rv$config$salary_caps[[platform]] %||% 50000
+        sal_col_disp <- if ("Sal" %in% names(exp_tbl)) "Sal" else if ("Salary" %in% names(exp_tbl)) "Salary" else NULL
+        if (!is.null(sal_col_disp) && cap >= 1000) dt <- dt %>% formatCurrency(sal_col_disp,"$",digits=0)
+        dt
       }
-      if (salary_col %in% names(exp_tbl)) setnames(exp_tbl, salary_col, "Salary")
-      if (!is_sd && !is.null(own_col) && own_col %in% names(exp_tbl)) {
-        setnames(exp_tbl, own_col, "OwnProj")
-        if (max(exp_tbl$OwnProj, na.rm = TRUE) <= 1) exp_tbl[, OwnProj := OwnProj * 100]
-        exp_tbl[, OwnProj  := round(OwnProj, 1)]
-        exp_tbl[, Leverage := round(Exposure - OwnProj, 1)]
-      }
-      base_meta  <- c("Player", if (is_f1) "PlayerType" else NULL,
-                      "PosGroup","Salary","RGProj","RGMin","SimProj","GameTime","Starting","Team","Car",
-                      "Position","Match","Opponent","Surface","Tour","TeeTimeGroup","CutProb")
-      meta_order    <- intersect(base_meta, names(exp_tbl))
-      split_cols    <- intersect(c("CptExp","UtilExp","FlexExp"), names(exp_tbl))
-      metrics_order <- intersect(c("Exposure","OwnProj","Leverage"), names(exp_tbl))
-      setcolorder(exp_tbl, c(meta_order, split_cols, metrics_order))
-      exp_tbl <- exp_tbl[Exposure > 0]; setorder(exp_tbl, -Exposure)
-      if (is_cbb) {
-        rename_map <- c(PosGroup="Pos", Salary="Sal", RGMin="Mins", RGProj="Proj", GameTime="Time", SimProj="Sim")
-        for (old in names(rename_map)) if (old %in% names(exp_tbl)) setnames(exp_tbl, old, rename_map[[old]])
-      }
-      dt <- datatable(exp_tbl, options=list(pageLength=50,scrollX=TRUE,searching=FALSE,lengthChange=FALSE,dom='tp'), rownames=FALSE)
-      rc <- intersect(c("Exposure","CptExp","UtilExp","FlexExp","OwnProj","Leverage",
-                        "CutProb","RGProj","RGMin","SimProj","Proj","Mins","Sim"), names(exp_tbl))
-      if (length(rc) > 0) dt <- dt %>% formatRound(rc, 1)
-      cap <- rv$config$salary_caps[[platform]] %||% 50000
-      sal_col_disp <- if ("Sal" %in% names(exp_tbl)) "Sal" else if ("Salary" %in% names(exp_tbl)) "Salary" else NULL
-      if (!is.null(sal_col_disp) && cap >= 1000) dt <- dt %>% formatCurrency(sal_col_disp,"$",digits=0)
-      dt
     })
   }
   output$dk_portfolio_exposure <- make_portfolio_exposure("dk","DK")
   output$fd_portfolio_exposure <- make_portfolio_exposure("fd","FD")
   output$sd_portfolio_exposure <- make_portfolio_exposure("sd","SD")
   
+  # Build row selection → update rv$xx_selected_builds so exposure table reacts
+  make_build_selection_observer <- function(lp) {
+    observeEvent(input[[paste0(lp, "_builds_summary_rows_selected")]], {
+      sel_rows <- input[[paste0(lp, "_builds_summary_rows_selected")]]
+      builds   <- rv[[paste0(lp, "_builds")]]
+      if (length(sel_rows) == 0 || is.null(builds)) {
+        rv[[paste0(lp, "_selected_builds")]] <- character(0)
+      } else {
+        rv[[paste0(lp, "_selected_builds")]] <- names(builds)[sel_rows]
+      }
+    }, ignoreNULL = FALSE)
+  }
+  make_build_selection_observer("dk")
+  make_build_selection_observer("fd")
+  make_build_selection_observer("sd")
+  
   make_portfolio_lineups <- function(lp) {
     renderDT({
       port <- rv[[paste0(lp,"_portfolio")]]; req(port, rv$config)
-      display_table <- create_portfolio_display_table(port, rv$config)
+      display_table <- create_portfolio_display_table(port, rv$config, lp)
       format_cols   <- tryCatch(get_format_columns(display_table, rv$config), error=function(e) character(0))
       dt <- datatable(display_table[,-"RowID"],
-                      options=list(pageLength=50,scrollX=TRUE,searching=FALSE,lengthChange=FALSE,dom='tp',
-                                   columnDefs=list(list(width='30px',targets=0))),
+                      options=list(pageLength=50,scrollX=TRUE,searching=FALSE,lengthChange=FALSE,dom='tp'),
+                      selection=list(mode='multiple', target='row'),
                       escape=FALSE, rownames=FALSE)
       if(length(format_cols)>0) dt <- dt %>% formatRound(format_cols,1)
       if("Salary" %in% names(display_table)) dt <- dt %>% formatCurrency("Salary","$",digits=0)
