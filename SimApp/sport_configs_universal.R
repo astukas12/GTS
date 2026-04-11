@@ -87,7 +87,13 @@ SPORT_CONFIGS <- list(
       )
     ),
     
-    lineup_metrics_function = "calculate_nascar_lineup_metrics"
+    lineup_metrics_function = "calculate_nascar_lineup_metrics",
+    
+    # DK bulk upload column headers (in player slot order)
+    dk_export_slots = list(
+      DK = c("D", "D", "D", "D", "D", "D"),
+      FD = c("D", "D", "D", "D", "D")
+    )
   ),
   
   
@@ -132,6 +138,13 @@ SPORT_CONFIGS <- list(
     ),
     
     lineup_metrics_function = "calculate_mma_lineup_metrics",
+    
+    # DK bulk upload column headers (in player slot order)
+    dk_export_slots = list(
+      DK = c("F", "F", "F", "F", "F", "F"),
+      FD = c("MVP", "FLEX", "FLEX", "FLEX", "FLEX", "FLEX"),
+      SD = c("CPT", "UTIL", "UTIL", "UTIL", "UTIL", "UTIL")
+    ),
     
     portfolio_filters = list(
       rate_minimums = list(
@@ -281,7 +294,12 @@ SPORT_CONFIGS <- list(
       )
     ),
     
-    lineup_metrics_function = "calculate_tennis_lineup_metrics"
+    lineup_metrics_function = "calculate_tennis_lineup_metrics",
+    
+    # DK bulk upload column headers (in player slot order)
+    dk_export_slots = list(
+      DK = c("P", "P", "P", "P", "P", "P")
+    )
   ),
   
   
@@ -376,7 +394,14 @@ SPORT_CONFIGS <- list(
                         "FDSalary", "FDID", "FDOwn")
       )
     ),
-    max_lineups = 5000
+    max_lineups = 5000,
+    
+    # DK bulk upload column headers (in player slot order)
+    # NFL DK: QB + 2RB + 3WR + TE + FLEX + DST
+    dk_export_slots = list(
+      DK = c("QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "DST"),
+      FD = c("QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "K")
+    )
   ),
   
   
@@ -484,7 +509,13 @@ SPORT_CONFIGS <- list(
     ),
     
     # Called by add_custom_metrics() after Phase 3
-    lineup_metrics_function = "calculate_golf_lineup_metrics"
+    lineup_metrics_function = "calculate_golf_lineup_metrics",
+    
+    # DK bulk upload column headers (in player slot order)
+    dk_export_slots = list(
+      DK = c("G", "G", "G", "G", "G", "G"),
+      FD = c("G", "G", "G", "G", "G", "G")
+    )
   ),
   
   
@@ -513,7 +544,13 @@ SPORT_CONFIGS <- list(
         metadata    = c("Player", "DKSalary", "DKID", "Team")
       )
     ),
-    lineup_metrics_function = "calculate_f1_lineup_metrics"
+    lineup_metrics_function = "calculate_f1_lineup_metrics",
+    
+    # DK bulk upload column headers (in player slot order)
+    # F1 DK: CPT (1.5x) + 4 Drivers + Constructor
+    dk_export_slots = list(
+      DK = c("CPT", "D", "D", "D", "D", "CNSTR")
+    )
   ),
   
   # ==========================================================================
@@ -603,7 +640,15 @@ SPORT_CONFIGS <- list(
       UTIL = 2
     ),
     
-    lineup_metrics_function = "calculate_cbb_lineup_metrics"
+    lineup_metrics_function = "calculate_cbb_lineup_metrics",
+    
+    # DK bulk upload column headers (in player slot order)
+    # CBB DK: 3G + 3F + 2UTIL | FD: 4G + 3F + 1UTIL | SD: CPT + 5UTIL
+    dk_export_slots = list(
+      DK = c("G", "G", "G", "F", "F", "F", "UTIL", "UTIL"),
+      FD = c("G", "G", "G", "G", "F", "F", "F", "UTIL"),
+      SD = c("CPT", "UTIL", "UTIL", "UTIL", "UTIL", "UTIL")
+    )
   )
   
 )

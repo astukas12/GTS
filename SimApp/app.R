@@ -10,8 +10,8 @@ library(ggplot2)
 
 source("sport_configs_universal.R")
 source("OptimalLineups_Core.R")
-source("LineupBuilder_Core.R")
 source("portfolio_helpers_universal.R")
+source("cash_game_module.R")
 
 # Source all sport engines once at startup.
 # Never re-source inside reactive observers — re-sourcing re-executes all
@@ -86,10 +86,11 @@ ui <- dashboardPage(
     ),
     sidebarMenu(
       id = "sidebar_menu",
-      menuItem("Data Input",        tabName = "input",      icon = icon("file-upload")),
-      menuItem("Sim Results",       tabName = "sim_results", icon = icon("chart-bar")),
-      menuItem("Lineup Scoring",    tabName = "scoring",    icon = icon("trophy")),
-      menuItem("Portfolio Builder", tabName = "portfolio",  icon = icon("layer-group"))
+      menuItem("Data Input",         tabName = "input",       icon = icon("file-upload")),
+      menuItem("Sim Results",        tabName = "sim_results", icon = icon("chart-bar")),
+      menuItem("Tournament Lineups", tabName = "scoring",     icon = icon("trophy")),
+      menuItem("Cash Games",         tabName = "cash_games",  icon = icon("coins")),
+      menuItem("Portfolio Builder",  tabName = "portfolio",   icon = icon("layer-group"))
     )
   ),
   
@@ -479,12 +480,30 @@ ui <- dashboardPage(
       ),
       
       # ======================================================================
-      # TAB 3: LINEUP SCORING
+      # TAB 3: TOURNAMENT LINEUPS (formerly Lineup Scoring)
       # ======================================================================
       tabItem(tabName = "scoring",  uiOutput("scoring_tabs_ui")),
       
       # ======================================================================
-      # TAB 4: PORTFOLIO BUILDER
+      # TAB 4: CASH GAMES — Double Up Simulator
+      # ======================================================================
+      tabItem(tabName = "cash_games",
+              conditionalPanel(
+                condition = "output.has_sim_results == false",
+                div(style = "text-align:center;padding:60px 40px;",
+                    icon("coins", class = "fa-3x", style = "color:#333;margin-bottom:20px;"),
+                    p("Run a simulation first, then score DK Tournament Lineups.",
+                      style = "color:#555;font-size:14px;margin-top:10px;")
+                )
+              ),
+              conditionalPanel(
+                condition = "output.has_sim_results == true",
+                render_cash_game_tab_ui()
+              )
+      ),
+      
+      # ======================================================================
+      # TAB 5: PORTFOLIO BUILDER
       # ======================================================================
       tabItem(tabName = "portfolio", uiOutput("portfolio_tabs_ui"))
     )
@@ -1086,7 +1105,7 @@ server <- function(input, output, session) {
         score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
         progress$set(detail="Phase 3: Calculating metrics...", value=0.75)
         own_data <- copy(rv$sim_metadata)
-        if ("DKOwn" %in% names(own_data)) setnames(own_data, "DKOwn", "Own")
+        if ("DKOwn" %in% names(own_data)) { setnames(own_data, "DKOwn", "Own"); if (max(own_data$Own, na.rm=TRUE) > 1) own_data[, Own := Own / 100] }
         final_results <- calculate_distribution_metrics(score_matrix, lineup_data, dk_opt_cfg,
                                                         ownership_data=own_data, verbose=TRUE)
         progress$set(detail="Adding golf metrics...", value=0.90)
@@ -1107,7 +1126,7 @@ server <- function(input, output, session) {
         score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
         progress$set(detail="Phase 3: Metrics...", value=0.7)
         own_data <- copy(rv$sim_metadata)
-        if ("DKOwn" %in% names(own_data)) setnames(own_data, "DKOwn", "Own")
+        if ("DKOwn" %in% names(own_data)) { setnames(own_data, "DKOwn", "Own"); if (max(own_data$Own, na.rm=TRUE) > 1) own_data[, Own := Own / 100] }
         final_results <- calculate_distribution_metrics(score_matrix, lineup_data, opt_config,
                                                         ownership_data=own_data, verbose=TRUE)
         final_results <- add_custom_metrics(final_results, rv$sim_metadata, rv$config, tennis_precalc)
@@ -1179,7 +1198,7 @@ server <- function(input, output, session) {
         score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
         progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
         own_data <- copy(rv$sim_metadata)
-        if ("DKOwn" %in% names(own_data)) setnames(own_data, "DKOwn", "Own")
+        if ("DKOwn" %in% names(own_data)) { setnames(own_data, "DKOwn", "Own"); if (max(own_data$Own, na.rm=TRUE) > 1) own_data[, Own := Own / 100] }
         final_results <- calculate_distribution_metrics(score_matrix, lineup_data, opt_config,
                                                         ownership_data=own_data, verbose=TRUE)
         progress$set(detail="Phase 3: Adding custom metrics...", value=0.90)
@@ -1233,7 +1252,7 @@ server <- function(input, output, session) {
         score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
         progress$set(detail="Phase 3...", value=0.75)
         own_data <- copy(rv$sim_metadata)
-        if ("FDOwn" %in% names(own_data)) setnames(own_data, "FDOwn", "Own")
+        if ("FDOwn" %in% names(own_data)) { setnames(own_data, "FDOwn", "Own"); if (max(own_data$Own, na.rm=TRUE) > 1) own_data[, Own := Own / 100] }
         final_results <- calculate_distribution_metrics(score_matrix, lineup_data, fd_opt_cfg,
                                                         ownership_data=own_data, verbose=TRUE)
         progress$set(detail="Golf metrics...", value=0.90)
@@ -1280,7 +1299,7 @@ server <- function(input, output, session) {
         score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
         progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
         own_data <- copy(rv$sim_metadata)
-        if ("FDOwn" %in% names(own_data)) setnames(own_data, "FDOwn", "Own")
+        if ("FDOwn" %in% names(own_data)) { setnames(own_data, "FDOwn", "Own"); if (max(own_data$Own, na.rm=TRUE) > 1) own_data[, Own := Own / 100] }
         final_results <- calculate_distribution_metrics(score_matrix, lineup_data, opt_config,
                                                         ownership_data=own_data, verbose=TRUE)
         progress$set(detail="Phase 3: Adding custom metrics...", value=0.90)
@@ -1355,7 +1374,7 @@ server <- function(input, output, session) {
         score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
         progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
         own_data <- copy(rv$sim_metadata)
-        if ("DKOwn" %in% names(own_data)) setnames(own_data, "DKOwn", "Own")
+        if ("DKOwn" %in% names(own_data)) { setnames(own_data, "DKOwn", "Own"); if (max(own_data$Own, na.rm=TRUE) > 1) own_data[, Own := Own / 100] }
         final_results <- calculate_distribution_metrics(score_matrix, lineup_data, opt_config,
                                                         ownership_data=own_data, verbose=TRUE)
         progress$set(detail="Phase 3: Adding custom metrics...", value=0.90)
@@ -3313,6 +3332,12 @@ server <- function(input, output, session) {
       datatable(data.table(Error=e$message), rownames=FALSE)
     })
   })
+  
+  
+  # ==========================================================================
+  # CASH GAME MODULE
+  # ==========================================================================
+  register_cash_game_observers(input, output, session, rv)
   
   
 }
