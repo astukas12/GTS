@@ -29,6 +29,30 @@ get_dk_constraints <- function(config) {
   list(salary_cap = salary_cap, roster_size = as.integer(roster_size))
 }
 
+get_cash_params <- function(config) {
+  sport <- config$sport_name %||% ""
+  if (sport == "NBA") {
+    list(n_field = 50L, n_yours = 10L, top_n_ppd = 15L,
+         sal_floor = 49000, total_lineups = 60L)
+  } else {
+    list(n_field = 500L, n_yours = 50L, top_n_ppd = 20L,
+         sal_floor = 49000, total_lineups = 550L)
+  }
+}
+
+# NBA DK slot names for display (Player1..Player8 -> PG/SG/SF/PF/C/G/F/UTIL)
+get_slot_labels <- function(config, n_slots) {
+  sport <- config$sport_name %||% ""
+  if (sport == "NBA") {
+    switch(as.character(n_slots),
+           "8" = c("PG","SG","SF","PF","C","G","F","UTIL"),
+           "9" = c("PG","PG2","SG","SG2","SF","SF2","PF","PF2","C"),
+           "6" = c("CPT","UTIL1","UTIL2","UTIL3","UTIL4","UTIL5"),
+           paste0("P", seq_len(n_slots))
+    )
+  } else NULL  # NULL = keep Player1..N
+}
+
 
 # ============================================================================
 # FIELD LINEUP GENERATION
@@ -426,13 +450,14 @@ register_cash_game_observers <- function(input, output, session, rv) {
     tryCatch({
       progress$set(detail = "Computing PPD, building combinations...", value = 0.2)
       
+      cash_p <- get_cash_params(rv$config)
       field <- generate_field_lineups(
         metadata     = meta,
-        n            = 500L,
+        n            = cash_p$n_field,
         salary_cap   = sal_cap,
         salary_floor = sal_floor,
         roster_size  = r_size,
-        top_n_ppd    = 20L
+        top_n_ppd    = cash_p$top_n_ppd
       )
       
       du_rv$field_pool <- field
@@ -444,7 +469,8 @@ register_cash_game_observers <- function(input, output, session, rv) {
       )
       du_rv$status <- pool_summary
       progress$set(value = 1, detail = "Done")
-      showNotification(sprintf("Field generated: %d lineups.", nrow(field)), type = "message")
+      showNotification(sprintf("Field generated: %d lineups (top %d PPD players).",
+                               nrow(field), cash_p$top_n_ppd), type = "message")
       
     }, error = function(e) {
       du_rv$status <- paste("Field generation error:", e$message)
@@ -561,12 +587,13 @@ register_cash_game_observers <- function(input, output, session, rv) {
       flush.console()
       
       # ── Step 2: Select your top 20 ────────────────────────────────────────
-      cat("  [DoubleUp] Step 2/5: Selecting your top 50 lineups by median...\n")
+      cash_p <- get_cash_params(rv$config)
+      cat(sprintf("  [DoubleUp] Step 2/5: Selecting your top %d lineups by median...\n", cash_p$n_yours))
       flush.console()
-      progress$set(detail = "Step 2/5: Selecting your top 50 by median...", value = 0.18)
+      progress$set(detail = sprintf("Step 2/5: Selecting your top %d by median...", cash_p$n_yours), value = 0.18)
       
       setorder(dk_opt, -MedianScore)
-      your_pool <- head(dk_opt, 50L)
+      your_pool <- head(dk_opt, cash_p$n_yours)
       your_pool[, LineupID := paste0("Y", seq_len(.N))]
       
       if (!identical(player_cols, std_cols)) setnames(your_pool, player_cols, std_cols)
@@ -586,7 +613,8 @@ register_cash_game_observers <- function(input, output, session, rv) {
       flush.console()
       
       # ── Step 3: Combine pools ─────────────────────────────────────────────
-      cat("  [DoubleUp] Step 3/5: Combining 50 your + 500 field = 550 lineups...\n")
+      cat(sprintf("  [DoubleUp] Step 3/5: Combining %d your + %d field = %d lineups...\n",
+                  cash_p$n_yours, cash_p$n_field, cash_p$total_lineups))
       flush.console()
       progress$set(detail = "Step 3/5: Combining lineup pools...", value = 0.25)
       
@@ -650,6 +678,14 @@ register_cash_game_observers <- function(input, output, session, rv) {
                              "TotalSalary", "AvgOwn", "MedianScore", "CashRate"))
       setorder(results, -CashRate, -MedianScore)
       
+      # Rename Player1..N to sport-specific slot labels for display
+      slot_labels <- get_slot_labels(rv$config, length(std_cols))
+      if (!is.null(slot_labels)) {
+        for (i in seq_along(std_cols))
+          if (std_cols[i] %in% names(results))
+            setnames(results, std_cols[i], slot_labels[i])
+      }
+      
       # ── Exposure ──────────────────────────────────────────────────────────
       progress$set(detail = "Building exposure table...", value = 0.95)
       cat("  [DoubleUp] Building exposure table...\n"); flush.console()
@@ -662,7 +698,8 @@ register_cash_game_observers <- function(input, output, session, rv) {
       
       elapsed_total <- as.numeric(difftime(Sys.time(), t_total, units = "secs"))
       status_msg <- sprintf(
-        "Double Up complete \u2014 550 lineups (500 field + 50 yours) | %s sims | %.1fs total",
+        "Double Up complete \u2014 %d lineups (%d field + %d yours) | %s sims | %.1fs total",
+        cash_p$total_lineups, cash_p$n_field, cash_p$n_yours,
         format(n_sims, big.mark = ","), elapsed_total
       )
       du_rv$status <- status_msg
@@ -743,10 +780,7 @@ register_cash_game_observers <- function(input, output, session, rv) {
       { if ("TotalSalary" %in% names(dt)) formatCurrency(., "TotalSalary", "$", digits = 0) else . } %>%
       { if ("AvgOwn"      %in% names(dt)) formatRound(.,    "AvgOwn",      2)               else . } %>%
       formatRound("MedianScore", 1) %>%
-      formatStyle("CashRate",
-                  background = styleColorBar(range(dt$CashRate, na.rm = TRUE), "#FFE500"),
-                  backgroundSize = "90% 70%", backgroundRepeat = "no-repeat",
-                  backgroundPosition = "left") %>%
+      # No color bar on CashRate (NBA) — plain numeric display
       formatStyle("Source",
                   color      = styleEqual(c("Yours", "Field"), c("#FFE500", "#aaaaaa")),
                   fontWeight = styleEqual(c("Yours", "Field"), c("700",     "400")))
@@ -757,10 +791,24 @@ register_cash_game_observers <- function(input, output, session, rv) {
   output$du_download <- downloadHandler(
     filename = function() paste0("GTS_DoubleUp_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".xlsx"),
     content  = function(file) {
-      req(du_rv$results, du_rv$exposure)
+      req(du_rv$results, du_rv$exposure, rv$sim_metadata)
+      meta <- as.data.table(rv$sim_metadata)
+      dl   <- copy(du_rv$results)
+      
+      # Append DKID to player name columns for DK upload: "Name (ID)"
+      # Detect slot columns: named PG/SG/... for NBA or Player1/... for others
+      slot_cols <- grep("^(PG|SG|SF|PF|C$|^G$|^F$|UTIL|Player[0-9]+|CPT|Util[0-9]+)",
+                        names(dl), value = TRUE)
+      if ("DKID" %in% names(meta) && length(slot_cols) > 0) {
+        id_lu <- setNames(meta$DKID, meta$Player)
+        for (col in slot_cols) {
+          dl[[col]] <- paste0(dl[[col]], " (", id_lu[dl[[col]]], ")")
+        }
+      }
+      
       wb <- openxlsx::createWorkbook()
       openxlsx::addWorksheet(wb, "Lineups Ranked")
-      openxlsx::writeData(wb, "Lineups Ranked", as.data.frame(du_rv$results))
+      openxlsx::writeData(wb, "Lineups Ranked", as.data.frame(dl))
       openxlsx::addWorksheet(wb, "Exposure")
       openxlsx::writeData(wb, "Exposure", as.data.frame(du_rv$exposure))
       openxlsx::saveWorkbook(wb, file, overwrite = TRUE)
