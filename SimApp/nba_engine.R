@@ -600,6 +600,8 @@ run_nba_simulation <- function(input_data, n_sims = 10000, config = NULL,
       dt <- copy(input_data$sd_ids[[n]]); dt[, SDFile := n]; dt
     }), fill = TRUE)
     setnames(sd_all, "Name", "Player")
+    # Normalise player names same as DK CSV (strips BOM/accents)
+    sd_all[, Player := trimws(iconv(Player, to = "ASCII//TRANSLIT"))]
     
     # Rename SD columns cleanly before merge — avoids .SD scoping issues
     sd_sub <- sd_all[, .(
@@ -611,6 +613,19 @@ run_nba_simulation <- function(input_data, n_sims = 10000, config = NULL,
       SDID      = as.character(UTIL_ID),
       SDSalary  = as.numeric(UTIL_Salary)
     )]
+    # Ensure ShowdownFile is populated on metadata before the three-key merge.
+    # game_sd_lu maps Team -> ShowdownFile; players whose team isn't in Games
+    # will have NA ShowdownFile and miss the join.
+    if (!"ShowdownFile" %in% names(metadata))
+      metadata[, ShowdownFile := NA_character_]
+    
+    # Fill any NA ShowdownFile from game_sd_lu
+    missing_sf <- is.na(metadata$ShowdownFile)
+    if (any(missing_sf)) {
+      lu_vec <- setNames(game_sd_lu$ShowdownFile, game_sd_lu$Team)
+      metadata[missing_sf, ShowdownFile := lu_vec[Team]]
+    }
+    
     metadata <- merge(
       metadata,
       sd_sub,
@@ -724,19 +739,27 @@ assign_nba_slots_dk <- function(cm) {
   pos_vec <- if ("DKPos" %in% names(cm)) cm$DKPos else cm$PosGroup
   
   fill_slot <- function(player, pos) {
-    g_ok <- grepl("PG|SG|^G$|G/|/G", pos)
-    f_ok <- grepl("SF|PF|^F$|F/|/F", pos)
-    c_ok <- grepl("^C$|C/|/C",        pos)
+    # Build candidate slots based on SPECIFIC positions listed in pos string
+    # A PG fills: PG, G, UTIL — NOT SG/SF/PF/F
+    # A SG/SF fills: SG, SF, G, F, UTIL
+    # A SF/PF fills: SF, PF, F, UTIL
+    # A C fills: C, UTIL
+    candidates <- character(0)
+    if (grepl("PG", pos)) candidates <- c(candidates, "PG")
+    if (grepl("SG", pos)) candidates <- c(candidates, "SG")
+    if (grepl("SF", pos)) candidates <- c(candidates, "SF")
+    if (grepl("PF", pos)) candidates <- c(candidates, "PF")
+    if (grepl("^C$|C/|/C", pos)) candidates <- c(candidates, "C")
+    # Generic flex slots: G if any guard, F if any forward
+    if (grepl("PG|SG|^G$|G/|/G", pos)) candidates <- c(candidates, "G")
+    if (grepl("SF|PF|^F$|F/|/F", pos)) candidates <- c(candidates, "F")
+    candidates <- c(candidates, "UTIL")
+    candidates <- unique(candidates)
     
-    # Try slots in priority order: named position -> flex -> UTIL
-    candidates <- c(
-      if (g_ok) c("PG","SG","G"),
-      if (f_ok) c("SF","PF","F"),
-      if (c_ok) "C",
-      "UTIL"
-    )
     for (sl in candidates) {
-      if (is.na(slots[[sl]])) { slots[[sl]] <<- player; return(TRUE) }
+      if (sl %in% names(slots) && is.na(slots[[sl]])) {
+        slots[[sl]] <<- player; return(TRUE)
+      }
     }
     FALSE
   }
@@ -763,17 +786,19 @@ assign_nba_slots_fd <- function(cm) {
   pos_vec <- if ("FDPos" %in% names(cm)) cm$FDPos else cm$FDPosGroup
   
   fill_slot <- function(player, pos) {
-    g_ok <- grepl("PG|SG|G$|G/|/G",  pos)
-    f_ok <- grepl("SF|PF|F$|F/|/F",  pos)
-    c_ok <- grepl("^C$|C/|/C",        pos)
-    
-    candidates <- c(
-      if (g_ok) c("PG1","PG2","SG1","SG2"),
-      if (f_ok) c("SF1","SF2","PF1","PF2"),
-      if (c_ok) "C"
-    )
+    # Position-specific: PG fills PG slots only, SG fills SG slots only etc.
+    # SG/SF fills SG or SF slots.
+    candidates <- character(0)
+    if (grepl("PG", pos)) candidates <- c(candidates, "PG1","PG2")
+    if (grepl("SG", pos)) candidates <- c(candidates, "SG1","SG2")
+    if (grepl("SF", pos)) candidates <- c(candidates, "SF1","SF2")
+    if (grepl("PF", pos)) candidates <- c(candidates, "PF1","PF2")
+    if (grepl("^C$|C/|/C", pos)) candidates <- c(candidates, "C")
+    candidates <- unique(candidates)
     for (sl in candidates) {
-      if (is.na(slots[[sl]])) { slots[[sl]] <<- player; return(TRUE) }
+      if (sl %in% names(slots) && is.na(slots[[sl]])) {
+        slots[[sl]] <<- player; return(TRUE)
+      }
     }
     FALSE
   }
