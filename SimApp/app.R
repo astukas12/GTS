@@ -17,7 +17,7 @@ source("cash_game_module.R")
 # Never re-source inside reactive observers — re-sourcing re-executes all
 # top-level code on every upload/sim run.
 local({
-  engines <- c("nascar", "mma", "tennis", "golf", "f1", "nfl", "cbb")
+  engines <- c("nascar", "mma", "tennis", "golf", "f1", "nfl", "cbb", "nba")
   for (e in engines) {
     f <- paste0(e, "_engine.R")
     if (file.exists(f)) source(f) else warning("Engine not found at startup: ", f)
@@ -36,7 +36,8 @@ load_sport_input <- function(file_path, sport, config) {
   reader_map <- list(
     GOLF = read_golf_input,
     F1   = read_f1_input,
-    CBB  = read_cbb_input
+    CBB  = read_cbb_input,
+    NBA  = read_nba_input
   )
   if (sport %in% names(reader_map)) {
     return(reader_map[[sport]](file_path))
@@ -60,6 +61,7 @@ sport_icon_name <- function(sport) {
          F1     = "car",
          NFL    = "football-ball",
          CBB    = "basketball-ball",
+         NBA    = "basketball-ball",
          "circle"
   )
 }
@@ -1184,6 +1186,27 @@ server <- function(input, output, session) {
         if ("AvgOwn" %in% names(final_results)) final_results[, AvgOwn := round(AvgOwn, 1)]
         rv$dk_optimal_lineups <- final_results
         
+      } else if (rv$sport == "NBA") {
+        progress$set(message="Finding optimal NBA DK lineups...", value=0)
+        nba_dk_config <- list(salary_cap   = rv$config$salary_caps$DK,
+                              max_lineups  = 5000,
+                              percentiles  = c(0.01, 0.05, 0.10, 0.20),
+                              platform_col = "DKScore")
+        progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
+        lineup_data <- find_optimal_lineups_nba(rv$simulation_results, rv$sim_metadata,
+                                                nba_dk_config, verbose=TRUE)
+        progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
+                                    format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
+        nba_sim_dk <- copy(rv$simulation_results); setDT(nba_sim_dk)
+        score_matrix <- score_all_lineups(lineup_data, nba_sim_dk, verbose=TRUE)
+        progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
+        own_data <- copy(rv$sim_metadata)
+        if ("DKOwn" %in% names(own_data)) { setnames(own_data, "DKOwn", "Own"); own_data[, Own := Own / 100] }
+        final_results <- calculate_distribution_metrics(score_matrix, lineup_data, nba_dk_config,
+                                                        ownership_data=own_data, verbose=TRUE)
+        if ("AvgOwn" %in% names(final_results)) final_results[, AvgOwn := round(AvgOwn, 1)]
+        rv$dk_optimal_lineups <- final_results
+        
       } else {
         dk_mode <- rv$config$optimization_modes$DK %||% "standard"
         progress$set(message="Finding optimal DraftKings lineups...", value=0)
@@ -1282,6 +1305,27 @@ server <- function(input, output, session) {
         if ("AvgOwn" %in% names(final_results)) final_results[, AvgOwn := round(AvgOwn, 1)]
         rv$fd_optimal_lineups <- final_results
         
+      } else if (rv$sport == "NBA") {
+        progress$set(message="Finding optimal NBA FD lineups...", value=0)
+        nba_fd_config <- list(salary_cap   = rv$config$salary_caps$FD,
+                              max_lineups  = 5000,
+                              percentiles  = c(0.01, 0.05, 0.10, 0.20),
+                              platform_col = "FDScore")
+        progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
+        lineup_data <- find_optimal_lineups_nba_fd(rv$simulation_results, rv$sim_metadata,
+                                                   nba_fd_config, verbose=TRUE)
+        progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
+                                    format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
+        nba_sim_fd <- copy(rv$simulation_results); setDT(nba_sim_fd)
+        score_matrix <- score_all_lineups(lineup_data, nba_sim_fd, verbose=TRUE)
+        progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
+        own_data <- copy(rv$sim_metadata)
+        if ("FDOwn" %in% names(own_data)) { setnames(own_data, "FDOwn", "Own"); own_data[, Own := Own / 100] }
+        final_results <- calculate_distribution_metrics(score_matrix, lineup_data, nba_fd_config,
+                                                        ownership_data=own_data, verbose=TRUE)
+        if ("AvgOwn" %in% names(final_results)) final_results[, AvgOwn := round(AvgOwn, 1)]
+        rv$fd_optimal_lineups <- final_results
+        
       } else {
         if (!isTRUE(rv$has_fd)) {
           showNotification("No FD salary data in this file.", type="warning"); return()
@@ -1360,6 +1404,33 @@ server <- function(input, output, session) {
         if ("AvgOwn" %in% names(final_results)) final_results[, AvgOwn := NULL]
         rv$sd_optimal_lineups <- final_results
         
+      } else if (rv$sport == "NBA") {
+        sd_meta <- copy(rv$sim_metadata); setDT(sd_meta)
+        if (!all(c("CPTSalary","SDSalary") %in% names(sd_meta)))
+          stop("Missing CPTSalary/SDSalary in metadata. Check SD_IDs sheets.")
+        selected_sd <- if (!is.null(input$sd_game_select)) input$sd_game_select else
+          rv$input_data$games[!is.na(ShowdownFile) & ShowdownFile != "", ShowdownFile[1]]
+        sd_meta <- sd_meta[ShowdownFile == selected_sd]
+        if (nrow(sd_meta) == 0) stop(sprintf("No players found for showdown: %s", selected_sd))
+        sd_sim <- rv$simulation_results[Player %in% sd_meta$Player]
+        nba_sd_config <- list(salary_cap    = rv$config$salary_caps$SD,
+                              max_lineups   = 5000,
+                              percentiles   = c(0.01, 0.05, 0.10, 0.20),
+                              platform_col  = "DKScore",
+                              cpt_multiplier = 1.5)
+        progress$set(message=sprintf("Finding optimal NBA Showdown lineups (%s)...", selected_sd),
+                     detail="Phase 1: Building lineup pool...", value=0.05)
+        lineup_data  <- find_optimal_lineups_nba_sd(sd_sim, sd_meta, nba_sd_config, verbose=TRUE)
+        progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
+                                    format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
+        nba_sd_sim   <- copy(sd_sim); setDT(nba_sd_sim)
+        score_matrix <- score_all_lineups(lineup_data, nba_sd_sim, verbose=TRUE)
+        progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
+        final_results <- calculate_distribution_metrics(score_matrix, lineup_data, nba_sd_config,
+                                                        ownership_data=NULL, verbose=TRUE)
+        if ("AvgOwn" %in% names(final_results)) final_results[, AvgOwn := NULL]
+        rv$sd_optimal_lineups <- final_results
+        
       } else {
         sd_mode    <- rv$config$optimization_modes$SD %||% "captain"
         opt_data   <- prepare_optimization_data(rv$simulation_results, rv$sim_metadata, "SD")
@@ -1396,10 +1467,10 @@ server <- function(input, output, session) {
   
   output$dk_download <- downloadHandler(
     filename=function() paste0("DK_Optimal_Lineups_",format(Sys.Date(),"%Y%m%d"),".csv"),
-    content=function(file) { dl <- if (isTRUE(rv$sport == "CBB")) create_download_cbb(rv$dk_optimal_lineups, rv$sim_metadata, "DK") else create_download_table(rv$dk_optimal_lineups, rv$sim_metadata, "DK", rv$sport); fwrite(dl, file) })
+    content=function(file) { dl <- if (isTRUE(rv$sport %in% c("CBB","NBA"))) create_download_cbb(rv$dk_optimal_lineups, rv$sim_metadata, "DK") else create_download_table(rv$dk_optimal_lineups, rv$sim_metadata, "DK", rv$sport); fwrite(dl, file) })
   output$fd_download <- downloadHandler(
     filename=function() paste0("FD_Optimal_Lineups_",format(Sys.Date(),"%Y%m%d"),".csv"),
-    content=function(file) { dl <- if (isTRUE(rv$sport == "CBB")) create_download_cbb(rv$fd_optimal_lineups, rv$sim_metadata, "FD") else create_download_table(rv$fd_optimal_lineups, rv$sim_metadata, "FD", rv$sport); fwrite(dl, file) })
+    content=function(file) { dl <- if (isTRUE(rv$sport %in% c("CBB","NBA"))) create_download_cbb(rv$fd_optimal_lineups, rv$sim_metadata, "FD") else create_download_table(rv$fd_optimal_lineups, rv$sim_metadata, "FD", rv$sport); fwrite(dl, file) })
   output$sd_download <- downloadHandler(
     filename=function() paste0("SD_Optimal_Lineups_",format(Sys.Date(),"%Y%m%d"),".csv"),
     content=function(file) fwrite(create_download_table(rv$sd_optimal_lineups, rv$sim_metadata, "SD", rv$sport), file))
@@ -1436,7 +1507,7 @@ server <- function(input, output, session) {
   
   output$scoring_tabs_ui <- renderUI({
     req(rv$config)
-    sd_game_selector <- if (isTRUE(rv$sport == "CBB") && "SD" %in% rv$config$platforms &&
+    sd_game_selector <- if (isTRUE(rv$sport %in% c("CBB","NBA")) && "SD" %in% rv$config$platforms &&
                             !is.null(rv$input_data$games)) {
       games_with_sd <- rv$input_data$games[!is.na(ShowdownFile) & ShowdownFile != ""]
       if (nrow(games_with_sd) > 1) {
@@ -1497,7 +1568,7 @@ server <- function(input, output, session) {
     optimal <- switch(input$view_platform,
                       "DK"=rv$dk_optimal_lineups, "FD"=rv$fd_optimal_lineups, "SD"=rv$sd_optimal_lineups)
     req(optimal)
-    display_table <- if (isTRUE(rv$sport == "CBB")) create_display_table_cbb(optimal, input$view_platform) else create_display_table(optimal, rv$sim_metadata, input$view_platform)
+    display_table <- if (isTRUE(rv$sport %in% c("CBB","NBA"))) create_display_table_cbb(optimal, input$view_platform) else create_display_table(optimal, rv$sim_metadata, input$view_platform)
     dt <- datatable(display_table,
                     options=list(pageLength=50, searching=FALSE, lengthChange=FALSE, scrollX=TRUE, dom='tp',
                                  order=list(list(which(names(display_table)=="Win")-1,'desc'))),
@@ -1807,7 +1878,7 @@ server <- function(input, output, session) {
       req(filtered_reactive(), rv$sim_metadata)
       filtered   <- filtered_reactive()
       is_f1      <- isTRUE(rv$sport == "F1")
-      is_cbb     <- isTRUE(rv$sport == "CBB")
+      is_cbb     <- isTRUE(rv$sport %in% c("CBB","NBA"))
       is_sd      <- platform == "SD"
       salary_col <- if (is_sd) "DKSalary" else paste0(platform, "Salary")
       own_col    <- if (is_sd) NULL else paste0(platform, "Own")
@@ -2042,7 +2113,7 @@ server <- function(input, output, session) {
     renderDT({
       pn <- paste0(lp,"_portfolio"); port <- rv[[pn]]; req(port, rv$sim_metadata)
       is_f1  <- isTRUE(rv$sport == "F1")
-      is_cbb <- isTRUE(rv$sport == "CBB")
+      is_cbb <- isTRUE(rv$sport %in% c("CBB","NBA"))
       is_sd  <- platform == "SD"
       salary_col <- if (is_sd) "DKSalary" else paste0(platform, "Salary")
       own_col    <- if (is_sd) NULL        else paste0(platform, "Own")
@@ -2387,9 +2458,12 @@ server <- function(input, output, session) {
       sapply(rv$config$metadata_columns, function(x) x$name)
     } else character(0)
     
-    # Add CBB-specific RG columns
+    # Add CBB/NBA projection + minutes columns
     if (isTRUE(rv$sport == "CBB")) {
       sport_meta_cols <- c(sport_meta_cols, intersect(c("RGProj","RGMin"), names(meta)))
+    }
+    if (isTRUE(rv$sport == "NBA")) {
+      sport_meta_cols <- c(sport_meta_cols, intersect(c("DKProj","FDProj","Mins"), names(meta)))
     }
     
     # Pull all sport metadata that actually exists in sim_metadata
@@ -2402,6 +2476,7 @@ server <- function(input, output, session) {
     # Rename for display
     if ("RGProj" %in% names(proj)) setnames(proj, "RGProj", "Proj")
     if ("RGMin"  %in% names(proj)) setnames(proj, "RGMin",  "Mins")
+    if ("DKProj" %in% names(proj)) setnames(proj, "DKProj", "Proj")
     if ("PosGroup" %in% names(proj)) setnames(proj, "PosGroup", "Pos")
     
     setorder(proj, -Avg)
@@ -2428,7 +2503,7 @@ server <- function(input, output, session) {
                       setdiff(sport_cols, nascar_order))
     }
     # Put CBB Proj/Mins after salary
-    cbb_extra  <- intersect(c("Proj","Mins"), names(proj))
+    cbb_extra  <- intersect(c("Proj","FDProj","Mins"), names(proj))
     display_order <- c(base_cols, cbb_extra, sport_cols, stat_cols)
     display_order <- intersect(display_order, names(proj))
     proj <- proj[, ..display_order]
@@ -2483,7 +2558,7 @@ server <- function(input, output, session) {
       dl_stats   <- intersect(c("Avg","Median","P20","P75","P90"), names(proj))
       skip_cols  <- c(base_cols, c("Avg","Median","P90","P75","P20","Proj","Mins"))
       sport_cols <- setdiff(names(proj), skip_cols)
-      cbb_extra  <- intersect(c("Proj","Mins"), names(proj))
+      cbb_extra  <- intersect(c("Proj","FDProj","Mins"), names(proj))
       dl_order   <- c(base_cols, cbb_extra, sport_cols, dl_stats)
       dl_order   <- intersect(dl_order, names(proj))
       fwrite(proj[, ..dl_order], file)
@@ -2545,7 +2620,7 @@ server <- function(input, output, session) {
   
   output$sport_specific_visuals_ui <- renderUI({
     req(rv$sport)
-    if (rv$sport == "CBB") {
+    if (rv$sport %in% c("CBB","NBA")) {
       req(rv$sport_visuals)
       return(render_cbb_visuals(rv$sport_visuals))
     }

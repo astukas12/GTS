@@ -313,7 +313,7 @@ SPORT_CONFIGS <- list(
     player_label_plural = "Players",
     
     detection = list(
-      custom_detect = function(sheets) {
+      custom_detect = function(sheets, file_path = NULL) {
         has_rushing   <- any(grepl("_Rushing$",   sheets))
         has_receiving <- any(grepl("_Receiving$", sheets))
         has_passing   <- any(grepl("_Passing$",   sheets))
@@ -565,11 +565,19 @@ SPORT_CONFIGS <- list(
     detection = list(
       # New format: IDs + Games + at least one Sim_ sheet
       # Old format: Slate + at least one Sim_ sheet (kept for backward compat)
-      custom_detect = function(sheets) {
+      custom_detect = function(sheets, file_path = NULL) {
         has_sim <- any(grepl("^Sim_", sheets))
         new_fmt <- "IDs" %in% sheets && "Games" %in% sheets
         old_fmt <- "Slate" %in% sheets
-        has_sim && (new_fmt || old_fmt)
+        if (!has_sim || !(new_fmt || old_fmt)) return(FALSE)
+        # Exclude NBA files (which have OverUnder in Games tab)
+        if (new_fmt && !is.null(file_path)) {
+          tryCatch({
+            g <- suppressMessages(readxl::read_excel(file_path, sheet="Games", n_max=1))
+            if ("OverUnder" %in% names(g)) return(FALSE)  # NBA, not CBB
+          }, error = function(e) NULL)
+        }
+        TRUE
       }
     ),
     
@@ -649,7 +657,110 @@ SPORT_CONFIGS <- list(
       FD = c("G", "G", "G", "G", "F", "F", "F", "UTIL"),
       SD = c("CPT", "UTIL", "UTIL", "UTIL", "UTIL", "UTIL")
     )
+  ),
+  
+  # ==========================================================================
+  # NBA (National Basketball Association)
+  # ==========================================================================
+  NBA = list(
+    sport_name          = "NBA",
+    sport_display_name  = "NBA",
+    player_label        = "Player",
+    player_label_plural = "Players",
+    
+    detection = list(
+      # NBA input: IDs + Games + at least one Sim_ sheet
+      # Distinguished from CBB by presence of OverUnder / HomeSpread in Games tab
+      custom_detect = function(sheets, file_path = NULL) {
+        has_sim   <- any(grepl("^Sim_", sheets))
+        has_ids   <- "IDs" %in% sheets
+        has_games <- "Games" %in% sheets
+        if (!has_sim || !has_ids || !has_games) return(FALSE)
+        # Confirm NBA by checking for OverUnder column in Games sheet
+        if (!is.null(file_path)) {
+          tryCatch({
+            g <- suppressMessages(readxl::read_excel(file_path, sheet="Games", n_max=1))
+            return("OverUnder" %in% names(g))
+          }, error = function(e) FALSE)
+        }
+        TRUE  # fallback if no path
+      }
+    ),
+    
+    platforms          = c("DK", "FD", "SD"),
+    roster_sizes       = list(DK = 8, FD = 9, SD = 6),
+    salary_caps        = list(DK = 50000, FD = 60000, SD = 50000),
+    optimization_modes = list(DK = "standard", FD = "standard", SD = "captain"),
+    max_lineups        = 5000,
+    
+    standard_metrics = c(
+      "WinRate", "Top1Rate", "Top5Rate", "Top10Rate", "Top20Rate",
+      "TotalSalary", "AvgOwn"
+    ),
+    
+    custom_metrics = list(),
+    
+    metadata_columns = list(
+      list(name = "Team",     label = "Team",     type = "text", display = TRUE,  filter = TRUE),
+      list(name = "PosGroup", label = "Position", type = "text", display = TRUE,  filter = TRUE),
+      list(name = "GameKey",  label = "Game",     type = "text", display = FALSE, filter = FALSE)
+    ),
+    
+    portfolio_filters = list(
+      rate_minimums = list(
+        list(name = "Win",   label = "Win",    step = 0.1),
+        list(name = "Top1",  label = "Top 1",  step = 0.1),
+        list(name = "Top5",  label = "Top 5",  step = 0.5),
+        list(name = "Top10", label = "Top 10", step = 1),
+        list(name = "Top20", label = "Top 20", step = 2)
+      ),
+      range_filters = list(
+        list(name = "Salary", label = "Salary (K)", column = "TotalSalary", step = 0.1, format = "salary_k"),
+        list(name = "AvgOwn", label = "Avg Own",    column = "AvgOwn",      step = 0.1, format = "decimal")
+      )
+    ),
+    
+    platform_columns = list(
+      DK = list(salary = "DKSalary", id = "DKID", ownership = "DKOwn", score = "DKScore"),
+      FD = list(salary = "FDSalary", id = "FDID", ownership = "FDOwn", score = "FDScore"),
+      SD = list(salary = "SDSalary", id = "SDID", cpt_id = "CPTID",
+                ownership = "DKOwn", score = "DKScore", cpt_multiplier = 1.5,
+                platform_label = "DK Showdown")
+    ),
+    
+    download_formats = list(
+      DK     = "{Name} ({DKID})",
+      FD     = "{Name} ({FDID})",
+      SD     = "{Name} ({SDID})",
+      SD_CPT = "{Name} ({CPTID})"
+    ),
+    
+    input_file = list(
+      type            = "excel",
+      load_all_sheets = TRUE,
+      player_sheet    = "IDs"
+    ),
+    
+    simulation = list(
+      function_name = "run_nba_simulation",
+      output_format = list(
+        sim_results = c("SimID", "Player", "DKScore", "FDScore"),
+        metadata    = c("Player", "DKID", "DKSalary", "DKOwn",
+                        "FDID", "FDSalary", "FDOwn",
+                        "Team", "PosGroup", "GameKey", "GameTime", "GameRank")
+      )
+    ),
+    
+    lineup_metrics_function = "calculate_nba_lineup_metrics",
+    
+    # DK: PG/SG/SF/PF/C/G/F/UTIL | FD: PG/PG/SG/SG/SF/SF/PF/PF/C | SD: CPT+5UTIL
+    dk_export_slots = list(
+      DK = c("PG", "SG", "SF", "PF", "C", "G", "F", "UTIL"),
+      FD = c("PG", "PG", "SG", "SG", "SF", "SF", "PF", "PF", "C"),
+      SD = c("CPT", "UTIL", "UTIL", "UTIL", "UTIL", "UTIL")
+    )
   )
+  
   
 )
 
@@ -670,7 +781,7 @@ detect_sport <- function(file_path) {
       
       # Custom detect function (NFL)
       if (!is.null(detection$custom_detect)) {
-        if (detection$custom_detect(sheets)) return(sport_name)
+        if (detection$custom_detect(sheets, file_path)) return(sport_name)
         next
       }
       
