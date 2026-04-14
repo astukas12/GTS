@@ -254,6 +254,7 @@ run_nba_simulation <- function(input_data, n_sims = 10000, config = NULL,
   cb("Building player roster...", 0.03)
   
   slate_cols <- c("Player","DKID","FDID","DKSalary","FDSalary","DKPos","FDPos",
+                  "DKOwn","FDOwn",
                   "PosGroup","FDPosGroup","GameKey","SimKey","GameTime","GameRank",
                   "OverUnder","HomeSpread","DKProj","FDProj","Mins","Team")
   
