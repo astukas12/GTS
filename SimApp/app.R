@@ -1037,6 +1037,71 @@ server <- function(input, output, session) {
   
   
   # ==========================================================================
+  # NBA DISPLAY + DOWNLOAD FUNCTIONS
+  # DK:  PG / SG / SF / PF / C / G / F / UTIL  (8 players)
+  # FD:  PG / PG / SG / SG / SF / SF / PF / PF / C  (9 players)
+  # SD:  Captain + Util1..5
+  # ==========================================================================
+  
+  create_display_table_nba <- function(optimal_lineups, platform = "DK") {
+    dl <- copy(optimal_lineups)
+    if ("Captain" %in% names(dl)) {
+      slot_cols <- c("Captain", grep("^Util", names(dl), value=TRUE))
+    } else if (platform == "FD") {
+      pos_rename <- c(Player1="PG1", Player2="PG2", Player3="SG1", Player4="SG2",
+                      Player5="SF1", Player6="SF2", Player7="PF1", Player8="PF2",
+                      Player9="C")
+      for (o in names(pos_rename)) if (o %in% names(dl)) setnames(dl, o, pos_rename[o])
+      slot_cols <- intersect(c("PG1","PG2","SG1","SG2","SF1","SF2","PF1","PF2","C"), names(dl))
+    } else {
+      pos_rename <- c(Player1="PG", Player2="SG", Player3="SF", Player4="PF",
+                      Player5="C", Player6="G", Player7="F", Player8="UTIL")
+      for (o in names(pos_rename)) if (o %in% names(dl)) setnames(dl, o, pos_rename[o])
+      slot_cols <- intersect(c("PG","SG","SF","PF","C","G","F","UTIL"), names(dl))
+    }
+    metric_cols <- intersect(c("WinRate","Top1Pct","Top5Pct","Top10Pct","Top20Pct",
+                               "TotalSalary","AvgOwn"), names(dl))
+    keep <- c(slot_cols, metric_cols)
+    dl <- dl[, ..keep]
+    metric_rename <- c("WinRate"="Win","Top1Pct"="Top1","Top5Pct"="Top5",
+                       "Top10Pct"="Top10","Top20Pct"="Top20","TotalSalary"="Salary")
+    for (o in names(metric_rename)) if (o %in% names(dl)) setnames(dl, o, metric_rename[o])
+    if ("AvgOwn" %in% names(dl)) dl[, AvgOwn := round(AvgOwn, 1)]
+    dl
+  }
+  
+  create_download_nba <- function(optimal_lineups, metadata, platform = "DK") {
+    dl <- copy(optimal_lineups)
+    if ("Captain" %in% names(dl)) {
+      return(create_download_showdown(dl, metadata))
+    } else if (platform == "FD") {
+      pos_rename <- c(Player1="PG1", Player2="PG2", Player3="SG1", Player4="SG2",
+                      Player5="SF1", Player6="SF2", Player7="PF1", Player8="PF2",
+                      Player9="C")
+      for (o in names(pos_rename)) if (o %in% names(dl)) setnames(dl, o, pos_rename[o])
+      slot_cols <- intersect(c("PG1","PG2","SG1","SG2","SF1","SF2","PF1","PF2","C"), names(dl))
+      for (col in slot_cols) {
+        ids <- metadata[match(dl[[col]], metadata$Player), FDID]
+        dl[[col]] <- paste0(ids, ":", dl[[col]])
+      }
+    } else {
+      pos_rename <- c(Player1="PG", Player2="SG", Player3="SF", Player4="PF",
+                      Player5="C", Player6="G", Player7="F", Player8="UTIL")
+      for (o in names(pos_rename)) if (o %in% names(dl)) setnames(dl, o, pos_rename[o])
+      slot_cols <- intersect(c("PG","SG","SF","PF","C","G","F","UTIL"), names(dl))
+      for (col in slot_cols) {
+        ids <- metadata[match(dl[[col]], metadata$Player), DKID]
+        dl[[col]] <- paste0(dl[[col]], " (", ids, ")")
+      }
+    }
+    metric_rename <- c("WinRate"="Win","Top1Pct"="Top1","Top5Pct"="Top5",
+                       "Top10Pct"="Top10","Top20Pct"="Top20","TotalSalary"="Salary")
+    for (o in names(metric_rename)) if (o %in% names(dl)) setnames(dl, o, metric_rename[o])
+    dl
+  }
+  
+  
+  # ==========================================================================
   # SPORT-SPECIFIC LINEUP METRICS
   # ==========================================================================
   
@@ -1467,10 +1532,10 @@ server <- function(input, output, session) {
   
   output$dk_download <- downloadHandler(
     filename=function() paste0("DK_Optimal_Lineups_",format(Sys.Date(),"%Y%m%d"),".csv"),
-    content=function(file) { dl <- if (isTRUE(rv$sport %in% c("CBB","NBA"))) create_download_cbb(rv$dk_optimal_lineups, rv$sim_metadata, "DK") else create_download_table(rv$dk_optimal_lineups, rv$sim_metadata, "DK", rv$sport); fwrite(dl, file) })
+    content=function(file) { dl <- if (isTRUE(rv$sport == "CBB")) create_download_cbb(rv$dk_optimal_lineups, rv$sim_metadata, "DK") else if (isTRUE(rv$sport == "NBA")) create_download_nba(rv$dk_optimal_lineups, rv$sim_metadata, "DK") else create_download_table(rv$dk_optimal_lineups, rv$sim_metadata, "DK", rv$sport); fwrite(dl, file) })
   output$fd_download <- downloadHandler(
     filename=function() paste0("FD_Optimal_Lineups_",format(Sys.Date(),"%Y%m%d"),".csv"),
-    content=function(file) { dl <- if (isTRUE(rv$sport %in% c("CBB","NBA"))) create_download_cbb(rv$fd_optimal_lineups, rv$sim_metadata, "FD") else create_download_table(rv$fd_optimal_lineups, rv$sim_metadata, "FD", rv$sport); fwrite(dl, file) })
+    content=function(file) { dl <- if (isTRUE(rv$sport == "CBB")) create_download_cbb(rv$fd_optimal_lineups, rv$sim_metadata, "FD") else if (isTRUE(rv$sport == "NBA")) create_download_nba(rv$fd_optimal_lineups, rv$sim_metadata, "FD") else create_download_table(rv$fd_optimal_lineups, rv$sim_metadata, "FD", rv$sport); fwrite(dl, file) })
   output$sd_download <- downloadHandler(
     filename=function() paste0("SD_Optimal_Lineups_",format(Sys.Date(),"%Y%m%d"),".csv"),
     content=function(file) fwrite(create_download_table(rv$sd_optimal_lineups, rv$sim_metadata, "SD", rv$sport), file))
@@ -1568,7 +1633,7 @@ server <- function(input, output, session) {
     optimal <- switch(input$view_platform,
                       "DK"=rv$dk_optimal_lineups, "FD"=rv$fd_optimal_lineups, "SD"=rv$sd_optimal_lineups)
     req(optimal)
-    display_table <- if (isTRUE(rv$sport %in% c("CBB","NBA"))) create_display_table_cbb(optimal, input$view_platform) else create_display_table(optimal, rv$sim_metadata, input$view_platform)
+    display_table <- if (isTRUE(rv$sport == "CBB")) create_display_table_cbb(optimal, input$view_platform) else if (isTRUE(rv$sport == "NBA")) create_display_table_nba(optimal, input$view_platform) else create_display_table(optimal, rv$sim_metadata, input$view_platform)
     dt <- datatable(display_table,
                     options=list(pageLength=50, searching=FALSE, lengthChange=FALSE, scrollX=TRUE, dom='tp',
                                  order=list(list(which(names(display_table)=="Win")-1,'desc'))),
@@ -2325,7 +2390,7 @@ server <- function(input, output, session) {
         } else if ("MVP" %in% names(dl)) {
           dl <- create_download_mvp(dl, rv$sim_metadata)
         } else if (isTRUE(rv$sport == "CBB")) {
-          dl <- create_download_cbb(dl, rv$sim_metadata, platform)
+          dl <- if (rv$sport == "NBA") create_download_nba(dl, rv$sim_metadata, platform) else create_download_cbb(dl, rv$sim_metadata, platform)
         } else if (id_col %in% names(rv$sim_metadata)) {
           for (col in grep("^Player",names(dl),value=TRUE)) {
             ids <- rv$sim_metadata[match(dl[[col]],rv$sim_metadata$Player), get(id_col)]

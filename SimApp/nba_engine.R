@@ -101,8 +101,11 @@ read_nba_input <- function(file_path) {
     lapply(team_sheet_names, function(s) {
       dt <- as.data.table(read_excel(file_path, sheet = s))
       setnames(dt, trimws(names(dt)))
-      # DKProj/FDProj are the canonical names — no rename needed
-      drop <- intersect(c("DKSal","FDSal","DKSalary","FDSalary"), names(dt))
+      # Drop columns that come from IDs tab — avoids .x/.y collision on merge
+      # DKProj/FDProj/Mins live in the IDs tab; team tab is percentile shares only
+      drop <- intersect(c("DKSal","FDSal","DKSalary","FDSalary",
+                          "DKProj","FDProj","RGProj","RGFDProj","Mins",
+                          "DKOwn","FDOwn"), names(dt))
       if (length(drop)) dt[, (drop) := NULL]
       dt
     }),
@@ -598,19 +601,19 @@ run_nba_simulation <- function(input_data, n_sims = 10000, config = NULL,
     }), fill = TRUE)
     setnames(sd_all, "Name", "Player")
     
-    sd_join_cols <- intersect(
-      c("Player","Team","SDFile","CPT_ID","CPT_Salary","UTIL_ID","UTIL_Salary"),
-      names(sd_all)
-    )
+    # Rename SD columns cleanly before merge — avoids .SD scoping issues
+    sd_sub <- sd_all[, .(
+      Player    = Player,
+      Team      = Team,
+      SDFile    = SDFile,
+      CPTID     = CPT_ID,
+      CPTSalary = as.numeric(CPT_Salary),
+      SDID      = as.character(UTIL_ID),
+      SDSalary  = as.numeric(UTIL_Salary)
+    )]
     metadata <- merge(
       metadata,
-      sd_all[, ..sd_join_cols][, .(
-        Player, Team, SDFile,
-        CPTID     = CPT_ID,
-        CPTSalary = CPT_Salary,
-        SDID      = if ("UTIL_ID"     %in% names(.SD)) UTIL_ID     else NA_integer_,
-        SDSalary  = if ("UTIL_Salary" %in% names(.SD)) UTIL_Salary else NA_real_
-      )],
+      sd_sub,
       by.x = c("Player","Team","ShowdownFile"),
       by.y = c("Player","Team","SDFile"),
       all.x = TRUE
@@ -623,6 +626,13 @@ run_nba_simulation <- function(input_data, n_sims = 10000, config = NULL,
     any(!is.na(metadata$FDSalary) & metadata$FDSalary > 0)
   has_sd <- "CPTSalary" %in% names(metadata) &&
     any(!is.na(metadata$CPTSalary) & metadata$CPTSalary > 0)
+  
+  if (length(input_data$sd_ids) > 0 && !has_sd) {
+    cat("  Warning: SD IDs loaded but no CPTSalary in metadata after join.\n")
+    cat(sprintf("  metadata cols: %s\n", paste(names(metadata), collapse=", ")))
+    cat(sprintf("  ShowdownFile values: %s\n",
+                paste(unique(metadata$ShowdownFile), collapse=", ")))
+  }
   
   elapsed <- round((proc.time() - start_time)["elapsed"], 1)
   cat(sprintf("  NBA sim complete: %d sims | %d players | %.1fs\n",
