@@ -240,14 +240,15 @@ run_nba_simulation <- function(input_data, n_sims = 10000, config = NULL,
     if (!ta %in% names(team_data))
       stop(sprintf("No team tab found for: %s", ta))
   
+  # Per-minute rate percentiles — scaled by Mins/36 before draw
   pct_cols <- list(
-    fgm = c("fgm_p10","fgm_p25","fgm_p50","fgm_p75","fgm_p90"),
-    ftm = c("ftm_p10","ftm_p25","ftm_p50","ftm_p75","ftm_p90"),
-    reb = c("reb_p10","reb_p25","reb_p50","reb_p75","reb_p90"),
-    ast = c("ast_p10","ast_p25","ast_p50","ast_p75","ast_p90"),
-    stl = c("stl_p10","stl_p25","stl_p50","stl_p75","stl_p90"),
-    blk = c("blk_p10","blk_p25","blk_p50","blk_p75","blk_p90"),
-    to  = c("to_p10", "to_p25", "to_p50", "to_p75", "to_p90")
+    fgm = c("fgm_pm_p10","fgm_pm_p25","fgm_pm_p50","fgm_pm_p75","fgm_pm_p90"),
+    ftm = c("ftm_pm_p10","ftm_pm_p25","ftm_pm_p50","ftm_pm_p75","ftm_pm_p90"),
+    reb = c("reb_pm_p10","reb_pm_p25","reb_pm_p50","reb_pm_p75","reb_pm_p90"),
+    ast = c("ast_pm_p10","ast_pm_p25","ast_pm_p50","ast_pm_p75","ast_pm_p90"),
+    stl = c("stl_pm_p10","stl_pm_p25","stl_pm_p50","stl_pm_p75","stl_pm_p90"),
+    blk = c("blk_pm_p10","blk_pm_p25","blk_pm_p50","blk_pm_p75","blk_pm_p90"),
+    to  = c("to_pm_p10", "to_pm_p25", "to_pm_p50", "to_pm_p75", "to_pm_p90")
   )
   
   # ── Build player list ──────────────────────────────────────────────────────
@@ -320,7 +321,13 @@ run_nba_simulation <- function(input_data, n_sims = 10000, config = NULL,
     tpm_col <- paste0(team, "_", sim_tpm_col)
     totals[["tpm_sim"]] <- if (tpm_col %in% names(dt)) as.numeric(dt[[tpm_col]])[ri] else rep(0, n_sims)
     
-    # Percentile share matrices (n_team × 5)
+    # Per-minute rate percentile matrices (n_team × 5), pre-scaled by Mins/36
+    # Scale the entire distribution by tonight's projected minutes before draw —
+    # this gives correct variance shape: a 24-min player draws from a 24-min distribution
+    player_mins <- as.numeric(player_list$Mins[pidx])
+    player_mins[is.na(player_mins) | player_mins <= 0] <- 24  # fallback: 24 min
+    min_scale   <- player_mins / 36  # per-player scaling vector (n_team)
+    
     pcts <- setNames(lapply(share_stats, function(s) {
       cols <- pct_cols[[s]]
       m    <- matrix(0.0, n_team, 5)
@@ -328,7 +335,9 @@ run_nba_simulation <- function(input_data, n_sims = 10000, config = NULL,
         col <- cols[j]
         if (col %in% names(player_list)) {
           v <- as.numeric(player_list[[col]][pidx])
-          m[, j] <- ifelse(is.na(v), 0, v)
+          v[is.na(v)] <- 0
+          # Scale each player's percentile column by their Mins/36
+          m[, j] <- v * min_scale
         }
       }
       m
@@ -380,6 +389,8 @@ run_nba_simulation <- function(input_data, n_sims = 10000, config = NULL,
     pidx <- td$pidx
     
     for (s in share_stats) {
+      # pcts matrix already scaled by Mins/36 — draw gives minutes-adjusted raw estimates
+      # Normalize each sim column to the sim-row team total (step 3 of per-minute model)
       pm  <- td$pcts[[s]]
       shr <- interp_shares(team_draws[[team]][[s]],
                            pm[,1], pm[,2], pm[,3], pm[,4], pm[,5])
@@ -848,9 +859,13 @@ find_optimal_lineups_nba <- function(sim_results, metadata, config,
     meta[, GameRank := NULL]
   } else meta[, game_rank := 1L]
   
+  # GameKey already in meta from metadata merge above — just ensure no NAs
+  if (!"GameKey" %in% names(meta)) meta[, GameKey := "G1"]
+  meta[is.na(GameKey), GameKey := "G1"]
+  
   opt_data <- merge(
     sim_results[, .(SimID, Player, FantasyPoints = DKScore)],
-    meta[, .(Player, Salary = DKSalary, g_elig, f_elig, c_elig, game_rank)],
+    meta[, .(Player, Salary = DKSalary, g_elig, f_elig, c_elig, game_rank, GameKey)],
     by = "Player"
   )
   opt_data <- opt_data[Salary > 0 & !is.na(Salary) & !is.na(FantasyPoints)]
@@ -873,13 +888,29 @@ find_optimal_lineups_nba <- function(sim_results, metadata, config,
     n_p  <- nrow(pool)
     if (n_p < 8L) next
     
+    # Build game indicator constraints — at most 7 from any one game
+    # This forces players from at least 2 games on every slate with 2+ games
+    game_keys_pool <- unique(pool$GameKey)
+    game_constraints <- if (length(game_keys_pool) >= 2L) {
+      lapply(game_keys_pool, function(gk) as.integer(pool$GameKey == gk))
+    } else list()
+    
+    constraint_mat <- rbind(
+      rep(1, n_p),               # total players = 8
+      pool$Salary,               # salary <= cap
+      as.integer(pool$g_elig),   # >= 2 guards
+      as.integer(pool$f_elig),   # >= 2 forwards
+      as.integer(pool$c_elig),   # >= 1 center
+      do.call(rbind, game_constraints)  # <= 7 per game
+    )
+    constraint_dir <- c("==", "<=", ">=", ">=", ">=",
+                        rep("<=", length(game_constraints)))
+    constraint_rhs <- c(8L, salary_cap, 2L, 2L, 1L,
+                        rep(7L, length(game_constraints)))
+    
     res <- tryCatch(
-      lp("max", pool$FantasyPoints,
-         rbind(rep(1,n_p), pool$Salary,
-               as.integer(pool$g_elig), as.integer(pool$f_elig),
-               as.integer(pool$c_elig)),
-         c("==","<=",">=",">=",">="),
-         c(8L, salary_cap, 2L, 2L, 1L), all.bin = TRUE),
+      lp("max", pool$FantasyPoints, constraint_mat,
+         constraint_dir, constraint_rhs, all.bin = TRUE),
       error = function(e) list(status = 1L)
     )
     if (res$status != 0L) next
@@ -981,9 +1012,12 @@ find_optimal_lineups_nba_fd <- function(sim_results, metadata, config,
     meta[, GameRank := NULL]
   } else meta[, game_rank := 1L]
   
+  if (!"GameKey" %in% names(meta)) meta[, GameKey := "G1"]
+  meta[is.na(GameKey), GameKey := "G1"]
+  
   opt_data <- merge(
     sim_results[, .(SimID, Player, FantasyPoints = FDScore)],
-    meta[, .(Player, Salary = FDSalary, g_elig, f_elig, c_elig, game_rank)],
+    meta[, .(Player, Salary = FDSalary, g_elig, f_elig, c_elig, game_rank, GameKey)],
     by = "Player"
   )
   opt_data <- opt_data[Salary > 0 & !is.na(Salary) & !is.na(FantasyPoints)]
@@ -1002,13 +1036,27 @@ find_optimal_lineups_nba_fd <- function(sim_results, metadata, config,
     n_p  <- nrow(pool)
     if (n_p < 9L) next
     
+    game_keys_pool <- unique(pool$GameKey)
+    game_constraints <- if (length(game_keys_pool) >= 2L) {
+      lapply(game_keys_pool, function(gk) as.integer(pool$GameKey == gk))
+    } else list()
+    
+    constraint_mat <- rbind(
+      rep(1, n_p),
+      pool$Salary,
+      as.integer(pool$g_elig),
+      as.integer(pool$f_elig),
+      as.integer(pool$c_elig),
+      do.call(rbind, game_constraints)
+    )
+    constraint_dir <- c("==", "<=", ">=", ">=", ">=",
+                        rep("<=", length(game_constraints)))
+    constraint_rhs <- c(9L, salary_cap, 4L, 4L, 1L,
+                        rep(8L, length(game_constraints)))
+    
     res <- tryCatch(
-      lp("max", pool$FantasyPoints,
-         rbind(rep(1,n_p), pool$Salary,
-               as.integer(pool$g_elig), as.integer(pool$f_elig),
-               as.integer(pool$c_elig)),
-         c("==","<=",">=",">=",">="),
-         c(9L, salary_cap, 4L, 4L, 1L), all.bin = TRUE),
+      lp("max", pool$FantasyPoints, constraint_mat,
+         constraint_dir, constraint_rhs, all.bin = TRUE),
       error = function(e) list(status = 1L)
     )
     if (res$status != 0L) next
