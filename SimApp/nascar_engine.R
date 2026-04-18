@@ -212,12 +212,33 @@ run_nascar_simulation <- function(input_data, n_sims, config, progress_callback 
   # ========================================================================
   
   # Simulation results (long format)
-  sim_results <- combined_results[, .(
-    SimID,
-    Player = Name,
-    DKScore,
-    FDScore
-  )]
+  # Note: Starting omitted here — lives in metadata, joined by app.R (avoids duplicate col)
+  if (has_fd) {
+    sim_results <- combined_results[, .(
+      SimID,
+      Player = Name,
+      FinishPos = FinishPosition,
+      DKFinishPts,
+      DKPlaceDiff,
+      DKSpeedPts = DKDominatorPoints,
+      DKScore,
+      FDFinishPts,
+      FDPlaceDiff,
+      FDSpeedPts = FDDominatorPoints,
+      FDScore
+    )]
+  } else {
+    sim_results <- combined_results[, .(
+      SimID,
+      Player = Name,
+      FinishPos = FinishPosition,
+      DKFinishPts,
+      DKPlaceDiff,
+      DKSpeedPts = DKDominatorPoints,
+      DKScore,
+      FDScore
+    )]
+  }
   
   # Player metadata (one row per player)
   metadata <- unique(driver_data[, .(
@@ -333,10 +354,11 @@ run_nascar_simulation <- function(input_data, n_sims, config, progress_callback 
     driver_meta = driver_meta,
     accuracy_data = accuracy_data,
     has_fd      = has_fd,
-    # Keep full_results for optimizer/download — but only needed cols
+    # Keep full_results for optimizer/download — intersect() safely drops FD cols when has_fd = FALSE
     full_results = combined_results[, intersect(
-      c("SimID","Name","Starting","FinishPosition","DKSalary","DKScore",
-        "FDScore","DKDominatorPoints","FDDominatorPoints"),
+      c("SimID","Name","Starting","FinishPosition","DKSalary",
+        "DKFinishPts","DKPlaceDiff","DKDominatorPoints","DKScore",
+        "FDFinishPts","FDPlaceDiff","FDDominatorPoints","FDScore"),
       names(combined_results)), with = FALSE]
   )
   
@@ -367,116 +389,104 @@ run_nascar_simulation <- function(input_data, n_sims, config, progress_callback 
 #' for each driver across all finishing positions.
 precompute_driver_distributions <- function(driver_data) {
   n_drivers <- nrow(driver_data)
-  n_positions <- 40  # Standard NASCAR field size
+  n_positions <- n_drivers  # Field size comes from the input file — varies each race
   
   # Pre-allocate matrix: rows = drivers, cols = positions (probabilities)
   prob_matrix <- matrix(0, nrow = n_drivers, ncol = n_positions)
   rownames(prob_matrix) <- driver_data$Name
   
   for (i in 1:n_drivers) {
-    # Extract milestone probabilities
-    W <- driver_data$W[i]
-    T3 <- driver_data$T3[i]
-    T5 <- driver_data$T5[i]
+    W   <- driver_data$W[i]
+    T3  <- driver_data$T3[i]
+    T5  <- driver_data$T5[i]
     T10 <- driver_data$T10[i]
     T15 <- driver_data$T15[i]
     T20 <- driver_data$T20[i]
     T25 <- driver_data$T25[i]
     T30 <- driver_data$T30[i]
     
-    # Initialize position probabilities
     position_probs <- numeric(n_positions)
     
-    # =========================================================================
-    # POSITION 1 (Winner)
-    # =========================================================================
+    # Each bucket gets exactly the marginal probability from the milestone inputs.
+    # "1 - T30" is the probability of finishing OUTSIDE the top 30 — all of it
+    # goes into positions 31:n_positions (clamped to field size).
+    # This ensures probabilities sum to 1.0 without any normalization inflation.
+    
     position_probs[1] <- W
     
-    # =========================================================================
-    # POSITIONS 2-3 (Top-3 finishers excluding winner)
-    # =========================================================================
-    prob_2_3 <- max(0, T3 - W)
-    position_probs[2] <- prob_2_3 / 2
-    position_probs[3] <- prob_2_3 / 2
-    
-    # =========================================================================
-    # POSITIONS 4-5
-    # =========================================================================
-    prob_4_5 <- max(0, T5 - T3)
-    position_probs[4] <- prob_4_5 / 2
-    position_probs[5] <- prob_4_5 / 2
-    
-    # =========================================================================
-    # POSITIONS 6-10
-    # =========================================================================
-    prob_6_10 <- max(0, T10 - T5)
-    # Use slight exponential decay (preference for earlier positions)
-    weights_6_10 <- exp(-0.08 * (0:4))
-    weights_6_10 <- weights_6_10 / sum(weights_6_10)
-    position_probs[6:10] <- prob_6_10 * weights_6_10
-    
-    # =========================================================================
-    # POSITIONS 11-15
-    # =========================================================================
-    prob_11_15 <- max(0, T15 - T10)
-    weights_11_15 <- exp(-0.08 * (0:4))
-    weights_11_15 <- weights_11_15 / sum(weights_11_15)
-    position_probs[11:15] <- prob_11_15 * weights_11_15
-    
-    # =========================================================================
-    # POSITIONS 16-20
-    # =========================================================================
-    prob_16_20 <- max(0, T20 - T15)
-    weights_16_20 <- exp(-0.08 * (0:4))
-    weights_16_20 <- weights_16_20 / sum(weights_16_20)
-    position_probs[16:20] <- prob_16_20 * weights_16_20
-    
-    # =========================================================================
-    # POSITIONS 21-25
-    # =========================================================================
-    prob_21_25 <- max(0, T25 - T20)
-    weights_21_25 <- exp(-0.08 * (0:4))
-    weights_21_25 <- weights_21_25 / sum(weights_21_25)
-    position_probs[21:25] <- prob_21_25 * weights_21_25
-    
-    # =========================================================================
-    # POSITIONS 26-30
-    # =========================================================================
-    prob_26_30 <- max(0, T30 - T25)
-    weights_26_30 <- exp(-0.08 * (0:4))
-    weights_26_30 <- weights_26_30 / sum(weights_26_30)
-    position_probs[26:30] <- prob_26_30 * weights_26_30
-    
-    # =========================================================================
-    # POSITIONS 31-40 (Tail)
-    # =========================================================================
-    prob_31_40 <- max(0, 1 - T30)
-    # Stronger decay for tail positions
-    weights_31_40 <- exp(-0.12 * (0:9))
-    weights_31_40 <- weights_31_40 / sum(weights_31_40)
-    position_probs[31:40] <- prob_31_40 * weights_31_40
-    
-    # =========================================================================
-    # HARD-ZERO MASK: positions that had zero input probability stay zero
-    # after normalization — prevents floating-point leakage into excluded zones
-    # =========================================================================
-    zero_mask <- position_probs == 0
-    
-    # =========================================================================
-    # NORMALIZE (ensure probabilities sum to 1.0)
-    # =========================================================================
-    total_prob <- sum(position_probs)
-    if (total_prob > 0) {
-      position_probs <- position_probs / total_prob
-    } else {
-      position_probs <- rep(1/n_positions, n_positions)
+    if (n_positions >= 3) {
+      p <- max(0, T3 - W)
+      position_probs[2:min(3, n_positions)] <- p / length(2:min(3, n_positions))
     }
     
-    # Re-apply hard zeros (normalization cannot create probability where none existed)
+    if (n_positions >= 4) {
+      p <- max(0, T5 - T3)
+      idx <- 4:min(5, n_positions)
+      position_probs[idx] <- p / length(idx)
+    }
+    
+    if (n_positions >= 6) {
+      p <- max(0, T10 - T5)
+      idx <- 6:min(10, n_positions)
+      w <- exp(-0.08 * seq_along(idx))
+      position_probs[idx] <- p * w / sum(w)
+    }
+    
+    if (n_positions >= 11) {
+      p <- max(0, T15 - T10)
+      idx <- 11:min(15, n_positions)
+      w <- exp(-0.08 * seq_along(idx))
+      position_probs[idx] <- p * w / sum(w)
+    }
+    
+    if (n_positions >= 16) {
+      p <- max(0, T20 - T15)
+      idx <- 16:min(20, n_positions)
+      w <- exp(-0.08 * seq_along(idx))
+      position_probs[idx] <- p * w / sum(w)
+    }
+    
+    if (n_positions >= 21) {
+      p <- max(0, T25 - T20)
+      idx <- 21:min(25, n_positions)
+      w <- exp(-0.08 * seq_along(idx))
+      position_probs[idx] <- p * w / sum(w)
+    }
+    
+    if (n_positions >= 26) {
+      p <- max(0, T30 - T25)
+      idx <- 26:min(30, n_positions)
+      w <- exp(-0.08 * seq_along(idx))
+      position_probs[idx] <- p * w / sum(w)
+    }
+    
+    # Tail: everything NOT in the top 30 goes into positions 31:n_positions.
+    # For a 37-car field this is 31-37. For Blake (T30=0.20) this correctly
+    # gives him 0.80 probability spread across 31-37, not just 0.20.
+    if (n_positions >= 31) {
+      p <- max(0, 1 - T30)
+      idx <- 31:n_positions
+      w <- exp(-0.12 * seq(0, length(idx) - 1))
+      position_probs[idx] <- p * w / sum(w)
+    } else {
+      # Field smaller than 31 — remaining probability goes into last position bucket
+      remaining <- max(0, 1 - sum(position_probs))
+      if (remaining > 0) {
+        last_start <- max(26, n_positions - 4)
+        idx <- last_start:n_positions
+        w <- exp(-0.12 * seq(0, length(idx) - 1))
+        position_probs[idx] <- position_probs[idx] + remaining * w / sum(w)
+      }
+    }
+    
+    # Hard-zero mask: any position that received zero probability above stays zero.
+    # Re-normalize only to fix floating-point dust (should be ~1.0 already).
+    zero_mask <- position_probs == 0
+    total <- sum(position_probs)
+    if (total > 0) position_probs <- position_probs / total
     position_probs[zero_mask] <- 0
-    # Re-normalize after masking
-    total_prob2 <- sum(position_probs)
-    if (total_prob2 > 0) position_probs <- position_probs / total_prob2
+    total2 <- sum(position_probs)
+    if (total2 > 0) position_probs <- position_probs / total2
     
     prob_matrix[i, ] <- position_probs
   }
@@ -485,90 +495,45 @@ precompute_driver_distributions <- function(driver_data) {
 }
 
 
-#' Simulate finish positions with hard zero-probability enforcement
+#' Simulate finish positions — position-first assignment
 #'
-#' Zero-probability positions (e.g. W=0 means position 1 is impossible) are
-#' NEVER assigned, even as a last resort. Each driver's valid positions are
-#' pre-computed once. Collision resolution bumps displaced drivers to the closest
-#' valid available position, worst-to-best priority so front-runners always win
-#' contested spots. If no valid position remains (extremely rare edge case with
-#' many drivers fighting for few tail spots), the driver is placed at their
-#' closest boundary position — never outside their allowed range.
+#' Iterates positions 1 through n_positions. For each position, only drivers
+#' who have non-zero probability there are eligible. One is drawn proportionally
+#' from that eligible pool and assigned. Drivers already assigned are excluded.
+#' Because each position is filled exactly once in order, collisions are
+#' impossible by construction — no driver can land outside their valid range.
 simulate_finish_positions_vectorized <- function(prob_matrix, n_sims) {
   n_drivers   <- nrow(prob_matrix)
   n_positions <- ncol(prob_matrix)
   driver_names <- rownames(prob_matrix)
   
-  # Pre-compute valid positions per driver (non-zero prob only) — done once
-  valid_positions <- lapply(seq_len(n_drivers), function(i) {
-    which(prob_matrix[i, ] > 0)
-  })
-  names(valid_positions) <- driver_names
-  
-  # Pre-allocate output matrix
   final_positions <- matrix(0L, nrow = n_drivers, ncol = n_sims)
   rownames(final_positions) <- driver_names
   
   for (sim_id in seq_len(n_sims)) {
     
-    # Step 1: Each driver samples ONLY from their valid (non-zero) positions
-    sampled_positions <- integer(n_drivers)
-    for (i in seq_len(n_drivers)) {
-      vp <- valid_positions[[i]]
-      sampled_positions[i] <- if (length(vp) == 1L) vp else
-        sample(vp, 1L, prob = prob_matrix[i, vp])
-    }
+    assigned        <- integer(n_drivers)   # position assigned to each driver (0 = unassigned)
+    driver_assigned <- logical(n_drivers)   # TRUE once driver has a position
     
-    # Step 2: Resolve conflicts — process best sampled position first
-    # (front-runners claim spots; bumped drivers move to next valid available)
-    assigned_positions <- integer(n_drivers)
-    occupied <- logical(n_positions)   # TRUE = position already taken
-    
-    driver_order <- order(sampled_positions)  # ascending = best first
-    
-    for (driver_idx in driver_order) {
-      sampled_pos <- sampled_positions[driver_idx]
-      vp          <- valid_positions[[driver_idx]]
+    for (pos in seq_len(n_positions)) {
       
-      if (!occupied[sampled_pos]) {
-        # Position is free — take it
-        assigned_positions[driver_idx] <- sampled_pos
-        occupied[sampled_pos] <- TRUE
+      # Eligible: drivers with non-zero prob at this position who aren't yet assigned
+      eligible <- which(prob_matrix[, pos] > 0 & !driver_assigned)
+      
+      if (length(eligible) == 0L) next  # no eligible driver (shouldn't happen with valid inputs)
+      
+      if (length(eligible) == 1L) {
+        chosen <- eligible
       } else {
-        # Position taken — find closest valid available position
-        # Prefer worse (higher number) to preserve ordering intent; if none, take better
-        available_valid <- vp[!occupied[vp]]
-        
-        if (length(available_valid) > 0L) {
-          # Closest valid available to sampled (prefer worse if tie)
-          dists <- available_valid - sampled_pos
-          # Positive = worse (preferred), negative = better (fallback)
-          worse  <- available_valid[dists >= 0L]
-          better <- available_valid[dists <  0L]
-          if (length(worse) > 0L) {
-            chosen_pos <- worse[which.min(worse - sampled_pos)]
-          } else {
-            chosen_pos <- better[which.max(better)]  # closest better
-          }
-        } else {
-          # No valid positions left — place at boundary of allowed range
-          # This preserves the zero-prob contract: never outside valid range
-          chosen_pos <- if (sampled_pos > max(vp)) max(vp) else min(vp)
-          # If even boundary is occupied, find nearest occupied-but-valid
-          # (shouldn't normally happen with 40 slots and <40 drivers)
-          if (occupied[chosen_pos]) {
-            candidates <- vp[order(abs(vp - sampled_pos))]
-            chosen_pos <- candidates[1L]
-          }
-        }
-        
-        assigned_positions[driver_idx] <- chosen_pos
-        occupied[chosen_pos] <- TRUE
+        probs <- prob_matrix[eligible, pos]
+        chosen <- eligible[sample.int(length(eligible), 1L, prob = probs)]
       }
+      
+      assigned[chosen]        <- pos
+      driver_assigned[chosen] <- TRUE
     }
     
-    
-    final_positions[, sim_id] <- assigned_positions
+    final_positions[, sim_id] <- assigned
   }
   
   return(final_positions)
@@ -670,8 +635,9 @@ calculate_fantasy_points <- function(race_result, scoring_systems, has_fd = TRUE
   dk_finish_points <- scoring_systems$DK$Points[race_result$FinishPosition]
   dk_position_diff <- race_result$Starting - race_result$FinishPosition
   
-  # Use set() instead of := to avoid internal reference warnings
-  set(race_result, j = "DKScore", 
+  set(race_result, j = "DKFinishPts", value = dk_finish_points)
+  set(race_result, j = "DKPlaceDiff", value = dk_position_diff)
+  set(race_result, j = "DKScore",
       value = dk_finish_points + race_result$DKDominatorPoints + dk_position_diff)
   
   # FanDuel (only if has_fd is TRUE)
@@ -679,11 +645,11 @@ calculate_fantasy_points <- function(race_result, scoring_systems, has_fd = TRUE
     fd_finish_points <- scoring_systems$FD$Points[race_result$FinishPosition]
     fd_position_diff <- race_result$Starting - race_result$FinishPosition
     
-    # Use set() instead of := to avoid internal reference warnings
-    set(race_result, j = "FDScore", 
-        value = fd_finish_points + race_result$FDDominatorPoints + (fd_position_diff)*.5)
+    set(race_result, j = "FDFinishPts", value = fd_finish_points)
+    set(race_result, j = "FDPlaceDiff", value = fd_position_diff * 0.5)
+    set(race_result, j = "FDScore",
+        value = fd_finish_points + race_result$FDDominatorPoints + (fd_position_diff) * .5)
   } else {
-    # Set FD fantasy points to 0 when not available
     set(race_result, j = "FDScore", value = 0)
   }
   
