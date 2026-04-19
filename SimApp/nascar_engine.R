@@ -22,6 +22,17 @@ run_nascar_simulation <- function(input_data, n_sims, config, progress_callback 
   race_weights <- as.data.table(input_data$Race_Weights)
   race_profiles <- as.data.table(input_data$Race_Profiles)
   
+  # FDLaps: pre-calculated laps-completed pts per finishing position (optional)
+  # Sheet columns: Ps (finish position), Pt (lap points for that position)
+  if (!is.null(input_data$FDLaps)) {
+    fd_laps <- as.data.table(input_data$FDLaps)
+    setnames(fd_laps, names(fd_laps), c("Position", "LapPts"))
+    fd_laps[, Position := as.integer(Position)]
+    fd_laps[, LapPts   := as.numeric(LapPts)]
+  } else {
+    fd_laps <- NULL
+  }
+  
   # Validate required columns
   # Core columns (always required)
   core_required <- c("Name", "W", "T3", "T5", "T10", "T15", "T20", "T25", "T30",
@@ -180,7 +191,7 @@ run_nascar_simulation <- function(input_data, n_sims, config, progress_callback 
     }
     
     # Calculate total fantasy points
-    race_result <- calculate_fantasy_points(race_result, scoring_systems, has_fd)
+    race_result <- calculate_fantasy_points(race_result, scoring_systems, has_fd, fd_laps)
     
     all_results[[sim_id]] <- race_result
   }
@@ -224,6 +235,7 @@ run_nascar_simulation <- function(input_data, n_sims, config, progress_callback 
       DKScore,
       FDFinishPts,
       FDPlaceDiff,
+      FDLapPts,
       FDSpeedPts = FDDominatorPoints,
       FDScore
     )]
@@ -358,7 +370,7 @@ run_nascar_simulation <- function(input_data, n_sims, config, progress_callback 
     full_results = combined_results[, intersect(
       c("SimID","Name","Starting","FinishPosition","DKSalary",
         "DKFinishPts","DKPlaceDiff","DKDominatorPoints","DKScore",
-        "FDFinishPts","FDPlaceDiff","FDDominatorPoints","FDScore"),
+        "FDFinishPts","FDPlaceDiff","FDLapPts","FDDominatorPoints","FDScore"),
       names(combined_results)), with = FALSE]
   )
   
@@ -629,7 +641,7 @@ create_scoring_system <- function() {
 
 
 #' Calculate total fantasy points
-calculate_fantasy_points <- function(race_result, scoring_systems, has_fd = TRUE) {
+calculate_fantasy_points <- function(race_result, scoring_systems, has_fd = TRUE, fd_laps = NULL) {
   
   # DraftKings (always calculated)
   dk_finish_points <- scoring_systems$DK$Points[race_result$FinishPosition]
@@ -645,10 +657,19 @@ calculate_fantasy_points <- function(race_result, scoring_systems, has_fd = TRUE
     fd_finish_points <- scoring_systems$FD$Points[race_result$FinishPosition]
     fd_position_diff <- race_result$Starting - race_result$FinishPosition
     
+    # Laps completed pts — look up by finish position from FDLaps sheet
+    if (!is.null(fd_laps) && nrow(fd_laps) > 0) {
+      fd_lap_pts <- fd_laps$LapPts[match(race_result$FinishPosition, fd_laps$Position)]
+      fd_lap_pts[is.na(fd_lap_pts)] <- 0
+    } else {
+      fd_lap_pts <- 0
+    }
+    
     set(race_result, j = "FDFinishPts", value = fd_finish_points)
     set(race_result, j = "FDPlaceDiff", value = fd_position_diff * 0.5)
+    set(race_result, j = "FDLapPts",    value = fd_lap_pts)
     set(race_result, j = "FDScore",
-        value = fd_finish_points + race_result$FDDominatorPoints + (fd_position_diff) * .5)
+        value = fd_finish_points + race_result$FDDominatorPoints + (fd_position_diff * 0.5) + fd_lap_pts)
   } else {
     set(race_result, j = "FDScore", value = 0)
   }
@@ -1488,6 +1509,15 @@ get_full_nascar_simulation_data <- function(input_data, n_sims, config) {
   race_weights <- as.data.table(input_data$Race_Weights)
   race_profiles <- as.data.table(input_data$Race_Profiles)
   
+  if (!is.null(input_data$FDLaps)) {
+    fd_laps <- as.data.table(input_data$FDLaps)
+    setnames(fd_laps, names(fd_laps), c("Position", "LapPts"))
+    fd_laps[, Position := as.integer(Position)]
+    fd_laps[, LapPts   := as.numeric(LapPts)]
+  } else {
+    fd_laps <- NULL
+  }
+  
   # Standardize column names
   if ("DKOP" %in% names(driver_data)) setnames(driver_data, "DKOP", "DKOwn")
   if ("FDOP" %in% names(driver_data)) setnames(driver_data, "FDOP", "FDOwn")
@@ -1559,7 +1589,7 @@ get_full_nascar_simulation_data <- function(input_data, n_sims, config) {
     }
     
     # Calculate fantasy points
-    race_result <- calculate_fantasy_points(race_result, scoring_systems, has_fd)
+    race_result <- calculate_fantasy_points(race_result, scoring_systems, has_fd, fd_laps)
     
     all_results[[sim_id]] <- race_result
   }

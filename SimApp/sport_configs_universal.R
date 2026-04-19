@@ -68,6 +68,7 @@ SPORT_CONFIGS <- list(
     
     input_file = list(
       type            = "excel",
+      load_all_sheets = TRUE,
       required_sheets = c("Driver", "Race_Weights", "Race_Profiles"),
       player_sheet    = "Driver",
       required_columns = list(
