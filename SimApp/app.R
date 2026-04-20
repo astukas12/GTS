@@ -1577,9 +1577,21 @@ server <- function(input, output, session) {
       games_with_sd <- rv$input_data$games[!is.na(ShowdownFile) & ShowdownFile != ""]
       if (nrow(games_with_sd) > 1) {
         choices <- setNames(games_with_sd$ShowdownFile, games_with_sd$GameKey)
-        div(style="margin-bottom:10px;",
-            selectInput("sd_game_select", "Showdown Game:",
-                        choices=choices, selected=choices[1], width="300px"))
+        div(id = "sd_game_pills", style = "margin-bottom:14px;",
+            span(class = "gts-sr-label",
+                 style = "margin-right:10px;color:#FFE500;font-size:11px;font-weight:700;letter-spacing:.06em;",
+                 "SD GAME:"),
+            lapply(seq_along(choices), function(i) {
+              tags$button(
+                class   = paste("gts-pill", if (i == 1) "active" else ""),
+                onclick = sprintf(
+                  "Shiny.setInputValue('sd_game_select','%s',{priority:'event'});
+                   document.querySelectorAll('#sd_game_pills .gts-pill').forEach(function(b){b.classList.remove('active')});
+                   this.classList.add('active')", choices[i]),
+                names(choices)[i]
+              )
+            })
+        )
       }
     }
     # Use available_platforms() so FD/SD are hidden when data is absent
@@ -1982,8 +1994,8 @@ server <- function(input, output, session) {
       
       # ── Build metadata column list ─────────────────────────────────────────
       if (is_nba && is_sd) {
-        # SD: show DKPos, CPTSalary, SDSalary, Team, DKProj, Mins
-        nba_sd_meta <- intersect(c("Player","DKPos","Team","CPTSalary","SDSalary","DKProj","Mins"),
+        # SD: show DKPos, SDSalary (as Salary), Team, DKProj, Mins
+        nba_sd_meta <- intersect(c("Player","DKPos","Team","SDSalary","DKProj","Mins"),
                                  names(rv$sim_metadata))
         meta_cols <- nba_sd_meta
       } else if (is_nba) {
@@ -2015,9 +2027,10 @@ server <- function(input, output, session) {
       }
       
       if (is_nba && is_sd) {
-        # SD column ordering: Player, DKPos, Team, CPTSalary, SDSalary, GTS, DKProj, Mins, CptExp, UtilExp, Exposure
+        # SD column ordering: Player, DKPos, Team, Salary(SDSalary), GTS, ETR, Mins, CptExp, UtilExp, Exposure
+        if ("SDSalary" %in% names(exp_tbl)) setnames(exp_tbl, "SDSalary", "Salary")
         if ("DKProj" %in% names(exp_tbl)) setnames(exp_tbl, "DKProj", "ETR")
-        meta_order    <- intersect(c("Player","DKPos","Team","CPTSalary","SDSalary","GTS","ETR","Mins"), names(exp_tbl))
+        meta_order    <- intersect(c("Player","DKPos","Team","Salary","GTS","ETR","Mins"), names(exp_tbl))
         split_cols    <- intersect(c("CptExp","UtilExp"), names(exp_tbl))
         metrics_order <- intersect(c("Exposure"), names(exp_tbl))
         setcolorder(exp_tbl, c(meta_order, split_cols, metrics_order))
@@ -2067,10 +2080,6 @@ server <- function(input, output, session) {
       cap <- rv$config$salary_caps[[platform]] %||% 50000
       sal_col_disp <- if ("Sal" %in% names(exp_tbl)) "Sal" else if ("Salary" %in% names(exp_tbl)) "Salary" else NULL
       if (!is.null(sal_col_disp) && cap >= 1000) dt <- dt %>% formatCurrency(sal_col_disp,"$",digits=0)
-      if (is_nba && is_sd) {
-        for (sc in intersect(c("CPTSalary","SDSalary"), names(exp_tbl)))
-          dt <- dt %>% formatCurrency(sc,"$",digits=0)
-      }
       dt
     })
   }
@@ -2250,7 +2259,7 @@ server <- function(input, output, session) {
       
       # ── Build metadata column list ─────────────────────────────────────────
       if (is_nba && is_sd) {
-        mc <- intersect(c("Player","DKPos","Team","CPTSalary","SDSalary","DKProj","Mins"),
+        mc <- intersect(c("Player","DKPos","Team","SDSalary","DKProj","Mins"),
                         names(rv$sim_metadata))
       } else if (is_nba) {
         pos_col_nba <- if (platform == "FD") "FDPos" else "DKPos"
@@ -2303,8 +2312,9 @@ server <- function(input, output, session) {
         if (salary_col %in% names(exp_tbl)) setnames(exp_tbl, salary_col, "Salary")
         
         if (is_nba && is_sd) {
+          if ("SDSalary" %in% names(exp_tbl)) setnames(exp_tbl, "SDSalary", "Salary")
           if ("DKProj" %in% names(exp_tbl)) setnames(exp_tbl, "DKProj", "ETR")
-          meta_order <- intersect(c("Player","DKPos","Team","CPTSalary","SDSalary","GTS","ETR","Mins"), names(exp_tbl))
+          meta_order <- intersect(c("Player","DKPos","Team","Salary","GTS","ETR","Mins"), names(exp_tbl))
         } else if (is_nba) {
           pos_col_nba <- if (platform == "FD") "FDPos" else "DKPos"
           proj_col    <- if (platform == "FD") "FDProj" else "DKProj"
@@ -2345,10 +2355,6 @@ server <- function(input, output, session) {
         sal_disp <- intersect(c("Sal","Salary"), names(exp_tbl))
         cap_val  <- rv$config$salary_caps[[platform]] %||% 50000
         if (length(sal_disp) && cap_val >= 1000) dt <- dt %>% formatCurrency(sal_disp[1], "$", digits=0)
-        if (is_nba && is_sd) {
-          for (sc in intersect(c("CPTSalary","SDSalary"), names(exp_tbl)))
-            dt <- dt %>% formatCurrency(sc,"$",digits=0)
-        }
         dt <- dt %>% formatStyle("IN-OUT",
                                  color = styleInterval(c(-0.001, 0.001), c("#ff6b6b", "#888888", "#69db7c")))
         dt
@@ -2380,8 +2386,9 @@ server <- function(input, output, session) {
         if (!is.null(gts_tbl)) exp_tbl <- merge(exp_tbl, gts_tbl, by="Player", all.x=TRUE)
         
         if (is_nba && is_sd) {
+          if ("SDSalary" %in% names(exp_tbl)) setnames(exp_tbl, "SDSalary", "Salary")
           if ("DKProj" %in% names(exp_tbl)) setnames(exp_tbl, "DKProj", "ETR")
-          meta_order    <- intersect(c("Player","DKPos","Team","CPTSalary","SDSalary","GTS","ETR","Mins"), names(exp_tbl))
+          meta_order    <- intersect(c("Player","DKPos","Team","Salary","GTS","ETR","Mins"), names(exp_tbl))
           split_cols    <- intersect(c("CptExp","UtilExp"), names(exp_tbl))
           metrics_order <- "Exposure"
           setcolorder(exp_tbl, c(meta_order, split_cols, metrics_order))
@@ -2429,10 +2436,6 @@ server <- function(input, output, session) {
         cap <- rv$config$salary_caps[[platform]] %||% 50000
         sal_col_disp <- if ("Sal" %in% names(exp_tbl)) "Sal" else if ("Salary" %in% names(exp_tbl)) "Salary" else NULL
         if (!is.null(sal_col_disp) && cap >= 1000) dt <- dt %>% formatCurrency(sal_col_disp,"$",digits=0)
-        if (is_nba && is_sd) {
-          for (sc in intersect(c("CPTSalary","SDSalary"), names(exp_tbl)))
-            dt <- dt %>% formatCurrency(sc,"$",digits=0)
-        }
         dt
       }
     })
@@ -2633,7 +2636,10 @@ server <- function(input, output, session) {
     }
     if (isTRUE(rv$sport == "NBA")) {
       nba_proj_col <- if (platform == "FD") "FDProj" else "DKProj"
-      sport_meta_cols <- c(sport_meta_cols, intersect(c(nba_proj_col, "Mins"), names(meta)))
+      nba_pos_col  <- if (platform == "FD") "FDPos"  else "DKPos"
+      sport_meta_cols <- c(sport_meta_cols, intersect(c(nba_proj_col, nba_pos_col, "Mins"), names(meta)))
+      # Remove PosGroup from sport_meta_cols — we'll use granular DKPos/FDPos instead
+      sport_meta_cols <- sport_meta_cols[sport_meta_cols != "PosGroup"]
     }
     
     # Pull all sport metadata that actually exists in sim_metadata
@@ -2648,6 +2654,8 @@ server <- function(input, output, session) {
     if ("RGMin"  %in% names(proj)) setnames(proj, "RGMin",  "Mins")
     if ("DKProj" %in% names(proj)) setnames(proj, "DKProj", "ETR")
     if ("FDProj" %in% names(proj)) setnames(proj, "FDProj", "ETR")
+    if ("DKPos"  %in% names(proj)) setnames(proj, "DKPos",  "Pos")
+    if ("FDPos"  %in% names(proj)) setnames(proj, "FDPos",  "Pos")
     if ("PosGroup" %in% names(proj)) setnames(proj, "PosGroup", "Pos")
     
     setorder(proj, -Avg)
@@ -3260,13 +3268,6 @@ server <- function(input, output, session) {
     req(visuals)
     teams  <- visuals$teams
     is_nba <- isTRUE(rv$sport == "NBA")
-    
-    # Derive position pills for NBA (from DKPos, exclude UTIL)
-    nba_positions <- if (is_nba && !is.null(visuals$player_means) && "DKPos" %in% names(visuals$player_means)) {
-      pos_raw <- unique(visuals$player_means$DKPos)
-      sort(pos_raw[!is.na(pos_raw) & pos_raw != "" & !grepl("UTIL", pos_raw, ignore.case=TRUE)])
-    } else character(0)
-    
     box_title <- if (is_nba) "NBA Analysis" else "College Basketball Analysis"
     
     fluidRow(column(12,
@@ -3281,7 +3282,27 @@ server <- function(input, output, session) {
                         
                         tags$hr(style="border-color:#2a2a2a;margin:16px 0;"),
                         
-                        # ── Team pills ──────────────────────────────────────────────────
+                        # ── NBA: Mode toggle (By Team / By Position) ─────────────────────
+                        if (is_nba)
+                          div(id = "nba_mode_pills", style = "margin-bottom:12px;",
+                              span(class = "gts-sr-label", style = "margin-right:10px;", "View:"),
+                              tags$button(
+                                class   = "gts-pill active",
+                                onclick = "Shiny.setInputValue('nba_view_mode','team',{priority:'event'});
+                             document.querySelectorAll('#nba_mode_pills .gts-pill').forEach(function(b){b.classList.remove('active')});
+                             this.classList.add('active')",
+                             "By Team"
+                              ),
+                             tags$button(
+                               class   = "gts-pill",
+                               onclick = "Shiny.setInputValue('nba_view_mode','position',{priority:'event'});
+                             document.querySelectorAll('#nba_mode_pills .gts-pill').forEach(function(b){b.classList.remove('active')});
+                             this.classList.add('active')",
+                             "By Position"
+                             )
+                          ),
+                        
+                        # ── Team pills (shown in team mode) ─────────────────────────────
                         div(id = "cbb_team_pills", style = "margin-bottom:10px;",
                             span(class = "gts-sr-label", style = "margin-right:10px;", "Team:"),
                             lapply(seq_along(teams), function(i) {
@@ -3296,20 +3317,13 @@ server <- function(input, output, session) {
                             })
                         ),
                      
-                     # ── Position pills (NBA only) ────────────────────────────────────
-                     if (is_nba && length(nba_positions) > 0)
+                     # ── Position pills (shown in position mode, NBA only) ────────────
+                     if (is_nba)
                        div(id = "nba_pos_pills", style = "margin-bottom:14px;",
                            span(class = "gts-sr-label", style = "margin-right:10px;", "Position:"),
-                           tags$button(
-                             class   = "gts-pill active",
-                             onclick = "Shiny.setInputValue('nba_selected_pos','ALL',{priority:'event'});
-                             document.querySelectorAll('#nba_pos_pills .gts-pill').forEach(function(b){b.classList.remove('active')});
-                             this.classList.add('active')",
-                             "ALL"
-                           ),
-                           lapply(nba_positions, function(pos) {
+                           lapply(c("PG","SG","SF","PF","C"), function(pos) {
                              tags$button(
-                               class   = "gts-pill",
+                               class   = paste("gts-pill", if (pos == "PG") "active" else ""),
                                onclick = sprintf(
                                  "Shiny.setInputValue('nba_selected_pos','%s',{priority:'event'});
                        document.querySelectorAll('#nba_pos_pills .gts-pill').forEach(function(b){b.classList.remove('active')});
@@ -3336,26 +3350,29 @@ server <- function(input, output, session) {
     req(rv$sport_visuals)
     pm     <- rv$sport_visuals$player_means
     is_nba <- isTRUE(rv$sport == "NBA")
-    team   <- if (!is.null(input$cbb_selected_team) && input$cbb_selected_team %in% rv$sport_visuals$teams)
-      input$cbb_selected_team else rv$sport_visuals$teams[1]
     
-    td <- pm[Team == team]
+    # Platform-aware FP column
+    plat     <- if (!is.null(input$sim_results_platform) && nchar(input$sim_results_platform) > 0) input$sim_results_platform else "DK"
+    fp_col   <- if (is_nba && plat == "FD" && "FDAvgFP" %in% names(pm)) "FDAvgFP" else if ("DKAvgFP" %in% names(pm)) "DKAvgFP" else "AvgFP"
+    fp_label <- if (is_nba) paste("Avg", plat, "Fantasy Points") else "Avg DK Fantasy Points"
     
-    # NBA: filter by position pill if set (not ALL)
-    if (is_nba && !is.null(input$nba_selected_pos) && input$nba_selected_pos != "ALL" &&
-        "DKPos" %in% names(td)) {
-      sel_pos <- input$nba_selected_pos
-      td <- td[grepl(sel_pos, DKPos, fixed = TRUE)]
+    # Determine mode and filter data
+    view_mode <- if (is_nba && !is.null(input$nba_view_mode)) input$nba_view_mode else "team"
+    
+    if (is_nba && view_mode == "position") {
+      # Position mode: filter all players whose DKPos contains the selected base position
+      sel_pos <- if (!is.null(input$nba_selected_pos) && nchar(input$nba_selected_pos) > 0) input$nba_selected_pos else "PG"
+      req("DKPos" %in% names(pm))
+      # Match base position: PG matches PG, PG/SG, PG/SF etc — but not SG alone
+      td <- pm[grepl(paste0("(^|/)", sel_pos, "(/|$)"), DKPos)]
+    } else {
+      # Team mode
+      team <- if (!is.null(input$cbb_selected_team) && input$cbb_selected_team %in% rv$sport_visuals$teams)
+        input$cbb_selected_team else rv$sport_visuals$teams[1]
+      td <- pm[Team == team]
     }
     
     req(nrow(td) > 0)
-    
-    # Platform-aware FP column
-    plat      <- if (!is.null(input$sim_results_platform) && nchar(input$sim_results_platform) > 0) input$sim_results_platform else "DK"
-    fp_col    <- if (is_nba && plat == "FD" && "FDAvgFP" %in% names(td)) "FDAvgFP" else "DKAvgFP"
-    fp_col    <- if (fp_col %in% names(td)) fp_col else "AvgFP"
-    fp_label  <- if (is_nba) paste("Avg", plat, "Fantasy Points") else "Avg DK Fantasy Points"
-    
     setorderv(td, fp_col, order = 1L)
     h_px <- max(200, nrow(td) * 44)
     
@@ -3384,41 +3401,37 @@ server <- function(input, output, session) {
     req(rv$sport_visuals)
     pm     <- rv$sport_visuals$player_means
     is_nba <- isTRUE(rv$sport == "NBA")
-    team   <- if (!is.null(input$cbb_selected_team) && input$cbb_selected_team %in% rv$sport_visuals$teams)
-      input$cbb_selected_team else rv$sport_visuals$teams[1]
+    plat   <- if (!is.null(input$sim_results_platform) && nchar(input$sim_results_platform) > 0) input$sim_results_platform else "DK"
+    fp_col <- if (is_nba && plat == "FD" && "FDAvgFP" %in% names(pm)) "FDAvgFP" else if ("DKAvgFP" %in% names(pm)) "DKAvgFP" else "AvgFP"
     
-    td <- pm[Team == team]
+    view_mode <- if (is_nba && !is.null(input$nba_view_mode)) input$nba_view_mode else "team"
     
-    # NBA: filter by position pill
-    if (is_nba && !is.null(input$nba_selected_pos) && input$nba_selected_pos != "ALL" &&
-        "DKPos" %in% names(td)) {
-      sel_pos <- input$nba_selected_pos
-      td <- td[grepl(sel_pos, DKPos, fixed = TRUE)]
+    if (is_nba && view_mode == "position") {
+      sel_pos <- if (!is.null(input$nba_selected_pos) && nchar(input$nba_selected_pos) > 0) input$nba_selected_pos else "PG"
+      req("DKPos" %in% names(pm))
+      td <- pm[grepl(paste0("(^|/)", sel_pos, "(/|$)"), DKPos)]
+    } else {
+      team <- if (!is.null(input$cbb_selected_team) && input$cbb_selected_team %in% rv$sport_visuals$teams)
+        input$cbb_selected_team else rv$sport_visuals$teams[1]
+      td <- pm[Team == team]
     }
     
     req(nrow(td) > 0)
-    
-    # Platform-aware sort & FP column
-    plat   <- if (!is.null(input$sim_results_platform) && nchar(input$sim_results_platform) > 0) input$sim_results_platform else "DK"
-    fp_col <- if (is_nba && plat == "FD" && "FDAvgFP" %in% names(td)) "FDAvgFP" else if ("DKAvgFP" %in% names(td)) "DKAvgFP" else "AvgFP"
     setorderv(td, fp_col, order = -1L)
     
     if (is_nba) {
-      # Include DKPos for NBA; show platform FP column
-      fp_display <- if (plat == "FD") "FDAvgFP" else "DKAvgFP"
-      fp_display <- if (fp_display %in% names(td)) fp_display else "AvgFP"
-      show_cols <- intersect(c("Player","DKPos",fp_display,"pts","tpm","twom","ftm","reb","ast","stl","blk","to"),
-                             names(td))
+      fp_display <- if (fp_col %in% names(td)) fp_col else "AvgFP"
+      show_cols  <- intersect(c("Player","DKPos","Team",fp_display,"pts","tpm","twom","ftm","reb","ast","stl","blk","to"),
+                              names(td))
       td <- td[, ..show_cols]
-      fp_name <- paste0("Avg ", plat, " FP")
+      fp_name   <- paste0("Avg ", plat, " FP")
       setnames(td, fp_display, fp_name)
-      old_names <- intersect(c("DKPos","pts","tpm","twom","ftm","reb","ast","stl","blk","to"), names(td))
-      new_names <- c("Pos","Pts","3PM","2PM","FTM","Reb","Ast","Stl","Blk","TO")[seq_along(old_names)]
+      old_names <- intersect(c("DKPos","Team","pts","tpm","twom","ftm","reb","ast","stl","blk","to"), names(td))
+      new_names <- c("Pos","Team","Pts","3PM","2PM","FTM","Reb","Ast","Stl","Blk","TO")[seq_along(old_names)]
       setnames(td, old_names, new_names)
       highlight_col <- fp_name
     } else {
-      show_cols <- intersect(c("Player","AvgFP","pts","tpm","twom","ftm","reb","ast","stl","blk","to"),
-                             names(td))
+      show_cols <- intersect(c("Player","AvgFP","pts","tpm","twom","ftm","reb","ast","stl","blk","to"), names(td))
       td <- td[, ..show_cols]
       setnames(td, old = intersect(c("AvgFP","pts","tpm","twom","ftm","reb","ast","stl","blk","to"), names(td)),
                new = c("Avg FP","Pts","3PM","2PM","FTM","Reb","Ast","Stl","Blk","TO")[seq_len(
