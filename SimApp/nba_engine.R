@@ -671,39 +671,51 @@ run_nba_simulation <- function(input_data, n_sims = 10000, config = NULL,
   teams       <- sort(unique(metadata$Team))
   twom_mat_v  <- pmax(stat_mats[["fgm"]] - tpm_mat, 0L)
   
+  # Build lookup for granular positions from metadata
+  pos_lu <- unique(player_list[, .(
+    Player  = Name,
+    DKPos   = if ("DKPos" %in% names(player_list)) DKPos else NA_character_,
+    FDPos   = if ("FDPos" %in% names(player_list)) FDPos else NA_character_
+  )])
+  
   player_means <- data.table(
-    Player = player_names,
-    Team   = player_teams,
-    AvgFP  = round(rowMeans(dk_mat),              1),
-    pts    = round(rowMeans(pts_mat),              1),
-    tpm    = round(rowMeans(tpm_mat),              1),
-    twom   = round(rowMeans(twom_mat_v),           1),
-    ftm    = round(rowMeans(stat_mats[["ftm"]]),   1),
-    reb    = round(rowMeans(stat_mats[["reb"]]),   1),
-    ast    = round(rowMeans(stat_mats[["ast"]]),   1),
-    stl    = round(rowMeans(stat_mats[["stl"]]),   1),
-    blk    = round(rowMeans(stat_mats[["blk"]]),   1),
-    to     = round(rowMeans(stat_mats[["to"]]),    1)
+    Player   = player_names,
+    Team     = player_teams,
+    DKAvgFP  = round(rowMeans(dk_mat),              1),
+    FDAvgFP  = round(rowMeans(fd_mat),              1),
+    AvgFP    = round(rowMeans(dk_mat),              1),   # kept for backwards compat
+    pts      = round(rowMeans(pts_mat),              1),
+    tpm      = round(rowMeans(tpm_mat),              1),
+    twom     = round(rowMeans(twom_mat_v),           1),
+    ftm      = round(rowMeans(stat_mats[["ftm"]]),   1),
+    reb      = round(rowMeans(stat_mats[["reb"]]),   1),
+    ast      = round(rowMeans(stat_mats[["ast"]]),   1),
+    stl      = round(rowMeans(stat_mats[["stl"]]),   1),
+    blk      = round(rowMeans(stat_mats[["blk"]]),   1),
+    to       = round(rowMeans(stat_mats[["to"]]),    1)
   )
-  setorder(player_means, Team, -AvgFP)
+  player_means <- merge(player_means, pos_lu, by = "Player", all.x = TRUE)
+  setorder(player_means, Team, -DKAvgFP)
   
   team_means <- rbindlist(lapply(teams, function(tm) {
     pidx <- which(player_teams == tm)
     data.table(
-      Team  = tm,
-      AvgFP = round(mean(colSums(dk_mat[pidx,,drop=FALSE])),           1),
-      pts   = round(mean(colSums(pts_mat[pidx,,drop=FALSE])),          1),
-      tpm   = round(mean(colSums(tpm_mat[pidx,,drop=FALSE])),          1),
-      twom  = round(mean(colSums(twom_mat_v[pidx,,drop=FALSE])),       1),
-      ftm   = round(mean(colSums(stat_mats[["ftm"]][pidx,,drop=FALSE])),1),
-      reb   = round(mean(colSums(stat_mats[["reb"]][pidx,,drop=FALSE])),1),
-      ast   = round(mean(colSums(stat_mats[["ast"]][pidx,,drop=FALSE])),1),
-      stl   = round(mean(colSums(stat_mats[["stl"]][pidx,,drop=FALSE])),1),
-      blk   = round(mean(colSums(stat_mats[["blk"]][pidx,,drop=FALSE])),1),
-      to    = round(mean(colSums(stat_mats[["to"]][pidx,,drop=FALSE])), 1)
+      Team    = tm,
+      DKAvgFP = round(mean(colSums(dk_mat[pidx,,drop=FALSE])),            1),
+      FDAvgFP = round(mean(colSums(fd_mat[pidx,,drop=FALSE])),            1),
+      AvgFP   = round(mean(colSums(dk_mat[pidx,,drop=FALSE])),            1),
+      pts     = round(mean(colSums(pts_mat[pidx,,drop=FALSE])),           1),
+      tpm     = round(mean(colSums(tpm_mat[pidx,,drop=FALSE])),           1),
+      twom    = round(mean(colSums(twom_mat_v[pidx,,drop=FALSE])),        1),
+      ftm     = round(mean(colSums(stat_mats[["ftm"]][pidx,,drop=FALSE])),1),
+      reb     = round(mean(colSums(stat_mats[["reb"]][pidx,,drop=FALSE])),1),
+      ast     = round(mean(colSums(stat_mats[["ast"]][pidx,,drop=FALSE])),1),
+      stl     = round(mean(colSums(stat_mats[["stl"]][pidx,,drop=FALSE])),1),
+      blk     = round(mean(colSums(stat_mats[["blk"]][pidx,,drop=FALSE])),1),
+      to      = round(mean(colSums(stat_mats[["to"]][pidx,,drop=FALSE])), 1)
     )
   }))
-  setorder(team_means, -AvgFP)
+  setorder(team_means, -DKAvgFP)
   
   sport_visuals <- list(
     teams        = teams,
