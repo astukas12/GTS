@@ -6,8 +6,8 @@
 #
 # DK scoring:  PTS(1) + 3PM(0.5) + REB(1.25) + AST(1.5) + STL(2) + BLK(2)
 #              - TO(0.5) + DD bonus(1.5) + TD bonus(3, replaces DD)
-# FD scoring:  PTS(1) + 3PM(0.5) + REB(1.20) + AST(1.5) + STL(2) + BLK(2)
-#              - TO(1.0)  [no bonus]
+# FD scoring:  PTS(1) + FGM(2) + 3PM(1) + REB(1.20) + AST(1.5) + STL(3) + BLK(3)
+#              - TO(1.0)  [no DD/TD bonus]
 # SD scoring:  same as DK (DKScore × 1.5 for CPT slot)
 #
 # Input file sheet structure:
@@ -115,38 +115,17 @@ read_nba_input <- function(file_path) {
   # ── Build slate ────────────────────────────────────────────────────────────
   slate <- merge(ids, team_game_lu, by = "Team", all.x = TRUE)
   
-  # DK position grouping: G / F / C — NBA uses specific positions
-  # G slot: PG, SG, G  |  F slot: SF, PF, F  |  C: center only
-  # UTIL: anything
-  dk_pos_group <- function(pos) {
-    fcase(
-      grepl("^PG|^SG|^G$|G/",  pos), "G",
-      grepl("^SF|^PF|^F$|F/",  pos), "F",
-      grepl("^C$|C/|/C",       pos), "C",
-      default = "UTIL"
-    )
-  }
-  fd_pos_group <- function(pos) {
-    fcase(
-      grepl("^PG|^SG|G$|G/|/G", pos), "G",
-      grepl("^SF|^PF|F$|F/|/F", pos), "F",
-      grepl("^C$|C/|/C",        pos), "C",
-      default = "UTIL"
-    )
-  }
-  
+  # NBA always has specific positions from DK/FD exports (PG, SG, SF, PF, C, or combos like SG/SF).
+  # Eligibility flags are derived directly from the position string — no generic G/F grouping needed.
   if ("DKPos" %in% names(slate)) {
-    slate[, PosGroup := dk_pos_group(DKPos)]
-    # Dual eligibility flags — a player can be both G and F eligible (e.g. SG/SF)
-    slate[, dk_g_elig := grepl("PG|SG|^G$|G/|/G", DKPos)]
-    slate[, dk_f_elig := grepl("SF|PF|^F$|F/|/F", DKPos)]
-    slate[, dk_c_elig := grepl("^C$|C/|/C",        DKPos)]
+    slate[, dk_g_elig := grepl("PG|SG", DKPos)]
+    slate[, dk_f_elig := grepl("SF|PF", DKPos)]
+    slate[, dk_c_elig := grepl("^C$|C/|/C", DKPos)]
   }
   if ("FDPos" %in% names(slate)) {
-    slate[, FDPosGroup := fd_pos_group(FDPos)]
-    slate[, fd_g_elig  := grepl("PG|SG|G$|G/|/G",  FDPos)]
-    slate[, fd_f_elig  := grepl("SF|PF|F$|F/|/F",  FDPos)]
-    slate[, fd_c_elig  := grepl("^C$|C/|/C",        FDPos)]
+    slate[, fd_g_elig := grepl("PG|SG", FDPos)]
+    slate[, fd_f_elig := grepl("SF|PF", FDPos)]
+    slate[, fd_c_elig := grepl("^C$|C/|/C", FDPos)]
   }
   slate <- unique(slate, by = "Player")
   
@@ -196,9 +175,10 @@ dk_score_nba <- function(pts, tpm, reb, ast, stl, blk, to) {
   base + ifelse(cats >= 3, 3.0, ifelse(cats >= 2, 1.5, 0.0))
 }
 
-fd_score_nba <- function(pts, tpm, reb, ast, stl, blk, to) {
-  # FD NBA scoring: STL/BLK = +3 (not +2), no DD/TD bonus, TO = -1
-  pts + tpm*0.5 + reb*1.20 + ast*1.5 + stl*3.0 + blk*3.0 - to*1.0
+fd_score_nba <- function(pts, fgm, tpm, reb, ast, stl, blk, to) {
+  # FD NBA scoring: PTS(1) + FGM(2) + 3PM(1) + REB(1.2) + AST(1.5) + STL(3) + BLK(3) - TO(1)
+  # No DD/TD bonus. fgm bonus applies to all field goals (2s and 3s alike).
+  pts + fgm*2.0 + tpm*1.0 + reb*1.20 + ast*1.5 + stl*3.0 + blk*3.0 - to*1.0
 }
 
 
@@ -256,7 +236,7 @@ run_nba_simulation <- function(input_data, n_sims = 10000, config = NULL,
   
   slate_cols <- c("Player","DKID","FDID","DKSalary","FDSalary","DKPos","FDPos",
                   "DKOwn","FDOwn",
-                  "PosGroup","FDPosGroup","GameKey","SimKey","GameTime","GameRank",
+                  "GameKey","SimKey","GameTime","GameRank",
                   "OverUnder","HomeSpread","DKProj","FDProj","Mins","Team")
   
   player_list <- rbindlist(lapply(team_abbrevs, function(team) {
@@ -325,7 +305,13 @@ run_nba_simulation <- function(input_data, n_sims = 10000, config = NULL,
     # Scale the entire distribution by tonight's projected minutes before draw —
     # this gives correct variance shape: a 24-min player draws from a 24-min distribution
     player_mins <- as.numeric(player_list$Mins[pidx])
-    player_mins[is.na(player_mins) | player_mins <= 0] <- 24  # fallback: 24 min
+    # Fallback chain: projected Mins -> historical minutes_avg -> league default 24
+    mins_avg_fallback <- if ("minutes_avg" %in% names(player_list))
+      as.numeric(player_list$minutes_avg[pidx]) else rep(NA_real_, length(pidx))
+    player_mins <- ifelse(is.na(player_mins) | player_mins <= 0,
+                          ifelse(is.na(mins_avg_fallback) | mins_avg_fallback <= 0, 24,
+                                 mins_avg_fallback),
+                          player_mins)
     min_scale   <- player_mins / 36  # per-player scaling vector (n_team)
     
     pcts <- setNames(lapply(share_stats, function(s) {
@@ -343,9 +329,22 @@ run_nba_simulation <- function(input_data, n_sims = 10000, config = NULL,
       m
     }), share_stats)
     
-    # Player-level fg3_rate, pot_ast_share, ast_conv
-    fg3_rate     <- as.numeric(player_list$fg3_rate[pidx])
-    fg3_rate[is.na(fg3_rate)] <- 0.30  # league average fallback
+    # Player-level fg3_rate percentile matrix (n_team × 5)
+    # Draw a fg3_rate per player per sim from this distribution
+    fg3_pct_cols <- c("fg3_rate_p10","fg3_rate_p25","fg3_rate_p50",
+                      "fg3_rate_p75","fg3_rate_p90")
+    fg3_pcts <- matrix(0.30, n_team, 5)  # default: 30% across all percentiles
+    for (j in seq_along(fg3_pct_cols)) {
+      col <- fg3_pct_cols[j]
+      if (col %in% names(player_list)) {
+        v <- as.numeric(player_list[[col]][pidx])
+        # Fallback to fg3_rate mean if percentile missing
+        mean_rate <- as.numeric(player_list$fg3_rate[pidx])
+        mean_rate[is.na(mean_rate)] <- 0.30
+        v[is.na(v)] <- mean_rate[is.na(v)]
+        fg3_pcts[, j] <- v
+      }
+    }
     
     pot_ast_share <- as.numeric(player_list$pot_ast_share[pidx])
     pot_ast_share[is.na(pot_ast_share)] <- 1 / n_team  # equal share fallback
@@ -360,7 +359,7 @@ run_nba_simulation <- function(input_data, n_sims = 10000, config = NULL,
     else rep(1/n_team, n_team)
     
     list(pidx = pidx, n_team = n_team, totals = totals, pcts = pcts,
-         fg3_rate = fg3_rate, ast_weight = ast_weight)
+         fg3_pcts = fg3_pcts, ast_weight = ast_weight)
   }), team_abbrevs)
   
   # ── Pre-draw uniform samples ───────────────────────────────────────────────
@@ -368,10 +367,13 @@ run_nba_simulation <- function(input_data, n_sims = 10000, config = NULL,
   
   team_draws <- setNames(lapply(team_abbrevs, function(team) {
     n_team <- team_data_prepped[[team]]$n_team
-    setNames(
+    draws  <- setNames(
       lapply(share_stats, function(s) matrix(runif(n_team * n_sims), n_team, n_sims)),
       share_stats
     )
+    # fg3_rate draws — separate uniform matrix for the 3-point rate distribution
+    draws[["fg3_rate"]] <- matrix(runif(n_team * n_sims), n_team, n_sims)
+    draws
   }), team_abbrevs)
   
   # ── Allocate share-based stats ─────────────────────────────────────────────
@@ -400,23 +402,30 @@ run_nba_simulation <- function(input_data, n_sims = 10000, config = NULL,
     }
   }
   
-  # ── Derive tpm from fgm × fg3_rate, scaled to sim-row tpm total ───────────
-  # This preserves player shot-type tendency while anchoring to game environment.
-  # For each sim: tpm_i_natural = fgm_i × fg3_rate_i
-  # Scale so sum(tpm_i) = team_tpm_simrow
-  # Hard constraint: tpm_i <= fgm_i
+  # ── Derive tpm from fgm × fg3_rate_drawn, scaled to sim-row tpm total ────────
+  # fg3_rate is now drawn from each player's P10/P25/P50/P75/P90 distribution
+  # each sim, so shot-type mix varies realistically across simulations.
+  # The sim-row team tpm total still anchors the team total — individual rates vary.
   cb("Deriving 3-pointers...", 0.55)
   
   for (team in team_abbrevs) {
     td   <- team_data_prepped[[team]]
     pidx <- td$pidx
     
-    fgm_t      <- stat_mats[["fgm"]][pidx, , drop = FALSE]   # n_team × n_sims
-    fg3_rate_v <- td$fg3_rate                                  # n_team vector
-    sim_tpm    <- td$totals[["tpm_sim"]]                       # n_sims vector
+    fgm_t   <- stat_mats[["fgm"]][pidx, , drop = FALSE]   # n_team × n_sims
+    sim_tpm <- td$totals[["tpm_sim"]]                       # n_sims vector
     
-    # Natural tpm per player: fgm × fg3_rate
-    tpm_natural <- sweep(fgm_t, 1, fg3_rate_v, `*`)            # n_team × n_sims
+    # Draw fg3_rate per player per sim from their percentile distribution
+    fg3_draws  <- team_draws[[team]][["fg3_rate"]]           # n_team × n_sims uniform
+    fg3_pcts_m <- td$fg3_pcts                                # n_team × 5
+    fg3_rate_mat <- interp_shares(fg3_draws,
+                                  fg3_pcts_m[,1], fg3_pcts_m[,2], fg3_pcts_m[,3],
+                                  fg3_pcts_m[,4], fg3_pcts_m[,5])
+    # Clamp to [0, 1]
+    fg3_rate_mat <- pmin(pmax(fg3_rate_mat, 0), 1)
+    
+    # Natural tpm per player per sim: fgm × drawn_fg3_rate
+    tpm_natural <- fgm_t * fg3_rate_mat                      # n_team × n_sims
     
     # Scale to match sim-row tpm total
     natural_sum <- colSums(tpm_natural)
@@ -562,7 +571,7 @@ run_nba_simulation <- function(input_data, n_sims = 10000, config = NULL,
                          stat_mats[["reb"]], stat_mats[["ast"]],
                          stat_mats[["stl"]], stat_mats[["blk"]],
                          stat_mats[["to"]])
-  fd_mat <- fd_score_nba(pts_mat, tpm_mat,
+  fd_mat <- fd_score_nba(pts_mat, stat_mats[["fgm"]], tpm_mat,
                          stat_mats[["reb"]], stat_mats[["ast"]],
                          stat_mats[["stl"]], stat_mats[["blk"]],
                          stat_mats[["to"]])
@@ -589,7 +598,7 @@ run_nba_simulation <- function(input_data, n_sims = 10000, config = NULL,
   
   keep_cols <- intersect(
     c("Name","DKID","FDID","DKSalary","FDSalary","DKPos","FDPos",
-      "DKOwn","FDOwn","PosGroup","FDPosGroup","Team","GameKey","SimKey",
+      "DKOwn","FDOwn","Team","GameKey","SimKey",
       "GameTime","GameRank","OverUnder","HomeSpread","DKProj","FDProj","Mins"),
     names(player_list)
   )
@@ -730,27 +739,20 @@ run_nba_simulation <- function(input_data, n_sims = 10000, config = NULL,
        sport_visuals = sport_visuals)
 }
 
-
 # ============================================================================
 # NBA SLOT ASSIGNMENT
-# DK:  PG/SG/SF/PF/C/G/F/UTIL  (8 players)
-# FD:  PG/SG/SF/PF/C/PG/SG/SF  (actually FD uses G/F/C/UTIL system)
+# DK Classic:  PG / SG / SF / PF / C / G / F / UTIL  (8 players, $50K)
+# FD Classic:  PG / PG / SG / SG / SF / SF / PF / PF / C  (9 players, $60K)
 #
-# Simplified grouping used for optimizer:
-#   G-eligible: PosGroup == "G"  (PG, SG, G, PG/SG etc.)
-#   F-eligible: PosGroup == "F"  (SF, PF, F, SF/PF etc.)
-#   C-eligible: PosGroup == "C"
-#   Any: UTIL
-#
-# DK slots: 1PG, 1SG, 1SF, 1PF, 1C, 1G, 1F, 1UTIL
-# Simplified to LP constraints: >=2 G-elig, >=2 F-elig, >=1 C-elig, 8 total
+# Eligibility is derived directly from DKPos/FDPos strings (e.g. "SG/SF").
+# LP constraints use: >=2 G-elig (PG|SG), >=2 F-elig (SF|PF), >=1 C-elig.
 # Post-LP slot assignment maps players to named slots deterministically.
 # ============================================================================
 
 assign_nba_slots_dk <- function(cm) {
-  # cm: data.table with Player, DKPos (or PosGroup), game_rank
-  # Handles dual-eligible positions: SG/SF fills G slots OR F slots
-  # Slot preference order: specific named slot -> flex slot -> UTIL
+  # cm: data.table with Player, DKPos, game_rank
+  # Dual-eligible positions (e.g. SG/SF) fill either named slot OR the flex G/F/UTIL slots.
+  # Slot preference order: specific named slot -> G/F flex -> UTIL
   
   setorder(cm, game_rank, Player)
   
@@ -759,14 +761,14 @@ assign_nba_slots_dk <- function(cm) {
                 C =NA_character_, G =NA_character_,
                 F =NA_character_, UTIL=NA_character_)
   
-  # Derive eligibility per player from DKPos if available, else PosGroup
-  pos_vec <- if ("DKPos" %in% names(cm)) cm$DKPos else cm$PosGroup
+  pos_vec <- cm$DKPos
   
   fill_slot <- function(player, pos) {
-    # Build candidate slots based on SPECIFIC positions listed in pos string
-    # A PG fills: PG, G, UTIL — NOT SG/SF/PF/F
+    # A PG fills: PG, G, UTIL
+    # A SG fills: SG, G, UTIL
+    # A SF fills: SF, F, UTIL
+    # A PF fills: PF, F, UTIL
     # A SG/SF fills: SG, SF, G, F, UTIL
-    # A SF/PF fills: SF, PF, F, UTIL
     # A C fills: C, UTIL
     candidates <- character(0)
     if (grepl("PG", pos)) candidates <- c(candidates, "PG")
@@ -774,9 +776,9 @@ assign_nba_slots_dk <- function(cm) {
     if (grepl("SF", pos)) candidates <- c(candidates, "SF")
     if (grepl("PF", pos)) candidates <- c(candidates, "PF")
     if (grepl("^C$|C/|/C", pos)) candidates <- c(candidates, "C")
-    # Generic flex slots: G if any guard, F if any forward
-    if (grepl("PG|SG|^G$|G/|/G", pos)) candidates <- c(candidates, "G")
-    if (grepl("SF|PF|^F$|F/|/F", pos)) candidates <- c(candidates, "F")
+    # Flex slots: guards spill into G, forwards into F, anyone into UTIL
+    if (grepl("PG|SG", pos)) candidates <- c(candidates, "G")
+    if (grepl("SF|PF", pos)) candidates <- c(candidates, "F")
     candidates <- c(candidates, "UTIL")
     candidates <- unique(candidates)
     
@@ -797,8 +799,8 @@ assign_nba_slots_dk <- function(cm) {
 }
 
 assign_nba_slots_fd <- function(cm) {
-  # FD NBA: PG / PG / SG / SG / SF / SF / PF / PF / C  (9 players, $60K)
-  # Handles dual-eligible positions: SG/SF fills G or F slots
+  # FD NBA Classic: PG / PG / SG / SG / SF / SF / PF / PF / C  (9 players, $60K)
+  # NBA always has specific positions. Dual-eligible (e.g. SG/SF) fills either named slot.
   setorder(cm, game_rank, Player)
   
   slots <- list(PG1=NA_character_, PG2=NA_character_,
@@ -807,11 +809,10 @@ assign_nba_slots_fd <- function(cm) {
                 PF1=NA_character_, PF2=NA_character_,
                 C  =NA_character_)
   
-  pos_vec <- if ("FDPos" %in% names(cm)) cm$FDPos else cm$FDPosGroup
+  pos_vec <- cm$FDPos
   
   fill_slot <- function(player, pos) {
-    # Position-specific: PG fills PG slots only, SG fills SG slots only etc.
-    # SG/SF fills SG or SF slots.
+    # PG fills PG slots, SG fills SG slots, SG/SF fills SG or SF slots, etc.
     candidates <- character(0)
     if (grepl("PG", pos)) candidates <- c(candidates, "PG1","PG2")
     if (grepl("SG", pos)) candidates <- c(candidates, "SG1","SG2")
@@ -851,19 +852,10 @@ find_optimal_lineups_nba <- function(sim_results, metadata, config,
   salary_cap  <- config$salary_cap
   max_lineups <- if (!is.null(config$max_lineups)) config$max_lineups else 5000L
   
-  meta <- unique(metadata[, .(Player, DKSalary, PosGroup,
-                              DKPos = if("DKPos" %in% names(metadata)) DKPos else NA_character_,
-                              GameKey)], by = "Player")
-  # Use DKPos directly for dual eligibility — SG/SF is both G and F eligible
-  if ("DKPos" %in% names(meta) && !all(is.na(meta$DKPos))) {
-    meta[, g_elig := grepl("PG|SG|^G$|G/|/G", DKPos)]
-    meta[, f_elig := grepl("SF|PF|^F$|F/|/F", DKPos)]
-    meta[, c_elig := grepl("^C$|C/|/C",        DKPos)]
-  } else {
-    meta[, g_elig := PosGroup == "G"]
-    meta[, f_elig := PosGroup == "F"]
-    meta[, c_elig := PosGroup == "C"]
-  }
+  meta <- unique(metadata[, .(Player, DKSalary, DKPos, GameKey)], by = "Player")
+  meta[, g_elig := grepl("PG|SG", DKPos)]
+  meta[, f_elig := grepl("SF|PF", DKPos)]
+  meta[, c_elig := grepl("^C$|C/|/C", DKPos)]
   
   if ("GameRank" %in% names(metadata)) {
     meta <- merge(meta, unique(metadata[, .(Player, GameRank)]), by = "Player", all.x = TRUE)
@@ -959,7 +951,7 @@ find_optimal_lineups_nba <- function(sim_results, metadata, config,
   slot_list <- vector("list", nrow(counts))
   for (li in seq_len(nrow(counts))) {
     players <- strsplit(counts$Lineup[li], "\\|")[[1]]
-    cm_cols <- intersect(c("Player","PosGroup","DKPos","game_rank"), names(meta))
+    cm_cols <- intersect(c("Player","DKPos","game_rank"), names(meta))
     cm      <- meta[Player %in% players, ..cm_cols]
     slots   <- assign_nba_slots_dk(cm)
     if (!is.null(slots)) {
@@ -988,8 +980,8 @@ find_optimal_lineups_nba <- function(sim_results, metadata, config,
 
 # ============================================================================
 # NBA FD CLASSIC OPTIMIZER
-# Roster: PG / PG / SG / SG / SF / PF / C / UTIL  (8 players, $60K)
-# LP constraints: 8 total, <=$60K, >=2 G-elig, >=2 F-elig, >=1 C-elig
+# Roster: PG / PG / SG / SG / SF / SF / PF / PF / C  (9 players, $60K)
+# LP constraints: 9 total, <=$60K, >=4 G-elig, >=4 F-elig, >=1 C-elig
 # ============================================================================
 
 find_optimal_lineups_nba_fd <- function(sim_results, metadata, config,
@@ -1001,21 +993,10 @@ find_optimal_lineups_nba_fd <- function(sim_results, metadata, config,
   salary_cap  <- config$salary_cap
   max_lineups <- if (!is.null(config$max_lineups)) config$max_lineups else 5000L
   
-  pos_col <- if ("FDPosGroup" %in% names(metadata)) "FDPosGroup" else "PosGroup"
-  meta <- unique(metadata[, .(Player, FDSalary,
-                              FDPosGroup = get(pos_col),
-                              FDPos = if("FDPos" %in% names(metadata)) FDPos else NA_character_,
-                              GameKey)], by = "Player")
-  # Use FDPos directly for dual eligibility
-  if ("FDPos" %in% names(meta) && !all(is.na(meta$FDPos))) {
-    meta[, g_elig := grepl("PG|SG|G$|G/|/G",  FDPos)]
-    meta[, f_elig := grepl("SF|PF|F$|F/|/F",  FDPos)]
-    meta[, c_elig := grepl("^C$|C/|/C",        FDPos)]
-  } else {
-    meta[, g_elig := FDPosGroup == "G"]
-    meta[, f_elig := FDPosGroup == "F"]
-    meta[, c_elig := FDPosGroup == "C"]
-  }
+  meta <- unique(metadata[, .(Player, FDSalary, FDPos, GameKey)], by = "Player")
+  meta[, g_elig := grepl("PG|SG", FDPos)]
+  meta[, f_elig := grepl("SF|PF", FDPos)]
+  meta[, c_elig := grepl("^C$|C/|/C", FDPos)]
   meta <- meta[FDSalary > 0 & !is.na(FDSalary)]
   
   if ("GameRank" %in% names(metadata)) {
@@ -1105,7 +1086,7 @@ find_optimal_lineups_nba_fd <- function(sim_results, metadata, config,
   slot_list <- vector("list", nrow(counts))
   for (li in seq_len(nrow(counts))) {
     players <- strsplit(counts$Lineup[li], "\\|")[[1]]
-    cm_cols <- intersect(c("Player","FDPosGroup","FDPos","game_rank"), names(meta))
+    cm_cols <- intersect(c("Player","FDPos","game_rank"), names(meta))
     cm      <- meta[Player %in% players, ..cm_cols]
     slots   <- assign_nba_slots_fd(cm)
     if (!is.null(slots)) {
