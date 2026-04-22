@@ -3354,46 +3354,93 @@ server <- function(input, output, session) {
     # Platform-aware FP column
     plat     <- if (!is.null(input$sim_results_platform) && nchar(input$sim_results_platform) > 0) input$sim_results_platform else "DK"
     fp_col   <- if (is_nba && plat == "FD" && "FDAvgFP" %in% names(pm)) "FDAvgFP" else if ("DKAvgFP" %in% names(pm)) "DKAvgFP" else "AvgFP"
-    fp_label <- if (is_nba) paste("Avg", plat, "Fantasy Points") else "Avg DK Fantasy Points"
+    fp_label <- if (is_nba) paste(plat, "Fantasy Points Distribution") else "Avg DK Fantasy Points"
     
     # Determine mode and filter data
     view_mode <- if (is_nba && !is.null(input$nba_view_mode)) input$nba_view_mode else "team"
     
     if (is_nba && view_mode == "position") {
-      # Position mode: filter all players whose DKPos contains the selected base position
       sel_pos <- if (!is.null(input$nba_selected_pos) && nchar(input$nba_selected_pos) > 0) input$nba_selected_pos else "PG"
       req("DKPos" %in% names(pm))
-      # Match base position: PG matches PG, PG/SG, PG/SF etc — but not SG alone
       td <- pm[grepl(paste0("(^|/)", sel_pos, "(/|$)"), DKPos)]
     } else {
-      # Team mode
       team <- if (!is.null(input$cbb_selected_team) && input$cbb_selected_team %in% rv$sport_visuals$teams)
         input$cbb_selected_team else rv$sport_visuals$teams[1]
       td <- pm[Team == team]
     }
     
     req(nrow(td) > 0)
-    setorderv(td, fp_col, order = 1L)
-    h_px <- max(200, nrow(td) * 44)
     
-    plot_ly(data = as.data.frame(td),
-            x = as.formula(paste0("~", fp_col)),
-            y = ~factor(Player, levels = Player),
-            type = "bar", orientation = "h",
-            marker = list(color = "#FFE500",
-                          line  = list(color = "#d4b800", width = 0.5)),
-            text  = as.formula(paste0("~round(", fp_col, ", 1)")), textposition = "outside",
-            textfont = list(color = "#ccc", size = 11)) %>%
-      layout(
-        xaxis = list(title = fp_label, gridcolor = "#2a2a2a",
-                     color = "#888", zeroline = FALSE),
-        yaxis = list(title = "", color = "#ccc", tickfont = list(size = 11),
-                     automargin = TRUE),
-        paper_bgcolor = "#121212", plot_bgcolor = "#141414",
-        font          = list(color = "#FFFFFF", size = 11),
-        showlegend    = FALSE, height = h_px,
-        margin        = list(l = 160, r = 60, t = 20, b = 40)
-      ) %>% config(displayModeBar = FALSE)
+    # ── NBA: box plot from raw sim distributions ──────────────────────────────
+    if (is_nba) {
+      req(rv$simulation_results)
+      score_col <- if (plat == "FD" && "FDScore" %in% names(rv$simulation_results)) "FDScore" else "DKScore"
+      
+      players_to_show <- td$Player
+      sim_dt <- as.data.table(rv$simulation_results)[Player %in% players_to_show,
+                                                     .(Player, Score = get(score_col))]
+      
+      # Cap at 2000 sims per player to keep plotly responsive
+      n_sims_total <- length(unique(rv$simulation_results$SimID))
+      if (n_sims_total > 2000) {
+        keep_sims <- unique(rv$simulation_results$SimID)[seq_len(2000)]
+        sim_dt    <- as.data.table(rv$simulation_results)[Player %in% players_to_show &
+                                                            SimID %in% keep_sims,
+                                                          .(Player, Score = get(score_col))]
+      }
+      
+      req(nrow(sim_dt) > 0)
+      
+      # Order players by median score ascending (so highest median is at top)
+      med_order <- sim_dt[, .(med = median(Score)), by = Player][order(med), Player]
+      sim_dt[, Player := factor(Player, levels = med_order)]
+      h_px <- max(200, length(med_order) * 48)
+      
+      plot_ly(data = as.data.frame(sim_dt),
+              x = ~Score, y = ~Player,
+              type = "box", orientation = "h",
+              marker      = list(color = "rgba(255,229,0,0.5)",
+                                 outliercolor = "rgba(255,229,0,0.15)",
+                                 line  = list(color = "rgba(255,229,0,0.3)", width = 1)),
+              line        = list(color = "#FFE500"),
+              fillcolor   = "rgba(255,229,0,0.15)",
+              hovertemplate = "<b>%{y}</b><br>Median: %{median:.1f}<br>Q1: %{q1:.1f}  Q3: %{q3:.1f}<extra></extra>") %>%
+        layout(
+          xaxis = list(title = fp_label, gridcolor = "#2a2a2a",
+                       color = "#888", zeroline = FALSE),
+          yaxis = list(title = "", color = "#ccc", tickfont = list(size = 11),
+                       automargin = TRUE,
+                       categoryorder = "array", categoryarray = med_order),
+          paper_bgcolor = "#121212", plot_bgcolor = "#141414",
+          font          = list(color = "#FFFFFF", size = 11),
+          showlegend    = FALSE, height = h_px,
+          margin        = list(l = 160, r = 60, t = 20, b = 40)
+        ) %>% config(displayModeBar = FALSE)
+      
+    } else {
+      # ── CBB: bar chart of averages (unchanged) ──────────────────────────────
+      setorderv(td, fp_col, order = 1L)
+      h_px <- max(200, nrow(td) * 44)
+      
+      plot_ly(data = as.data.frame(td),
+              x = as.formula(paste0("~", fp_col)),
+              y = ~factor(Player, levels = Player),
+              type = "bar", orientation = "h",
+              marker = list(color = "#FFE500",
+                            line  = list(color = "#d4b800", width = 0.5)),
+              text  = as.formula(paste0("~round(", fp_col, ", 1)")), textposition = "outside",
+              textfont = list(color = "#ccc", size = 11)) %>%
+        layout(
+          xaxis = list(title = fp_label, gridcolor = "#2a2a2a",
+                       color = "#888", zeroline = FALSE),
+          yaxis = list(title = "", color = "#ccc", tickfont = list(size = 11),
+                       automargin = TRUE),
+          paper_bgcolor = "#121212", plot_bgcolor = "#141414",
+          font          = list(color = "#FFFFFF", size = 11),
+          showlegend    = FALSE, height = h_px,
+          margin        = list(l = 160, r = 60, t = 20, b = 40)
+        ) %>% config(displayModeBar = FALSE)
+    }
   })
   
   
