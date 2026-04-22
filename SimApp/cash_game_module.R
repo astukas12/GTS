@@ -32,8 +32,8 @@ get_dk_constraints <- function(config) {
 get_cash_params <- function(config, platform = "DK") {
   sport <- config$sport_name %||% ""
   if (sport == "NBA") {
-    list(n_field = 100L, n_yours = 10L, top_n_ppd = 15L,
-         sal_floor = 49000, total_lineups = 110L)
+    list(n_field = 25L, n_yours = 10L, top_n_ppd = 15L,
+         sal_floor = 49000, total_lineups = 35L)
   } else {
     list(n_field = 500L, n_yours = 50L, top_n_ppd = 20L,
          sal_floor = 49000, total_lineups = 550L)
@@ -218,7 +218,7 @@ generate_field_lineups <- function(metadata,
 #' @param salary_cap numeric (default 50000)
 #' @return data.table: LineupID, Player1..8, TotalSalary, AvgProj
 generate_field_lineups_nba <- function(metadata,
-                                       n            = 100L,
+                                       n            = 25L,
                                        salary_cap   = 50000,
                                        platform     = "DK") {
   
@@ -385,63 +385,26 @@ make_lineup_data <- function(lineup_pool, sim_results, player_cols, score_col = 
 }
 
 
-#' Compute double-up cash rates from a score matrix with field entry weighting.
-#'
-#' Field lineups are weighted by an exponential decay (F1 appears most, Fn least)
-#' to model a real cash field where chalk lineups are entered many times.
-#' "Yours" lineups always get weight 1 — one entry each.
-#'
-#' For each sim, a lineup cashes if the total weighted entries that scored HIGHER
-#' is less than cash_rank (top 45% of total weighted entries).
+#' Compute double-up cash rates from a score matrix.
+#' Ranks all lineups per sim, lineup cashes if in top cash_pct.
 #'
 #' @param score_matrix  numeric matrix: n_lineups x n_sims
-#' @param lineup_ids    character vector of LineupID (F* = field, Y* = yours)
+#' @param lineup_ids    character vector of LineupID
 #' @param cash_pct      numeric 0-1, fraction that cash (0.45 for double up)
-#' @param max_weight    integer, copies of the #1 field lineup (default 200)
-#' @param min_weight    integer, floor copies for last field lineup (default 5)
 #' @param verbose       logical
 #' @return data.table: LineupID, MedianScore, CashRate
 cash_rate_from_score_matrix <- function(score_matrix, lineup_ids,
-                                        cash_pct   = 0.45,
-                                        max_weight = 20L,
-                                        min_weight = 1L,
-                                        verbose    = TRUE) {
+                                        cash_pct = 0.45,
+                                        verbose  = TRUE) {
   n_lineups <- nrow(score_matrix)
   n_sims    <- ncol(score_matrix)
-  
-  # ── Build weight vector ───────────────────────────────────────────────────
-  is_field  <- grepl("^F", lineup_ids)
-  field_idx <- which(is_field)
-  yours_idx <- which(!is_field)
-  n_field   <- length(field_idx)
-  
-  weights <- integer(n_lineups)
-  weights[yours_idx] <- 1L
-  if (n_field > 0) {
-    if (n_field == 1L) {
-      weights[field_idx] <- max_weight
-    } else {
-      lam <- log(max_weight / min_weight) / (n_field - 1L)
-      weights[field_idx] <- pmax(min_weight,
-                                 as.integer(round(max_weight * exp(-lam * seq(0, n_field - 1L)))))
-    }
-  }
-  
-  total_entries <- sum(weights)
-  cash_rank     <- floor(total_entries * cash_pct)
+  cash_rank <- floor(n_lineups * cash_pct)
   
   if (verbose) {
-    cat(sprintf(
-      "  [Cash] %d lineups | field weighted to %s entries + %d yours | cash line: top %d (%.0f%%)\n",
-      n_lineups, format(sum(weights[field_idx]), big.mark=","),
-      length(yours_idx), cash_rank, cash_pct * 100))
+    cat(sprintf("  [Cash] %d lineups x %s sims | cash line: top %d (%.0f%%)\n",
+                n_lineups, format(n_sims, big.mark = ","), cash_rank, cash_pct * 100))
     flush.console()
   }
-  
-  # ── Vectorized weighted ranking via sort + cumsum ────────────────────────
-  # For each sim: sort lineups by score desc, cumsum weights gives each
-  # lineup's weighted rank (total weight of all lineups scoring strictly higher).
-  # Lineup cashes if weighted_rank < cash_rank.  O(n log n) per sim.
   
   t0          <- Sys.time()
   chunk_size  <- 2000L
@@ -449,21 +412,11 @@ cash_rate_from_score_matrix <- function(score_matrix, lineup_ids,
   cash_counts <- integer(n_lineups)
   
   for (chunk_idx in seq_len(n_chunks)) {
-    chunk_start <- (chunk_idx - 1L) * chunk_size + 1L
-    chunk_end   <- min(chunk_idx * chunk_size, n_sims)
-    S           <- score_matrix[, chunk_start:chunk_end, drop = FALSE]
-    
-    chunk_cash <- apply(S, 2L, function(scores) {
-      ord           <- order(scores, decreasing = TRUE)
-      sorted_w      <- weights[ord]
-      # cum_above[i] = total weight of all lineups ranked above position i
-      cum_above     <- c(0L, cumsum(sorted_w)[-n_lineups])
-      weighted_rank <- integer(n_lineups)
-      weighted_rank[ord] <- cum_above
-      as.integer(weighted_rank < cash_rank)
-    })
-    # chunk_cash: n_lineups x chunk matrix of 0/1
-    cash_counts <- cash_counts + rowSums(chunk_cash)
+    chunk_start  <- (chunk_idx - 1L) * chunk_size + 1L
+    chunk_end    <- min(chunk_idx * chunk_size, n_sims)
+    chunk_scores <- score_matrix[, chunk_start:chunk_end, drop = FALSE]
+    rank_mat     <- apply(chunk_scores, 2L, function(x) rank(-x, ties.method = "min"))
+    cash_counts  <- cash_counts + rowSums(rank_mat <= cash_rank)
     
     if (verbose) {
       elapsed <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
@@ -566,10 +519,6 @@ render_cash_game_tab_ui <- function() {
             div(style = "display:flex;align-items:center;padding:0 18px;height:42px;border-right:1px solid #222;flex-shrink:0;",
                 span(style = "font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#444;margin-right:10px;", "Field"),
                 uiOutput("du_field_desc_ui")
-            ),
-            div(style = "display:flex;align-items:center;padding:0 18px;height:42px;border-right:1px solid #222;flex-shrink:0;",
-                span(style = "font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#444;margin-right:10px;", "Your Pool"),
-                uiOutput("du_yours_desc_ui")
             ),
             div(style = "display:flex;align-items:center;padding:0 18px;height:42px;flex-shrink:0;",
                 span(style = "font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#444;margin-right:10px;", "Cash Line"),
@@ -674,37 +623,28 @@ register_cash_game_observers <- function(input, output, session, rv) {
   
   output$du_cashline_desc_ui <- renderUI({
     cash_p <- get_cash_params(rv$config %||% list())
-    cash_n <- floor(cash_p$total_lineups * 0.45)
+    cash_n <- floor(cash_p$n_field * 0.45)
     span(style = "color:#aaa;font-size:12px;",
-         sprintf("Top 45\u202f\u2022\u202f%d of %d cash", cash_n, cash_p$total_lineups))
+         sprintf("Top 45\u202f\u2022\u202f%d of %d cash", cash_n, cash_p$n_field))
   })
   
   output$du_field_desc_ui <- renderUI({
     cash_p <- get_cash_params(rv$config %||% list())
     is_nba <- isTRUE(rv$config$sport_name == "NBA")
     plat   <- du_platform()
-    desc   <- if (plat == "SD")     paste0("Top ", cash_p$n_field, " from tournament pool")
-    else if (is_nba)      paste0("Top ", cash_p$n_field, " LP-optimized (ETR projections)")
-    else                  paste0("Top ", cash_p$n_field, " by AvgOwn (top ", cash_p$top_n_ppd, " PPD players)")
+    desc   <- if (plat == "SD")  paste0(cash_p$n_field, " lineups (top median from tournament pool)")
+    else if (is_nba)   paste0(cash_p$n_field, " LP-optimized lineups (ETR projections)")
+    else               paste0(cash_p$n_field, " lineups by AvgOwn (top ", cash_p$top_n_ppd, " PPD players)")
     span(style = "color:#aaa;font-size:12px;", desc)
   })
   
-  output$du_yours_desc_ui <- renderUI({
-    cash_p <- get_cash_params(rv$config %||% list())
-    span(style = "color:#aaa;font-size:12px;",
-         paste0("Top ", cash_p$n_yours, " by median score"))
-  })
   
-  
-  # ── Run Double Up (field generation + scoring in one step) ──────────────────
+  # ── Run Double Up (build ETR field, score against each other) ───────────────
   observeEvent(input$du_run, {
-    plat    <- du_platform()
-    opt_lus <- switch(plat,
-                      DK = rv$dk_optimal_lineups,
-                      FD = rv$fd_optimal_lineups,
-                      SD = rv$sd_optimal_lineups,
-                      NULL)
-    req(opt_lus, rv$simulation_results, rv$sim_metadata, rv$config)
+    plat <- du_platform()
+    # SD needs the tournament pool as its field source; DK/FD build from projections
+    if (plat == "SD") req(rv$sd_optimal_lineups)
+    req(rv$simulation_results, rv$sim_metadata, rv$config)
     
     du_rv$has_results <- FALSE
     du_rv$results     <- NULL
@@ -737,7 +677,7 @@ register_cash_game_observers <- function(input, output, session, rv) {
       if (plat == "SD") {
         # SD field: matrix-score all tournament SD lineups on DKScore, take top
         # n_field by true median — same matrix-multiply path as NBA "yours" pool.
-        sd_pool <- copy(as.data.table(opt_lus))
+        sd_pool <- copy(as.data.table(rv$sd_optimal_lineups))
         if (!"LineupID" %in% names(sd_pool)) sd_pool[, LineupID := paste0("GPP", seq_len(.N))]
         sd_pc  <- get_player_cols(sd_pool)
         sd_std <- paste0("Player", seq_len(length(sd_pc)))
@@ -812,158 +752,37 @@ register_cash_game_observers <- function(input, output, session, rv) {
       sal_col   <- switch(plat, FD = "FDSalary", SD = "SDSalary", "DKSalary")
       id_col    <- switch(plat, FD = "FDID", SD = "DKID", "DKID")
       
-      dk_opt  <- copy(as.data.table(opt_lus))
-      sim_res <- copy(as.data.table(rv$simulation_results))
-      meta    <- copy(meta_raw)
+      sim_res   <- copy(as.data.table(rv$simulation_results))
+      meta      <- copy(meta_raw)
+      n_sims    <- length(unique(sim_res$SimID))
       
-      player_cols <- get_player_cols(dk_opt)
-      r_size      <- length(player_cols)
-      std_cols    <- paste0("Player", seq_len(r_size))
-      n_sims      <- length(unique(sim_res$SimID))
-      n_gpp       <- nrow(dk_opt)
+      # field_pool already has Player1..N std_cols from Step 0
+      player_cols <- get_player_cols(field_pool)
+      std_cols    <- paste0("Player", seq_len(length(player_cols)))
+      if (!identical(player_cols, std_cols))
+        setnames(field_pool, player_cols, std_cols)
       
-      cat(sprintf("  [DoubleUp] %s | %s sims | %d GPP lineups | %d field lineups\n",
-                  plat, format(n_sims, big.mark = ","), n_gpp, nrow(field_pool)))
+      lineup_ids <- field_pool$LineupID
+      
+      cat(sprintf("  [DoubleUp] %s | %s sims | %d field lineups\n",
+                  plat, format(n_sims, big.mark = ","), nrow(field_pool)))
       flush.console()
       
-      if (!"LineupID" %in% names(dk_opt)) dk_opt[, LineupID := paste0("GPP", seq_len(.N))]
-      
-      # ── Step 1: Rank GPP pool by true median score ────────────────────────
-      # For NBA: always matrix-score — WinRate/Top1Count are GPP metrics, not
-      # useful proxies for cash median.
-      # For other sports: use pre-computed MedianScore/AvgScore if available.
-      cat(sprintf("  [DoubleUp] Step 1/5: Ranking %s GPP pool by median score...\n", plat))
+      # ── Step 1: Score all field lineups ───────────────────────────────────
+      cat(sprintf("  [DoubleUp] Step 1/2: Scoring %d lineups x %s sims...\n",
+                  nrow(field_pool), format(n_sims, big.mark = ",")))
       flush.console()
-      progress$set(detail = "Step 1/5: Ranking GPP pool...", value = 0.08)
-      t1 <- Sys.time()
+      progress$set(detail = sprintf("Step 1/2: Scoring %d lineups...", nrow(field_pool)), value = 0.20)
       
-      is_nba_cash <- isTRUE(rv$config$sport_name == "NBA")
-      rank_col    <- NULL
-      
-      if (!is_nba_cash) {
-        for (candidate in c("MedianScore", "AvgScore")) {
-          if (candidate %in% names(dk_opt)) { rank_col <- candidate; break }
-        }
-      }
-      
-      if (!is.null(rank_col)) {
-        cat(sprintf("  [DoubleUp] Step 1/5: Using pre-computed '%s' column\n", rank_col))
-        flush.console()
-        if (!"MedianScore" %in% names(dk_opt)) {
-          setnames(dk_opt, rank_col, "MedianScore"); rank_col <- "MedianScore"
-        }
-      } else {
-        if (is_nba_cash) {
-          cat(sprintf("  [DoubleUp] Step 1/5: NBA cash — matrix scoring on %s\n", score_col))
-        } else {
-          cat("  [DoubleUp] Step 1/5: No pre-computed column — matrix scoring\n")
-        }
-        flush.console()
-        
-        if (!score_col %in% names(sim_res))
-          stop(score_col, " not found in sim results.")
-        
-        all_players <- unique(sim_res$Player)
-        n_players   <- length(all_players)
-        player_idx  <- setNames(seq_along(all_players), all_players)
-        
-        score_wide <- dcast(sim_res[, c("SimID","Player", score_col), with=FALSE],
-                            Player ~ SimID, value.var = score_col, fill = 0)
-        score_mat  <- as.matrix(score_wide[, -1, with = FALSE])
-        rownames(score_mat) <- score_wide$Player
-        
-        chunk_sz   <- 500L
-        n_chunks   <- ceiling(n_gpp / chunk_sz)
-        med_scores <- numeric(n_gpp)
-        
-        for (ci in seq_len(n_chunks)) {
-          idx_s <- (ci - 1L) * chunk_sz + 1L
-          idx_e <- min(ci * chunk_sz, n_gpp)
-          chunk <- dk_opt[idx_s:idx_e]
-          
-          mem_mat <- matrix(0L, nrow = nrow(chunk), ncol = n_players)
-          colnames(mem_mat) <- all_players
-          for (pc in player_cols) {
-            p_idx <- player_idx[chunk[[pc]]]; valid <- !is.na(p_idx)
-            mem_mat[cbind(which(valid), p_idx[valid])] <- 1L
-          }
-          totals_mat             <- mem_mat %*% score_mat
-          med_scores[idx_s:idx_e] <- apply(totals_mat, 1, median)
-          
-          cat(sprintf("\r  [DoubleUp] Step 1/5: %d%%", round(idx_e / n_gpp * 100)))
-          flush.console()
-        }
-        cat("\n"); flush.console()
-        dk_opt[, MedianScore := med_scores]
-        rank_col <- "MedianScore"
-      }
-      
-      cat(sprintf("  [DoubleUp] Step 1/5 done in %.1fs\n",
-                  as.numeric(difftime(Sys.time(), t1, units = "secs"))))
-      flush.console()
-      
-      # ── Step 2: Select your top N lineups by median ───────────────────────
-      cash_p <- get_cash_params(rv$config)
-      cat(sprintf("  [DoubleUp] Step 2/5: Selecting your top %d lineups by median...\n", cash_p$n_yours))
-      flush.console()
-      progress$set(detail = sprintf("Step 2/5: Selecting your top %d by median...", cash_p$n_yours), value = 0.18)
-      
-      setorder(dk_opt, -MedianScore)
-      your_pool <- head(dk_opt, cash_p$n_yours)
-      your_pool[, LineupID := paste0("Y", seq_len(.N))]
-      
-      if (!identical(player_cols, std_cols)) setnames(your_pool, player_cols, std_cols)
-      
-      if (!"TotalSalary" %in% names(your_pool) && sal_col %in% names(meta)) {
-        your_pool[, TotalSalary := rowSums(
-          sapply(std_cols, function(col) meta[match(your_pool[[col]], meta$Player), get(sal_col)]),
-          na.rm = TRUE
-        )]
-      } else if (!"TotalSalary" %in% names(your_pool)) {
-        your_pool[, TotalSalary := NA_real_]
-      }
-      
-      cat(sprintf("  [DoubleUp] Step 2/5 done — median range: %.1f - %.1f\n",
-                  min(your_pool$MedianScore, na.rm = TRUE),
-                  max(your_pool$MedianScore, na.rm = TRUE)))
-      flush.console()
-      
-      # ── Step 3: Combine pools ─────────────────────────────────────────────
-      cat(sprintf("  [DoubleUp] Step 3/5: Combining %d your + %d field = %d lineups...\n",
-                  cash_p$n_yours, cash_p$n_field, cash_p$total_lineups))
-      flush.console()
-      progress$set(detail = "Step 3/5: Combining lineup pools...", value = 0.25)
-      
-      field_pool[, TotalSalary := as.numeric(TotalSalary)]
-      your_avg_own <- if ("AvgOwn" %in% names(your_pool)) your_pool$AvgOwn else NA_real_
-      
-      keep_cols <- c("LineupID", std_cols, "TotalSalary")
-      combined  <- rbindlist(
-        list(your_pool[, keep_cols, with = FALSE],
-             field_pool[, keep_cols, with = FALSE]),
-        use.names = TRUE
-      )
-      lineup_ids <- combined$LineupID
-      cat(sprintf("  [DoubleUp] Step 3/5 done — %d total lineups\n", nrow(combined)))
-      flush.console()
-      
-      # ── Step 4: Score all lineups ─────────────────────────────────────────
-      cat(sprintf("  [DoubleUp] Step 4/5: Scoring %d lineups x %s sims...\n",
-                  nrow(combined), format(n_sims, big.mark = ",")))
-      flush.console()
-      progress$set(detail = sprintf("Step 4/5: Scoring %d lineups x %s sims...",
-                                    nrow(combined), format(n_sims, big.mark = ",")),
-                   value = 0.30)
-      
-      lineup_data_for_scoring <- make_lineup_data(combined, sim_res, std_cols, score_col)
+      lineup_data_for_scoring <- make_lineup_data(field_pool, sim_res, std_cols, score_col)
       score_mat_cash <- score_all_lineups(lineup_data_for_scoring, sim_res, verbose = TRUE)
       
-      progress$set(detail = "Step 4/5: Scoring complete.", value = 0.55)
+      progress$set(detail = "Step 1/2: Scoring complete.", value = 0.70)
       
-      # ── Step 5: Cash rates ────────────────────────────────────────────────
-      cat(sprintf("  [DoubleUp] Step 5/5: Computing cash rates (45%% line)...\n"))
+      # ── Step 2: Cash rates ────────────────────────────────────────────────
+      cat("  [DoubleUp] Step 2/2: Computing cash rates (45% line)...\n")
       flush.console()
-      progress$set(detail = "Step 5/5: Computing cash rates...", value = 0.57)
+      progress$set(detail = "Step 2/2: Computing cash rates...", value = 0.75)
       
       metrics <- cash_rate_from_score_matrix(
         score_matrix = score_mat_cash,
@@ -971,25 +790,21 @@ register_cash_game_observers <- function(input, output, session, rv) {
         cash_pct     = 0.45,
         verbose      = TRUE
       )
-      progress$set(detail = "Step 5/5: Cash rates complete.", value = 0.92)
+      progress$set(detail = "Step 2/2: Cash rates complete.", value = 0.92)
       
       # ── Assemble results ──────────────────────────────────────────────────
       cat("  [DoubleUp] Assembling results table...\n"); flush.console()
       
-      results <- merge(combined, metrics, by = "LineupID")
-      results[, Source := ifelse(grepl("^Y", LineupID), "Yours", "Field")]
-      
-      field_own <- field_pool[, .(LineupID, AvgOwn)]
-      your_own  <- data.table(LineupID = your_pool$LineupID,
-                              AvgOwn   = if (all(is.na(your_avg_own))) NA_real_ else your_avg_own)
-      all_own   <- rbindlist(list(your_own, field_own), use.names = TRUE)
-      results   <- merge(results, all_own, by = "LineupID", all.x = TRUE)
+      results <- merge(field_pool[, c("LineupID", std_cols, "TotalSalary"), with = FALSE],
+                       metrics, by = "LineupID")
+      results[, Source := "Field"]
+      results[, AvgOwn := NA_real_]
       
       setcolorder(results, c("LineupID", "Source", std_cols,
-                             "TotalSalary", "AvgOwn", "MedianScore", "CashRate"))
+                             "TotalSalary", "MedianScore", "CashRate"))
       setorder(results, -CashRate, -MedianScore)
       
-      # Rename Player1..N to slot labels matching the platform
+      # Rename Player1..N to slot labels
       slot_labels <- get_slot_labels(rv$config, length(std_cols))
       if (!is.null(slot_labels)) {
         for (i in seq_along(std_cols))
@@ -1001,7 +816,6 @@ register_cash_game_observers <- function(input, output, session, rv) {
       progress$set(detail = "Building exposure table...", value = 0.95)
       cat("  [DoubleUp] Building exposure table...\n"); flush.console()
       
-      # For exposure, use platform-appropriate salary/own columns
       exp_meta <- copy(meta)
       if (sal_col %in% names(exp_meta) && sal_col != "DKSalary")
         setnames(exp_meta, sal_col, "DKSalary")
@@ -1009,7 +823,7 @@ register_cash_game_observers <- function(input, output, session, rv) {
       if (own_col_exp %in% names(exp_meta) && own_col_exp != "DKOwn")
         setnames(exp_meta, own_col_exp, "DKOwn")
       
-      exposure <- build_combined_exposure(field_pool, your_pool, exp_meta, std_cols)
+      exposure <- build_combined_exposure(field_pool, field_pool, exp_meta, std_cols)
       
       # ── Store & report ────────────────────────────────────────────────────
       du_rv$results     <- results
@@ -1020,9 +834,8 @@ register_cash_game_observers <- function(input, output, session, rv) {
       
       elapsed_total <- as.numeric(difftime(Sys.time(), t_total, units = "secs"))
       status_msg <- sprintf(
-        "Double Up complete \u2014 %s | %d lineups (%d field + %d yours) | %s sims | %.1fs",
-        plat, nrow(combined), cash_p$n_field, cash_p$n_yours,
-        format(n_sims, big.mark = ","), elapsed_total
+        "Double Up complete \u2014 %s | %d ETR lineups | %s sims | %.1fs",
+        plat, nrow(field_pool), format(n_sims, big.mark = ","), elapsed_total
       )
       du_rv$status <- status_msg
       
@@ -1042,11 +855,11 @@ register_cash_game_observers <- function(input, output, session, rv) {
   output$du_status_msg <- renderUI({
     msg <- du_rv$status
     if (is.null(msg)) {
-      has_any <- !is.null(rv$dk_optimal_lineups) || !is.null(rv$fd_optimal_lineups)
+      has_any <- !is.null(rv$sim_metadata)
       if (!has_any)
         return(div(style = "color:#666;font-size:12px;padding:8px 0;",
                    icon("info-circle"),
-                   " Score Tournament Lineups first, then Generate Field and Run Double Up."))
+                   " Run a simulation first, then use Run Double Up."))
       return(div(style = "color:#666;font-size:12px;padding:8px 0;",
                  icon("info-circle"),
                  " Click Run Double Up to build the field and score your lineups."))
