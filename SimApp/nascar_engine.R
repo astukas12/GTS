@@ -1903,3 +1903,44 @@ create_nascar_fantasy_violin <- function(sim_results, platform = "DK",
   
   return(p)
 }
+
+# ============================================================================
+# LINEUP METRICS — called by add_custom_metrics() after Phase 3
+# Adds AvgStart (geometric mean of Starting positions for the 6 drivers)
+# to the scored lineups table so the portfolio filter slider appears.
+# ============================================================================
+
+calculate_nascar_lineup_metrics <- function(scored_lineups, sim_results, metadata) {
+  if (!is.data.table(scored_lineups)) setDT(scored_lineups)
+  if (!is.data.table(metadata))       setDT(metadata)
+  
+  # Build a lookup: player → Starting position
+  start_lookup <- metadata[, .(Player, Starting)]
+  start_lookup <- start_lookup[!is.na(Starting) & Starting > 0]
+  setkey(start_lookup, Player)
+  
+  # Identify the 6 player columns (Player1..Player6)
+  player_cols <- grep("^Player[0-9]", names(scored_lineups), value = TRUE)
+  if (length(player_cols) == 0) {
+    scored_lineups[, AvgStart := NA_real_]
+    return(scored_lineups)
+  }
+  
+  # For each lineup compute the geometric mean of the 6 starting positions
+  scored_lineups[, AvgStart := {
+    vapply(seq_len(.N), function(i) {
+      spots <- vapply(player_cols, function(pc) {
+        nm <- .SD[[pc]][i]
+        if (is.na(nm) || nm == "") return(NA_real_)
+        v <- start_lookup[nm, Starting]
+        if (length(v) == 0 || is.na(v)) NA_real_ else as.numeric(v)
+      }, numeric(1))
+      spots <- spots[!is.na(spots)]
+      if (length(spots) == 0) NA_real_
+      else exp(mean(log(spots)))
+    }, numeric(1))
+  }, .SDcols = player_cols]
+  
+  scored_lineups[, AvgStart := round(AvgStart, 1)]
+  scored_lineups
+}

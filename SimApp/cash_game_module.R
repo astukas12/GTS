@@ -34,6 +34,9 @@ get_cash_params <- function(config, platform = "DK") {
   if (sport == "NBA") {
     list(n_field = 100L, n_yours = 10L, top_n_ppd = 15L,
          sal_floor = 49000, total_lineups = 110L)
+  } else if (sport == "MMA") {
+    list(n_field = 100L, n_yours = 10L, top_n_ppd = 20L,
+         sal_floor = 49000, total_lineups = 110L)
   } else {
     list(n_field = 500L, n_yours = 50L, top_n_ppd = 20L,
          sal_floor = 49000, total_lineups = 550L)
