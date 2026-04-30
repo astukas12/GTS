@@ -33,19 +33,13 @@ read_nba_input <- function(file_path) {
   if (!length(team_sheet_names)) stop("No team tabs found.")
   team_data <- setNames(lapply(team_sheet_names,function(s){
     dt<-as.data.table(read_excel(file_path,sheet=s)); setnames(dt,trimws(names(dt)))
-    drop<-intersect(c("DKSal","FDSal","DKSalary","FDSalary","DKProj","FDProj",
-                      "RGProj","RGFDProj","Mins","DKOwn","FDOwn"),names(dt))
+    # Only drop legacy alias names -- real columns now live in team tab
+    drop<-intersect(c("DKSal","FDSal","RGProj","RGFDProj"),names(dt))
     if (length(drop)) dt[,(drop):=NULL]; dt
   }), team_sheet_names)
   slate <- merge(ids, team_game_lu, by="Team", all.x=TRUE)
-  if ("DKPos" %in% names(slate)) {
-    slate[,dk_g_elig:=grepl("PG|SG",DKPos)][,dk_f_elig:=grepl("SF|PF",DKPos)]
-    slate[,dk_c_elig:=grepl("^C$|C/|/C",DKPos)]
-  }
-  if ("FDPos" %in% names(slate)) {
-    slate[,fd_g_elig:=grepl("PG|SG",FDPos)][,fd_f_elig:=grepl("SF|PF",FDPos)]
-    slate[,fd_c_elig:=grepl("^C$|C/|/C",FDPos)]
-  }
+  # DKPos/FDPos now live in team tab -- eligibility flags computed in optimizers
+  # from metadata$DKPos/FDPos after player_list merge
   slate <- unique(slate, by="Player")
   cat(sprintf("NBA Input: %d players | %d games | %d team tabs | %d sim sheets\n",
               nrow(slate),nrow(games),length(team_data),length(sim_games)))
@@ -85,14 +79,17 @@ run_nba_simulation <- function(input_data, n_sims=10000, config=NULL, progress_c
   
   # ── Player list ──
   cb("Building player roster...",0.03)
-  slate_cols<-c("Player","DKID","FDID","DKSalary","FDSalary","DKPos","FDPos","DKOwn","FDOwn",
-                "GameKey","SimKey","GameTime","GameRank","OverUnder","HomeSpread",
-                "DKProj","FDProj","Mins","Team")
+  # Cols from IDs tab only -- DKSalary/FDSalary/DKPos/FDPos/DKOwn/FDOwn/DKProj/FDProj/Mins
+  # now live in the team tab and come through via team_data merge below
+  slate_cols<-c("Player","DKID","FDID",
+                "GameKey","SimKey","GameTime","GameRank","OverUnder","HomeSpread","Team")
   player_list<-rbindlist(lapply(team_abbrevs,function(team){
     tab<-team_data[[team]]; sl<-slate[Team==team,intersect(slate_cols,names(slate)),with=FALSE]
     m<-tab[Name %in% sl$Player]; if(!nrow(m)) return(NULL)
     merged<-merge(m,sl,by.x="Name",by.y="Player",all.x=TRUE)
-    needed<-c("DKProj","FDProj","Mins","fg3_mean","fg3_alpha","fg3_beta",
+    needed<-c("DKSalary","FDSalary","DKPos","FDPos","DKOwn","FDOwn",
+              "DKProj","FDProj","Mins",
+              "fg3_mean","fg3_alpha","fg3_beta",
               "pot_ast_share","ast_conv",unname(mu_cols),unname(phi_cols))
     for(col in needed) if(!col %in% names(merged)) merged[,(col):=NA_real_]
     merged[,Team:=team]; merged
