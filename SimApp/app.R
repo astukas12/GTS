@@ -1278,7 +1278,7 @@ server <- function(input, output, session) {
         opt_data   <- prepare_optimization_data(rv$simulation_results, rv$sim_metadata, "DK")
         opt_config <- list(roster_size=rv$config$roster_sizes$DK, salary_cap=rv$config$salary_caps$DK,
                            percentiles=c(0.01,0.05,0.10,0.20), platform_col="DKScore",
-                           progress_frequency=500, use_parallel=TRUE, max_lineups=10000)
+                           progress_frequency=500, use_parallel=TRUE, max_lineups=5000)
         progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
         lineup_data <- find_optimal_lineups(opt_data, opt_config, mode=dk_mode, k=1, verbose=TRUE)
         progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
@@ -1400,7 +1400,7 @@ server <- function(input, output, session) {
         opt_data   <- prepare_optimization_data(rv$simulation_results, rv$sim_metadata, "FD")
         opt_config <- list(roster_size=rv$config$roster_sizes$FD, salary_cap=rv$config$salary_caps$FD,
                            percentiles=c(0.01,0.05,0.10,0.20), platform_col="FDScore",
-                           mvp_multiplier=1.5, progress_frequency=500, use_parallel=TRUE, max_lineups=10000)
+                           mvp_multiplier=1.5, progress_frequency=500, use_parallel=TRUE, max_lineups=5000)
         progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
         lineup_data <- find_optimal_lineups(opt_data, opt_config, mode=fd_mode, k=1, verbose=TRUE)
         progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
