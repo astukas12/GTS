@@ -88,7 +88,7 @@ run_nba_simulation <- function(input_data, n_sims=10000, config=NULL, progress_c
     m<-tab[Name %in% sl$Player]; if(!nrow(m)) return(NULL)
     merged<-merge(m,sl,by.x="Name",by.y="Player",all.x=TRUE)
     needed<-c("DKSalary","FDSalary","DKPos","FDPos","DKOwn","FDOwn",
-              "DKProj","FDProj","Mins",
+              "DKProj","FDProj","Mins","mins_sigma",
               "fg3_mean","fg3_alpha","fg3_beta",
               "pot_ast_share","ast_conv",unname(mu_cols),unname(phi_cols))
     for(col in needed) if(!col %in% names(merged)) merged[,(col):=NA_real_]
@@ -122,10 +122,20 @@ run_nba_simulation <- function(input_data, n_sims=10000, config=NULL, progress_c
     }),share_stats)
     tpm_cn<-paste0(team,"_tpm")
     totals[["tpm_sim"]]<-if(tpm_cn %in% names(dt)) as.numeric(dt[[tpm_cn]])[ri] else rep(0,n_sims)
-    # Fixed minutes (no variance this version)
-    pm<-as.numeric(player_list$Mins[pidx])
-    fb<-if("minutes_avg" %in% names(player_list)) as.numeric(player_list$minutes_avg[pidx]) else rep(NA_real_,length(pidx))
-    pm<-ifelse(is.na(pm)|pm<=0,ifelse(is.na(fb)|fb<=0,24,fb),pm)
+    # Minutes: truncated Normal draws renormed to team total of 240
+    pm_proj<-as.numeric(player_list$Mins[pidx])
+    mins_avg_fb<-if("minutes_avg" %in% names(player_list)) as.numeric(player_list$minutes_avg[pidx]) else rep(NA_real_,length(pidx))
+    pm_proj<-ifelse(is.na(pm_proj)|pm_proj<=0,ifelse(is.na(mins_avg_fb)|mins_avg_fb<=0,24,mins_avg_fb),pm_proj)
+    pm_sigma<-if("mins_sigma" %in% names(player_list)) as.numeric(player_list$mins_sigma[pidx]) else rep(3.0,length(pidx))
+    pm_sigma[is.na(pm_sigma)|pm_sigma<=0]<-3.0
+    mins_mat<-matrix(0.0,n_team,n_sims)
+    for(pi in seq_len(n_team)){
+      raw_d<-rnorm(n_sims,mean=pm_proj[pi],sd=pm_sigma[pi])
+      mins_mat[pi,]<-pmax(pmin(raw_d,48),0)
+    }
+    team_mins_sum<-colSums(mins_mat)
+    team_mins_sum[team_mins_sum<=0]<-240
+    mins_mat<-sweep(mins_mat,2,240/team_mins_sum,`*`)
     # NegBin param matrices
     mu_mat <-matrix(0.0,n_team,length(share_stats),dimnames=list(NULL,share_stats))
     phi_mat<-matrix(4.0,n_team,length(share_stats),dimnames=list(NULL,share_stats))
@@ -133,7 +143,7 @@ run_nba_simulation <- function(input_data, n_sims=10000, config=NULL, progress_c
       s<-share_stats[j]
       mu_v<-if(mu_cols[s] %in% names(player_list)){v<-as.numeric(player_list[[mu_cols[s]]][pidx]);v[is.na(v)]<-0;v} else rep(0,n_team)
       phi_v<-if(phi_cols[s] %in% names(player_list)){v<-as.numeric(player_list[[phi_cols[s]]][pidx]);v[is.na(v)]<-4;v} else rep(4,n_team)
-      mu_mat[,j]<-mu_v*(pm/36); phi_mat[,j]<-phi_v
+      mu_mat[,j]<-mu_v; phi_mat[,j]<-phi_v
     }
     fg3_alpha<-as.numeric(player_list$fg3_alpha[pidx]); fg3_alpha[is.na(fg3_alpha)]<-0.9
     fg3_beta <-as.numeric(player_list$fg3_beta[pidx]);  fg3_beta[is.na(fg3_beta)]<-2.1
@@ -142,7 +152,7 @@ run_nba_simulation <- function(input_data, n_sims=10000, config=NULL, progress_c
     aw_raw<-pas*acv; aw_sum<-sum(aw_raw,na.rm=TRUE)
     aw<-if(aw_sum>0) aw_raw/aw_sum else rep(1/n_team,n_team)
     list(pidx=pidx,n_team=n_team,totals=totals,mu_mat=mu_mat,phi_mat=phi_mat,
-         fg3_alpha=fg3_alpha,fg3_beta=fg3_beta,ast_weight=aw)
+         mins_mat=mins_mat,fg3_alpha=fg3_alpha,fg3_beta=fg3_beta,ast_weight=aw)
   }),team_abbrevs)
   
   # ── NegBin draws + team-total normalization ──
@@ -184,7 +194,10 @@ run_nba_simulation <- function(input_data, n_sims=10000, config=NULL, progress_c
     for(j in seq_along(share_stats)){
       s<-share_stats[j]; mu_vec<-td$mu_mat[,j]; phi_vec<-td$phi_mat[,j]; team_tot<-td$totals[[s]]
       raw_mat<-matrix(0L,td$n_team,n_sims)
-      for(pi in seq_len(td$n_team)) raw_mat[pi,]<-draw_negbin(mu_vec[pi],phi_vec[pi],n_sims)
+      for(pi in seq_len(td$n_team)){
+        mu_sims<-pmax(mu_vec[pi]*td$mins_mat[pi,]/36,0)
+        raw_mat[pi,]<-as.integer(rnbinom(n_sims,size=max(phi_vec[pi],0.5),mu=mu_sims))
+      }
       stat_mats[[s]][pidx,]<-normalize_to_total(raw_mat,team_tot,mu_vec,td$n_team)
     }
   }
