@@ -539,6 +539,7 @@ server <- function(input, output, session) {
     rv$sd_portfolio        <- NULL;  rv$sd_builds <- list();  rv$sd_build_counter <- 0
     rv$sport_visuals       <- NULL
     rv$full_sim_results    <- NULL
+    rv$has_dk              <- TRUE
     rv$has_fd              <- TRUE
     rv$has_sd              <- TRUE
     rv$dk_lock_v           <- 0L
@@ -582,6 +583,7 @@ server <- function(input, output, session) {
     golf_cut_line      = 65,
     has_fd             = TRUE,
     has_sd             = TRUE,
+    has_dk             = TRUE,
     sport_visuals      = NULL,
     full_sim_results   = NULL
   )
@@ -595,6 +597,7 @@ server <- function(input, output, session) {
   available_platforms <- reactive({
     req(rv$config)
     plats <- rv$config$platforms
+    if (!isTRUE(rv$has_dk)) plats <- setdiff(plats, "DK")
     if (!isTRUE(rv$has_fd)) plats <- setdiff(plats, "FD")
     if (!isTRUE(rv$has_sd)) plats <- setdiff(plats, "SD")
     plats
@@ -615,8 +618,10 @@ server <- function(input, output, session) {
         driver_cols <- names(suppressMessages(
           readxl::read_excel(input$input_file$datapath, sheet = "Driver", n_max = 1)
         ))
+        rv$has_dk <- TRUE
         rv$has_fd <- all(c("FDSalary", "FDID", "FDName") %in% driver_cols)
       } else {
+        rv$has_dk <- TRUE
         rv$has_fd <- TRUE
         rv$has_sd <- TRUE
       }
@@ -801,7 +806,10 @@ server <- function(input, output, session) {
           rv$has_sd           <- FALSE
         } else {
           rv$full_sim_results <- NULL
-          rv$has_fd <- if (!is.null(result$has_fd)) isTRUE(result$has_fd) else TRUE
+          # has_dk mirrors has_fd: SD-only files have neither DK classic nor FD
+          has_fd_val <- if (!is.null(result$has_fd)) isTRUE(result$has_fd) else TRUE
+          rv$has_dk <- has_fd_val
+          rv$has_fd <- has_fd_val
           rv$has_sd <- if (!is.null(result$has_sd)) isTRUE(result$has_sd) else TRUE
         }
         

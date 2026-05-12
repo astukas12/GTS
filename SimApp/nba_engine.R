@@ -12,34 +12,39 @@ library(data.table); library(readxl); library(lpSolve)
 
 read_nba_input <- function(file_path) {
   sheets <- excel_sheets(file_path)
-  ids    <- as.data.table(read_excel(file_path, sheet="IDs"))
-  setnames(ids, trimws(names(ids))); setnames(ids, "Name", "Player")
-  games  <- as.data.table(read_excel(file_path, sheet="Games"))
+  
+  # IDs and Games tabs are optional -- SD-only input files omit them.
+  # When absent, slate and game context are derived from team tabs + sim sheet names.
+  sim_names <- grep("^Sim_",sheets,value=TRUE)
+  if (!length(sim_names)) stop("No Sim_ sheets found.")
+  sim_games <- setNames(lapply(sim_names,function(s) as.data.table(read_excel(file_path,sheet=s))),
+                        sub("^Sim_","",sim_names))
+  
+  sd_names <- grep("^SD\\d+_IDs$",sheets,value=TRUE)
+  sd_ids <- if (length(sd_names)) setNames(lapply(sd_names,function(s){
+    dt<-as.data.table(read_excel(file_path,sheet=s)); setnames(dt,trimws(names(dt))); dt
+  }), sub("_IDs$","",sd_names)) else list()
+  
+  fixed_sheets <- c("IDs","Games",sd_names,sim_names,grep("^H2H_",sheets,value=TRUE))
+  team_sheet_names <- setdiff(sheets, fixed_sheets)
+  if (!length(team_sheet_names)) stop("No team tabs found.")
+  team_data <- setNames(lapply(team_sheet_names,function(s){
+    dt<-as.data.table(read_excel(file_path,sheet=s)); setnames(dt,trimws(names(dt)))
+    drop<-intersect(c("DKSal","FDSal","RGProj","RGFDProj"),names(dt))
+    if (length(drop)) dt[,(drop):=NULL]; dt
+  }), team_sheet_names)
+  
+  games <- as.data.table(read_excel(file_path, sheet="Games"))
   setnames(games, trimws(names(games)))
   games[, SimKey := paste0(HomeTeam,"_vs_",AwayTeam)]
   team_game_lu <- rbind(
     games[, .(Team=HomeTeam,SimKey,GameKey,GameTime,GameRank,OverUnder,HomeSpread,ShowdownFile)],
     games[, .(Team=AwayTeam,SimKey,GameKey,GameTime,GameRank,OverUnder,HomeSpread,ShowdownFile)]
   )
-  sim_names <- grep("^Sim_",sheets,value=TRUE)
-  if (!length(sim_names)) stop("No Sim_ sheets found.")
-  sim_games <- setNames(lapply(sim_names,function(s) as.data.table(read_excel(file_path,sheet=s))),
-                        sub("^Sim_","",sim_names))
-  sd_names <- grep("^SD\\d+_IDs$",sheets,value=TRUE)
-  sd_ids <- if (length(sd_names)) setNames(lapply(sd_names,function(s){
-    dt<-as.data.table(read_excel(file_path,sheet=s)); setnames(dt,trimws(names(dt))); dt
-  }), sub("_IDs$","",sd_names)) else list()
-  team_sheet_names <- setdiff(sheets,c("IDs","Games",sd_names,sim_names))
-  if (!length(team_sheet_names)) stop("No team tabs found.")
-  team_data <- setNames(lapply(team_sheet_names,function(s){
-    dt<-as.data.table(read_excel(file_path,sheet=s)); setnames(dt,trimws(names(dt)))
-    # Only drop legacy alias names -- real columns now live in team tab
-    drop<-intersect(c("DKSal","FDSal","RGProj","RGFDProj"),names(dt))
-    if (length(drop)) dt[,(drop):=NULL]; dt
-  }), team_sheet_names)
+  ids   <- as.data.table(read_excel(file_path, sheet="IDs"))
+  setnames(ids, trimws(names(ids))); setnames(ids, "Name", "Player")
   slate <- merge(ids, team_game_lu, by="Team", all.x=TRUE)
-  # DKPos/FDPos now live in team tab -- eligibility flags computed in optimizers
-  # from metadata$DKPos/FDPos after player_list merge
+  
   slate <- unique(slate, by="Player")
   cat(sprintf("NBA Input: %d players | %d games | %d team tabs | %d sim sheets\n",
               nrow(slate),nrow(games),length(team_data),length(sim_games)))
@@ -284,7 +289,8 @@ run_nba_simulation <- function(input_data, n_sims=10000, config=NULL, progress_c
   cb("Building metadata...",0.96)
   keep_cols<-intersect(c("Name","DKID","FDID","DKSalary","FDSalary","DKPos","FDPos",
                          "DKOwn","FDOwn","Team","GameKey","SimKey","GameTime","GameRank",
-                         "OverUnder","HomeSpread","DKProj","FDProj","Mins"),names(player_list))
+                         "OverUnder","HomeSpread","DKProj","FDProj","Mins",
+                         "CPTSalary","CPTOwn","CPTProj"),names(player_list))
   metadata<-unique(player_list[,..keep_cols],by="Name"); setnames(metadata,"Name","Player")
   metadata[,GameTimeSort:=as.numeric(as.POSIXct(paste(Sys.Date(),GameTime),
                                                 format="%Y-%m-%d %I:%M %p",tz="America/New_York"))]
@@ -300,6 +306,10 @@ run_nba_simulation <- function(input_data, n_sims=10000, config=NULL, progress_c
     if(!"ShowdownFile" %in% names(metadata)) metadata[,ShowdownFile:=NA_character_]
     missing_sf<-is.na(metadata$ShowdownFile)
     if(any(missing_sf)){lu_vec<-setNames(game_sd_lu$ShowdownFile,game_sd_lu$Team);metadata[missing_sf,ShowdownFile:=lu_vec[Team]]}
+    # Drop any SD columns already in metadata (from team tab passthrough)
+    # so the sd_sub values from the SD_IDs tab win cleanly
+    sd_cols <- c("CPTID","CPTSalary","SDID","SDSalary")
+    metadata[, (intersect(sd_cols, names(metadata))) := NULL]
     metadata<-merge(metadata,sd_sub,by.x=c("Player","Team","ShowdownFile"),by.y=c("Player","Team","SDFile"),all.x=TRUE)
   }
   sim_results<-sim_results[Player %in% metadata$Player]

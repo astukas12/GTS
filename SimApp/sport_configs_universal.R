@@ -677,7 +677,7 @@ SPORT_CONFIGS <- list(
         has_ids   <- "IDs" %in% sheets
         has_games <- "Games" %in% sheets
         if (!has_sim || !has_ids || !has_games) return(FALSE)
-        # Confirm NBA by checking for OverUnder column in Games sheet
+        # Confirm NBA (not CBB) by checking for OverUnder in Games sheet
         if (!is.null(file_path)) {
           tryCatch({
             g <- suppressMessages(readxl::read_excel(file_path, sheet="Games", n_max=1))
@@ -739,7 +739,7 @@ SPORT_CONFIGS <- list(
     input_file = list(
       type            = "excel",
       load_all_sheets = TRUE,
-      player_sheet    = "IDs"
+      player_sheet    = NULL  # read_nba_input() handles IDs/SD-only detection
     ),
     
     simulation = list(
