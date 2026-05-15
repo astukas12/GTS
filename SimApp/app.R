@@ -539,7 +539,6 @@ server <- function(input, output, session) {
     rv$sd_portfolio        <- NULL;  rv$sd_builds <- list();  rv$sd_build_counter <- 0
     rv$sport_visuals       <- NULL
     rv$full_sim_results    <- NULL
-    rv$has_dk              <- TRUE
     rv$has_fd              <- TRUE
     rv$has_sd              <- TRUE
     rv$dk_lock_v           <- 0L
@@ -583,7 +582,6 @@ server <- function(input, output, session) {
     golf_cut_line      = 65,
     has_fd             = TRUE,
     has_sd             = TRUE,
-    has_dk             = TRUE,
     sport_visuals      = NULL,
     full_sim_results   = NULL
   )
@@ -597,7 +595,6 @@ server <- function(input, output, session) {
   available_platforms <- reactive({
     req(rv$config)
     plats <- rv$config$platforms
-    if (!isTRUE(rv$has_dk)) plats <- setdiff(plats, "DK")
     if (!isTRUE(rv$has_fd)) plats <- setdiff(plats, "FD")
     if (!isTRUE(rv$has_sd)) plats <- setdiff(plats, "SD")
     plats
@@ -618,10 +615,8 @@ server <- function(input, output, session) {
         driver_cols <- names(suppressMessages(
           readxl::read_excel(input$input_file$datapath, sheet = "Driver", n_max = 1)
         ))
-        rv$has_dk <- TRUE
         rv$has_fd <- all(c("FDSalary", "FDID", "FDName") %in% driver_cols)
       } else {
-        rv$has_dk <- TRUE
         rv$has_fd <- TRUE
         rv$has_sd <- TRUE
       }
@@ -806,10 +801,7 @@ server <- function(input, output, session) {
           rv$has_sd           <- FALSE
         } else {
           rv$full_sim_results <- NULL
-          # has_dk mirrors has_fd: SD-only files have neither DK classic nor FD
-          has_fd_val <- if (!is.null(result$has_fd)) isTRUE(result$has_fd) else TRUE
-          rv$has_dk <- has_fd_val
-          rv$has_fd <- has_fd_val
+          rv$has_fd <- if (!is.null(result$has_fd)) isTRUE(result$has_fd) else TRUE
           rv$has_sd <- if (!is.null(result$has_sd)) isTRUE(result$has_sd) else TRUE
         }
         
@@ -1984,7 +1976,7 @@ server <- function(input, output, session) {
         p <- exp_tbl$Player[i]
         if (p %in% names(all_counts)) exp_tbl$Exposure[i] <- as.numeric(all_counts[p]) / n_lineups * 100
       }
-      if (is_f1 || (is_cbb && has_captain) || (is_nba && is_sd && has_captain)) {
+      if (is_f1 || (is_cbb && has_captain)) {
         cpt_counts  <- if (length(cpt_cols))  table(unlist(filtered[, ..cpt_cols]))  else table(character(0))
         util_counts <- if (length(util_cols)) table(unlist(filtered[, ..util_cols])) else table(character(0))
         exp_tbl[, CptExp  := 0]
@@ -2002,8 +1994,8 @@ server <- function(input, output, session) {
       
       # ── Build metadata column list ─────────────────────────────────────────
       if (is_nba && is_sd) {
-        nba_sd_meta <- intersect(c("Player","Team","SDSalary","DKProj","Mins",
-                                   "CPTOwn","DKOwn"),
+        # SD: show DKPos, SDSalary (as Salary), Team, DKProj, Mins
+        nba_sd_meta <- intersect(c("Player","DKPos","Team","SDSalary","DKProj","Mins"),
                                  names(rv$sim_metadata))
         meta_cols <- nba_sd_meta
       } else if (is_nba) {
@@ -2035,31 +2027,13 @@ server <- function(input, output, session) {
       }
       
       if (is_nba && is_sd) {
+        # SD column ordering: Player, DKPos, Team, Salary(SDSalary), GTS, ETR, Mins, CptExp, UtilExp, Exposure
         if ("SDSalary" %in% names(exp_tbl)) setnames(exp_tbl, "SDSalary", "Salary")
-        if ("CPTOwn" %in% names(exp_tbl)) {
-          if (max(exp_tbl$CPTOwn, na.rm=TRUE) <= 1) exp_tbl[, CPTOwn := CPTOwn * 100]
-          setnames(exp_tbl, "CPTOwn", "CptOwn")
-        }
-        if ("DKOwn" %in% names(exp_tbl)) {
-          if (max(exp_tbl$DKOwn, na.rm=TRUE) <= 1) exp_tbl[, DKOwn := DKOwn * 100]
-          setnames(exp_tbl, "DKOwn", "UtlOwn")
-        }
-        if ("UtilExp" %in% names(exp_tbl)) setnames(exp_tbl, "UtilExp", "UtlExp")
-        if (all(c("CptExp","CptOwn") %in% names(exp_tbl)))
-          exp_tbl[, CptLev := round(CptExp - CptOwn, 1)]
-        if (all(c("UtlExp","UtlOwn") %in% names(exp_tbl)))
-          exp_tbl[, UtlLev := round(UtlExp - UtlOwn, 1)]
-        exp_tbl[, TotExp := round(Exposure, 1)]
-        if (all(c("CptOwn","UtlOwn") %in% names(exp_tbl)))
-          exp_tbl[, TotOwn := round(CptOwn + UtlOwn, 1)]
-        if (all(c("TotExp","TotOwn") %in% names(exp_tbl)))
-          exp_tbl[, TotLev := round(TotExp - TotOwn, 1)]
-        exp_tbl[, Exposure := NULL]
-        meta_order <- intersect(c("Player","Team","Salary"), names(exp_tbl))
-        split_cols <- intersect(c("CptExp","CptOwn","CptLev",
-                                  "UtlExp","UtlOwn","UtlLev",
-                                  "TotExp","TotOwn","TotLev"), names(exp_tbl))
-        setcolorder(exp_tbl, c(meta_order, split_cols))
+        if ("DKProj" %in% names(exp_tbl)) setnames(exp_tbl, "DKProj", "ETR")
+        meta_order    <- intersect(c("Player","DKPos","Team","Salary","GTS","ETR","Mins"), names(exp_tbl))
+        split_cols    <- intersect(c("CptExp","UtilExp"), names(exp_tbl))
+        metrics_order <- intersect(c("Exposure"), names(exp_tbl))
+        setcolorder(exp_tbl, c(meta_order, split_cols, metrics_order))
       } else if (is_nba) {
         pos_col_nba <- if (platform == "FD") "FDPos" else "DKPos"
         proj_col    <- if (platform == "FD") "FDProj" else "DKProj"
@@ -2096,17 +2070,11 @@ server <- function(input, output, session) {
         }
       }
       
-      # For NBA-SD, Exposure was replaced by TotExp
-      exp_sort_col <- if ("Exposure" %in% names(exp_tbl)) "Exposure" else "TotExp"
-      exp_tbl <- exp_tbl[get(exp_sort_col) > 0]
-      setorderv(exp_tbl, exp_sort_col, order = -1L)
+      exp_tbl <- exp_tbl[Exposure > 0]; setorder(exp_tbl, -Exposure)
       dt <- datatable(exp_tbl,
                       options=list(pageLength=50,scrollX=TRUE,searching=FALSE,lengthChange=FALSE,dom='tp'),
                       rownames=FALSE)
-      rc <- intersect(c("CptExp","CptOwn","CptLev",
-                        "UtlExp","UtlOwn","UtlLev",
-                        "TotExp","TotOwn","TotLev",
-                        "Exposure","FlexExp","OwnProj","Leverage",
+      rc <- intersect(c("Exposure","CptExp","UtilExp","FlexExp","OwnProj","Leverage",
                         "CutProb","RGProj","RGMin","GTS","ETR","Mins","Proj","Sim"), names(exp_tbl))
       if (length(rc) > 0) dt <- dt %>% formatRound(rc, 1)
       cap <- rv$config$salary_caps[[platform]] %||% 50000
@@ -2291,8 +2259,7 @@ server <- function(input, output, session) {
       
       # ── Build metadata column list ─────────────────────────────────────────
       if (is_nba && is_sd) {
-        mc <- intersect(c("Player","Team","SDSalary","DKProj","Mins",
-                          "CPTOwn","DKOwn"),
+        mc <- intersect(c("Player","DKPos","Team","SDSalary","DKProj","Mins"),
                         names(rv$sim_metadata))
       } else if (is_nba) {
         pos_col_nba <- if (platform == "FD") "FDPos" else "DKPos"
@@ -2346,30 +2313,85 @@ server <- function(input, output, session) {
         
         if (is_nba && is_sd) {
           if ("SDSalary" %in% names(exp_tbl)) setnames(exp_tbl, "SDSalary", "Salary")
-          if ("CPTOwn" %in% names(exp_tbl)) {
-            if (max(exp_tbl$CPTOwn, na.rm=TRUE) <= 1) exp_tbl[, CPTOwn := CPTOwn * 100]
-            setnames(exp_tbl, "CPTOwn", "CptOwn")
+          if ("DKProj" %in% names(exp_tbl)) setnames(exp_tbl, "DKProj", "ETR")
+          meta_order <- intersect(c("Player","DKPos","Team","Salary","GTS","ETR","Mins"), names(exp_tbl))
+        } else if (is_nba) {
+          pos_col_nba <- if (platform == "FD") "FDPos" else "DKPos"
+          proj_col    <- if (platform == "FD") "FDProj" else "DKProj"
+          if (salary_col %in% names(exp_tbl)) setnames(exp_tbl, salary_col, "Sal")
+          if (proj_col %in% names(exp_tbl)) setnames(exp_tbl, proj_col, "ETR")
+          meta_order <- intersect(c("Player", pos_col_nba, "Sal","GTS","ETR","Mins","Team"), names(exp_tbl))
+        } else {
+          base_meta  <- c("Player", if (is_f1) "PlayerType" else NULL,
+                          "PosGroup","Salary","RGProj","RGMin","GameTime","Starting","Team","Car",
+                          "Position","Match","Opponent","TeeTimeGroup","CutProb")
+          meta_order <- intersect(base_meta, names(exp_tbl))
+          if (is_cbb) {
+            rename_map <- c(PosGroup="Pos", Salary="Sal", RGProj="Proj", RGMin="Mins", GameTime="Time")
+            for (old in names(rename_map)) if (old %in% names(exp_tbl)) setnames(exp_tbl, old, rename_map[[old]])
+            meta_order <- intersect(c("Player","Pos","Sal","GTS","Proj","Mins","Time","Team"), names(exp_tbl))
           }
-          if ("DKOwn" %in% names(exp_tbl)) {
-            if (max(exp_tbl$DKOwn, na.rm=TRUE) <= 1) exp_tbl[, DKOwn := DKOwn * 100]
-            setnames(exp_tbl, "DKOwn", "UtlOwn")
+        }
+        
+        in_col  <- grep("^IN ",    names(exp_tbl), value=TRUE)
+        out_col <- grep("^OUT ",   names(exp_tbl), value=TRUE)
+        tot_col <- grep("^Total ", names(exp_tbl), value=TRUE)
+        diff_col <- "IN-OUT"
+        setcolorder(exp_tbl, c(meta_order, in_col, out_col, tot_col, diff_col))
+        exp_tbl <- exp_tbl[exp_tbl[[tot_col]] > 0]
+        setorderv(exp_tbl, in_col, order=-1L)
+        
+        sel_label <- paste(sel_builds, collapse=", ")
+        cap_msg   <- paste0("IN = [", sel_label, "]  \u2502  OUT = all other builds  \u2502  Click a row to deselect")
+        
+        dt <- datatable(exp_tbl,
+                        caption  = htmltools::tags$caption(
+                          style="color:#FFE500;font-weight:bold;font-size:13px;padding:6px 0;", cap_msg),
+                        options  = list(pageLength=50, scrollX=TRUE, searching=FALSE,
+                                        lengthChange=FALSE, dom='tp'),
+                        rownames = FALSE)
+        rc <- intersect(c(in_col, out_col, tot_col, "IN-OUT","GTS","ETR","Mins"), names(exp_tbl))
+        if (length(rc)) dt <- dt %>% formatRound(rc, 1)
+        sal_disp <- intersect(c("Sal","Salary"), names(exp_tbl))
+        cap_val  <- rv$config$salary_caps[[platform]] %||% 50000
+        if (length(sal_disp) && cap_val >= 1000) dt <- dt %>% formatCurrency(sal_disp[1], "$", digits=0)
+        dt <- dt %>% formatStyle("IN-OUT",
+                                 color = styleInterval(c(-0.001, 0.001), c("#ff6b6b", "#888888", "#69db7c")))
+        dt
+        
+      } else {
+        # ── Normal full-portfolio exposure mode ──────────────────────────────
+        n_lineups  <- nrow(port)
+        all_counts <- table(unlist(port[, ..all_pc]))
+        exp_tbl <- data.table(Player = meta_players, Exposure = 0)
+        for (i in seq_len(nrow(exp_tbl))) {
+          p <- exp_tbl$Player[i]
+          if (p %in% names(all_counts)) exp_tbl$Exposure[i] <- as.numeric(all_counts[p]) / n_lineups * 100
+        }
+        if (is_f1 || (is_cbb && has_captain)) {
+          cpt_counts  <- if (length(cpt_cols))  table(unlist(port[, ..cpt_cols]))  else table(character(0))
+          util_counts <- if (length(util_cols)) table(unlist(port[, ..util_cols])) else table(character(0))
+          exp_tbl[, CptExp  := 0]
+          exp_tbl[, UtilExp := 0]
+          for (i in seq_len(nrow(exp_tbl))) {
+            p <- exp_tbl$Player[i]
+            if (p %in% names(cpt_counts))  exp_tbl$CptExp[i]  <- as.numeric(cpt_counts[p])  / n_lineups * 100
+            if (p %in% names(util_counts)) exp_tbl$UtilExp[i] <- as.numeric(util_counts[p]) / n_lineups * 100
           }
-          if ("UtilExp" %in% names(exp_tbl)) setnames(exp_tbl, "UtilExp", "UtlExp")
-          if (all(c("CptExp","CptOwn") %in% names(exp_tbl)))
-            exp_tbl[, CptLev := round(CptExp - CptOwn, 1)]
-          if (all(c("UtlExp","UtlOwn") %in% names(exp_tbl)))
-            exp_tbl[, UtlLev := round(UtlExp - UtlOwn, 1)]
-          exp_tbl[, TotExp := round(Exposure, 1)]
-          if (all(c("CptOwn","UtlOwn") %in% names(exp_tbl)))
-            exp_tbl[, TotOwn := round(CptOwn + UtlOwn, 1)]
-          if (all(c("TotExp","TotOwn") %in% names(exp_tbl)))
-            exp_tbl[, TotLev := round(TotExp - TotOwn, 1)]
-          exp_tbl[, Exposure := NULL]
-          meta_order <- intersect(c("Player","Team","Salary"), names(exp_tbl))
-          split_cols <- intersect(c("CptExp","CptOwn","CptLev",
-                                    "UtlExp","UtlOwn","UtlLev",
-                                    "TotExp","TotOwn","TotLev"), names(exp_tbl))
-          setcolorder(exp_tbl, c(meta_order, split_cols))
+          if (is_f1)
+            exp_tbl[Player %in% rv$sim_metadata$Player[rv$sim_metadata$PlayerType == "Constructor"],
+                    c("CptExp","UtilExp") := NA_real_]
+        }
+        exp_tbl <- merge(exp_tbl, rv$sim_metadata[Player %in% meta_players, ..mc], by="Player", all.x=TRUE)
+        if (!is.null(gts_tbl)) exp_tbl <- merge(exp_tbl, gts_tbl, by="Player", all.x=TRUE)
+        
+        if (is_nba && is_sd) {
+          if ("SDSalary" %in% names(exp_tbl)) setnames(exp_tbl, "SDSalary", "Salary")
+          if ("DKProj" %in% names(exp_tbl)) setnames(exp_tbl, "DKProj", "ETR")
+          meta_order    <- intersect(c("Player","DKPos","Team","Salary","GTS","ETR","Mins"), names(exp_tbl))
+          split_cols    <- intersect(c("CptExp","UtilExp"), names(exp_tbl))
+          metrics_order <- "Exposure"
+          setcolorder(exp_tbl, c(meta_order, split_cols, metrics_order))
         } else if (is_nba) {
           pos_col_nba <- if (platform == "FD") "FDPos" else "DKPos"
           proj_col    <- if (platform == "FD") "FDProj" else "DKProj"
@@ -2406,14 +2428,9 @@ server <- function(input, output, session) {
           }
         }
         
-        exp_sort_col <- if ("Exposure" %in% names(exp_tbl)) "Exposure" else "TotExp"
-        exp_tbl <- exp_tbl[get(exp_sort_col) > 0]
-        setorderv(exp_tbl, exp_sort_col, order = -1L)
+        exp_tbl <- exp_tbl[Exposure > 0]; setorder(exp_tbl, -Exposure)
         dt <- datatable(exp_tbl, options=list(pageLength=50,scrollX=TRUE,searching=FALSE,lengthChange=FALSE,dom='tp'), rownames=FALSE)
-        rc <- intersect(c("CptExp","CptOwn","CptLev",
-                          "UtlExp","UtlOwn","UtlLev",
-                          "TotExp","TotOwn","TotLev",
-                          "Exposure","FlexExp","OwnProj","Leverage",
+        rc <- intersect(c("Exposure","CptExp","UtilExp","FlexExp","OwnProj","Leverage",
                           "CutProb","RGProj","RGMin","GTS","ETR","Mins","Proj","Sim"), names(exp_tbl))
         if (length(rc) > 0) dt <- dt %>% formatRound(rc, 1)
         cap <- rv$config$salary_caps[[platform]] %||% 50000
