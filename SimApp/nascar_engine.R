@@ -460,14 +460,14 @@ precompute_driver_distributions <- function(driver_data) {
     
     if (n_positions >= 21) {
       p <- max(0, T25 - T20)
-      idx <- 21:min(25, n_positions)
+      idx <- 21:min(26, n_positions)
       w <- exp(-0.08 * seq_along(idx))
       position_probs[idx] <- p * w / sum(w)
     }
     
-    if (n_positions >= 26) {
+    if (n_positions >= 27) {
       p <- max(0, T30 - T25)
-      idx <- 26:min(30, n_positions)
+      idx <- 27:min(30, n_positions)
       w <- exp(-0.08 * seq_along(idx))
       position_probs[idx] <- p * w / sum(w)
     }
@@ -522,6 +522,9 @@ simulate_finish_positions_vectorized <- function(prob_matrix, n_sims) {
   final_positions <- matrix(0L, nrow = n_drivers, ncol = n_sims)
   rownames(final_positions) <- driver_names
   
+  # Pre-compute which drivers are locked to top 26 (T25=1 means zero prob at pos 27+)
+  locked_top26 <- apply(prob_matrix[, min(27, n_positions):n_positions, drop = FALSE], 1, function(x) all(x == 0))
+  
   for (sim_id in seq_len(n_sims)) {
     
     assigned        <- integer(n_drivers)   # position assigned to each driver (0 = unassigned)
@@ -532,7 +535,7 @@ simulate_finish_positions_vectorized <- function(prob_matrix, n_sims) {
       # Eligible: drivers with non-zero prob at this position who aren't yet assigned
       eligible <- which(prob_matrix[, pos] > 0 & !driver_assigned)
       
-      if (length(eligible) == 0L) next  # no eligible driver (shouldn't happen with valid inputs)
+      if (length(eligible) == 0L) next  # no eligible driver - handled in mop-up below
       
       if (length(eligible) == 1L) {
         chosen <- eligible
@@ -543,6 +546,35 @@ simulate_finish_positions_vectorized <- function(prob_matrix, n_sims) {
       
       assigned[chosen]        <- pos
       driver_assigned[chosen] <- TRUE
+    }
+    
+    # Mop-up: assign any remaining unassigned drivers to unfilled positions.
+    # Locked-top-26 drivers (T25=1) must only get positions <= 26.
+    unassigned        <- which(!driver_assigned)
+    unfilled          <- setdiff(seq_len(n_positions), assigned[driver_assigned])
+    
+    if (length(unassigned) > 0L && length(unfilled) > 0L) {
+      locked_unassigned   <- unassigned[locked_top26[unassigned]]
+      unlocked_unassigned <- unassigned[!locked_top26[unassigned]]
+      unfilled_top26      <- unfilled[unfilled <= 26]
+      unfilled_tail       <- unfilled[unfilled > 26]
+      
+      # Assign locked drivers to top-26 unfilled slots first
+      if (length(locked_unassigned) > 0L && length(unfilled_top26) > 0L) {
+        fill_order <- sample(length(locked_unassigned))
+        for (k in seq_along(fill_order)) {
+          assigned[locked_unassigned[fill_order[k]]] <- unfilled_top26[k]
+        }
+      }
+      
+      # Assign unlocked drivers to remaining unfilled slots
+      remaining_unfilled <- setdiff(unfilled, assigned[assigned > 0])
+      if (length(unlocked_unassigned) > 0L && length(remaining_unfilled) > 0L) {
+        fill_order <- sample(length(unlocked_unassigned))
+        for (k in seq_along(fill_order)) {
+          assigned[unlocked_unassigned[fill_order[k]]] <- remaining_unfilled[k]
+        }
+      }
     }
     
     final_positions[, sim_id] <- assigned
@@ -644,7 +676,8 @@ create_scoring_system <- function() {
 calculate_fantasy_points <- function(race_result, scoring_systems, has_fd = TRUE, fd_laps = NULL) {
   
   # DraftKings (always calculated)
-  dk_finish_points <- scoring_systems$DK$Points[race_result$FinishPosition]
+  fp <- pmax(1L, pmin(race_result$FinishPosition, nrow(scoring_systems$DK)))
+  dk_finish_points <- scoring_systems$DK$Points[fp]
   dk_position_diff <- race_result$Starting - race_result$FinishPosition
   
   set(race_result, j = "DKFinishPts", value = dk_finish_points)
@@ -654,7 +687,8 @@ calculate_fantasy_points <- function(race_result, scoring_systems, has_fd = TRUE
   
   # FanDuel (only if has_fd is TRUE)
   if (has_fd) {
-    fd_finish_points <- scoring_systems$FD$Points[race_result$FinishPosition]
+    fp_fd <- pmax(1L, pmin(race_result$FinishPosition, nrow(scoring_systems$FD)))
+    fd_finish_points <- scoring_systems$FD$Points[fp_fd]
     fd_position_diff <- race_result$Starting - race_result$FinishPosition
     
     # Laps completed pts — look up by finish position from FDLaps sheet
