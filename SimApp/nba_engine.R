@@ -138,6 +138,26 @@ run_nba_simulation <- function(input_data, n_sims=10000, config=NULL, progress_c
       raw_d<-rnorm(n_sims,mean=pm_proj[pi],sd=pm_sigma[pi])
       mins_mat[pi,]<-pmax(pmin(raw_d,48),0)
     }
+    # Game-script minutes adjustment ------------------------------------
+    # Close games: starters play more, bench less
+    # Blowouts: starters rest earlier, bench gets run
+    pts_col_self <- paste0(team, "_pts")
+    gk_parts <- strsplit(gk, "_vs_")[[1]]
+    opp_team <- if (gk_parts[1] == team) gk_parts[2] else gk_parts[1]
+    pts_col_opp <- paste0(opp_team, "_pts")
+    if (pts_col_self %in% names(dt) && pts_col_opp %in% names(dt)) {
+      self_pts <- as.numeric(dt[[pts_col_self]])[ri]
+      opp_pts  <- as.numeric(dt[[pts_col_opp]])[ri]
+      margin   <- abs(self_pts - opp_pts)
+      # game_script: +0.15 at margin=0 (tight), 0 at ~10, -0.15 at 25+
+      game_script <- pmin(pmax((10 - margin) / 60, -0.15), 0.15)
+      mean_proj <- mean(pm_proj)
+      for (pi in seq_len(n_team)) {
+        role_factor <- (pm_proj[pi] - mean_proj) / pmax(mean_proj, 1)
+        mins_mat[pi,] <- mins_mat[pi,] * (1 + game_script * role_factor)
+      }
+      mins_mat <- pmax(mins_mat, 0)
+    }
     team_mins_sum<-colSums(mins_mat)
     team_mins_sum[team_mins_sum<=0]<-240
     mins_mat<-sweep(mins_mat,2,240/team_mins_sum,`*`)
