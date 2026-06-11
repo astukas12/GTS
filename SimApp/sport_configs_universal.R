@@ -760,6 +760,94 @@ SPORT_CONFIGS <- list(
       FD = c("PG", "PG", "SG", "SG", "SF", "SF", "PF", "PF", "C"),
       SD = c("CPT", "UTIL", "UTIL", "UTIL", "UTIL", "UTIL")
     )
+  ),
+  
+  
+  # ==========================================================================
+  # SOCCER
+  # ==========================================================================
+  SOCCER = list(
+    sport_name         = "SOCCER",
+    sport_display_name = "Soccer",
+    player_label       = "Player",
+    player_label_plural = "Players",
+    
+    detection = list(
+      required_sheets   = c("Games", "Players"),
+      required_columns  = c("Goal_Share", "Shot_Share"),
+      min_sheet_matches = 2,
+      min_column_matches = 1
+    ),
+    
+    platforms    = c("DK", "SD"),
+    roster_sizes = list(DK = 8, SD = 6),
+    salary_caps  = list(DK = 50000, SD = 50000),
+    optimization_modes = list(DK = "lp", SD = "captain"),
+    max_lineups  = 5000,
+    
+    standard_metrics = c(
+      "WinRate", "Top1Rate", "Top5Rate", "Top10Rate", "Top20Rate",
+      "TotalSalary", "AvgOwn"
+    ),
+    
+    custom_metrics = list(),
+    
+    metadata_columns = list(
+      list(name = "Team",     label = "Team",     type = "text", display = TRUE, filter = TRUE),
+      list(name = "PosGroup", label = "Position", type = "text", display = TRUE, filter = TRUE),
+      list(name = "GameKey",  label = "Game",     type = "text", display = FALSE, filter = FALSE)
+    ),
+    
+    portfolio_filters = list(
+      rate_minimums = list(
+        list(name = "Win",   label = "Win",    step = 0.1),
+        list(name = "Top1",  label = "Top 1",  step = 0.1),
+        list(name = "Top5",  label = "Top 5",  step = 0.5),
+        list(name = "Top10", label = "Top 10", step = 1),
+        list(name = "Top20", label = "Top 20", step = 2)
+      ),
+      range_filters = list(
+        list(name = "Salary", label = "Salary (K)", column = "TotalSalary", step = 0.1, format = "salary_k"),
+        list(name = "AvgOwn", label = "Avg Own",    column = "AvgOwn",      step = 0.1, format = "decimal")
+      )
+    ),
+    
+    platform_columns = list(
+      DK = list(salary = "DKSalary", id = "DKID", ownership = "DKOwn", score = "DKScore"),
+      SD = list(salary = "SDSalary", id = "SDID", ownership = "DKOwn", score = "DKScore")
+    ),
+    
+    download_formats = list(
+      DK = "{Player} ({DKID})",
+      SD = "{Player} ({SDID})"
+    ),
+    
+    input_file = list(
+      type            = "excel",
+      load_all_sheets = TRUE,
+      player_sheet    = "Players",
+      required_sheets = c("Games", "Players", "IDs"),
+      required_columns = list(
+        base = c("Player", "Team", "Opp", "Pos"),
+        DK   = c("DK_Salary", "DK_ID")
+      )
+    ),
+    
+    simulation = list(
+      function_name = "run_soccer_simulation",
+      output_format = list(
+        sim_results = c("SimID", "Player", "DKScore"),
+        metadata    = c("Player", "DKSalary", "DKID", "DKOwn",
+                        "Team", "PosGroup", "GameKey")
+      )
+    ),
+    
+    lineup_metrics_function = "calculate_soccer_lineup_metrics",
+    
+    dk_export_slots = list(
+      DK = c("F", "F", "M", "M", "D", "D", "GK", "UTIL"),
+      SD = c("CPT", "FLEX", "FLEX", "FLEX", "FLEX", "FLEX")
+    )
   )
   
   

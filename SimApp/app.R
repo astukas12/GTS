@@ -17,7 +17,7 @@ source("cash_game_module.R")
 # Never re-source inside reactive observers — re-sourcing re-executes all
 # top-level code on every upload/sim run.
 local({
-  engines <- c("nascar", "mma", "tennis", "golf", "f1", "nfl", "cbb", "nba")
+  engines <- c("nascar", "mma", "tennis", "golf", "f1", "nfl", "cbb", "nba", "soccer")
   for (e in engines) {
     f <- paste0(e, "_engine.R")
     if (file.exists(f)) source(f) else warning("Engine not found at startup: ", f)
@@ -37,7 +37,8 @@ load_sport_input <- function(file_path, sport, config) {
     GOLF = read_golf_input,
     F1   = read_f1_input,
     CBB  = read_cbb_input,
-    NBA  = read_nba_input
+    NBA  = read_nba_input,
+    SOCCER = read_soccer_input
   )
   if (sport %in% names(reader_map)) {
     return(reader_map[[sport]](file_path))
@@ -62,6 +63,7 @@ sport_icon_name <- function(sport) {
          NFL    = "football-ball",
          CBB    = "basketball-ball",
          NBA    = "basketball-ball",
+         SOCCER = "futbol",
          "circle"
   )
 }
@@ -804,6 +806,11 @@ server <- function(input, output, session) {
           rv$full_sim_results <- NULL
           rv$has_fd           <- FALSE
           rv$has_sd           <- FALSE
+        } else if (rv$sport == "SOCCER") {
+          rv$full_sim_results <- NULL
+          rv$has_dk <- TRUE
+          rv$has_fd <- FALSE
+          rv$has_sd <- if (!is.null(result$has_sd)) isTRUE(result$has_sd) else FALSE
         } else {
           rv$full_sim_results <- NULL
           # has_dk mirrors has_fd: SD-only files have neither DK classic nor FD
@@ -1280,6 +1287,27 @@ server <- function(input, output, session) {
         if ("AvgOwn" %in% names(final_results)) final_results[, AvgOwn := round(AvgOwn, 1)]
         rv$dk_optimal_lineups <- final_results
         
+      } else if (rv$sport == "SOCCER") {
+        progress$set(message="Finding optimal Soccer DK lineups...", value=0)
+        soccer_dk_config <- list(salary_cap   = rv$config$salary_caps$DK,
+                                 max_lineups  = 5000,
+                                 percentiles  = c(0.01, 0.05, 0.10, 0.20),
+                                 platform_col = "DKScore")
+        progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
+        lineup_data <- find_optimal_lineups_soccer(rv$simulation_results, rv$sim_metadata,
+                                                   soccer_dk_config, verbose=TRUE)
+        progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
+                                    format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
+        soccer_sim_dk <- copy(rv$simulation_results); setDT(soccer_sim_dk)
+        score_matrix <- score_all_lineups(lineup_data, soccer_sim_dk, verbose=TRUE)
+        progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
+        own_data <- copy(rv$sim_metadata)
+        if ("DKOwn" %in% names(own_data)) { setnames(own_data, "DKOwn", "Own"); own_data[, Own := Own / 100] }
+        final_results <- calculate_distribution_metrics(score_matrix, lineup_data, soccer_dk_config,
+                                                        ownership_data=own_data, verbose=TRUE)
+        if ("AvgOwn" %in% names(final_results)) final_results[, AvgOwn := round(AvgOwn, 1)]
+        rv$dk_optimal_lineups <- final_results
+        
       } else {
         dk_mode <- rv$config$optimization_modes$DK %||% "standard"
         progress$set(message="Finding optimal DraftKings lineups...", value=0)
@@ -1504,6 +1532,35 @@ server <- function(input, output, session) {
         if ("AvgOwn" %in% names(final_results)) final_results[, AvgOwn := NULL]
         rv$sd_optimal_lineups <- final_results
         
+      } else if (rv$sport == "SOCCER") {
+        sd_meta <- copy(rv$sim_metadata); setDT(sd_meta)
+        if (!all(c("CPTSalary","SDSalary") %in% names(sd_meta)))
+          stop("Missing CPTSalary/SDSalary. Ensure SD files were included in the input.")
+        selected_sd <- if (!is.null(input$sd_game_select)) input$sd_game_select else {
+          sdf <- unique(sd_meta[!is.na(ShowdownFile) & ShowdownFile != "", ShowdownFile])
+          if (length(sdf)) sdf[1] else stop("No ShowdownFile found in metadata.")
+        }
+        sd_meta_filt <- sd_meta[ShowdownFile == selected_sd]
+        if (nrow(sd_meta_filt) == 0) stop(sprintf("No players for showdown: %s", selected_sd))
+        sd_sim <- rv$simulation_results[Player %in% sd_meta_filt$Player]
+        soccer_sd_config <- list(salary_cap     = rv$config$salary_caps$SD,
+                                 max_lineups   = 5000,
+                                 percentiles   = c(0.01, 0.05, 0.10, 0.20),
+                                 platform_col  = "DKScore",
+                                 cpt_multiplier = 1.5)
+        progress$set(message=sprintf("Finding optimal Soccer Showdown lineups (%s)...", selected_sd),
+                     detail="Phase 1: Building lineup pool...", value=0.05)
+        lineup_data <- find_optimal_lineups_soccer_sd(sd_sim, sd_meta_filt, soccer_sd_config, verbose=TRUE)
+        progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
+                                    format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
+        soccer_sd_sim <- copy(sd_sim); setDT(soccer_sd_sim)
+        score_matrix  <- score_all_lineups(lineup_data, soccer_sd_sim, verbose=TRUE)
+        progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
+        final_results <- calculate_distribution_metrics(score_matrix, lineup_data, soccer_sd_config,
+                                                        ownership_data=NULL, verbose=TRUE)
+        if ("AvgOwn" %in% names(final_results)) final_results[, AvgOwn := NULL]
+        rv$sd_optimal_lineups <- final_results
+        
       } else {
         sd_mode    <- rv$config$optimization_modes$SD %||% "captain"
         opt_data   <- prepare_optimization_data(rv$simulation_results, rv$sim_metadata, "SD")
@@ -1580,7 +1637,7 @@ server <- function(input, output, session) {
   
   output$scoring_tabs_ui <- renderUI({
     req(rv$config)
-    sd_game_selector <- if (isTRUE(rv$sport %in% c("CBB","NBA")) && "SD" %in% rv$config$platforms &&
+    sd_game_selector <- if (isTRUE(rv$sport %in% c("CBB","NBA","SOCCER")) && "SD" %in% rv$config$platforms &&
                             !is.null(rv$input_data$games)) {
       games_with_sd <- rv$input_data$games[!is.na(ShowdownFile) & ShowdownFile != ""]
       if (nrow(games_with_sd) > 1) {
@@ -2859,6 +2916,10 @@ server <- function(input, output, session) {
       req(rv$sport_visuals)
       return(render_cbb_visuals(rv$sport_visuals))
     }
+    if (rv$sport == "SOCCER") {
+      req(rv$sport_visuals)
+      return(render_soccer_visuals(rv$sport_visuals))
+    }
     req(rv$sport_visuals)
     if      (rv$sport == "TENNIS")  render_tennis_visuals(rv$sport_visuals)
     else if (rv$sport == "NASCAR")  render_nascar_visuals(rv$sport_visuals, input$sim_results_platform)
@@ -3784,6 +3845,196 @@ server <- function(input, output, session) {
     }, error=function(e) {
       datatable(data.table(Error=e$message), rownames=FALSE)
     })
+  })
+  
+  
+  # ---------- Soccer ----------
+  
+  render_soccer_visuals <- function(visuals) {
+    req(visuals)
+    fluidRow(column(12,
+                    box(width = NULL, title = "Soccer Simulation Analysis",
+                        status = "primary", solidHeader = TRUE,
+                        tabsetPanel(id = "soccer_visuals_tabs", type = "tabs",
+                                    tabPanel("DK Score Breakdown", div(style = "margin-top:15px;"),
+                                             DT::DTOutput("soccer_proj_table")),
+                                    tabPanel("Stat Averages", div(style = "margin-top:15px;"),
+                                             DT::DTOutput("soccer_stat_table")),
+                                    tabPanel("Score Distributions", div(style = "margin-top:15px;"),
+                                             uiOutput("soccer_violin_container")),
+                                    tabPanel("Scoreline Analysis", div(style = "margin-top:15px;"),
+                                             uiOutput("soccer_scoreline_container"),
+                                             div(style = "margin-top:20px;"),
+                                             tags$h4(style = "color:#FFE500;", "Team Summary"),
+                                             DT::DTOutput("soccer_team_table")),
+                                    tabPanel("Stat Validation", div(style = "margin-top:15px;"),
+                                             tags$p(style = "color:#888;", "Simulated stat distributions — top 10 players per stat"),
+                                             uiOutput("soccer_stat_violin_container"))
+                        )
+                    )
+    ))
+  }
+  
+  # Dynamic containers for variable-count plots
+  output$soccer_violin_container <- renderUI({
+    req(rv$sport == "SOCCER", rv$sport_visuals)
+    teams <- rv$sport_visuals$teams
+    tagList(lapply(seq_along(teams), function(i) {
+      n_pl <- length(unique(rv$sport_visuals$score_dist[Team == teams[i]]$Player))
+      plotlyOutput(paste0("soccer_violin_", i), height = paste0(max(250, n_pl * 38), "px")) %>%
+        shinycssloaders::withSpinner(color = "#FFE500", type = 6)
+    }))
+  })
+  
+  output$soccer_scoreline_container <- renderUI({
+    req(rv$sport == "SOCCER", rv$sport_visuals$scoreline_data)
+    games <- unique(rv$sport_visuals$scoreline_data$Game)
+    tagList(lapply(seq_along(games), function(i) {
+      plotlyOutput(paste0("soccer_scoreline_", i), height = "400px") %>%
+        shinycssloaders::withSpinner(color = "#FFE500", type = 6)
+    }))
+  })
+  
+  output$soccer_stat_violin_container <- renderUI({
+    req(rv$sport == "SOCCER", rv$sport_visuals$stat_dist)
+    st <- rv$sport_visuals$stat_dist
+    val_stats <- intersect(c("Shots","SOT","Crosses","TKLW","FC","FD","Passes","Goals"), names(st))
+    tagList(lapply(seq_along(val_stats), function(i) {
+      plotlyOutput(paste0("soccer_stat_violin_", i), height = "380px") %>%
+        shinycssloaders::withSpinner(color = "#FFE500", type = 6)
+    }))
+  })
+  
+  # Projection table
+  output$soccer_proj_table <- DT::renderDT({
+    req(rv$sport == "SOCCER", rv$sport_visuals)
+    pm <- rv$sport_visuals$player_means
+    cols <- intersect(c("Player","Team","Pos","Salary",
+                        "DKAvgFP","SDFP","P10","P50","P90","Ceiling","Value",
+                        "Pts_Goals","Pts_Assists","Pts_Shots","Pts_SOT","Pts_CC",
+                        "Pts_Passes","Pts_Crosses","Pts_TKLW","Pts_INT",
+                        "Pts_FD","Pts_FC","Pts_YC","Pts_Saves"), names(pm))
+    datatable(pm[, ..cols],
+              options = list(pageLength = 30, scrollX = TRUE, dom = "ftip",
+                             order = list(list(which(cols=="DKAvgFP")-1, "desc"))),
+              class = "compact stripe", rownames = FALSE
+    ) %>% formatRound(intersect(cols[5:length(cols)], cols), 2)
+  })
+  
+  # Stat averages table
+  output$soccer_stat_table <- DT::renderDT({
+    req(rv$sport == "SOCCER", rv$sport_visuals)
+    pm <- rv$sport_visuals$player_means
+    cols <- intersect(c("Player","Team","Pos","Salary","DKAvgFP",
+                        "AvgGoals","AvgAst","AvgShots","AvgSOT","AvgCC",
+                        "AvgPass","AvgCross","AvgTKLW","AvgINT",
+                        "AvgFD","AvgFC","AvgYC","AvgSaves"), names(pm))
+    datatable(pm[, ..cols],
+              options = list(pageLength = 30, scrollX = TRUE, dom = "ftip",
+                             order = list(list(which(cols=="DKAvgFP")-1, "desc"))),
+              class = "compact stripe", rownames = FALSE)
+  })
+  
+  # Team summary table
+  output$soccer_team_table <- DT::renderDT({
+    req(rv$sport == "SOCCER", rv$sport_visuals)
+    datatable(rv$sport_visuals$team_means,
+              options = list(dom = "t", scrollX = TRUE),
+              class = "compact stripe", rownames = FALSE
+    ) %>% formatRound(setdiff(names(rv$sport_visuals$team_means), "Team"), 1)
+  })
+  
+  # DK Score violin plots (one per team)
+  observe({
+    req(rv$sport == "SOCCER", rv$sport_visuals)
+    teams <- rv$sport_visuals$teams
+    sd <- rv$sport_visuals$score_dist
+    for (i in seq_along(teams)) { local({
+      ti <- i; tm <- teams[ti]
+      output[[paste0("soccer_violin_", ti)]] <- renderPlotly({
+        td <- sd[Team == tm]
+        med_ord <- td[, .(med=median(DKScore)), by=Player][order(-med)]$Player
+        td[, Player := factor(Player, levels=rev(med_ord))]
+        n_pl <- length(unique(td$Player))
+        plot_ly(data=as.data.frame(td), y=~Player, x=~DKScore,
+                type="box", orientation="h",
+                marker=list(color="#FFE500", size=2),
+                line=list(color="#FFE500"),
+                fillcolor="rgba(255,229,0,0.2)") %>%
+          layout(title=list(text=paste(tm, "— DK Score Distribution"),
+                            font=list(color="#FFE500", size=14)),
+                 xaxis=list(title="DK Points", gridcolor="#2a2a2a", color="#888", zeroline=FALSE),
+                 yaxis=list(title="", color="#ccc", tickfont=list(size=11), automargin=TRUE),
+                 paper_bgcolor="#121212", plot_bgcolor="#141414",
+                 font=list(color="#FFFFFF", size=11), showlegend=FALSE,
+                 height=max(250, n_pl*38),
+                 margin=list(l=180, r=30, t=40, b=50)) %>%
+          config(displayModeBar=FALSE)
+      })
+    })}
+  })
+  
+  # Scoreline distribution plots (one per game)
+  observe({
+    req(rv$sport == "SOCCER", rv$sport_visuals$scoreline_data)
+    sl <- rv$sport_visuals$scoreline_data
+    games <- unique(sl$Game)
+    for (i in seq_along(games)) { local({
+      gi <- i; gm <- games[gi]
+      output[[paste0("soccer_scoreline_", gi)]] <- renderPlotly({
+        gd <- sl[Game == gm]; n_t <- nrow(gd)
+        tab <- gd[, .(Count=.N, Pct=round(.N/n_t*100,1)), by=Scoreline]
+        setorder(tab, -Count); tab <- head(tab, 15)
+        tab[, Scoreline := factor(Scoreline, levels=rev(tab$Scoreline))]
+        hw <- round(mean(gd$HG > gd$AG)*100,1)
+        dr <- round(mean(gd$HG == gd$AG)*100,1)
+        aw <- round(mean(gd$HG < gd$AG)*100,1)
+        plot_ly(data=as.data.frame(tab), y=~Scoreline, x=~Pct,
+                type="bar", orientation="h",
+                marker=list(color="#FFE500"),
+                text=~paste0(Pct,"%"), textposition="outside",
+                textfont=list(color="#ccc", size=11)) %>%
+          layout(title=list(text=sprintf("%s  |  Home %.0f%%  Draw %.0f%%  Away %.0f%%",
+                                         gm, hw, dr, aw),
+                            font=list(color="#FFE500", size=14)),
+                 xaxis=list(title="Probability (%)", gridcolor="#2a2a2a", color="#888",
+                            range=c(0, max(tab$Pct)*1.4)),
+                 yaxis=list(title="", color="#ccc", tickfont=list(size=11)),
+                 paper_bgcolor="#121212", plot_bgcolor="#141414",
+                 font=list(color="#FFFFFF", size=11), showlegend=FALSE,
+                 margin=list(l=80, r=50, t=50, b=50)) %>%
+          config(displayModeBar=FALSE)
+      })
+    })}
+  })
+  
+  # Stat validation violin plots
+  observe({
+    req(rv$sport == "SOCCER", rv$sport_visuals$stat_dist)
+    st <- rv$sport_visuals$stat_dist
+    val_stats <- intersect(c("Shots","SOT","Crosses","TKLW","FC","FD","Passes","Goals"), names(st))
+    for (i in seq_along(val_stats)) { local({
+      si <- i; sn <- val_stats[si]
+      output[[paste0("soccer_stat_violin_", si)]] <- renderPlotly({
+        sdata <- st[, .(Player, Value = get(sn))]
+        top10 <- sdata[, .(Mean=mean(Value)), by=Player][order(-Mean)][1:min(10,.N)]$Player
+        sdata <- sdata[Player %in% top10]
+        sdata[, Player := factor(Player, levels=rev(top10))]
+        plot_ly(data=as.data.frame(sdata), y=~Player, x=~Value,
+                type="box", orientation="h",
+                marker=list(color="#FFE500", size=2),
+                line=list(color="#FFE500"),
+                fillcolor="rgba(255,229,0,0.2)") %>%
+          layout(title=list(text=paste(sn, "— Distribution (Top 10)"),
+                            font=list(color="#FFE500", size=14)),
+                 xaxis=list(title=sn, gridcolor="#2a2a2a", color="#888", zeroline=FALSE),
+                 yaxis=list(title="", color="#ccc", tickfont=list(size=11), automargin=TRUE),
+                 paper_bgcolor="#121212", plot_bgcolor="#141414",
+                 font=list(color="#FFFFFF", size=11), showlegend=FALSE,
+                 height=380, margin=list(l=180, r=30, t=40, b=50)) %>%
+          config(displayModeBar=FALSE)
+      })
+    })}
   })
   
   
