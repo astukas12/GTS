@@ -11,83 +11,254 @@ library(shinyjs)
 
 # Set up custom CSS for app theme with black and gold color scheme
 custom_css <- "
-  /* Override dashboard header colors */
-  .skin-blue .main-header {
-    background-color: #000000;
+  /* ============================================================
+     F1C DRAFT — DARK MODE
+     Palette:
+       --ink      #0B0B0D  near-black page base
+       --panel    #16161A  raised surface
+       --panel-2  #1F1F25  inputs / secondary surface
+       --line     #2C2C34  hairline borders
+       --gold     #FFC627  primary accent (restrained)
+       --gold-dim #C8961A  hover / borders
+       --text     #ECECEF  primary text
+       --muted    #8B8B95  secondary text
+     ============================================================ */
+
+  @import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap');
+
+  body, .content-wrapper, .right-side {
+    background-color: #0B0B0D !important;
+    color: #ECECEF;
+    font-family: 'IBM Plex Sans', -apple-system, sans-serif;
   }
+  /* Tabular figures everywhere numbers matter */
+  table.dataTable td, #current_av, #next_team { font-variant-numeric: tabular-nums; }
+
+  /* Modal — dark surface, light text, gold confirm button */
+  .modal-content {
+    background-color: #16161A;
+    color: #ECECEF;
+    border: 1px solid #2C2C34;
+    border-top: 3px solid #FFC627;
+    border-radius: 8px;
+  }
+  .modal-header {
+    border-bottom: 1px solid #2C2C34;
+  }
+  .modal-header .modal-title {
+    color: #FFC627;
+    font-family: 'Bebas Neue', sans-serif;
+    letter-spacing: 1.5px;
+    font-size: 22px;
+  }
+  .modal-body { color: #ECECEF; font-size: 15px; }
+  .modal-footer { border-top: 1px solid #2C2C34; }
+  .modal-footer .btn-default {
+    background-color: #FFC627;
+    border: none;
+    color: #0B0B0D;
+    font-weight: 600;
+  }
+  .modal-footer .btn-default:hover { background-color: #C8961A; }
+
+  /* Header — black bar, gold wordmark in condensed display face */
   .skin-blue .main-header .logo {
-    background-color: #000000;
-    color: #FFD700;
+    background-color: #0B0B0D;
+    color: #FFC627;
+    font-family: 'Bebas Neue', sans-serif;
+    font-weight: 700;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    border-bottom: 1px solid #2C2C34;
   }
-  .skin-blue .main-header .logo:hover {
-    background-color: #000000;
-  }
+  .skin-blue .main-header .logo:hover { background-color: #0B0B0D; }
   .skin-blue .main-header .navbar {
-    background-color: #000000;
+    background-color: #0B0B0D;
+    border-bottom: 1px solid #2C2C34;
   }
 
-  /* Override dashboard sidebar colors */
+  /* Sidebar */
   .skin-blue .left-side, .skin-blue .main-sidebar, .skin-blue .wrapper {
-    background-color: #222222;
+    background-color: #16161A;
   }
-  .skin-blue .sidebar a {
-    color: #FFD700;
+  .skin-blue .sidebar a { color: #ECECEF; }
+  .skin-blue .sidebar-menu > li > a {
+    border-left: 3px solid transparent;
+    font-weight: 500;
   }
   .skin-blue .sidebar-menu > li.active > a,
   .skin-blue .sidebar-menu > li:hover > a {
-    color: #ffffff;
-    background: #333333;
-    border-left-color: #FFD700;
+    color: #FFC627;
+    background: #1F1F25;
+    border-left-color: #FFC627;
   }
 
-  /* FORCE BLACK BOX HEADERS - More specific selectors */
-  .skin-blue .box.box-primary > .box-header,
+  /* Boxes / panels */
+  .box {
+    background: #16161A;
+    border: 1px solid #2C2C34;
+    border-top: 3px solid #FFC627;
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.45);
+  }
   .box.box-primary > .box-header,
   .box-header {
-    background-color: #000000 !important;
-    color: #FFD700 !important;
+    background-color: transparent !important;
+    color: #FFC627 !important;
+    font-family: 'Bebas Neue', sans-serif;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    font-weight: 600;
+    border-bottom: 1px solid #2C2C34;
   }
+  .box-header .box-title { font-size: 20px; }
+  /* Larger, more legible bidding-panel controls for screen sharing */
+  .auction-row label, .auction-row .control-label { font-size: 16px; }
+  .auction-row .form-control, .auction-row .selectize-input {
+    font-size: 18px !important;
+    height: auto !important;
+    padding: 10px 12px !important;
+  }
+  .auction-row .selectize-input { line-height: 22px; }
+  .bid-to-beat-header { font-size: 22px !important; }
 
-  /* Style buttons */
+  /* Inputs */
+  .form-control, .selectize-input, .selectize-dropdown {
+    background-color: #1F1F25 !important;
+    color: #ECECEF !important;
+    border: 1px solid #2C2C34 !important;
+    border-radius: 6px;
+  }
+  .form-control:focus, .selectize-input.focus {
+    border-color: #FFC627 !important;
+    box-shadow: 0 0 0 2px rgba(255,198,39,0.15) !important;
+  }
+  .selectize-dropdown .active { background: #FFC627 !important; color: #0B0B0D !important; }
+  label, .control-label { color: #8B8B95; font-weight: 500; letter-spacing: 0.3px; }
+
+  /* Buttons */
   .btn-primary {
-    background-color: #FFD700;
-    border-color: #DAA520;
-    color: #000000;
+    background-color: #FFC627;
+    border: none;
+    color: #0B0B0D;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    border-radius: 6px;
+    transition: all 0.15s ease;
   }
   .btn-primary:hover, .btn-primary:focus {
-    background-color: #DAA520;
-    border-color: #B8860B;
-    color: #000000;
+    background-color: #C8961A;
+    color: #0B0B0D;
+    transform: translateY(-1px);
+  }
+  .btn-warning {
+    background-color: transparent;
+    border: 1px solid #2C2C34;
+    color: #8B8B95;
+    border-radius: 6px;
+  }
+  .btn-warning:hover { border-color: #FFC627; color: #FFC627; background: transparent; }
+
+  /* DataTables dark theme */
+  .dataTables_wrapper { color: #ECECEF; }
+  table.dataTable thead th {
+    color: #FFC627 !important;
+    border-bottom: 2px solid #2C2C34 !important;
+    font-family: 'Bebas Neue', sans-serif;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    font-size: 18px;
+    padding: 10px 12px !important;
+  }
+  table.dataTable tbody td {
+    color: #ECECEF !important;
+    border-top: 1px solid #1F1F25 !important;
+    font-size: 17px;
+    padding: 11px 12px !important;
+  }
+  table.dataTable tbody tr { background-color: transparent !important; }
+  table.dataTable tbody tr:hover { background-color: #1F1F25 !important; }
+  .dataTables_filter input, .dataTables_length select {
+    background:#1F1F25 !important; color:#ECECEF !important; border:1px solid #2C2C34 !important;
+  }
+  .dataTables_info, .dataTables_paginate { color:#8B8B95 !important; }
+  .paginate_button { color:#8B8B95 !important; }
+  .paginate_button.current {
+    background:#FFC627 !important; color:#0B0B0D !important; border:none !important; border-radius:4px;
   }
 
-  /* Style tabs */
-  .nav-tabs-custom > .nav-tabs > li.active {
-    border-top-color: #FFD700;
+  /* Nomination banner — the visual centerpiece */
+  #nomination_status {
+    background: linear-gradient(135deg, #1F1F25 0%, #16161A 100%) !important;
+    border: 1px solid #2C2C34;
+    border-left: 4px solid #FFC627;
+  }
+  #nomination_status h3 { color:#8B8B95 !important; font-size:16px; text-transform:uppercase; letter-spacing:1.5px; }
+  #next_team {
+    color:#FFC627 !important;
+    font-family:'Bebas Neue', sans-serif;
+    font-size:44px;
+    font-weight:700;
+    display:block;
+    margin-top:6px;
   }
 
-  /* Additional styles for gold accents */
-  .pagination > .active > a,
-  .pagination > .active > span,
-  .pagination > .active > a:hover,
-  .pagination > .active > span:hover,
-  .pagination > .active > a:focus,
-  .pagination > .active > span:focus {
-    background-color: #FFD700;
-    border-color: #DAA520;
-    color: #000000;
+  /* AV readout */
+  .av-card {
+    background: linear-gradient(135deg, #1F1F25, #16161A);
+    border: 1px solid #2C2C34;
+    border-radius: 8px;
+    padding: 14px;
+    margin: 10px 0;
+    text-align: center;
   }
-
-  /* Make AV and Bid to Beat text black for better readability */
+  .av-card .av-label { color:#8B8B95; font-size:14px; text-transform:uppercase; letter-spacing:1.5px; }
   #current_av {
-    color: #000000 !important;
-    font-weight: bold;
+    color:#FFC627 !important;
+    font-family:'Bebas Neue', sans-serif;
+    font-size:58px;
+    font-weight:400;
+    line-height:1;
+    display:block;
   }
-  
   .bid-to-beat-header {
-    color: #000000 !important;
-    font-weight: bold;
+    color:#FFC627 !important;
+    font-family:'Bebas Neue', sans-serif;
+    text-transform:uppercase;
+    letter-spacing:1px;
+    font-weight:600;
   }
+
+  /* Status pills in team table */
+  .pill { padding:2px 10px; border-radius:999px; font-size:11px; font-weight:600; letter-spacing:0.5px; }
+
+  /* Auction panels size to their own content (no forced height) */
+  .auction-row .box { height: auto !important; min-height: 0 !important; }
+  .auction-row .box .box-body { overflow: visible; height: auto !important; padding-bottom: 16px; }
   "
+
+# ---- Persistence -----------------------------------------------------------
+# Draft state is written to disk after every change so a crash or accidental
+# refresh never loses the draft. Delete this file to start fresh.
+STATE_FILE <- "draft_state.rds"
+
+save_state <- function(rv) {
+  tryCatch(
+    saveRDS(
+      list(
+        teams_data            = rv$teams_data,
+        players_data          = rv$players_data,
+        drafted_players       = rv$drafted_players,
+        assignment_history    = rv$assignment_history,
+        current_nominating_team = rv$current_nominating_team,
+        current_team_index    = rv$current_team_index,
+        saved_at              = Sys.time()
+      ),
+      STATE_FILE
+    ),
+    error = function(e) message("Save failed: ", e$message)
+  )
+}
 
 # Helper function to calculate AV (Annual Value)
 calculate_av <- function(years, dollars) {
@@ -183,7 +354,7 @@ ui <- dashboardPage(
         src = "logo.jpg",
         height = "200px",
         width = "auto",
-        style = "border: 2px solid #FFD700; border-radius: 10px;"
+        style = "border: 2px solid #FFC627; border-radius: 10px;"
       )
     ),
     sidebarMenu(
@@ -225,8 +396,8 @@ ui <- dashboardPage(
                 6,
                 div(
                   id = "nomination_status",
-                  style = "background: #333333; color: #FFD700; padding: 15px; border-radius: 5px; margin-bottom: 15px;",
-                  h3("Next to Nominate: ", 
+                  style = "padding: 15px; margin-bottom: 15px;",
+                  h3("Next to Nominate",
                      span(id = "next_team", "Upload draft file to begin"),
                      style = "margin: 0; text-align: center;")
                 )
@@ -249,7 +420,7 @@ ui <- dashboardPage(
                 )
               )
             ),
-            DTOutput("available_players_table") %>% withSpinner(color = "#FFD700")
+            DTOutput("available_players_table") %>% withSpinner(color = "#FFC627")
           )
         )
       ),
@@ -258,13 +429,13 @@ ui <- dashboardPage(
       tabItem(
         tabName = "auction",
         fluidRow(
-          # Left Panel - Bidding Interface (made more vertical)
+          class = "auction-row",
+          # Left Panel - Bidding Interface
           box(
             width = 4,
             title = "Auction Bidding",
             status = "primary",
             solidHeader = TRUE,
-            height = "700px",
             # Current Player Selection
             fluidRow(
               column(
@@ -308,10 +479,9 @@ ui <- dashboardPage(
               column(
                 12,
                 div(
-                  style = "background: #f4f4f4; padding: 10px; border-radius: 5px; margin: 10px 0;",
-                  h4("Current Annual Value (AV): ",
-                     span(id = "current_av", "0.0"),
-                     style = "margin: 0; text-align: center;")
+                  class = "av-card",
+                  span("Current Annual Value", class = "av-label"),
+                  span(id = "current_av", "0.0")
                 )
               )
             ),
@@ -350,14 +520,13 @@ ui <- dashboardPage(
             )
           ),
           
-          # Right Panel - Team Status (made bigger)
+          # Right Panel - Team Status
           box(
             width = 8,
             title = "Team Status",
             status = "primary",
             solidHeader = TRUE,
-            height = "700px",
-            DTOutput("team_status_table") %>% withSpinner(color = "#FFD700")
+            DTOutput("team_status_table") %>% withSpinner(color = "#FFC627")
           )
         )
       ),
@@ -388,7 +557,7 @@ ui <- dashboardPage(
                 )
               )
             ),
-            DTOutput("drafted_players_table") %>% withSpinner(color = "#FFD700")
+            DTOutput("drafted_players_table") %>% withSpinner(color = "#FFC627")
           )
         )
       )
@@ -409,7 +578,7 @@ server <- function(input, output, session) {
     file_loaded = FALSE
   )
   
-
+  
   observe({
     # Only run once when app starts
     if (!rv$file_loaded) {
@@ -448,6 +617,29 @@ server <- function(input, output, session) {
         next_nom <- get_next_nominating_team(rv$teams_data, NULL)
         rv$current_nominating_team <- next_nom$team
         rv$current_team_index <- next_nom$index
+        
+        # Resume from a saved draft if one exists on disk
+        if (file.exists(STATE_FILE)) {
+          tryCatch({
+            saved <- readRDS(STATE_FILE)
+            rv$teams_data             <- saved$teams_data
+            rv$players_data           <- saved$players_data
+            rv$drafted_players        <- saved$drafted_players
+            rv$assignment_history     <- saved$assignment_history
+            rv$current_nominating_team <- saved$current_nominating_team
+            rv$current_team_index     <- saved$current_team_index
+            showModal(modalDialog(
+              title = "Draft Resumed",
+              paste0("Picked up the in-progress draft saved at ",
+                     format(saved$saved_at, "%b %d %I:%M %p"), " \u2014 ",
+                     nrow(saved$drafted_players), " players already drafted. ",
+                     "Delete draft_state.rds and reload to start over."),
+              easyClose = TRUE
+            ))
+          }, error = function(e) {
+            message("Could not restore saved state: ", e$message)
+          })
+        }
         
         # Update player choices
         updateSelectInput(
@@ -633,28 +825,24 @@ server <- function(input, output, session) {
       options = list(
         pageLength = 15,
         scrollX = FALSE,
-        dom = "tip",
+        dom = "t",
         ordering = FALSE,  # Disable user sorting to maintain salary sort
-        autoWidth = TRUE,
+        autoWidth = FALSE,
         columnDefs = list(
-          list(className = 'dt-center', targets = c(1, 2, 3)),
-          list(className = 'dt-left', targets = c(0, 4)),
-          list(width = '20%', targets = 0),
-          list(width = '15%', targets = 1),
-          list(width = '15%', targets = 2), 
-          list(width = '15%', targets = 3),
-          list(width = '15%', targets = 4)
+          list(className = "dt-left", targets = 0),
+          list(className = "dt-center", targets = "_all")
         )
       ),
       rownames = FALSE
     ) %>%
       formatStyle(
         "Status",
-        backgroundColor = styleEqual("Finished", "#ffcccc")
+        color = styleEqual(c("Finished", "Active"), c("#FF6B6B", "#FFC627")),
+        fontWeight = "bold"
       ) %>%
       formatStyle(
         columns = c("Spots", "Salary", "Years"),
-        backgroundColor = styleInterval(c(0.5), c("#ffcccc", "white"))
+        color = styleInterval(c(0.5), c("#FF6B6B", "#ECECEF"))
       )
     
     return(dt)
@@ -806,6 +994,9 @@ server <- function(input, output, session) {
       easyClose = TRUE
     ))
     
+    # Persist after every pick
+    save_state(rv)
+    
     # Switch back to available players tab
     updateTabItems(session, "sidebar_menu", "available_players")
   })
@@ -858,6 +1049,9 @@ server <- function(input, output, session) {
     next_nom <- get_next_nominating_team(rv$teams_data, rv$current_team_index - 1)
     rv$current_nominating_team <- next_nom$team
     rv$current_team_index <- next_nom$index
+    
+    # Persist the rollback
+    save_state(rv)
     
     showModal(modalDialog(
       title = "Assignment Undone",
