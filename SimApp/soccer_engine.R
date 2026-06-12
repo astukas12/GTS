@@ -13,13 +13,35 @@ library(data.table)
 SOCCER_P <- list(
   rho = -0.13, max_goals = 5,
   phi_excess_sot = 9.0, phi_off_target = 8.5, phi_fouls = 47.5, phi_shots = 10.5,
+  sot_kappa = 7.7,  # Beta concentration for SOT rate variance (from 21K Big 5 games, SD=0.162)
   phi_crosses = 8.2, phi_passes = 7.2, phi_cc = 3.0,
   phi_tackles = 5.0, phi_int = 5.0, phi_fd = 5.0,
   shots_scale   = c(0.857, 0.962, 1.048, 1.164, 1.281, 1.426),
   fouls_scale   = c(1.005, 1.020, 1.002, 0.975, 0.930, 0.867),
   excess_sot_mu = c(2.7, 2.9, 3.0, 3.3, 3.5, 3.7),
   p_assist = 0.709, yc_per_foul = 0.174,
-  p_second_yc = 0.018, p_straight_red = 0.0026
+  p_second_yc = 0.018, p_straight_red = 0.0026,
+  
+  # Game environment
+  tempo_sd     = 0.15,   # log-scale SD for open/tight game (affects crosses, passes)
+  dominance_sd = 0.12,   # SD for shot dominance swing between teams
+  
+  # Opponent-goal scaling (conceding reduces your attacking output)
+  opp_shots_scale = c(1.04, 1.02, 1.00, 0.94, 0.88),  # 0-4 opp goals
+  opp_fouls_scale = c(1.00, 1.02, 1.01, 0.98, 0.97),
+  
+  # Team-level caps AND floors (validated from WC 2022 + Big 5 player sums)
+  team_max_shots   = 30L,   team_min_shots   = 3L,
+  team_max_sot     = 15L,   team_min_sot     = 0L,
+  team_max_fouls   = 25L,   team_min_fouls   = 3L,    # WC range [3-30]
+  team_max_crosses = 35L,   team_min_crosses = 4L,    # WC range [4-46]
+  team_max_passes  = 800L,  team_min_passes  = 180L,  # WC range [154-1003]
+  team_max_cc      = 18L,   team_min_cc      = 1L,    # Big5 est [0.6-18.7]
+  team_max_tklw    = 15L,   team_min_tklw    = 2L,    # Big5 est [1.2-12.8]
+  team_max_int     = 14L,   team_min_int     = 1L,    # Big5 est [0.9-11.8]
+  
+  # SOT floor: minimum SOT as fraction of total shots (prevents 0 SOT on 13 shots)
+  sot_min_rate     = 0.08   # at least 8% SOT → 1 SOT per 12 shots minimum
 )
 
 # ── HELPERS ──────────────────────────────────────────────────────────────────
@@ -66,19 +88,18 @@ norm_to_total <- function(raw, totals, n_p) {
 
 # ── DK SCORING (vectorized) ─────────────────────────────────────────────────
 
-dk_score_soccer_v <- function(pos, goals, assists, shots, sot, cc, passes,
+dk_score_soccer_v <- function(dk_pos, goals, assists, shots, sot, cc, passes,
                               crosses, tklw, ints, fd, fc, yc, rc,
                               cs, gk_saves, gk_gc, gk_win, mins) {
   s <- goals*10 + assists*6 + shots + sot + cc + passes*0.02 +
     crosses*0.7 + tklw + ints*0.5 + fd - fc*0.5
-  # Cards: yc=1 → -1.5; yc=2 (double yellow) → -3.0
   s <- s + ifelse(yc>=2, -3.0, ifelse(yc==1, -1.5, 0))
-  s <- s + rc * (-3.0)  # straight red on top
-  # Clean sheet (D, 60+ min)
-  is_d <- grepl("D", pos) & !grepl("G", pos)
+  s <- s + rc * (-3.0)
+  # Clean sheet: DK awards to D-eligible players (D/UTIL, M/D, etc.), 60+ min
+  is_d <- grepl("D", dk_pos) & !grepl("GK", dk_pos)
   s <- s + ifelse(is_d & mins>=60 & cs==1, 3, 0)
-  # GK
-  is_gk <- grepl("^G", pos)
+  # GK bonuses: uses DK GK position
+  is_gk <- grepl("GK", dk_pos)
   s <- s + ifelse(is_gk, gk_saves*2 + gk_gc*(-2), 0)
   s <- s + ifelse(is_gk & mins>=60 & cs==1, 5, 0)
   s <- s + ifelse(is_gk & mins>=90 & gk_win==1, 5, 0)
@@ -158,7 +179,8 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL,
              "CS","GC","SV","Goal_Share","Assist_Share","Shot_Share",
              "SOG_Share","Foul_Share","CC_Share","DK_Salary")
   for (col in intersect(num_p, names(players))) players[[col]] <- as.numeric(players[[col]])
-  num_g <- c("Home_Lambda","Away_Lambda","Home_Shots","Away_Shots","Home_Fouls","Away_Fouls")
+  num_g <- c("Home_Lambda","Away_Lambda","Home_Shots","Away_Shots",
+             "Home_SOT","Away_SOT","Home_Fouls","Away_Fouls")
   for (col in intersect(num_g, names(games))) games[[col]] <- as.numeric(games[[col]])
   
   players <- players[!is.na(MIN) & MIN > 0]
@@ -295,6 +317,22 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL,
     gd <- game_info[[gi]]
     pct_base <- 0.08 + (gi-1)/n_games * 0.72
     
+    # ── GAME ENVIRONMENT (shared by both teams in this match) ──
+    
+    # Tempo: partially driven by scoreline, partially random
+    # High-scoring games tend to be open; low-scoring games tend to be tight
+    total_goals_sim <- gd$hg + gd$ag
+    goals_z <- (total_goals_sim - mean(total_goals_sim)) / max(sd(total_goals_sim), 0.5)
+    rho_tempo <- 0.4  # how much scoreline drives tempo (0=independent, 1=fully determined)
+    z_tempo <- rho_tempo * goals_z + sqrt(1 - rho_tempo^2) * rnorm(n_sims)
+    tempo_cross <- exp(SOCCER_P$tempo_sd * z_tempo)
+    tempo_pass  <- exp(SOCCER_P$tempo_sd * 0.8 * z_tempo)  # passes less affected
+    
+    # Shot dominance: positive → home gets more shots, away gets fewer
+    z_dom <- rnorm(n_sims, 0, SOCCER_P$dominance_sd)
+    home_dom_mult <- pmax(1 + z_dom, 0.5)  # home shot multiplier
+    away_dom_mult <- pmax(1 - z_dom, 0.5)  # away shot multiplier (opposite)
+    
     # Process each side
     for (side in c("home","away")) {
       pl <- if (side=="home") gd$hp else gd$ap
@@ -323,93 +361,149 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL,
       }
       mats$Goals[pidx, ] <- goals_m
       
-      # ── ASSISTS: ~71% of goals get one ──
+      # ── ASSISTS: 71% of goals get one, scorer EXCLUDED from assist pool ──
       a_shares <- pmax(pl$Assist_Share, 0.001)
       a_shares <- a_shares / sum(a_shares)
       assists_m <- matrix(0L, n_p, n_sims)
       
       for (s in seq_len(n_sims)) {
         tg <- team_goals[s]; if (tg == 0) next
-        n_ast <- rbinom(1, tg, SOCCER_P$p_assist)
-        if (n_ast == 0) next
-        assists_m[, s] <- rmultinom(1, size=n_ast, prob=a_shares)[,1]
+        # Process each goal individually to exclude scorer
+        goals_remaining <- goals_m[, s]  # who scored how many
+        for (g_idx in seq_len(tg)) {
+          # Who scored this goal? Sample proportional to remaining goals
+          scorers <- which(goals_remaining > 0)
+          if (!length(scorers)) next
+          scorer <- if (length(scorers) == 1) scorers else
+            sample(scorers, 1, prob = goals_remaining[scorers])
+          goals_remaining[scorer] <- goals_remaining[scorer] - 1L
+          
+          # Does this goal get an assist? (71% chance)
+          if (runif(1) > SOCCER_P$p_assist) next
+          
+          # Draw assister, excluding the scorer
+          ast_probs <- a_shares; ast_probs[scorer] <- 0
+          if (sum(ast_probs) == 0) next
+          assister <- sample.int(n_p, 1, prob = ast_probs)
+          assists_m[assister, s] <- assists_m[assister, s] + 1L
+        }
       }
       mats$Assists[pidx, ] <- assists_m
       
-      # ── TEAM SHOT TOTALS (new approach: draw total first, then split) ──
+      # ── TEAM SHOT TOTALS (draw total → cap → split → allocate) ──
       gi_vec <- pmin(team_goals, 5L) + 1L
+      opp_gi_vec <- pmin(opp_goals, 4L) + 1L
       
-      # Total shots: NegBin around projection scaled by scoreline
-      t_shots_mu <- shots_mu * SOCCER_P$shots_scale[gi_vec]
+      # Shot dominance + opponent-goal scaling
+      dom_mult <- if (side == "home") home_dom_mult else away_dom_mult
+      opp_scale <- SOCCER_P$opp_shots_scale[opp_gi_vec]
+      
+      # Draw and cap/floor total shots
+      t_shots_mu <- shots_mu * SOCCER_P$shots_scale[gi_vec] * dom_mult * opp_scale
       t_shots <- rnb(n_sims, t_shots_mu, SOCCER_P$phi_shots)
-      t_shots <- pmax(t_shots, team_goals)  # at least as many shots as goals
+      t_shots <- pmax(t_shots, team_goals, SOCCER_P$team_min_shots)  # floor
+      t_shots <- pmin(t_shots, SOCCER_P$team_max_shots)              # cap
       
-      # SOT: Binomial fraction of total shots using team's projected SOT rate
+      # SOT: Binomial split with Beta variance + floor + cap
       sot_mu <- if (side=="home") gd$game$Home_SOT else gd$game$Away_SOT
-      sot_rate <- pmin(pmax(sot_mu / pmax(shots_mu, 1), 0.15), 0.60)  # clamp to realistic range
-      t_sot <- rbinom(n_sims, t_shots, sot_rate)
-      t_sot <- pmax(t_sot, team_goals)  # SOT must be >= goals scored
-      t_sot <- pmin(t_sot, t_shots)     # SOT can't exceed total shots
+      sot_rate_base <- pmin(pmax(sot_mu / pmax(shots_mu, 1), 0.15), 0.60)
+      alpha_sot <- sot_rate_base * SOCCER_P$sot_kappa
+      beta_sot  <- (1 - sot_rate_base) * SOCCER_P$sot_kappa
+      sot_rates <- rbeta(n_sims, alpha_sot, beta_sot)
+      sot_rates <- pmin(pmax(sot_rates, 0.10), 0.70)
+      t_sot <- rbinom(n_sims, t_shots, sot_rates)
+      t_sot <- pmax(t_sot, team_goals)                   # SOT >= goals
+      t_sot <- pmax(t_sot, ceiling(t_shots * SOCCER_P$sot_min_rate))  # SOT FLOOR
+      t_sot <- pmin(t_sot, t_shots)                       # SOT <= shots
+      t_sot <- pmin(t_sot, SOCCER_P$team_max_sot)        # TEAM CAP
       
-      # Off-target is exact remainder
       t_off <- t_shots - t_sot
-      
-      # Saved shots for GK
       saved_shots <- t_sot - team_goals
       
-      # SOT allocation: goals are SOT, distribute remaining saved shots
-      s_shares <- pmax(pl$Shot_Share, 0.001)
-      s_shares <- s_shares / sum(s_shares)
-      
-      raw_sot <- matrix(rnb(n_p*n_sims, rep(pl$SOG*ms, n_sims), SOCCER_P$phi_excess_sot),
-                        n_p, n_sims)
+      # SOT allocation to players
+      s_shares <- pmax(pl$Shot_Share, 0.001); s_shares <- s_shares / sum(s_shares)
+      raw_sot <- matrix(rnb(n_p*n_sims, rep(pl$SOG*ms, n_sims), SOCCER_P$phi_excess_sot), n_p, n_sims)
       saved_sot_m <- norm_to_total(raw_sot, saved_shots, n_p)
       sot_m <- goals_m + saved_sot_m
       mats$SOT[pidx, ] <- sot_m
       
       # Off-target allocation
-      raw_off <- matrix(rnb(n_p*n_sims, rep(pl$S*ms*0.6, n_sims), SOCCER_P$phi_off_target),
-                        n_p, n_sims)
+      raw_off <- matrix(rnb(n_p*n_sims, rep(pl$S*ms*0.6, n_sims), SOCCER_P$phi_off_target), n_p, n_sims)
       off_m <- norm_to_total(raw_off, t_off, n_p)
       mats$Shots[pidx, ] <- sot_m + off_m
       
-      # ── FOULS (team total drawn, allocated to players) ──
-      t_fouls <- rnb(n_sims, fouls_mu * SOCCER_P$fouls_scale[gi_vec], SOCCER_P$phi_fouls)
+      # ── FOULS (with opponent-goal scaling + team cap) ──
+      opp_fouls_adj <- SOCCER_P$opp_fouls_scale[opp_gi_vec]
+      t_fouls <- rnb(n_sims, fouls_mu * SOCCER_P$fouls_scale[gi_vec] * opp_fouls_adj, SOCCER_P$phi_fouls)
+      t_fouls <- pmax(t_fouls, SOCCER_P$team_min_fouls)    # floor
+      t_fouls <- pmin(t_fouls, SOCCER_P$team_max_fouls)    # cap
       raw_fc <- matrix(rnb(n_p*n_sims, rep(pl$FC*ms, n_sims), SOCCER_P$phi_fouls),
                        n_p, n_sims)
       fc_m <- norm_to_total(raw_fc, t_fouls, n_p)
       mats$FC[pidx, ] <- fc_m
       
-      # ── INDEPENDENT STATS (vectorized NegBin per player) ──
-      mats$CC[pidx, ]      <- matrix(rnb(n_p*n_sims, rep(pl$CC  *ms, n_sims), SOCCER_P$phi_cc),      n_p, n_sims)
-      mats$Passes[pidx, ]  <- matrix(rnb(n_p*n_sims, rep(pl$P   *ms, n_sims), SOCCER_P$phi_passes),  n_p, n_sims)
-      mats$Crosses[pidx, ] <- matrix(rnb(n_p*n_sims, rep(pl$CR  *ms, n_sims), SOCCER_P$phi_crosses), n_p, n_sims)
-      mats$TKLW[pidx, ]    <- matrix(rnb(n_p*n_sims, rep(pl$TKLW*ms, n_sims), SOCCER_P$phi_tackles), n_p, n_sims)
-      mats$INT[pidx, ]     <- matrix(rnb(n_p*n_sims, rep(pl$INT *ms, n_sims), SOCCER_P$phi_int),     n_p, n_sims)
-      mats$FD[pidx, ]      <- matrix(rnb(n_p*n_sims, rep(pl$FS  *ms, n_sims), SOCCER_P$phi_fd),      n_p, n_sims)
+      # ══════════════════════════════════════════════════════════════════════
+      # ALL REMAINING STATS: TEAM-TOTAL-FIRST → ALLOCATE TO PLAYERS
+      # Every stat: draw team total (NegBin × environment) → cap/floor → allocate
+      # ══════════════════════════════════════════════════════════════════════
       
-      # ── REALISTIC CAPS ──
-      # Per-player caps
-      mats$CC[pidx, ]      <- pmin(mats$CC[pidx, ],      8L)
-      mats$Passes[pidx, ]  <- pmin(mats$Passes[pidx, ],  130L)
-      mats$Crosses[pidx, ] <- pmin(mats$Crosses[pidx, ], 15L)   # tightened from 18
-      mats$TKLW[pidx, ]    <- pmin(mats$TKLW[pidx, ],    10L)
-      mats$INT[pidx, ]     <- pmin(mats$INT[pidx, ],     8L)
-      mats$FD[pidx, ]      <- pmin(mats$FD[pidx, ],      8L)
-      mats$Shots[pidx, ]   <- pmin(mats$Shots[pidx, ],   12L)
-      mats$SOT[pidx, ]     <- pmin(mats$SOT[pidx, ],     8L)
-      fc_m                 <- pmin(fc_m,                  6L)
-      mats$FC[pidx, ]      <- fc_m
+      dom_mult <- if (side == "home") home_dom_mult else away_dom_mult
+      opp_dom  <- if (side == "home") away_dom_mult else home_dom_mult
       
-      # Team-level crosses cap (max ~30 per team per game)
-      team_cross_total <- colSums(mats$Crosses[pidx, , drop=FALSE])
-      cross_cap <- 30L
-      over_cross <- which(team_cross_total > cross_cap)
-      if (length(over_cross)) {
-        scale_down <- cross_cap / team_cross_total[over_cross]
-        mats$Crosses[pidx, over_cross] <- round(
-          sweep(mats$Crosses[pidx, over_cross, drop=FALSE], 2, scale_down, `*`))
-      }
+      # Team projection totals (from sum of player projections × minutes)
+      proj_crosses <- sum(pl$CR   * ms)
+      proj_passes  <- sum(pl$P    * ms)
+      proj_cc      <- sum(pl$CC   * ms)
+      proj_tklw    <- sum(pl$TKLW * ms)
+      proj_int     <- sum(pl$INT  * ms)
+      
+      # ── CROSSES: team total × tempo ──
+      t_crosses <- rnb(n_sims, proj_crosses * tempo_cross, SOCCER_P$phi_crosses)
+      t_crosses <- pmax(t_crosses, SOCCER_P$team_min_crosses)
+      t_crosses <- pmin(t_crosses, SOCCER_P$team_max_crosses)
+      raw_cr <- matrix(rnb(n_p*n_sims, rep(pl$CR*ms, n_sims), SOCCER_P$phi_crosses), n_p, n_sims)
+      mats$Crosses[pidx, ] <- norm_to_total(raw_cr, t_crosses, n_p)
+      mats$Crosses[pidx, ] <- pmin(mats$Crosses[pidx, ], 15L)
+      
+      # ── PASSES: team total × tempo ──
+      t_passes <- rnb(n_sims, proj_passes * tempo_pass, SOCCER_P$phi_passes)
+      t_passes <- pmax(t_passes, SOCCER_P$team_min_passes)
+      t_passes <- pmin(t_passes, SOCCER_P$team_max_passes)
+      raw_pa <- matrix(rnb(n_p*n_sims, rep(pl$P*ms, n_sims), SOCCER_P$phi_passes), n_p, n_sims)
+      mats$Passes[pidx, ] <- norm_to_total(raw_pa, t_passes, n_p)
+      mats$Passes[pidx, ] <- pmin(mats$Passes[pidx, ], 130L)
+      
+      # ── CHANCES CREATED: team total × your dominance ──
+      t_cc <- rnb(n_sims, proj_cc * dom_mult, SOCCER_P$phi_cc)
+      t_cc <- pmax(t_cc, SOCCER_P$team_min_cc)
+      t_cc <- pmin(t_cc, SOCCER_P$team_max_cc)
+      raw_cc <- matrix(rnb(n_p*n_sims, rep(pl$CC*ms, n_sims), SOCCER_P$phi_cc), n_p, n_sims)
+      mats$CC[pidx, ] <- norm_to_total(raw_cc, t_cc, n_p)
+      mats$CC[pidx, ] <- pmin(mats$CC[pidx, ], 8L)
+      
+      # ── TACKLES WON: team total × opponent dominance ──
+      t_tklw <- rnb(n_sims, proj_tklw * opp_dom, SOCCER_P$phi_tackles)
+      t_tklw <- pmax(t_tklw, SOCCER_P$team_min_tklw)
+      t_tklw <- pmin(t_tklw, SOCCER_P$team_max_tklw)
+      raw_tk <- matrix(rnb(n_p*n_sims, rep(pl$TKLW*ms, n_sims), SOCCER_P$phi_tackles), n_p, n_sims)
+      mats$TKLW[pidx, ] <- norm_to_total(raw_tk, t_tklw, n_p)
+      mats$TKLW[pidx, ] <- pmin(mats$TKLW[pidx, ], 10L)
+      
+      # ── INTERCEPTIONS: team total × opponent dominance ──
+      t_int <- rnb(n_sims, proj_int * opp_dom, SOCCER_P$phi_int)
+      t_int <- pmax(t_int, SOCCER_P$team_min_int)
+      t_int <- pmin(t_int, SOCCER_P$team_max_int)
+      raw_in <- matrix(rnb(n_p*n_sims, rep(pl$INT*ms, n_sims), SOCCER_P$phi_int), n_p, n_sims)
+      mats$INT[pidx, ] <- norm_to_total(raw_in, t_int, n_p)
+      mats$INT[pidx, ] <- pmin(mats$INT[pidx, ], 8L)
+      
+      # FD (fouls drawn) cross-referenced after both sides (below)
+      
+      # Per-player caps for allocated stats
+      mats$Shots[pidx, ] <- pmin(mats$Shots[pidx, ], 12L)
+      mats$SOT[pidx, ]   <- pmin(mats$SOT[pidx, ],   8L)
+      fc_m               <- pmin(fc_m, 6L)
+      mats$FC[pidx, ]    <- fc_m
       
       # ── CARDS (vectorized, conditional on fouls) ──
       fc_flat <- as.vector(fc_m)
@@ -425,32 +519,77 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL,
       mats$CS[pidx, ] <- matrix(rep(cs_vec, each=n_p), n_p, n_sims)
       
       win_vec <- as.integer(team_goals > opp_goals)
-      gk_idx_local <- which(grepl("^G", pl$Pos) & mins >= 60)
-      if (length(gk_idx_local)) {
-        pk <- gk_idx_local[1]  # primary GK
-        # Opponent SOT for saves: need to compute from other side
-        opp_gi <- pmin(opp_goals, 5L) + 1L
-        opp_excess <- rnb(n_sims, SOCCER_P$excess_sot_mu[opp_gi], SOCCER_P$phi_excess_sot)
-        opp_sot <- opp_goals + opp_excess
-        gk_saves_vec <- opp_sot - opp_goals  # = opp_excess
-        mats$GK_Saves[pidx[pk], ] <- gk_saves_vec
-        mats$GK_GC[pidx[pk], ]    <- opp_goals
-      }
       mats$GK_Win[pidx, ] <- matrix(rep(win_vec, each=n_p), n_p, n_sims)
+      
+      # Store team SOT, fouls, and player info for cross-reference
+      if (side == "home") {
+        game_info[[gi]]$home_t_sot    <- t_sot
+        game_info[[gi]]$home_t_fouls  <- t_fouls
+        game_info[[gi]]$home_pidx     <- pidx
+        game_info[[gi]]$home_gk_local <- which(grepl("^G", pl$Pos) & mins >= 60)
+        game_info[[gi]]$home_fs_shares <- pmax(pl$FS * ms, 0.001)  # for FD allocation
+      } else {
+        game_info[[gi]]$away_t_sot    <- t_sot
+        game_info[[gi]]$away_t_fouls  <- t_fouls
+        game_info[[gi]]$away_pidx     <- pidx
+        game_info[[gi]]$away_gk_local <- which(grepl("^G", pl$Pos) & mins >= 60)
+        game_info[[gi]]$away_fs_shares <- pmax(pl$FS * ms, 0.001)
+      }
       
       player_offset <- player_offset + n_p
     }
+    
+    # ── GK SAVES (cross-reference: home GK faces away SOT, and vice versa) ──
+    gd <- game_info[[gi]]
+    if (length(gd$home_gk_local) && !is.null(gd$away_t_sot)) {
+      pk <- gd$home_pidx[gd$home_gk_local[1]]
+      mats$GK_Saves[pk, ] <- gd$away_t_sot - gd$ag
+      mats$GK_GC[pk, ]    <- gd$ag
+    }
+    if (length(gd$away_gk_local) && !is.null(gd$home_t_sot)) {
+      pk <- gd$away_pidx[gd$away_gk_local[1]]
+      mats$GK_Saves[pk, ] <- gd$home_t_sot - gd$hg
+      mats$GK_GC[pk, ]    <- gd$hg
+    }
+    
+    # ── FOULS DRAWN (cross-reference: your FD = opponent's fouls committed) ──
+    # Home players' fouls drawn = away team's total fouls, allocated by FS shares
+    if (!is.null(gd$away_t_fouls) && !is.null(gd$home_fs_shares)) {
+      h_pidx <- gd$home_pidx; n_hp <- length(h_pidx)
+      h_shares <- gd$home_fs_shares; h_shares <- h_shares / sum(h_shares)
+      raw_fd_h <- matrix(rnb(n_hp*n_sims, rep(h_shares * mean(gd$away_t_fouls), n_sims),
+                             SOCCER_P$phi_fd), n_hp, n_sims)
+      mats$FD[h_pidx, ] <- norm_to_total(raw_fd_h, gd$away_t_fouls, n_hp)
+      mats$FD[h_pidx, ] <- pmin(mats$FD[h_pidx, ], 8L)  # per-player cap
+    }
+    # Away players' fouls drawn = home team's total fouls
+    if (!is.null(gd$home_t_fouls) && !is.null(gd$away_fs_shares)) {
+      a_pidx <- gd$away_pidx; n_ap <- length(a_pidx)
+      a_shares <- gd$away_fs_shares; a_shares <- a_shares / sum(a_shares)
+      raw_fd_a <- matrix(rnb(n_ap*n_sims, rep(a_shares * mean(gd$home_t_fouls), n_sims),
+                             SOCCER_P$phi_fd), n_ap, n_sims)
+      mats$FD[a_pidx, ] <- norm_to_total(raw_fd_a, gd$home_t_fouls, n_ap)
+      mats$FD[a_pidx, ] <- pmin(mats$FD[a_pidx, ], 8L)
+    }
+    
     cb(sprintf("Game %d/%d: %s complete", gi, n_games, gd$game$Game),
        pct_base + 0.72/n_games)
   }
   
   # ── DK SCORES ──
   cb("Calculating DK scores...", 0.82)
-  pos_vec <- all_players_list$Pos
   mins_vec <- all_players_list$MIN
+  # Use DK roster position for clean sheet/GK bonuses
+  dk_pos_vec <- if ("DK_RosterPos" %in% names(all_players_list)) {
+    all_players_list$DK_RosterPos
+  } else {
+    all_players_list$Pos
+  }
+  # Fill NA positions with projection position
+  dk_pos_vec[is.na(dk_pos_vec)] <- all_players_list$Pos[is.na(dk_pos_vec)]
   
   dk_mat <- dk_score_soccer_v(
-    pos   = rep(pos_vec, n_sims),
+    dk_pos = rep(dk_pos_vec, n_sims),
     goals = as.vector(mats$Goals), assists = as.vector(mats$Assists),
     shots = as.vector(mats$Shots), sot = as.vector(mats$SOT),
     cc = as.vector(mats$CC), passes = as.vector(mats$Passes),
