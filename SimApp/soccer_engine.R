@@ -12,7 +12,7 @@ library(data.table)
 
 SOCCER_P <- list(
   rho = -0.13, max_goals = 5,
-  phi_excess_sot = 9.0, phi_off_target = 8.5, phi_fouls = 47.5,
+  phi_excess_sot = 9.0, phi_off_target = 8.5, phi_fouls = 47.5, phi_shots = 10.5,
   phi_crosses = 8.2, phi_passes = 7.2, phi_cc = 3.0,
   phi_tackles = 5.0, phi_int = 5.0, phi_fd = 5.0,
   shots_scale   = c(0.857, 0.962, 1.048, 1.164, 1.281, 1.426),
@@ -208,7 +208,11 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL,
   game_info <- list()
   
   # Check for scoreline odds tabs in the input data
+  # They may be at top level (app generic loader) or inside all_sheets (read_soccer_input)
   all_sheet_names <- names(input_data)
+  if ("all_sheets" %in% all_sheet_names) {
+    all_sheet_names <- unique(c(all_sheet_names, names(input_data$all_sheets)))
+  }
   
   for (gi in seq_len(n_games)) {
     g <- games[gi]
@@ -218,8 +222,12 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL,
     odds_tab_alt  <- paste0(g$Home, " vs ", g$Away)
     odds_tab <- NULL
     for (tn in c(odds_tab_name, odds_tab_alt, g$Game)) {
-      if (tn %in% all_sheet_names) {
+      if (tn %in% names(input_data)) {
         odds_tab <- as.data.table(input_data[[tn]])
+        break
+      }
+      if ("all_sheets" %in% names(input_data) && tn %in% names(input_data$all_sheets)) {
+        odds_tab <- as.data.table(input_data$all_sheets[[tn]])
         break
       }
     }
@@ -328,21 +336,31 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL,
       }
       mats$Assists[pidx, ] <- assists_m
       
-      # ── TEAM SHOT TOTALS (vectorized) ──
+      # ── TEAM SHOT TOTALS (new approach: draw total first, then split) ──
       gi_vec <- pmin(team_goals, 5L) + 1L
-      excess_mu <- SOCCER_P$excess_sot_mu[gi_vec]
-      excess_sot <- rnb(n_sims, excess_mu, SOCCER_P$phi_excess_sot)
-      t_sot <- team_goals + excess_sot
-      offtgt_mu <- pmax(shots_mu * SOCCER_P$shots_scale[gi_vec] - t_sot, 1)
-      t_off <- rnb(n_sims, offtgt_mu, SOCCER_P$phi_off_target)
-      t_shots <- t_sot + t_off
       
-      # SOT allocation: goals are SOT, distribute remaining (saved shots)
-      saved_shots <- t_sot - team_goals  # vector of length n_sims
+      # Total shots: NegBin around projection scaled by scoreline
+      t_shots_mu <- shots_mu * SOCCER_P$shots_scale[gi_vec]
+      t_shots <- rnb(n_sims, t_shots_mu, SOCCER_P$phi_shots)
+      t_shots <- pmax(t_shots, team_goals)  # at least as many shots as goals
+      
+      # SOT: Binomial fraction of total shots using team's projected SOT rate
+      sot_mu <- if (side=="home") gd$game$Home_SOT else gd$game$Away_SOT
+      sot_rate <- pmin(pmax(sot_mu / pmax(shots_mu, 1), 0.15), 0.60)  # clamp to realistic range
+      t_sot <- rbinom(n_sims, t_shots, sot_rate)
+      t_sot <- pmax(t_sot, team_goals)  # SOT must be >= goals scored
+      t_sot <- pmin(t_sot, t_shots)     # SOT can't exceed total shots
+      
+      # Off-target is exact remainder
+      t_off <- t_shots - t_sot
+      
+      # Saved shots for GK
+      saved_shots <- t_sot - team_goals
+      
+      # SOT allocation: goals are SOT, distribute remaining saved shots
       s_shares <- pmax(pl$Shot_Share, 0.001)
       s_shares <- s_shares / sum(s_shares)
       
-      # Draw raw shots per player, normalize to saved_shots
       raw_sot <- matrix(rnb(n_p*n_sims, rep(pl$SOG*ms, n_sims), SOCCER_P$phi_excess_sot),
                         n_p, n_sims)
       saved_sot_m <- norm_to_total(raw_sot, saved_shots, n_p)
@@ -370,18 +388,28 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL,
       mats$INT[pidx, ]     <- matrix(rnb(n_p*n_sims, rep(pl$INT *ms, n_sims), SOCCER_P$phi_int),     n_p, n_sims)
       mats$FD[pidx, ]      <- matrix(rnb(n_p*n_sims, rep(pl$FS  *ms, n_sims), SOCCER_P$phi_fd),      n_p, n_sims)
       
-      # ── REALISTIC CAPS (historical per-player-per-game maximums) ──
-      # Prevents NegBin tail from producing impossible stat lines
-      mats$CC[pidx, ]      <- pmin(mats$CC[pidx, ],      8L)   # max chances created
-      mats$Passes[pidx, ]  <- pmin(mats$Passes[pidx, ],  130L) # extreme possession mid
-      mats$Crosses[pidx, ] <- pmin(mats$Crosses[pidx, ], 18L)  # extreme wingback
-      mats$TKLW[pidx, ]    <- pmin(mats$TKLW[pidx, ],    10L)  # extreme defensive game
+      # ── REALISTIC CAPS ──
+      # Per-player caps
+      mats$CC[pidx, ]      <- pmin(mats$CC[pidx, ],      8L)
+      mats$Passes[pidx, ]  <- pmin(mats$Passes[pidx, ],  130L)
+      mats$Crosses[pidx, ] <- pmin(mats$Crosses[pidx, ], 15L)   # tightened from 18
+      mats$TKLW[pidx, ]    <- pmin(mats$TKLW[pidx, ],    10L)
       mats$INT[pidx, ]     <- pmin(mats$INT[pidx, ],     8L)
       mats$FD[pidx, ]      <- pmin(mats$FD[pidx, ],      8L)
-      mats$Shots[pidx, ]   <- pmin(mats$Shots[pidx, ],   12L)  # per player shot cap
+      mats$Shots[pidx, ]   <- pmin(mats$Shots[pidx, ],   12L)
       mats$SOT[pidx, ]     <- pmin(mats$SOT[pidx, ],     8L)
-      fc_m                 <- pmin(fc_m,                  6L)   # 6+ fouls → almost certainly sent off
+      fc_m                 <- pmin(fc_m,                  6L)
       mats$FC[pidx, ]      <- fc_m
+      
+      # Team-level crosses cap (max ~30 per team per game)
+      team_cross_total <- colSums(mats$Crosses[pidx, , drop=FALSE])
+      cross_cap <- 30L
+      over_cross <- which(team_cross_total > cross_cap)
+      if (length(over_cross)) {
+        scale_down <- cross_cap / team_cross_total[over_cross]
+        mats$Crosses[pidx, over_cross] <- round(
+          sweep(mats$Crosses[pidx, over_cross, drop=FALSE], 2, scale_down, `*`))
+      }
       
       # ── CARDS (vectorized, conditional on fouls) ──
       fc_flat <- as.vector(fc_m)
