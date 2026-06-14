@@ -86,20 +86,52 @@ categorize_outcome <- function(outcome) {
 
 create_mma_metadata <- function(fights_data) {
   setDT(fights_data)
-  meta <- unique(fights_data[, .(
-    Player   = Name,
-    Opponent = as.character(Opponent),
-    DKSalary = as.numeric(DKSalary),
-    DKID     = as.character(DKID),
-    DKOwn    = as.numeric(DKOwn),
-    FDSalary = as.numeric(FDSalary),
-    FDID     = as.character(FDID),
-    FDOwn    = as.numeric(FDOwn),
-    CPTID    = as.character(CPTID),
-    SDID     = as.character(SDID),
-    SDSalary = as.numeric(SDSal),
-    WinProb  = as.numeric(DeViggedProb)
-  )])
+  # Helper: safely read a column that may not exist in the input
+  col_or_na <- function(col, type = "numeric") {
+    if (col %in% names(fights_data)) {
+      if (type == "character") as.character(fights_data[[col]])
+      else                     as.numeric(fights_data[[col]])
+    } else {
+      if (type == "character") NA_character_ else NA_real_
+    }
+  }
+  
+  # Build one row per player with all platform metadata
+  # Use fights_data directly (already setDT) — one row per fighter
+  player_lookup <- unique(fights_data, by = "Name")
+  
+  get_col <- function(col, type = "numeric") {
+    if (col %in% names(player_lookup)) {
+      v <- player_lookup[[col]]
+      if (type == "character") as.character(v) else as.numeric(v)
+    } else {
+      if (type == "character") rep(NA_character_, nrow(player_lookup))
+      else rep(NA_real_, nrow(player_lookup))
+    }
+  }
+  
+  meta <- data.table(
+    Player   = as.character(player_lookup$Name),
+    Opponent = as.character(player_lookup$Opponent),
+    DKSalary = get_col("DKSalary"),
+    DKID     = get_col("DKID", "character"),
+    DKOwn    = get_col("DKOwn"),
+    FDSalary = get_col("FDSalary"),
+    FDID     = get_col("FDID", "character"),
+    FDOwn    = get_col("FDOwn"),
+    CPTID    = get_col("CPTID", "character"),
+    SDID     = get_col("SDID", "character"),
+    SDSalary = get_col("SDSal"),
+    SDOwn    = get_col("SDOwn"),
+    WinProb  = as.numeric(player_lookup$DeViggedProb)
+  )
+  
+  cat(sprintf("  Metadata: %d players, SDSalary range: %s-%s, SDOwn range: %s-%s\n",
+              nrow(meta),
+              round(min(meta$SDSalary, na.rm=TRUE)),
+              round(max(meta$SDSalary, na.rm=TRUE)),
+              round(min(meta$SDOwn, na.rm=TRUE), 1),
+              round(max(meta$SDOwn, na.rm=TRUE), 1)))
   meta
 }
 
@@ -126,7 +158,7 @@ run_mma_simulation <- function(input_data, n_sims, config, progress_callback = N
   for (col in intersect(char_cols, names(fights_data)))
     fights_data[, (col) := as.character(get(col))]
   
-  num_cols_f <- c("DKSalary","FDSalary","DKOwn","FDOwn","SDSal",
+  num_cols_f <- c("DKSalary","FDSalary","DKOwn","FDOwn","SDSal","SDOwn",
                   "OriginalML","DeViggedProb",
                   "R1","QuickWin_R1","R2","R3","R4","R5","Decision")
   for (col in intersect(num_cols_f, names(fights_data)))
@@ -350,8 +382,18 @@ run_mma_simulation <- function(input_data, n_sims, config, progress_callback = N
     stats
   }
   
-  dk_fantasy <- build_fantasy_stats("DKScore", "DKSalary", "DKOwn", 1000)
-  fd_fantasy <- build_fantasy_stats("FDScore", "FDSalary", "FDOwn", 1)
+  dk_fantasy <- if ("DKSalary" %in% names(metadata) && !all(is.na(metadata$DKSalary))) {
+    build_fantasy_stats("DKScore", "DKSalary", "DKOwn", 1000)
+  } else { NULL }
+  fd_fantasy <- if ("FDSalary" %in% names(metadata) && !all(is.na(metadata$FDSalary))) {
+    build_fantasy_stats("FDScore", "FDSalary", "FDOwn", 1)
+  } else { NULL }
+  # Showdown: DK scoring with SD salary and ownership (showdown slates only)
+  sd_fantasy <- if ("SDOwn" %in% names(metadata) && !all(is.na(metadata$SDOwn))) {
+    build_fantasy_stats("DKScore", "SDSalary", "SDOwn", 1000)
+  } else {
+    NULL
+  }
   
   # Outcome distribution for stacked bar
   total_per_fighter <- sim_results[, .(TotalFights = .N), by = Player]
@@ -359,13 +401,16 @@ run_mma_simulation <- function(input_data, n_sims, config, progress_callback = N
   outcome_pct <- merge(outcome_pct, total_per_fighter, by = "Player")
   outcome_pct[, WinPct := Count / TotalFights * 100]
   
+  sal_cols_avail <- intersect(c("Player","DKSalary","FDSalary","SDSalary"), names(metadata))
   fighter_summary <- merge(
     sim_results[, .(WinRate = mean(Win == 1L) * 100), by = Player],
-    metadata[, .(Player, DKSalary, FDSalary, SDSalary)],
+    metadata[, ..sal_cols_avail],
     by = "Player", all.x = TRUE
   )
-  # sorted DK salary ascending; app renderer reverses for high-salary-at-top display
-  setorder(fighter_summary, DKSalary)
+  # Sort by whichever salary is available: SD first, then DK
+  sort_sal <- if ("SDSalary" %in% names(fighter_summary)) "SDSalary"
+  else if ("DKSalary" %in% names(fighter_summary)) "DKSalary" else NULL
+  if (!is.null(sort_sal)) setorderv(fighter_summary, sort_sal)
   # Labels built per-platform in the app renderer (platform not known here)
   # outcome_pct YLabel also set in app renderer
   
@@ -412,6 +457,7 @@ run_mma_simulation <- function(input_data, n_sims, config, progress_callback = N
   sport_visuals <- list(
     dk_fantasy      = dk_fantasy,
     fd_fantasy      = fd_fantasy,
+    sd_fantasy      = sd_fantasy,
     outcome_pct     = outcome_pct,
     fighter_summary = fighter_summary,
     score_dist      = score_dist,
@@ -424,10 +470,16 @@ run_mma_simulation <- function(input_data, n_sims, config, progress_callback = N
               nrow(metadata), format(nrow(sim_results), big.mark=","), elapsed))
   cb("Complete", 1.0)
   
+  # Signal which platforms are present so app can hide unavailable buttons
+  has_fd <- !all(is.na(metadata$FDSalary))
+  has_sd <- !all(is.na(metadata$SDSalary))
+  
   return(list(
     sim_results   = sim_results,
     metadata      = metadata,
-    sport_visuals = sport_visuals
+    sport_visuals = sport_visuals,
+    has_fd        = has_fd,
+    has_sd        = has_sd
   ))
 }
 

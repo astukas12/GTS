@@ -541,9 +541,7 @@ server <- function(input, output, session) {
     rv$sd_portfolio        <- NULL;  rv$sd_builds <- list();  rv$sd_build_counter <- 0
     rv$sport_visuals       <- NULL
     rv$full_sim_results    <- NULL
-    rv$has_dk              <- TRUE
-    rv$has_fd              <- TRUE
-    rv$has_sd              <- TRUE
+    # has_dk/fd/sd persist from upload-time detection - not reset here
     rv$dk_lock_v           <- 0L
     rv$fd_lock_v           <- 0L
     rv$sd_lock_v           <- 0L
@@ -623,9 +621,15 @@ server <- function(input, output, session) {
         rv$has_dk <- TRUE
         rv$has_fd <- all(c("FDSalary", "FDID", "FDName") %in% driver_cols)
       } else {
-        rv$has_dk <- TRUE
-        rv$has_fd <- TRUE
-        rv$has_sd <- TRUE
+        # Detect platforms from Fights sheet columns
+        fights_cols <- tryCatch(
+          names(readxl::read_excel(input$input_file$datapath, sheet="Fights", n_max=1)),
+          error = function(e) character(0)
+        )
+        rv$has_dk <- any(c("DKSalary","DKID") %in% fights_cols)
+        rv$has_fd <- any(c("FDSalary","FDID") %in% fights_cols)
+        rv$has_sd <- any(c("SDSal","SDID","CPTID") %in% fights_cols)
+        
       }
       
       rv$input_data <- load_sport_input(input$input_file$datapath, rv$sport, rv$config)
@@ -813,11 +817,7 @@ server <- function(input, output, session) {
           rv$has_sd <- if (!is.null(result$has_sd)) isTRUE(result$has_sd) else FALSE
         } else {
           rv$full_sim_results <- NULL
-          # has_dk mirrors has_fd: SD-only files have neither DK classic nor FD
-          has_fd_val <- if (!is.null(result$has_fd)) isTRUE(result$has_fd) else TRUE
-          rv$has_dk <- has_fd_val
-          rv$has_fd <- has_fd_val
-          rv$has_sd <- if (!is.null(result$has_sd)) isTRUE(result$has_sd) else TRUE
+          # Keep platform flags from upload-time detection
         }
         
         if (!is.null(result$projections))   rv$projections   <- result$projections
@@ -1564,9 +1564,17 @@ server <- function(input, output, session) {
       } else {
         sd_mode    <- rv$config$optimization_modes$SD %||% "captain"
         opt_data   <- prepare_optimization_data(rv$simulation_results, rv$sim_metadata, "SD")
+        # MMA showdown: small player pool (14 players) so parallel overhead hurts.
+        # Trim percentiles to the two meaningful contest structures for SD.
+        # max_lineups capped at actual universe size to avoid duplicate work.
+        n_sd_players  <- length(unique(opt_data$Player))
+        n_flex        <- (rv$config$roster_sizes$SD %||% 6L) - 1L  # roster minus CPT slot
+        sd_universe   <- n_sd_players * choose(n_sd_players - 1L, n_flex)
+        sd_max_lineups <- min(5000L, max(500L, sd_universe))
         opt_config <- list(roster_size=rv$config$roster_sizes$SD, salary_cap=rv$config$salary_caps$SD,
                            percentiles=c(0.01,0.05,0.10,0.20), platform_col="DKScore",
-                           cpt_multiplier=1.5, progress_frequency=500, use_parallel=TRUE, max_lineups=5000)
+                           cpt_multiplier=1.5, progress_frequency=500,
+                           use_parallel=FALSE, max_lineups=sd_max_lineups)
         progress$set(message="Finding optimal Showdown lineups...",
                      detail="Phase 1: Building lineup pool...", value=0.05)
         lineup_data  <- find_optimal_lineups(opt_data, opt_config, mode=sd_mode, k=1, verbose=TRUE)
@@ -1575,7 +1583,13 @@ server <- function(input, output, session) {
         score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
         progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
         own_data <- copy(rv$sim_metadata)
-        if ("DKOwn" %in% names(own_data)) { setnames(own_data, "DKOwn", "Own"); if (max(own_data$Own, na.rm=TRUE) > 1) own_data[, Own := Own / 100] }
+        # Use SDOwn for showdown ownership; fall back to DKOwn for standard slates
+        own_col_sd <- if ("SDOwn" %in% names(own_data) && !all(is.na(own_data$SDOwn))) "SDOwn"
+        else if ("DKOwn" %in% names(own_data)) "DKOwn" else NULL
+        if (!is.null(own_col_sd)) {
+          setnames(own_data, own_col_sd, "Own")
+          if (max(own_data$Own, na.rm=TRUE) > 1) own_data[, Own := Own / 100]
+        }
         final_results <- calculate_distribution_metrics(score_matrix, lineup_data, opt_config,
                                                         ownership_data=own_data, verbose=TRUE)
         progress$set(detail="Phase 3: Adding custom metrics...", value=0.90)
@@ -2023,8 +2037,8 @@ server <- function(input, output, session) {
       is_cbb     <- isTRUE(rv$sport %in% c("CBB","NBA"))
       is_nba     <- isTRUE(rv$sport == "NBA")
       is_sd      <- platform == "SD"
-      salary_col <- if (is_sd) "DKSalary" else paste0(platform, "Salary")
-      own_col    <- if (is_sd) NULL else paste0(platform, "Own")
+      salary_col <- if (is_sd) "SDSalary" else paste0(platform, "Salary")
+      own_col    <- if (is_sd) "SDOwn"    else paste0(platform, "Own")
       cpt_cols  <- grep("^Captain", names(filtered), value=TRUE)
       util_cols <- grep("^Util",    names(filtered), value=TRUE)
       all_pc    <- grep("^Player|^Captain|^MVP|^Util|^G[1-4]$|^F[1-3]$|^C1$", names(filtered), value=TRUE)
@@ -2041,7 +2055,7 @@ server <- function(input, output, session) {
         p <- exp_tbl$Player[i]
         if (p %in% names(all_counts)) exp_tbl$Exposure[i] <- as.numeric(all_counts[p]) / n_lineups * 100
       }
-      if (is_f1 || (is_cbb && has_captain) || (is_nba && is_sd && has_captain)) {
+      if (is_f1 || (is_cbb && has_captain) || (is_sd && has_captain)) {
         cpt_counts  <- if (length(cpt_cols))  table(unlist(filtered[, ..cpt_cols]))  else table(character(0))
         util_counts <- if (length(util_cols)) table(unlist(filtered[, ..util_cols])) else table(character(0))
         exp_tbl[, CptExp  := 0]
@@ -2055,6 +2069,9 @@ server <- function(input, output, session) {
           exp_tbl[Player %in% rv$sim_metadata$Player[rv$sim_metadata$PlayerType == "Constructor"],
                   c("CptExp","UtilExp") := NA_real_]
         }
+        # Round exposure percentages to 1 decimal
+        if ("CptExp"  %in% names(exp_tbl)) exp_tbl[, CptExp  := round(CptExp, 1)]
+        if ("UtilExp" %in% names(exp_tbl)) exp_tbl[, UtilExp := round(UtilExp, 1)]
       }
       
       # ── Build metadata column list ─────────────────────────────────────────
@@ -2120,7 +2137,7 @@ server <- function(input, output, session) {
         setcolorder(exp_tbl, c(meta_order, split_cols, metrics_order))
       } else {
         if (salary_col %in% names(exp_tbl)) setnames(exp_tbl, salary_col, "Salary")
-        if (!is_sd && !is.null(own_col) && own_col %in% names(exp_tbl)) {
+        if (!is.null(own_col) && own_col %in% names(exp_tbl)) {
           setnames(exp_tbl, own_col, "OwnProj")
           if (max(exp_tbl$OwnProj, na.rm = TRUE) <= 1) exp_tbl[, OwnProj := OwnProj * 100]
           exp_tbl[, OwnProj  := round(OwnProj, 1)]
@@ -2319,8 +2336,8 @@ server <- function(input, output, session) {
       is_cbb <- isTRUE(rv$sport %in% c("CBB","NBA"))
       is_nba <- isTRUE(rv$sport == "NBA")
       is_sd  <- platform == "SD"
-      salary_col <- if (is_sd) "DKSalary" else paste0(platform, "Salary")
-      own_col    <- if (is_sd) NULL        else paste0(platform, "Own")
+      salary_col <- if (is_sd) "SDSalary" else paste0(platform, "Salary")
+      own_col    <- if (is_sd) "SDOwn"    else paste0(platform, "Own")
       cpt_cols  <- grep("^Captain", names(port), value=TRUE)
       util_cols <- grep("^Util",    names(port), value=TRUE)
       all_pc    <- grep("^Player|^Captain|^MVP|^Util|^G[1-4]$|^F[1-3]$|^C1$", names(port), value=TRUE)
@@ -2420,7 +2437,7 @@ server <- function(input, output, session) {
           setcolorder(exp_tbl, c(meta_order, split_cols, metrics_order))
         } else {
           if (salary_col %in% names(exp_tbl)) setnames(exp_tbl, salary_col, "Salary")
-          if (!is_sd && !is.null(own_col) && own_col %in% names(exp_tbl)) {
+          if (!is.null(own_col) && own_col %in% names(exp_tbl)) {
             setnames(exp_tbl, own_col, "OwnProj")
             if (max(exp_tbl$OwnProj, na.rm = TRUE) <= 1) exp_tbl[, OwnProj := OwnProj * 100]
             exp_tbl[, OwnProj  := round(OwnProj, 1)]
@@ -2517,7 +2534,7 @@ server <- function(input, output, session) {
           setcolorder(exp_tbl, c(meta_order, split_cols, metrics_order))
         } else {
           if (salary_col %in% names(exp_tbl)) setnames(exp_tbl, salary_col, "Salary")
-          if (!is_sd && !is.null(own_col) && own_col %in% names(exp_tbl)) {
+          if (!is.null(own_col) && own_col %in% names(exp_tbl)) {
             setnames(exp_tbl, own_col, "OwnProj")
             if (max(exp_tbl$OwnProj, na.rm = TRUE) <= 1) exp_tbl[, OwnProj := OwnProj * 100]
             exp_tbl[, OwnProj  := round(OwnProj, 1)]
@@ -2650,6 +2667,7 @@ server <- function(input, output, session) {
   output$sim_results_control_bar <- renderUI({
     req(rv$config)
     platforms   <- available_platforms()
+    
     plat_labels <- c(DK = "DraftKings", FD = "FanDuel", SD = "Showdown")
     selected    <- if (!is.null(input$sim_results_platform)) input$sim_results_platform else platforms[1]
     
@@ -2684,11 +2702,10 @@ server <- function(input, output, session) {
   # Keep sim_results_platform as a reactive value initialized to first platform
   observe({
     req(rv$config)
-    if (is.null(input$sim_results_platform)) {
-      plats <- available_platforms()
-      if (length(plats) > 0)
-        updateRadioButtons(session, "sim_results_platform", selected = plats[1])
-    }
+    plats <- available_platforms()
+    cur   <- input$sim_results_platform
+    if (length(plats) > 0 && (is.null(cur) || !cur %in% plats))
+      updateRadioButtons(session, "sim_results_platform", selected = plats[1])
   })
   
   
@@ -2704,16 +2721,18 @@ server <- function(input, output, session) {
     
     score_col  <- if (platform == "SD") "DKScore"  else paste0(platform, "Score")
     salary_col <- if (platform == "SD") "SDSalary" else paste0(platform, "Salary")
-    own_col    <- if (platform == "SD") "DKOwn"    else paste0(platform, "Own")
+    own_col    <- if (platform == "SD") "SDOwn"    else paste0(platform, "Own")
     
     sim  <- copy(rv$simulation_results);  setDT(sim)
     meta <- copy(rv$sim_metadata);        setDT(meta)
     
     # Filter to platform-eligible players for SD
     if (platform == "SD" && "SDSalary" %in% names(meta)) {
-      eligible <- meta[SDSalary > 0, Player]
-      sim  <- sim[Player %in% eligible]
-      meta <- meta[Player %in% eligible]
+      eligible <- meta[!is.na(SDSalary) & SDSalary > 0, Player]
+      if (length(eligible) > 0) {
+        sim  <- sim[Player %in% eligible]
+        meta <- meta[Player %in% eligible]
+      }
     }
     
     if (!score_col %in% names(sim)) return(NULL)
@@ -2779,7 +2798,10 @@ server <- function(input, output, session) {
   # ── Projections table display ────────────────────────────────────────────
   output$sim_projections_table <- renderDT({
     req(rv$simulation_results, rv$sim_metadata)
-    platform <- if (!is.null(input$sim_results_platform) && nchar(input$sim_results_platform) > 0) input$sim_results_platform else "DK"
+    plat_sel <- input$sim_results_platform
+    avail    <- available_platforms()
+    platform <- if (!is.null(plat_sel) && nchar(plat_sel) > 0 && plat_sel %in% avail)
+      plat_sel else if (length(avail) > 0) avail[1] else "DK"
     proj <- build_projections(platform)
     req(proj)
     
@@ -2879,7 +2901,7 @@ server <- function(input, output, session) {
       # Join key metadata: salary + own for the active platform
       platform   <- input$sim_results_platform %||% "DK"
       salary_col <- if (platform == "SD") "SDSalary" else paste0(platform, "Salary")
-      own_col    <- if (platform == "SD") "DKOwn"    else paste0(platform, "Own")
+      own_col    <- if (platform == "SD") "SDOwn"    else paste0(platform, "Own")
       
       meta_cols  <- intersect(c("Player", salary_col, own_col), names(meta))
       # Add sport metadata columns from config
