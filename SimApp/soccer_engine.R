@@ -150,8 +150,16 @@ read_soccer_input <- function(file_path) {
   
   cat(sprintf("Soccer: %d players | %d games | %d SD tabs\n",
               nrow(pl), nrow(gm), length(sd_tabs)))
+  
+  # Read Distributions tab if present (market-implied PMFs for direct sampling)
+  distributions <- NULL
+  if ("Distributions" %in% sheets) {
+    distributions <- as.data.table(data[["Distributions"]])
+    cat(sprintf("  Market distributions: %d\n", nrow(distributions)))
+  }
+  
   list(Players=pl, Games=gm, IDs=data$IDs, sd_tabs=sd_tabs,
-       games=gm,  # lowercase 'games' for app SD selector
+       games=gm, distributions=distributions,
        all_sheets=data)
 }
 
@@ -173,6 +181,24 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL,
   } else {
     players <- as.data.table(input_data[["Players"]])
     games   <- as.data.table(input_data[["Games"]])
+  }
+  
+  # Load market distributions if available (for direct PMF sampling)
+  market_dists <- list()
+  if (!is.null(input_data$distributions) && nrow(input_data$distributions) > 0) {
+    dd <- input_data$distributions
+    k_cols <- grep("^k\\d+$", names(dd), value = TRUE)
+    for (r in seq_len(nrow(dd))) {
+      key <- paste(dd$Game[r], dd$Team[r], dd$Stat[r], sep = "|")
+      probs <- as.numeric(dd[r, ..k_cols])
+      probs[is.na(probs)] <- 0
+      ks <- as.integer(gsub("^k", "", k_cols))
+      valid <- probs > 0
+      if (sum(valid) > 1) {
+        market_dists[[key]] <- list(k = ks[valid], prob = probs[valid] / sum(probs[valid]))
+      }
+    }
+    if (length(market_dists)) cat(sprintf("  Market PMFs loaded: %d distributions\n", length(market_dists)))
   }
   
   num_p <- c("MIN","G","A","S","SOG","CC","P","CR","INT","TKLW","FS","FC","Y","R",
@@ -420,32 +446,56 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL,
       }
       mats$Assists[pidx, ] <- assists_m
       
-      # ── TEAM SHOT TOTALS (draw total → cap → split → allocate) ──
+      # ── TEAM SHOT TOTALS ──
       gi_vec <- pmin(team_goals, 5L) + 1L
       opp_gi_vec <- pmin(opp_goals, 4L) + 1L
       
-      # Shot dominance + opponent-goal scaling
       dom_mult <- if (side == "home") home_dom_mult else away_dom_mult
       opp_scale <- SOCCER_P$opp_shots_scale[opp_gi_vec]
       
-      # Draw and cap/floor total shots
-      t_shots_mu <- shots_mu * SOCCER_P$shots_scale[gi_vec] * dom_mult * opp_scale
-      t_shots <- rnb(n_sims, t_shots_mu, SOCCER_P$phi_shots)
-      t_shots <- pmax(t_shots, team_goals, SOCCER_P$team_min_shots)  # floor
-      t_shots <- pmin(t_shots, SOCCER_P$team_max_shots)              # cap
+      # Look up market PMF for this team's shots
+      team_name <- if (side == "home") gd$game$Home else gd$game$Away
+      gk1 <- paste0(gd$game$Home, "vs", gd$game$Away)
+      gk2 <- paste0(gd$game$Away, "vs", gd$game$Home)
+      shots_pmf <- market_dists[[paste(gk1, team_name, "Shots", sep="|")]]
+      if (is.null(shots_pmf)) shots_pmf <- market_dists[[paste(gk2, team_name, "Shots", sep="|")]]
       
-      # SOT: Binomial split with Beta variance + floor + cap
-      sot_mu <- if (side=="home") gd$game$Home_SOT else gd$game$Away_SOT
-      sot_rate_base <- pmin(pmax(sot_mu / pmax(shots_mu, 1), 0.15), 0.60)
-      alpha_sot <- sot_rate_base * SOCCER_P$sot_kappa
-      beta_sot  <- (1 - sot_rate_base) * SOCCER_P$sot_kappa
-      sot_rates <- rbeta(n_sims, alpha_sot, beta_sot)
-      sot_rates <- pmin(pmax(sot_rates, 0.10), 0.70)
-      t_sot <- rbinom(n_sims, t_shots, sot_rates)
-      t_sot <- pmax(t_sot, team_goals)                   # SOT >= goals
-      t_sot <- pmax(t_sot, ceiling(t_shots * SOCCER_P$sot_min_rate))  # SOT FLOOR
-      t_sot <- pmin(t_sot, t_shots)                       # SOT <= shots
-      t_sot <- pmin(t_sot, SOCCER_P$team_max_sot)        # TEAM CAP
+      if (!is.null(shots_pmf)) {
+        # DIRECT SAMPLING: draw base shots from market PMF, apply game environment
+        base_shots <- sample(shots_pmf$k, n_sims, replace = TRUE, prob = shots_pmf$prob)
+        env_mult <- SOCCER_P$shots_scale[gi_vec] * dom_mult * opp_scale
+        t_shots <- round(base_shots * env_mult / mean(env_mult))  # normalize so mean stays market-implied
+      } else {
+        # Fallback: NegBin from projection
+        t_shots_mu <- shots_mu * SOCCER_P$shots_scale[gi_vec] * dom_mult * opp_scale
+        t_shots <- rnb(n_sims, t_shots_mu, SOCCER_P$phi_shots)
+      }
+      t_shots <- pmax(t_shots, team_goals, SOCCER_P$team_min_shots)
+      t_shots <- pmin(t_shots, SOCCER_P$team_max_shots)
+      
+      # ── SOT: market PMF or Binomial split ──
+      sot_pmf <- market_dists[[paste(gk1, team_name, "SOT", sep="|")]]
+      if (is.null(sot_pmf)) sot_pmf <- market_dists[[paste(gk2, team_name, "SOT", sep="|")]]
+      
+      if (!is.null(sot_pmf)) {
+        # DIRECT SAMPLING from market PMF, with game environment adjustment
+        base_sot <- sample(sot_pmf$k, n_sims, replace = TRUE, prob = sot_pmf$prob)
+        env_mult_sot <- SOCCER_P$shots_scale[gi_vec] * dom_mult
+        t_sot <- round(base_sot * env_mult_sot / mean(env_mult_sot))
+      } else {
+        # Fallback: Binomial split with Beta variance
+        sot_mu <- if (side=="home") gd$game$Home_SOT else gd$game$Away_SOT
+        sot_rate_base <- pmin(pmax(sot_mu / pmax(shots_mu, 1), 0.15), 0.60)
+        alpha_sot <- sot_rate_base * SOCCER_P$sot_kappa
+        beta_sot  <- (1 - sot_rate_base) * SOCCER_P$sot_kappa
+        sot_rates <- rbeta(n_sims, alpha_sot, beta_sot)
+        sot_rates <- pmin(pmax(sot_rates, 0.10), 0.70)
+        t_sot <- rbinom(n_sims, t_shots, sot_rates)
+      }
+      t_sot <- pmax(t_sot, team_goals)
+      t_sot <- pmax(t_sot, ceiling(t_shots * SOCCER_P$sot_min_rate))
+      t_sot <- pmin(t_sot, t_shots)
+      t_sot <- pmin(t_sot, SOCCER_P$team_max_sot)
       
       t_off <- t_shots - t_sot
       saved_shots <- t_sot - team_goals
@@ -679,7 +729,11 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL,
   } else {
     metadata[, DKPos := Pos]
   }
-  metadata[, GameKey := paste0(Team, " vs ", Opp)]
+  # GameKey: use canonical game name from Games tab (same for both teams)
+  metadata[, GameKey := {
+    gm_row <- games[Home == Team | Away == Team]
+    if (nrow(gm_row)) gm_row$Game[1] else paste0(Team, " vs ", Opp)
+  }, by = Player]
   
   # GameRank from Games tab order (row 1 = earliest game = rank 1)
   game_rank_map <- data.table(
