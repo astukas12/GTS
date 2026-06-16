@@ -7,6 +7,7 @@
 # ============================================================================
 
 library(data.table)
+library(openxlsx)
 
 SOCCER_P <- list(
   rho = -0.13, max_goals = 5,
@@ -122,6 +123,7 @@ read_soccer_input <- function(file_path) {
   sheets <- getSheetNames(file_path)
   data <- setNames(lapply(sheets, function(s) as.data.table(read.xlsx(file_path, sheet=s))), sheets)
   pl <- as.data.table(data$Players); gm <- as.data.table(data$Games)
+  setDT(pl); setDT(gm)  # reset internal selfref
   
   # Numeric coercion
   num_p <- c("MIN","DK_Salary","Goal_Share","Assist_Share","Shot_Share","SOT_Share",
@@ -199,12 +201,6 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
       }; has_sd <- TRUE
     }
     if(has_sd) cat("  SD merged\n")
-    # SD diagnostic
-    cat(sprintf("  SD tabs: %d | has_sd=%s\n", length(input_data$sd_tabs), has_sd))
-    for(sdn in names(input_data$sd_tabs)) {
-      sd_dt <- as.data.table(input_data$sd_tabs[[sdn]])
-      cat(sprintf("    %s: %d rows | cols: %s\n", sdn, nrow(sd_dt), paste(head(names(sd_dt),6), collapse=", ")))
-    }
   }
   
   n_games <- nrow(games); all_players_list <- copy(players); n_total <- nrow(all_players_list)
@@ -408,17 +404,6 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
         }
       }
       
-      # Diagnostic: print shares for first game/side
-      if(gi==1 && side=="home") {
-        cat("\n  SHARE DIAGNOSTIC (first team):\n")
-        cat(sprintf("  %-25s %6s %6s %6s %6s\n", "Player", "Goal", "Shot", "Cross", "Tackle"))
-        for(p in seq_len(n_p)) {
-          cat(sprintf("  %-25s %6.3f %6.3f %6.3f %6.3f\n", pl$Player[p], gs[p], ss[p], crs[p], tks[p]))
-        }
-        cat(sprintf("  Cross_Share in names: %s\n", "Cross_Share" %in% names(pl)))
-        cat(sprintf("  Cross_Share raw values: %s\n", paste(round(pl$Cross_Share, 4), collapse=", ")))
-      }
-      
       # Goals (multinomial per sim)
       goals_m <- matrix(0L, n_p, n_sims)
       for(s in seq_len(n_sims)) {
@@ -577,8 +562,6 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
     sd_dt<-as.data.table(input_data$sd_tabs[[sdn]]); tc<-intersect(c("Team","TeamAbbrev"),names(sd_dt))[1]
     if(!is.na(tc)) { st<-unique(sd_dt[[tc]]); metadata[Team %in% st & ShowdownFile=="", ShowdownFile := sdn] }
   }
-  cat(sprintf("  ShowdownFile on games: %s\n", paste(games$ShowdownFile, collapse=", ")))
-  cat(sprintf("  ShowdownFile on metadata: %d with SD\n", sum(metadata$ShowdownFile != "")))
   
   # ── VISUALS ──
   cb("Building visualizations...", 0.95)
