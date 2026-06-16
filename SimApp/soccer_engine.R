@@ -1,104 +1,113 @@
 # ============================================================================
-# SOCCER SIMULATION ENGINE — Golden Ticket Sims
+# SOCCER SIMULATION ENGINE v3 — Golden Ticket Sims
 # ============================================================================
-# Matrix-based: n_players × n_sims. Scorelines vectorized, team totals batched
-# by goal count, independent stats via vectorized NegBin. ~50-100x faster than
-# per-sim loop version.
+# Market-driven: scorelines, shots, SOT, tackles, fouls, corners→crosses
+# WC-calibrated: SOT rate by scoreline, CC/shot ratio, card rates, possession
+# Position-weighted: crosses, passes, INT from player data + position defaults
 # ============================================================================
 
 library(data.table)
 
-# ── PARAMETERS (from Big 5 + WC 2022 research) ──────────────────────────────
-
 SOCCER_P <- list(
   rho = -0.13, max_goals = 5,
-  phi_excess_sot = 9.0, phi_off_target = 8.5, phi_fouls = 47.5, phi_shots = 10.5,
-  sot_kappa = 7.7,  # Beta concentration for SOT rate variance (from 21K Big 5 games, SD=0.162)
-  phi_crosses = 8.2, phi_passes = 7.2, phi_cc = 3.0,
-  phi_tackles = 5.0, phi_int = 5.0, phi_fd = 5.0,
-  shots_scale   = c(0.857, 0.962, 1.048, 1.164, 1.281, 1.426),
-  fouls_scale   = c(1.005, 1.020, 1.002, 0.975, 0.930, 0.867),
-  excess_sot_mu = c(2.7, 2.9, 3.0, 3.3, 3.5, 3.7),
-  p_assist = 0.709, yc_per_foul = 0.174,
+  
+  # Fallback NegBin phi values
+  phi_shots = 10.5, phi_crosses = 8.2, phi_fouls = 47.5,
+  phi_tackles = 8.0, phi_def = 5.0,
+  tackle_win_rate = 0.60,  # market shows attempts, DK scores wins only
+  
+  # Scoreline scaling (indexed by own_goals+1: 0G,1G,2G,3G,4G,5G)
+  shots_scale = c(0.857, 0.962, 1.048, 1.164, 1.281, 1.426),
+  opp_shots_scale = c(1.04, 1.02, 1.00, 0.94, 0.88),  # indexed by opp_goals+1
+  
+  # SOT rate scaling by own goals (from WC data)
+  # 0G: 24.7%, 1G: 35.3%, 2G: 38.0%, 3G: 46.7%
+  sot_rate_scale = c(0.716, 1.023, 1.101, 1.354, 1.400, 1.400),
+  sot_kappa = 7.7,
+  
+  # CC = shots × rate
+  cc_rate = 0.74, cc_kappa = 10,
+  
+  # Cards (WC calibrated)
+  yc_per_foul = 0.141,  # WC rate
   p_second_yc = 0.018, p_straight_red = 0.0026,
+  p_assist = 0.709,
   
-  # Game environment
-  tempo_sd     = 0.15,   # log-scale SD for open/tight game (affects crosses, passes)
-  dominance_sd = 0.12,   # SD for shot dominance swing between teams
+  # YC frustration by opp goals (indexed opp_goals+1)
+  # Conceded 0:1.38, 1:1.58, 2:2.13, 3:2.62 → relative to mean 1.77
+  yc_frustration = c(0.78, 0.89, 1.20, 1.48, 1.48, 1.48),
   
-  # Opponent-goal scaling (conceding reduces your attacking output)
-  opp_shots_scale = c(1.04, 1.02, 1.00, 0.94, 0.88),  # 0-4 opp goals
-  opp_fouls_scale = c(1.00, 1.02, 1.01, 0.98, 0.97),
+  # Possession lookup (from WC data, indexed by shot_share bins)
+  # shot_share: 0.20→30%, 0.30→37%, 0.40→43%, 0.50→50%, 0.60→57%, 0.70→63%, 0.80→70%
+  poss_shot_shares = c(0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80),
+  poss_values      = c(30,   37,   43,   50,   57,   63,   70),
+  # Passes by possession (from WC data)
+  poss_for_passes = c(30, 40, 50, 60, 70),
+  passes_by_poss  = c(220, 290, 430, 550, 750),
+  # INT by possession (inverse)
+  int_by_poss     = c(8.0, 7.0, 6.0, 4.5, 3.0),
   
-  # Team-level caps AND floors (validated from WC 2022 + Big 5 player sums)
-  team_max_shots   = 30L,   team_min_shots   = 3L,
-  team_max_sot     = 15L,   team_min_sot     = 0L,
-  team_max_fouls   = 25L,   team_min_fouls   = 3L,    # WC range [3-30]
-  team_max_crosses = 35L,   team_min_crosses = 4L,    # WC range [4-46]
-  team_max_passes  = 800L,  team_min_passes  = 180L,  # WC range [154-1003]
-  team_max_cc      = 18L,   team_min_cc      = 1L,    # Big5 est [0.6-18.7]
-  team_max_tklw    = 15L,   team_min_tklw    = 2L,    # Big5 est [1.2-12.8]
-  team_max_int     = 14L,   team_min_int     = 1L,    # Big5 est [0.9-11.8]
+  # Caps
+  team_max_shots = 30L, team_min_shots = 3L, team_max_sot = 15L,
+  team_max_crosses = 40L, team_min_crosses = 2L,
   
-  # SOT floor: minimum SOT as fraction of total shots (prevents 0 SOT on 13 shots)
-  sot_min_rate     = 0.08   # at least 8% SOT → 1 SOT per 12 shots minimum
+  # Tempo
+  tempo_sd = 0.15,
+  
+  # Position weights (from Big 5 player data)
+  cross_wt = c(F=0.60, W=2.50, AM=1.00, CM=0.70, DM=0.40, WB=5.00, CB=0.15, GK=0.00),
+  int_wt   = c(F=0.15, W=0.20, AM=0.25, CM=0.55, DM=0.80, WB=0.45, CB=0.70, GK=0.00),
+  pass_wt  = c(F=17,   W=22,   AM=28,   CM=42,   DM=45,   WB=38,   CB=48,   GK=26)
 )
+
 
 # ── HELPERS ──────────────────────────────────────────────────────────────────
 
-tau_dc <- function(x, y, l1, l2, rho) {
-  if (x==0 && y==0) return(1 - l1*l2*rho)
-  if (x==0 && y==1) return(1 + l1*rho)
-  if (x==1 && y==0) return(1 + l2*rho)
-  if (x==1 && y==1) return(1 - rho)
-  1
+tau_dc <- function(x,y,l1,l2,rho) {
+  if(x==0&&y==0) return(1-l1*l2*rho); if(x==0&&y==1) return(1+l1*rho)
+  if(x==1&&y==0) return(1+l2*rho); if(x==1&&y==1) return(1-rho); 1
 }
 
 build_grid <- function(lh, la, rho=SOCCER_P$rho, mg=SOCCER_P$max_goals) {
   g <- CJ(hg=0:mg, ag=0:mg)
-  g[, prob := dpois(hg,lh)*dpois(ag,la)*
-      mapply(tau_dc, hg, ag, MoreArgs=list(l1=lh,l2=la,rho=rho))]
+  g[, prob := dpois(hg,lh)*dpois(ag,la)*mapply(tau_dc,hg,ag,MoreArgs=list(l1=lh,l2=la,rho=rho))]
   g[, prob := prob/sum(prob)]; g
 }
 
 rnb <- function(n, mu, phi) {
-  if (length(mu)==1 && mu<=0) return(rep(0L,n))
-  mu <- pmax(mu, 0)
-  if (phi==Inf) return(rpois(n, mu))
-  as.integer(rnbinom(n, size=phi, mu=mu))
+  mu <- pmax(mu, 0.01); if(length(mu)==1 && mu<=0.01) return(rep(0L,n))
+  if(phi==Inf) return(rpois(n,mu)); as.integer(rnbinom(n, size=phi, mu=mu))
 }
 
-# Normalize raw draw matrix to team totals (NBA pattern)
 norm_to_total <- function(raw, totals, n_p) {
-  cs <- colSums(raw)
-  cs[cs==0] <- 1
+  cs <- colSums(raw); cs[cs==0] <- 1
   scaled <- sweep(raw, 2, totals/cs, `*`)
   fl <- matrix(as.integer(floor(scaled)), n_p, length(totals))
   resid <- as.integer(round(totals)) - colSums(fl)
   frac <- scaled - fl
-  for (s in seq_along(totals)) {
-    r <- resid[s]; if (r==0 || !is.finite(r)) next
-    if (r>0) { top <- order(frac[,s], decreasing=TRUE)[seq_len(min(r,n_p))]
-    fl[top,s] <- fl[top,s]+1L
-    } else {  elig <- which(fl[,s]>0); if(!length(elig)) next
-    ord <- elig[order(frac[elig,s])]; sub_n <- seq_len(min(abs(r),length(ord)))
-    fl[ord[sub_n],s] <- fl[ord[sub_n],s]-1L }
+  for(s in seq_along(totals)) {
+    r <- resid[s]; if(r==0||!is.finite(r)) next
+    if(r>0) { top <- order(frac[,s],decreasing=TRUE)[seq_len(min(r,n_p))]; fl[top,s] <- fl[top,s]+1L
+    } else { elig <- which(fl[,s]>0); if(!length(elig)) next
+    ord <- elig[order(frac[elig,s])]; fl[ord[seq_len(min(abs(r),length(ord)))],s] <- fl[ord[seq_len(min(abs(r),length(ord)))],s]-1L }
   }; fl
 }
 
-# ── DK SCORING (vectorized) ─────────────────────────────────────────────────
+# Interpolation helper
+interp <- function(x, xp, yp) approx(xp, yp, xout=pmin(pmax(x, min(xp)), max(xp)), rule=2)$y
 
-dk_score_soccer_v <- function(dk_pos, goals, assists, shots, sot, cc, passes,
-                              crosses, tklw, ints, fd, fc, yc, rc,
-                              cs, gk_saves, gk_gc, gk_win, mins) {
-  s <- goals*10 + assists*6 + shots + sot + cc + passes*0.02 +
-    crosses*0.7 + tklw + ints*0.5 + fd - fc*0.5
+
+# ── DK SCORING ───────────────────────────────────────────────────────────────
+
+dk_score_soccer_v <- function(dk_pos, goals, assists, shots, sot, cc,
+                              crosses, tackles, fd, fc, passes,
+                              ints, yc, rc, cs, gk_saves, gk_gc, gk_win, mins) {
+  s <- goals*10 + assists*6 + shots + sot + cc + crosses*0.7 +
+    tackles + fd - fc*0.5 + passes*0.02 + ints*0.5
   s <- s + ifelse(yc>=2, -3.0, ifelse(yc==1, -1.5, 0))
   s <- s + rc * (-3.0)
-  # Clean sheet: DK awards to D-eligible players (D/UTIL, M/D, etc.), 60+ min
   is_d <- grepl("D", dk_pos) & !grepl("GK", dk_pos)
   s <- s + ifelse(is_d & mins>=60 & cs==1, 3, 0)
-  # GK bonuses: uses DK GK position
   is_gk <- grepl("GK", dk_pos)
   s <- s + ifelse(is_gk, gk_saves*2 + gk_gc*(-2), 0)
   s <- s + ifelse(is_gk & mins>=60 & cs==1, 5, 0)
@@ -106,1169 +115,593 @@ dk_score_soccer_v <- function(dk_pos, goals, assists, shots, sot, cc, passes,
   s
 }
 
+
 # ── INPUT READER ─────────────────────────────────────────────────────────────
 
 read_soccer_input <- function(file_path) {
-  sheets <- readxl::excel_sheets(file_path)
-  data <- setNames(lapply(sheets, function(s) {
-    dt <- as.data.table(readxl::read_excel(file_path, sheet=s))
-    setnames(dt, trimws(names(dt))); dt
-  }), sheets)
+  sheets <- getSheetNames(file_path)
+  data <- setNames(lapply(sheets, function(s) as.data.table(read.xlsx(file_path, sheet=s))), sheets)
+  pl <- as.data.table(data$Players); gm <- as.data.table(data$Games)
   
-  pl <- as.data.table(data$Players)
-  gm <- as.data.table(data$Games)
+  # Numeric coercion
+  num_p <- c("MIN","DK_Salary","Goal_Share","Assist_Share","Shot_Share","SOT_Share",
+             "Tackle_Share","Foul_Share","FD_Share","YC_Share","Cross_Share","INT_Share","Pass_Share")
+  for(col in intersect(num_p, names(pl))) pl[[col]] <- as.numeric(pl[[col]])
+  num_g <- c("Home_Lambda","Away_Lambda","Home_Shots","Away_Shots","Home_SOT","Away_SOT")
+  for(col in intersect(num_g, names(gm))) gm[[col]] <- as.numeric(gm[[col]])
   
-  num_p <- c("MIN","G","A","S","SOG","CC","P","CR","INT","TKLW","FS","FC","Y","R",
-             "CS","GC","SV","Goal_Share","Assist_Share","Shot_Share",
-             "SOG_Share","Foul_Share","CC_Share","DK_Salary")
-  for (col in intersect(num_p, names(pl))) pl[[col]] <- as.numeric(pl[[col]])
-  num_g <- c("Home_Lambda","Away_Lambda","Total","Home_Shots","Away_Shots",
-             "Home_SOT","Away_SOT","Home_Fouls","Away_Fouls",
-             "Home_Crosses","Away_Crosses","Home_Passes","Away_Passes")
-  for (col in intersect(num_g, names(gm))) gm[[col]] <- as.numeric(gm[[col]])
-  
+  # SD tabs
   sd_tabs <- list()
-  for (sn in grep("^SD\\d+_IDs$", sheets, value=TRUE)) {
-    sd_tabs[[sub("_IDs$","",sn)]] <- data[[sn]]
+  for(sn in grep("^SD\\d+_IDs$", sheets, value=TRUE)) sd_tabs[[sub("_IDs$","",sn)]] <- data[[sn]]
+  gm[, GameKey := Game]; gm[, ShowdownFile := ""]
+  for(sdn in names(sd_tabs)) {
+    sd_dt <- as.data.table(sd_tabs[[sdn]]); tc <- intersect(c("Team","TeamAbbrev"), names(sd_dt))[1]
+    if(!is.na(tc)) { st <- unique(sd_dt[[tc]])
+    for(r in seq_len(nrow(gm))) if(gm$Home[r] %in% st || gm$Away[r] %in% st) gm[r, ShowdownFile := sdn] }
   }
   
-  # Add ShowdownFile + GameKey to Games for SD pill selector
-  gm[, GameKey := Game]
-  gm[, ShowdownFile := ""]
-  for (sdn in names(sd_tabs)) {
-    sd_dt <- as.data.table(sd_tabs[[sdn]])
-    team_col <- intersect(c("Team","TeamAbbrev"), names(sd_dt))[1]
-    if (!is.na(team_col)) {
-      sd_teams <- unique(sd_dt[[team_col]])
-      for (r in seq_len(nrow(gm))) {
-        if (gm$Home[r] %in% sd_teams || gm$Away[r] %in% sd_teams) {
-          gm[r, ShowdownFile := sdn]
-        }
-      }
-    }
-  }
-  
-  cat(sprintf("Soccer: %d players | %d games | %d SD tabs\n",
-              nrow(pl), nrow(gm), length(sd_tabs)))
-  
-  # Read Distributions tab if present (market-implied PMFs for direct sampling)
+  # Distributions (market PMFs)
   distributions <- NULL
-  if ("Distributions" %in% sheets) {
-    distributions <- as.data.table(data[["Distributions"]])
-    cat(sprintf("  Market distributions: %d\n", nrow(distributions)))
-  }
+  if("Distributions" %in% sheets) { distributions <- as.data.table(data[["Distributions"]]); cat(sprintf("  Market PMFs: %d\n", nrow(distributions))) }
   
-  list(Players=pl, Games=gm, IDs=data$IDs, sd_tabs=sd_tabs,
-       games=gm, distributions=distributions,
-       all_sheets=data)
+  # WC bootstrap
+  wc_bootstrap <- NULL
+  wc_path <- "~/GTS/Soccer/data/wc22_game_flat.parquet"
+  if(file.exists(wc_path)) { wc_bootstrap <- as.data.table(arrow::read_parquet(wc_path)); cat(sprintf("  WC bootstrap: %d games\n", nrow(wc_bootstrap))) }
+  
+  cat(sprintf("Soccer: %d players | %d games | %d SD tabs\n", nrow(pl), nrow(gm), length(sd_tabs)))
+  list(Players=pl, Games=gm, IDs=data$IDs, sd_tabs=sd_tabs, games=gm,
+       distributions=distributions, wc_bootstrap=wc_bootstrap, all_sheets=data)
 }
 
-# ── MAIN ENGINE ──────────────────────────────────────────────────────────────
 
-run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL,
-                                  progress_callback=NULL) {
+# ── MAIN SIMULATION ─────────────────────────────────────────────────────────
+
+run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progress_callback=NULL) {
   t0 <- proc.time()["elapsed"]
-  cb <- function(d,v) {
-    if (!is.null(progress_callback)) progress_callback(d,v)
-    cat(sprintf("  [%.0f%%] %s\n", v*100, d)); flush.console()
-  }
+  cb <- function(d,v) { if(!is.null(progress_callback)) progress_callback(d,v); cat(sprintf("  [%.0f%%] %s\n", v*100, d)); flush.console() }
   cb("Loading input...", 0.01)
   
-  # ── Read input ──
-  if ("Players" %in% names(input_data)) {
-    players <- as.data.table(input_data$Players)
-    games   <- as.data.table(input_data$Games)
-  } else {
-    players <- as.data.table(input_data[["Players"]])
-    games   <- as.data.table(input_data[["Games"]])
-  }
+  players <- as.data.table(input_data$Players); games <- as.data.table(input_data$Games)
   
-  # Load market distributions if available (for direct PMF sampling)
+  # Market PMFs
   market_dists <- list()
-  if (!is.null(input_data$distributions) && nrow(input_data$distributions) > 0) {
-    dd <- input_data$distributions
-    k_cols <- grep("^k\\d+$", names(dd), value = TRUE)
-    for (r in seq_len(nrow(dd))) {
-      key <- paste(dd$Game[r], dd$Team[r], dd$Stat[r], sep = "|")
-      probs <- as.numeric(dd[r, ..k_cols])
-      probs[is.na(probs)] <- 0
-      ks <- as.integer(gsub("^k", "", k_cols))
-      valid <- probs > 0
-      if (sum(valid) > 1) {
-        market_dists[[key]] <- list(k = ks[valid], prob = probs[valid] / sum(probs[valid]))
-      }
+  if(!is.null(input_data$distributions) && nrow(input_data$distributions) > 0) {
+    dd <- input_data$distributions; k_cols <- grep("^k\\d+$", names(dd), value=TRUE)
+    for(r in seq_len(nrow(dd))) {
+      key <- paste(dd$Game[r], dd$Team[r], dd$Stat[r], sep="|")
+      probs <- as.numeric(dd[r, ..k_cols]); probs[is.na(probs)] <- 0
+      ks <- as.integer(gsub("^k","",k_cols)); valid <- probs > 0
+      if(sum(valid)>1) market_dists[[key]] <- list(k=ks[valid], prob=probs[valid]/sum(probs[valid]))
     }
-    if (length(market_dists)) cat(sprintf("  Market PMFs loaded: %d distributions\n", length(market_dists)))
+    if(length(market_dists)) cat(sprintf("  Market PMFs: %d\n", length(market_dists)))
   }
   
-  num_p <- c("MIN","G","A","S","SOG","CC","P","CR","INT","TKLW","FS","FC","Y","R",
-             "CS","GC","SV","Goal_Share","Assist_Share","Shot_Share",
-             "SOG_Share","Foul_Share","CC_Share","DK_Salary")
-  for (col in intersect(num_p, names(players))) players[[col]] <- as.numeric(players[[col]])
-  num_g <- c("Home_Lambda","Away_Lambda","Home_Shots","Away_Shots",
-             "Home_SOT","Away_SOT","Home_Fouls","Away_Fouls")
-  for (col in intersect(num_g, names(games))) games[[col]] <- as.numeric(games[[col]])
+  wc_boot <- input_data$wc_bootstrap; has_wc <- !is.null(wc_boot) && nrow(wc_boot) > 0
   
-  players <- players[!is.na(MIN) & MIN > 0]
-  n_games <- nrow(games)
-  cat(sprintf("  %d players | %d games | %s sims\n",
-              nrow(players), n_games, format(n_sims, big.mark=",")))
-  
-  # ── SD detection ──
-  sd_tabs <- if ("sd_tabs" %in% names(input_data)) input_data$sd_tabs else list()
-  # Also check for SD tabs from generic app loader
-  if (!length(sd_tabs)) {
-    for (nm in names(input_data)) {
-      if (grepl("^SD\\d+", nm)) sd_tabs[[nm]] <- as.data.table(input_data[[nm]])
+  # SD merge
+  has_sd <- FALSE
+  if(length(input_data$sd_tabs)) {
+    for(sdn in names(input_data$sd_tabs)) {
+      sd_dt <- as.data.table(input_data$sd_tabs[[sdn]])
+      nm_col <- intersect(c("Name","Nickname"), names(sd_dt))[1]; if(is.na(nm_col)) next
+      rp_col <- grep("Roster.*Pos|roster.*pos", names(sd_dt), value=TRUE, ignore.case=TRUE)[1]; if(is.na(rp_col)) next
+      id_col_sd <- grep("^ID$", names(sd_dt), value=TRUE)[1]; if(is.na(id_col_sd)) next
+      sal_col_sd <- grep("^Salary$", names(sd_dt), value=TRUE, ignore.case=TRUE)[1]; if(is.na(sal_col_sd)) next
+      for(j in seq_len(nrow(sd_dt))) {
+        pn <- sd_dt[[nm_col]][j]; rp <- sd_dt[[rp_col]][j]
+        if(is.na(pn) || is.na(rp) || !nchar(as.character(rp))) next
+        pi <- which(players$DK_Name == pn); if(!length(pi)) pi <- which(players$Player == pn)
+        if(!length(pi)) next
+        if(grepl("CPT", rp)) { players[pi[1], CPTID := as.character(sd_dt[[id_col_sd]][j])]; players[pi[1], CPTSalary := as.numeric(sd_dt[[sal_col_sd]][j])] }
+        if(grepl("FLEX", rp)) { players[pi[1], SDID := as.character(sd_dt[[id_col_sd]][j])]; players[pi[1], SDSalary := as.numeric(sd_dt[[sal_col_sd]][j])] }
+      }; has_sd <- TRUE
     }
-  }
-  has_sd <- length(sd_tabs) > 0
-  if (has_sd) {
-    tryCatch({
-      sd_all <- rbindlist(sd_tabs, fill=TRUE)
-      # Use whatever column names exist — don't force rename
-      # Find the name, ID, roster position, and salary columns
-      nm_col  <- intersect(c("Name","Player"), names(sd_all))[1]
-      id_col  <- intersect(c("ID","DKID"), names(sd_all))[1]
-      rp_col  <- intersect(c("RosterPos","Roster Position","Roster.Position"), names(sd_all))[1]
-      sal_col <- intersect(c("Salary","DKSalary"), names(sd_all))[1]
-      
-      if (!is.na(nm_col) && !is.na(id_col) && !is.na(rp_col) && !is.na(sal_col)) {
-        sd_all[, c("sd_name","sd_id","sd_rp","sd_sal") := .(
-          as.character(get(nm_col)), as.character(get(id_col)),
-          as.character(get(rp_col)), as.numeric(get(sal_col))
-        )]
-        sd_lookup <- unique(sd_all[sd_rp == "CPT", .(sd_name, CPTID = sd_id, CPTSalary = sd_sal)])
-        sd_flex   <- unique(sd_all[sd_rp == "FLEX", .(sd_name, SDID = sd_id, SDSalary = sd_sal)])
-        sd_merged <- merge(sd_lookup, sd_flex, by="sd_name", all=TRUE)
-        if ("DK_Name" %in% names(players)) {
-          players <- merge(players, sd_merged, by.x="DK_Name", by.y="sd_name", all.x=TRUE)
-        }
-        cat(sprintf("  SD merged: %d CPT + %d FLEX entries\n", nrow(sd_lookup), nrow(sd_flex)))
-      }
-    }, error = function(e) {
-      cat(sprintf("  SD merge warning: %s\n", conditionMessage(e)))
-    })
+    if(has_sd) cat("  SD merged\n")
   }
   
-  # ── Per-game setup: scoreline grids ──
+  n_games <- nrow(games); all_players_list <- copy(players); n_total <- nrow(all_players_list)
+  cat(sprintf("  %d players | %d games | %s sims\n", n_total, n_games, format(n_sims, big.mark=",")))
+  
+  # ── Scoreline setup ──
   cb("Building scoreline grids...", 0.03)
   game_info <- list()
   
-  # Check for scoreline odds tabs in the input data
-  # They may be at top level (app generic loader) or inside all_sheets (read_soccer_input)
-  all_sheet_names <- names(input_data)
-  if ("all_sheets" %in% all_sheet_names) {
-    all_sheet_names <- unique(c(all_sheet_names, names(input_data$all_sheets)))
-  }
-  
-  for (gi in seq_len(n_games)) {
-    g <- games[gi]
-    
-    # Look for a matching odds tab (e.g., "MEXvsRSA" or "MEX vs RSA")
-    odds_tab_name <- paste0(g$Home, "vs", g$Away)
-    odds_tab_alt  <- paste0(g$Home, " vs ", g$Away)
+  for(gi in seq_len(n_games)) {
+    g <- games[gi]; otn <- paste0(g$Home,"vs",g$Away)
     odds_tab <- NULL
-    for (tn in c(odds_tab_name, odds_tab_alt, g$Game)) {
-      if (tn %in% names(input_data)) {
-        odds_tab <- as.data.table(input_data[[tn]])
-        break
-      }
-      if ("all_sheets" %in% names(input_data) && tn %in% names(input_data$all_sheets)) {
-        odds_tab <- as.data.table(input_data$all_sheets[[tn]])
-        break
-      }
+    for(tn in c(otn, paste0(g$Away,"vs",g$Home), g$Game)) {
+      if("all_sheets" %in% names(input_data) && tn %in% names(input_data$all_sheets)) { odds_tab <- as.data.table(input_data$all_sheets[[tn]]); break }
     }
-    
-    if (!is.null(odds_tab) && nrow(odds_tab) > 1) {
-      # Use scoreline odds from input sheet
-      # Format: col1=home_goals, col2=away_goals, col3=american_odds
-      setnames(odds_tab, c("hg", "ag", "odds"))
-      odds_tab[, hg := as.integer(hg)]
-      odds_tab[, ag := as.integer(ag)]
-      odds_tab[, odds := as.numeric(odds)]
+    if(!is.null(odds_tab) && nrow(odds_tab)>1) {
+      setnames(odds_tab, c("hg","ag","odds"))
+      odds_tab[, hg := as.integer(hg)]; odds_tab[, ag := as.integer(ag)]; odds_tab[, odds := as.numeric(odds)]
       odds_tab <- odds_tab[!is.na(hg) & !is.na(ag) & !is.na(odds)]
-      
-      # Convert American odds to implied probability and devig
-      odds_tab[, implied := ifelse(odds > 0, 100 / (odds + 100), abs(odds) / (abs(odds) + 100))]
-      odds_tab[, prob := implied / sum(implied)]
-      
-      # Draw scorelines from devigged odds
-      draws <- sample.int(nrow(odds_tab), n_sims, replace = TRUE, prob = odds_tab$prob)
-      hg_vec <- odds_tab$hg[draws]
-      ag_vec <- odds_tab$ag[draws]
-      
-      cat(sprintf("  %s: ODDS-BASED (%d scorelines) | implied total %.2f\n",
-                  g$Game, nrow(odds_tab),
-                  sum(odds_tab$hg * odds_tab$prob) + sum(odds_tab$ag * odds_tab$prob)))
+      odds_tab[, implied := ifelse(odds>0, 100/(odds+100), abs(odds)/(abs(odds)+100))]
+      odds_tab[, prob := implied/sum(implied)]
+      draws <- sample.int(nrow(odds_tab), n_sims, replace=TRUE, prob=odds_tab$prob)
+      hg_vec <- odds_tab$hg[draws]; ag_vec <- odds_tab$ag[draws]
+      cat(sprintf("  %s: ODDS-BASED (%d scorelines)\n", g$Game, nrow(odds_tab)))
     } else {
-      # Fall back to Dixon-Coles from projection lambdas
       grid <- build_grid(g$Home_Lambda, g$Away_Lambda)
-      draws <- sample.int(nrow(grid), n_sims, replace = TRUE, prob = grid$prob)
-      hg_vec <- grid$hg[draws]
-      ag_vec <- grid$ag[draws]
-      
-      cat(sprintf("  %s: DIXON-COLES (lambda %.2f vs %.2f)\n",
-                  g$Game, g$Home_Lambda, g$Away_Lambda))
+      draws <- sample.int(nrow(grid), n_sims, replace=TRUE, prob=grid$prob)
+      hg_vec <- grid$hg[draws]; ag_vec <- grid$ag[draws]
+      cat(sprintf("  %s: DIXON-COLES\n", g$Game))
     }
-    
-    hp <- players[Team == g$Home & Opp == g$Away]
-    ap <- players[Team == g$Away & Opp == g$Home]
-    
-    game_info[[gi]] <- list(
-      game=g, hg=hg_vec, ag=ag_vec,
-      hp=hp, ap=ap, n_hp=nrow(hp), n_ap=nrow(ap)
-    )
-    cat(sprintf("    %d+%d players | Home win %.1f%% Draw %.1f%% Away %.1f%%\n",
-                nrow(hp), nrow(ap),
-                mean(hg_vec > ag_vec)*100, mean(hg_vec == ag_vec)*100,
-                mean(hg_vec < ag_vec)*100))
+    hp <- players[Team==g$Home & Opp==g$Away]; ap <- players[Team==g$Away & Opp==g$Home]
+    game_info[[gi]] <- list(game=g, hg=hg_vec, ag=ag_vec, hp=hp, ap=ap)
+    cat(sprintf("    %d+%d players | H%.0f%% D%.0f%% A%.0f%%\n", nrow(hp), nrow(ap),
+                mean(hg_vec>ag_vec)*100, mean(hg_vec==ag_vec)*100, mean(hg_vec<ag_vec)*100))
   }
   
-  # ── Allocate stat matrices ──
-  all_players_list <- rbindlist(lapply(game_info, function(gi) rbind(gi$hp, gi$ap)))
-  # Deduplicate (same player shouldn't appear twice, but just in case)
-  n_total <- nrow(all_players_list)
-  stat_names <- c("Goals","Assists","Shots","SOT","CC","Passes","Crosses",
-                  "TKLW","INT","FD","FC","YC","RC","GK_Saves","GK_GC","CS","GK_Win","MIN")
-  # Master matrices: n_total_players × n_sims
+  # ── Allocate matrices ──
+  stat_names <- c("Goals","Assists","Shots","SOT","CC","Crosses","Tackles","FD","FC",
+                  "Passes","INT","YC","RC","GK_Saves","GK_GC","CS","GK_Win","MIN")
   mats <- setNames(lapply(stat_names, function(s) matrix(0, n_total, n_sims)), stat_names)
-  dk_mat <- matrix(0, n_total, n_sims)
   
   cb("Simulating matches...", 0.08)
-  
   player_offset <- 0L
   
-  for (gi in seq_len(n_games)) {
-    gd <- game_info[[gi]]
-    pct_base <- 0.08 + (gi-1)/n_games * 0.72
+  for(gi in seq_len(n_games)) {
+    gd <- game_info[[gi]]; pct_base <- 0.08 + (gi-1)/n_games*0.72
     
-    # ── GAME ENVIRONMENT (shared by both teams in this match) ──
+    # Game environment: tempo tied to scoreline
+    tg_sim <- gd$hg + gd$ag
+    goals_z <- (tg_sim - mean(tg_sim)) / max(sd(tg_sim), 0.5)
+    z_tempo <- 0.4*goals_z + sqrt(1-0.16)*rnorm(n_sims)
+    tempo <- exp(SOCCER_P$tempo_sd * z_tempo)
     
-    # Tempo: partially driven by scoreline, partially random
-    # High-scoring games tend to be open; low-scoring games tend to be tight
-    total_goals_sim <- gd$hg + gd$ag
-    goals_z <- (total_goals_sim - mean(total_goals_sim)) / max(sd(total_goals_sim), 0.5)
-    rho_tempo <- 0.4  # how much scoreline drives tempo (0=independent, 1=fully determined)
-    z_tempo <- rho_tempo * goals_z + sqrt(1 - rho_tempo^2) * rnorm(n_sims)
-    tempo_cross <- exp(SOCCER_P$tempo_sd * z_tempo)
-    tempo_pass  <- exp(SOCCER_P$tempo_sd * 0.8 * z_tempo)  # passes less affected
-    
-    # Shot dominance: positive → home gets more shots, away gets fewer
-    z_dom <- rnorm(n_sims, 0, SOCCER_P$dominance_sd)
-    home_dom_mult <- pmax(1 + z_dom, 0.5)  # home shot multiplier
-    away_dom_mult <- pmax(1 - z_dom, 0.5)  # away shot multiplier (opposite)
-    
-    # Process each side
-    for (side in c("home","away")) {
-      pl <- if (side=="home") gd$hp else gd$ap
-      n_p <- nrow(pl)
-      if (n_p == 0) next
-      
-      team_goals <- if (side=="home") gd$hg else gd$ag
-      opp_goals  <- if (side=="home") gd$ag else gd$hg
-      shots_mu   <- if (side=="home") gd$game$Home_Shots else gd$game$Away_Shots
-      fouls_mu   <- if (side=="home") gd$game$Home_Fouls else gd$game$Away_Fouls
-      
+    for(side in c("home","away")) {
+      pl <- if(side=="home") gd$hp else gd$ap
+      n_p <- nrow(pl); if(n_p==0) next
+      team_goals <- if(side=="home") gd$hg else gd$ag
+      opp_goals  <- if(side=="home") gd$ag else gd$hg
       pidx <- (player_offset+1):(player_offset+n_p)
       
-      # ── MINUTES: stochastic per-sim ──
-      # Starters (proj MIN >= 60): rnorm(MIN, 8) clamped [45, 90]
-      # Subs (proj MIN < 60): P(play) = MIN/25, if playing: rnorm(MIN, 5) clamped [1, 45]
-      min_proj <- pl$MIN
-      is_starter <- min_proj >= 60
-      min_mat <- matrix(0, n_p, n_sims)
+      # Minutes: fixed from input
+      mins <- pl$MIN; ms <- mins/90
+      mats$MIN[pidx,] <- matrix(rep(mins, n_sims), n_p, n_sims)
       
-      for (p in seq_len(n_p)) {
-        if (is_starter[p]) {
-          min_mat[p, ] <- pmin(90, pmax(45, rnorm(n_sims, min_proj[p], 8)))
-        } else if (min_proj[p] > 0) {
-          plays <- runif(n_sims) < (min_proj[p] / 25)
-          min_mat[p, plays] <- pmin(45, pmax(1, rnorm(sum(plays), min_proj[p], 5)))
-        }
+      # Scoreline indices
+      gi_vec <- pmin(team_goals,5L)+1L
+      opp_gi <- pmin(opp_goals,4L)+1L
+      
+      # Market PMF lookup keys
+      tn <- if(side=="home") gd$game$Home else gd$game$Away
+      gk1 <- paste0(gd$game$Home,"vs",gd$game$Away); gk2 <- paste0(gd$game$Away,"vs",gd$game$Home)
+      get_pmf <- function(stat) {
+        p <- market_dists[[paste(gk1,tn,stat,sep="|")]]
+        if(is.null(p)) p <- market_dists[[paste(gk2,tn,stat,sep="|")]]
+        p
       }
       
-      # Normalize team total to ~990 player-minutes per sim
-      team_mins <- colSums(min_mat)
-      min_mat <- sweep(min_mat, 2, 990 / pmax(team_mins, 1), `*`)
-      min_mat <- round(pmin(min_mat, 90))
-      
-      ms_mat <- min_mat / 90  # n_p × n_sims scaling matrix
-      mats$MIN[pidx, ] <- min_mat  # store actual minutes for DK scoring
-      
-      # Per-90 rates (from per-game projections ÷ projected minutes fraction)
-      ms_fixed <- pmax(min_proj / 90, 0.01)  # avoid division by zero
-      per90 <- list(
-        G   = pl$G / ms_fixed,
-        A   = pl$A / ms_fixed,
-        S   = pl$S / ms_fixed,
-        SOG = pl$SOG / ms_fixed,
-        CC  = pl$CC / ms_fixed,
-        P   = pl$P / ms_fixed,
-        CR  = pl$CR / ms_fixed,
-        TKLW= pl$TKLW / ms_fixed,
-        INT = pl$INT / ms_fixed,
-        FS  = pl$FS / ms_fixed,
-        FC  = pl$FC / ms_fixed
-      )
-      
-      # ── GOALS: multinomial with per-sim minutes-weighted shares ──
-      goals_m <- matrix(0L, n_p, n_sims)
-      for (s in seq_len(n_sims)) {
-        tg <- team_goals[s]; if (tg == 0) next
-        g_sh <- pmax(per90$G * ms_mat[, s], 0.0001)
-        g_sh <- g_sh / sum(g_sh)
-        goals_m[, s] <- rmultinom(1, size = tg, prob = g_sh)[, 1]
-      }
-      mats$Goals[pidx, ] <- goals_m
-      
-      # ── ASSISTS: 71% of goals get one, scorer EXCLUDED from assist pool ──
-      assists_m <- matrix(0L, n_p, n_sims)
-      
-      for (s in seq_len(n_sims)) {
-        tg <- team_goals[s]; if (tg == 0) next
-        # Per-sim assist shares weighted by actual minutes
-        a_sh <- pmax(per90$A * ms_mat[, s], 0.0001)
-        a_sh <- a_sh / sum(a_sh)
-        goals_remaining <- goals_m[, s]
-        for (g_idx in seq_len(tg)) {
-          scorers <- which(goals_remaining > 0)
-          if (!length(scorers)) next
-          scorer <- if (length(scorers) == 1) scorers else
-            sample(scorers, 1, prob = goals_remaining[scorers])
-          goals_remaining[scorer] <- goals_remaining[scorer] - 1L
-          if (runif(1) > SOCCER_P$p_assist) next
-          ast_probs <- a_sh; ast_probs[scorer] <- 0
-          if (sum(ast_probs) == 0) next
-          assister <- sample.int(n_p, 1, prob = ast_probs)
-          assists_m[assister, s] <- assists_m[assister, s] + 1L
-        }
-      }
-      mats$Assists[pidx, ] <- assists_m
-      
-      # ── TEAM SHOT TOTALS ──
-      gi_vec <- pmin(team_goals, 5L) + 1L
-      opp_gi_vec <- pmin(opp_goals, 4L) + 1L
-      
-      dom_mult <- if (side == "home") home_dom_mult else away_dom_mult
-      opp_scale <- SOCCER_P$opp_shots_scale[opp_gi_vec]
-      
-      # Look up market PMF for this team's shots
-      team_name <- if (side == "home") gd$game$Home else gd$game$Away
-      gk1 <- paste0(gd$game$Home, "vs", gd$game$Away)
-      gk2 <- paste0(gd$game$Away, "vs", gd$game$Home)
-      shots_pmf <- market_dists[[paste(gk1, team_name, "Shots", sep="|")]]
-      if (is.null(shots_pmf)) shots_pmf <- market_dists[[paste(gk2, team_name, "Shots", sep="|")]]
-      
-      if (!is.null(shots_pmf)) {
-        # DIRECT SAMPLING: draw base shots from market PMF, apply game environment
-        base_shots <- sample(shots_pmf$k, n_sims, replace = TRUE, prob = shots_pmf$prob)
-        env_mult <- SOCCER_P$shots_scale[gi_vec] * dom_mult * opp_scale
-        t_shots <- round(base_shots * env_mult / mean(env_mult))  # normalize so mean stays market-implied
+      # ── TEAM SHOTS (market PMF × scoreline scale) ──
+      sp <- get_pmf("Shots")
+      shots_mu <- if(side=="home") gd$game$Home_Shots else gd$game$Away_Shots
+      if(!is.null(sp)) {
+        bs <- sample(sp$k, n_sims, replace=TRUE, prob=sp$prob)
+        em <- SOCCER_P$shots_scale[gi_vec] * SOCCER_P$opp_shots_scale[opp_gi]
+        t_shots <- as.integer(round(bs * em / mean(em)))
       } else {
-        # Fallback: NegBin from projection
-        t_shots_mu <- shots_mu * SOCCER_P$shots_scale[gi_vec] * dom_mult * opp_scale
-        t_shots <- rnb(n_sims, t_shots_mu, SOCCER_P$phi_shots)
+        t_shots <- rnb(n_sims, shots_mu*SOCCER_P$shots_scale[gi_vec]*SOCCER_P$opp_shots_scale[opp_gi], SOCCER_P$phi_shots)
       }
       t_shots <- pmax(t_shots, team_goals, SOCCER_P$team_min_shots)
       t_shots <- pmin(t_shots, SOCCER_P$team_max_shots)
       
-      # ── SOT: market PMF or Binomial split ──
-      sot_pmf <- market_dists[[paste(gk1, team_name, "SOT", sep="|")]]
-      if (is.null(sot_pmf)) sot_pmf <- market_dists[[paste(gk2, team_name, "SOT", sep="|")]]
-      
-      if (!is.null(sot_pmf)) {
-        # DIRECT SAMPLING from market PMF, with game environment adjustment
-        base_sot <- sample(sot_pmf$k, n_sims, replace = TRUE, prob = sot_pmf$prob)
-        env_mult_sot <- SOCCER_P$shots_scale[gi_vec] * dom_mult
-        t_sot <- round(base_sot * env_mult_sot / mean(env_mult_sot))
-      } else {
-        # Fallback: Binomial split with Beta variance
-        sot_mu <- if (side=="home") gd$game$Home_SOT else gd$game$Away_SOT
-        sot_rate_base <- pmin(pmax(sot_mu / pmax(shots_mu, 1), 0.15), 0.60)
-        alpha_sot <- sot_rate_base * SOCCER_P$sot_kappa
-        beta_sot  <- (1 - sot_rate_base) * SOCCER_P$sot_kappa
-        sot_rates <- rbeta(n_sims, alpha_sot, beta_sot)
-        sot_rates <- pmin(pmax(sot_rates, 0.10), 0.70)
-        t_sot <- rbinom(n_sims, t_shots, sot_rates)
-      }
+      # ── TEAM SOT (derived from shots × accuracy rate × scoreline) ──
+      sot_mu <- if(side=="home") gd$game$Home_SOT else gd$game$Away_SOT
+      base_sot_rate <- pmin(pmax(sot_mu / pmax(shots_mu, 1), 0.15), 0.60)
+      # Scale rate by scoreline (teams that score more are more clinical)
+      sim_sot_rate <- base_sot_rate * SOCCER_P$sot_rate_scale[gi_vec]
+      sim_sot_rate <- pmin(pmax(sim_sot_rate, 0.10), 0.70)
+      # Add Beta variance
+      alpha_s <- sim_sot_rate * SOCCER_P$sot_kappa
+      beta_s <- (1-sim_sot_rate) * SOCCER_P$sot_kappa
+      sot_rates <- pmin(pmax(rbeta(n_sims, alpha_s, beta_s), 0.10), 0.70)
+      t_sot <- rbinom(n_sims, t_shots, sot_rates)
       t_sot <- pmax(t_sot, team_goals)
-      t_sot <- pmax(t_sot, ceiling(t_shots * SOCCER_P$sot_min_rate))
-      t_sot <- pmin(t_sot, t_shots)
-      t_sot <- pmin(t_sot, SOCCER_P$team_max_sot)
+      t_sot <- pmin(t_sot, t_shots, SOCCER_P$team_max_sot)
       
-      t_off <- t_shots - t_sot
-      saved_shots <- t_sot - team_goals
+      # ── TEAM CC (74% of shots) ──
+      cc_rates <- rbeta(n_sims, SOCCER_P$cc_rate*SOCCER_P$cc_kappa,
+                        (1-SOCCER_P$cc_rate)*SOCCER_P$cc_kappa)
+      cc_rates <- pmin(pmax(cc_rates, 0.40), 0.95)
+      t_cc <- pmin(as.integer(round(t_shots * cc_rates)), t_shots)
       
-      # SOT allocation to players (per-sim means from minutes)
-      raw_sot <- matrix(rnb(n_p*n_sims, as.vector(per90$SOG * ms_mat), SOCCER_P$phi_excess_sot), n_p, n_sims)
-      saved_sot_m <- norm_to_total(raw_sot, saved_shots, n_p)
-      sot_m <- goals_m + saved_sot_m
-      mats$SOT[pidx, ] <- sot_m
+      # ── TEAM TACKLES (market PMF, independent) ──
+      tkp <- get_pmf("Tackles")
+      if(!is.null(tkp)) {
+        t_tackles <- as.integer(sample(tkp$k, n_sims, replace=TRUE, prob=tkp$prob))
+      } else {
+        tkl_mu <- if("Home_Tackles" %in% names(gd$game)) {
+          if(side=="home") gd$game$Home_Tackles else gd$game$Away_Tackles
+        } else 6.0
+        t_tackles <- rnb(n_sims, tkl_mu, SOCCER_P$phi_tackles)
+      }
+      t_tackles <- pmax(t_tackles, 1L); t_tackles <- pmin(t_tackles, 20L)
+      # Convert attempted → won (market shows attempts, DK scores wins)
+      t_tackles <- as.integer(round(t_tackles * SOCCER_P$tackle_win_rate))
       
-      # Off-target allocation
-      raw_off <- matrix(rnb(n_p*n_sims, as.vector(per90$S * 0.6 * ms_mat), SOCCER_P$phi_off_target), n_p, n_sims)
-      off_m <- norm_to_total(raw_off, t_off, n_p)
-      mats$Shots[pidx, ] <- sot_m + off_m
+      # ── TEAM FOULS (market PMF, independent) ──
+      flp <- get_pmf("Fouls")
+      if(!is.null(flp)) {
+        t_fouls <- as.integer(sample(flp$k, n_sims, replace=TRUE, prob=flp$prob))
+      } else if(has_wc) {
+        # Bootstrap from WC
+        t_fouls <- numeric(n_sims)
+        for(gc in 0:SOCCER_P$max_goals) {
+          si <- which(team_goals==gc); if(!length(si)) next
+          pool <- wc_boot[goals==min(gc,4)]; if(!nrow(pool)) pool <- wc_boot
+          t_fouls[si] <- pool$fouls[sample.int(nrow(pool), length(si), replace=TRUE)]
+        }
+        t_fouls <- as.integer(t_fouls)
+      } else { t_fouls <- rnb(n_sims, 12.5, SOCCER_P$phi_fouls) }
+      t_fouls <- pmax(t_fouls, 2L); t_fouls <- pmin(t_fouls, 25L)
       
-      # ── FOULS (with opponent-goal scaling + team cap) ──
-      opp_fouls_adj <- SOCCER_P$opp_fouls_scale[opp_gi_vec]
-      t_fouls <- rnb(n_sims, fouls_mu * SOCCER_P$fouls_scale[gi_vec] * opp_fouls_adj, SOCCER_P$phi_fouls)
-      t_fouls <- pmax(t_fouls, SOCCER_P$team_min_fouls)    # floor
-      t_fouls <- pmin(t_fouls, SOCCER_P$team_max_fouls)    # cap
-      raw_fc <- matrix(rnb(n_p*n_sims, as.vector(per90$FC * ms_mat), SOCCER_P$phi_fouls),
-                       n_p, n_sims)
-      fc_m <- norm_to_total(raw_fc, t_fouls, n_p)
-      mats$FC[pidx, ] <- fc_m
-      
-      # ══════════════════════════════════════════════════════════════════════
-      # ALL REMAINING STATS: TEAM-TOTAL-FIRST → ALLOCATE TO PLAYERS
-      # Every stat: draw team total (NegBin × environment) → cap/floor → allocate
-      # ══════════════════════════════════════════════════════════════════════
-      
-      dom_mult <- if (side == "home") home_dom_mult else away_dom_mult
-      opp_dom  <- if (side == "home") away_dom_mult else home_dom_mult
-      
-      # Team projection totals (fixed — from projected minutes, drives team total draw)
-      ms_proj <- pmax(min_proj / 90, 0.01)
-      proj_crosses <- sum(pl$CR   * ms_proj)
-      proj_passes  <- sum(pl$P    * ms_proj)
-      proj_cc      <- sum(pl$CC   * ms_proj)
-      proj_tklw    <- sum(pl$TKLW * ms_proj)
-      proj_int     <- sum(pl$INT  * ms_proj)
-      
-      # ── CROSSES: team total × tempo ──
-      t_crosses <- rnb(n_sims, proj_crosses * tempo_cross, SOCCER_P$phi_crosses)
+      # ── TEAM CORNERS → CROSSES (linear model from WC data) ──
+      crp <- get_pmf("Corners")
+      if(!is.null(crp)) {
+        t_corners <- as.integer(sample(crp$k, n_sims, replace=TRUE, prob=crp$prob))
+      } else {
+        corner_mu <- if(side=="home" && "Home_Corners" %in% names(gd$game)) gd$game$Home_Corners
+        else if(side=="away" && "Away_Corners" %in% names(gd$game)) gd$game$Away_Corners
+        else 4.5
+        t_corners <- rnb(n_sims, corner_mu, 7.5)
+      }
+      # Linear model: crosses ≈ 9.5 + 2.0 × corners (from WC data, r=0.694)
+      t_crosses <- as.integer(round(9.5 + 2.0*t_corners + rnorm(n_sims, 0, 4)))
       t_crosses <- pmax(t_crosses, SOCCER_P$team_min_crosses)
       t_crosses <- pmin(t_crosses, SOCCER_P$team_max_crosses)
-      raw_cr <- matrix(rnb(n_p*n_sims, as.vector(per90$CR * ms_mat), SOCCER_P$phi_crosses), n_p, n_sims)
-      mats$Crosses[pidx, ] <- norm_to_total(raw_cr, t_crosses, n_p)
-      mats$Crosses[pidx, ] <- pmin(mats$Crosses[pidx, ], 15L)
       
-      # ── PASSES: team total × tempo ──
-      t_passes <- rnb(n_sims, proj_passes * tempo_pass, SOCCER_P$phi_passes)
-      t_passes <- pmax(t_passes, SOCCER_P$team_min_passes)
-      t_passes <- pmin(t_passes, SOCCER_P$team_max_passes)
-      raw_pa <- matrix(rnb(n_p*n_sims, as.vector(per90$P * ms_mat), SOCCER_P$phi_passes), n_p, n_sims)
-      mats$Passes[pidx, ] <- norm_to_total(raw_pa, t_passes, n_p)
-      mats$Passes[pidx, ] <- pmin(mats$Passes[pidx, ], 130L)
+      # ── PASSES + INT (from possession proxy via shot ratio) ──
+      opp_shots_mu <- if(side=="home") gd$game$Away_Shots else gd$game$Home_Shots
+      opp_sp <- get_pmf(if(side=="home") paste(gk1,gd$game$Away,"Shots",sep="|") else "")
+      # Use team shot means for possession proxy
+      total_shot_mu <- shots_mu + opp_shots_mu
+      shot_share <- pmin(pmax(shots_mu / pmax(total_shot_mu, 1), 0.20), 0.80)
+      poss_est <- interp(shot_share, SOCCER_P$poss_shot_shares, SOCCER_P$poss_values)
+      t_passes <- as.integer(round(interp(poss_est, SOCCER_P$poss_for_passes, SOCCER_P$passes_by_poss) *
+                                     tempo + rnorm(n_sims, 0, 30)))
+      t_passes <- pmax(t_passes, 100L); t_passes <- pmin(t_passes, 800L)
+      t_int <- as.integer(round(interp(poss_est, SOCCER_P$poss_for_passes, SOCCER_P$int_by_poss) +
+                                  rnorm(n_sims, 0, 1.5)))
+      t_int <- pmax(t_int, 0L); t_int <- pmin(t_int, 15L)
       
-      # ── CHANCES CREATED: team total × your dominance ──
-      t_cc <- rnb(n_sims, proj_cc * dom_mult, SOCCER_P$phi_cc)
-      t_cc <- pmax(t_cc, SOCCER_P$team_min_cc)
-      t_cc <- pmin(t_cc, SOCCER_P$team_max_cc)
-      raw_cc <- matrix(rnb(n_p*n_sims, as.vector(per90$CC * ms_mat), SOCCER_P$phi_cc), n_p, n_sims)
-      mats$CC[pidx, ] <- norm_to_total(raw_cc, t_cc, n_p)
-      mats$CC[pidx, ] <- pmin(mats$CC[pidx, ], 8L)
+      # ── CARDS (from team fouls × rate × frustration) ──
+      frustration <- SOCCER_P$yc_frustration[opp_gi]
+      yc_rate_adj <- SOCCER_P$yc_per_foul * frustration
+      # Team YC ~ Binomial(fouls, adjusted rate)
+      t_yc <- rbinom(n_sims, t_fouls, pmin(yc_rate_adj, 0.40))
       
-      # ── TACKLES WON: team total × opponent dominance ──
-      t_tklw <- rnb(n_sims, proj_tklw * opp_dom, SOCCER_P$phi_tackles)
-      t_tklw <- pmax(t_tklw, SOCCER_P$team_min_tklw)
-      t_tklw <- pmin(t_tklw, SOCCER_P$team_max_tklw)
-      raw_tk <- matrix(rnb(n_p*n_sims, as.vector(per90$TKLW * ms_mat), SOCCER_P$phi_tackles), n_p, n_sims)
-      mats$TKLW[pidx, ] <- norm_to_total(raw_tk, t_tklw, n_p)
-      mats$TKLW[pidx, ] <- pmin(mats$TKLW[pidx, ], 10L)
+      # ══════════════════════════════════════════════════════════
+      # PLAYER ALLOCATION
+      # ══════════════════════════════════════════════════════════
       
-      # ── INTERCEPTIONS: team total × opponent dominance ──
-      t_int <- rnb(n_sims, proj_int * opp_dom, SOCCER_P$phi_int)
-      t_int <- pmax(t_int, SOCCER_P$team_min_int)
-      t_int <- pmin(t_int, SOCCER_P$team_max_int)
-      raw_in <- matrix(rnb(n_p*n_sims, as.vector(per90$INT * ms_mat), SOCCER_P$phi_int), n_p, n_sims)
-      mats$INT[pidx, ] <- norm_to_total(raw_in, t_int, n_p)
-      mats$INT[pidx, ] <- pmin(mats$INT[pidx, ], 8L)
-      
-      # FD (fouls drawn) cross-referenced after both sides (below)
-      
-      # Per-player caps for allocated stats
-      mats$Shots[pidx, ] <- pmin(mats$Shots[pidx, ], 12L)
-      mats$SOT[pidx, ]   <- pmin(mats$SOT[pidx, ],   8L)
-      fc_m               <- pmin(fc_m, 6L)
-      mats$FC[pidx, ]    <- fc_m
-      
-      # ── CARDS (vectorized, conditional on fouls) ──
-      fc_flat <- as.vector(fc_m)
-      p_yc <- 1 - (1 - SOCCER_P$yc_per_foul) ^ fc_flat
-      yc1 <- as.integer(runif(n_p*n_sims) < p_yc)
-      yc2 <- as.integer(yc1 & (runif(n_p*n_sims) < SOCCER_P$p_second_yc))
-      str_red <- as.integer(runif(n_p*n_sims) < SOCCER_P$p_straight_red)
-      mats$YC[pidx, ] <- matrix(yc1 + yc2, n_p, n_sims)
-      mats$RC[pidx, ] <- matrix(pmin(str_red + yc2, 1L), n_p, n_sims)  # cap at 1
-      
-      # ── CLEAN SHEET + GK ──
-      cs_vec <- as.integer(opp_goals == 0)
-      mats$CS[pidx, ] <- matrix(rep(cs_vec, each=n_p), n_p, n_sims)
-      
-      win_vec <- as.integer(team_goals > opp_goals)
-      mats$GK_Win[pidx, ] <- matrix(rep(win_vec, each=n_p), n_p, n_sims)
-      
-      # Store team SOT, fouls, and player info for cross-reference
-      if (side == "home") {
-        game_info[[gi]]$home_t_sot    <- t_sot
-        game_info[[gi]]$home_t_fouls  <- t_fouls
-        game_info[[gi]]$home_pidx     <- pidx
-        game_info[[gi]]$home_gk_local <- which(grepl("^G", pl$Pos) & min_proj >= 60)
-        game_info[[gi]]$home_fs_shares <- pmax(pl$FS * ms_proj, 0.001)  # for FD allocation
-      } else {
-        game_info[[gi]]$away_t_sot    <- t_sot
-        game_info[[gi]]$away_t_fouls  <- t_fouls
-        game_info[[gi]]$away_pidx     <- pidx
-        game_info[[gi]]$away_gk_local <- which(grepl("^G", pl$Pos) & min_proj >= 60)
-        game_info[[gi]]$away_fs_shares <- pmax(pl$FS * ms_proj, 0.001)
+      # Share vectors (all pre-computed in InputMaker)
+      get_share <- function(col) {
+        v <- if(col %in% names(pl)) as.numeric(pl[[col]]) else rep(1/n_p, n_p)
+        v[is.na(v)] <- 0; v <- pmax(v, 0)
+        if(sum(v)==0) v <- rep(1/n_p, n_p)
+        v / sum(v)
       }
       
+      gs <- get_share("Goal_Share"); as_s <- get_share("Assist_Share")
+      ss <- get_share("Shot_Share"); sots <- get_share("SOT_Share")
+      tks <- get_share("Tackle_Share"); fcs <- get_share("Foul_Share")
+      fds <- get_share("FD_Share"); ycs <- get_share("YC_Share")
+      crs <- get_share("Cross_Share"); ints <- get_share("INT_Share")
+      pas <- get_share("Pass_Share")
+      
+      # GKs only get passes and FD — zero out everything else
+      is_gk <- grepl("GK", pl$DK_RosterPos)
+      if(any(is_gk)) {
+        for(sh in c("gs","as_s","ss","sots","tks","fcs","crs","ints","ycs")) {
+          v <- get(sh); v[is_gk] <- 0
+          if(sum(v)>0) assign(sh, v/sum(v)) else assign(sh, v)
+        }
+      }
+      
+      # Diagnostic: print shares for first game/side
+      if(gi==1 && side=="home") {
+        cat("\n  SHARE DIAGNOSTIC (first team):\n")
+        cat(sprintf("  %-25s %6s %6s %6s %6s\n", "Player", "Goal", "Shot", "Cross", "Tackle"))
+        for(p in seq_len(n_p)) {
+          cat(sprintf("  %-25s %6.3f %6.3f %6.3f %6.3f\n", pl$Player[p], gs[p], ss[p], crs[p], tks[p]))
+        }
+        cat(sprintf("  Cross_Share in names: %s\n", "Cross_Share" %in% names(pl)))
+        cat(sprintf("  Cross_Share raw values: %s\n", paste(round(pl$Cross_Share, 4), collapse=", ")))
+      }
+      
+      # Goals (multinomial per sim)
+      goals_m <- matrix(0L, n_p, n_sims)
+      for(s in seq_len(n_sims)) {
+        tg <- team_goals[s]; if(tg==0) next
+        goals_m[,s] <- rmultinom(1, size=tg, prob=gs)[,1]
+      }
+      mats$Goals[pidx,] <- goals_m
+      
+      # Assists (per goal, exclude scorer)
+      ast_m <- matrix(0L, n_p, n_sims)
+      for(s in seq_len(n_sims)) {
+        tg <- team_goals[s]; if(tg==0) next
+        gr <- goals_m[,s]
+        for(g_i in seq_len(tg)) {
+          sc <- which(gr>0); if(!length(sc)) next
+          scorer <- if(length(sc)==1) sc else sample(sc,1,prob=gr[sc])
+          gr[scorer] <- gr[scorer]-1L
+          if(runif(1)>SOCCER_P$p_assist) next
+          ap <- as_s; ap[scorer] <- 0; if(sum(ap)==0) next
+          ast_m[sample.int(n_p,1,prob=ap), s] <- ast_m[sample.int(n_p,1,prob=ap), s] + 1L
+        }
+      }
+      mats$Assists[pidx,] <- ast_m
+      
+      # Shots
+      raw <- matrix(rnb(n_p*n_sims, rep(ss*mean(t_shots), n_sims), SOCCER_P$phi_shots), n_p, n_sims)
+      mats$Shots[pidx,] <- pmin(norm_to_total(raw, t_shots, n_p), 12L)
+      
+      # SOT (saved = SOT - goals, allocate saved by SOT share, add goals back)
+      saved <- pmax(t_sot - colSums(goals_m), 0)
+      raw_sot <- matrix(rnb(n_p*n_sims, rep(sots*mean(saved), n_sims), SOCCER_P$phi_shots), n_p, n_sims)
+      mats$SOT[pidx,] <- goals_m + norm_to_total(raw_sot, saved, n_p)
+      
+      # CC (allocate by assist share)
+      raw_cc <- matrix(rnb(n_p*n_sims, rep(as_s*mean(t_cc), n_sims), SOCCER_P$phi_def), n_p, n_sims)
+      mats$CC[pidx,] <- pmin(norm_to_total(raw_cc, t_cc, n_p), 8L)
+      
+      # Crosses
+      raw_cr <- matrix(rnb(n_p*n_sims, rep(crs*mean(t_crosses), n_sims), SOCCER_P$phi_crosses), n_p, n_sims)
+      mats$Crosses[pidx,] <- pmin(norm_to_total(raw_cr, t_crosses, n_p), 15L)
+      
+      # Tackles
+      raw_tk <- matrix(rnb(n_p*n_sims, rep(tks*mean(t_tackles), n_sims), SOCCER_P$phi_tackles), n_p, n_sims)
+      mats$Tackles[pidx,] <- pmin(norm_to_total(raw_tk, t_tackles, n_p), 10L)
+      
+      # Fouls committed
+      raw_fc <- matrix(rnb(n_p*n_sims, rep(fcs*mean(t_fouls), n_sims), SOCCER_P$phi_fouls), n_p, n_sims)
+      player_fc <- pmin(norm_to_total(raw_fc, t_fouls, n_p), 6L)
+      mats$FC[pidx,] <- player_fc
+      
+      # Passes
+      raw_pa <- matrix(rnb(n_p*n_sims, rep(pas*mean(t_passes), n_sims), 7.0), n_p, n_sims)
+      mats$Passes[pidx,] <- norm_to_total(raw_pa, t_passes, n_p)
+      
+      # INT
+      raw_in <- matrix(rnb(n_p*n_sims, rep(ints*mean(t_int), n_sims), SOCCER_P$phi_def), n_p, n_sims)
+      mats$INT[pidx,] <- pmin(norm_to_total(raw_in, t_int, n_p), 8L)
+      
+      # Cards (YC allocated by YC share from market, constrained by fouls)
+      yc_mat <- matrix(0L, n_p, n_sims)
+      rc_mat <- matrix(0L, n_p, n_sims)
+      # Allocate team YC to players by YC_Share
+      raw_yc <- matrix(rnb(n_p*n_sims, rep(ycs*mean(t_yc), n_sims), 5.0), n_p, n_sims)
+      yc_mat <- pmin(norm_to_total(raw_yc, t_yc, n_p), 2L)
+      # Straight reds (rare, from high-foul players)
+      fc_flat <- as.vector(player_fc)
+      rc_flat <- as.integer(runif(length(fc_flat)) < SOCCER_P$p_straight_red & fc_flat > 0)
+      rc_mat <- matrix(rc_flat, n_p, n_sims)
+      mats$YC[pidx,] <- yc_mat; mats$RC[pidx,] <- rc_mat
+      
+      # CS + GK Win
+      mats$CS[pidx,] <- matrix(rep(as.integer(opp_goals==0), each=n_p), n_p, n_sims)
+      mats$GK_Win[pidx,] <- matrix(rep(as.integer(team_goals>opp_goals), each=n_p), n_p, n_sims)
+      
+      # Store for cross-reference
+      if(side=="home") {
+        game_info[[gi]]$home_t_sot <- t_sot; game_info[[gi]]$home_t_fouls <- t_fouls
+        game_info[[gi]]$home_pidx <- pidx
+        game_info[[gi]]$home_gk <- which(grepl("GK", pl$DK_RosterPos) & mins >= 60)
+        game_info[[gi]]$home_fd_share <- get_share("FD_Share")
+      } else {
+        game_info[[gi]]$away_t_sot <- t_sot; game_info[[gi]]$away_t_fouls <- t_fouls
+        game_info[[gi]]$away_pidx <- pidx
+        game_info[[gi]]$away_gk <- which(grepl("GK", pl$DK_RosterPos) & mins >= 60)
+        game_info[[gi]]$away_fd_share <- get_share("FD_Share")
+      }
       player_offset <- player_offset + n_p
     }
     
-    # ── GK SAVES (cross-reference: home GK faces away SOT, and vice versa) ──
+    # ── CROSS-REFERENCE: GK saves + Fouls drawn ──
     gd <- game_info[[gi]]
-    if (length(gd$home_gk_local) && !is.null(gd$away_t_sot)) {
-      pk <- gd$home_pidx[gd$home_gk_local[1]]
-      mats$GK_Saves[pk, ] <- gd$away_t_sot - gd$ag
-      mats$GK_GC[pk, ]    <- gd$ag
+    if(length(gd$home_gk) && !is.null(gd$away_t_sot)) { pk<-gd$home_pidx[gd$home_gk[1]]; mats$GK_Saves[pk,]<-pmax(gd$away_t_sot-gd$ag, 0); mats$GK_GC[pk,]<-gd$ag }
+    if(length(gd$away_gk) && !is.null(gd$home_t_sot)) { pk<-gd$away_pidx[gd$away_gk[1]]; mats$GK_Saves[pk,]<-pmax(gd$home_t_sot-gd$hg, 0); mats$GK_GC[pk,]<-gd$hg }
+    
+    # FD: your fouls drawn = opponent's fouls committed
+    if(!is.null(gd$away_t_fouls)&&!is.null(gd$home_fd_share)) {
+      hp<-gd$home_pidx; nh<-length(hp); hs<-gd$home_fd_share
+      raw_fd<-matrix(rnb(nh*n_sims,rep(hs*mean(gd$away_t_fouls),n_sims),SOCCER_P$phi_fouls),nh,n_sims)
+      mats$FD[hp,] <- pmin(norm_to_total(raw_fd, gd$away_t_fouls, nh), 8L)
     }
-    if (length(gd$away_gk_local) && !is.null(gd$home_t_sot)) {
-      pk <- gd$away_pidx[gd$away_gk_local[1]]
-      mats$GK_Saves[pk, ] <- gd$home_t_sot - gd$hg
-      mats$GK_GC[pk, ]    <- gd$hg
+    if(!is.null(gd$home_t_fouls)&&!is.null(gd$away_fd_share)) {
+      ap<-gd$away_pidx; na_p<-length(ap); as2<-gd$away_fd_share
+      raw_fd<-matrix(rnb(na_p*n_sims,rep(as2*mean(gd$home_t_fouls),n_sims),SOCCER_P$phi_fouls),na_p,n_sims)
+      mats$FD[ap,] <- pmin(norm_to_total(raw_fd, gd$home_t_fouls, na_p), 8L)
     }
     
-    # ── FOULS DRAWN (cross-reference: your FD = opponent's fouls committed) ──
-    # Home players' fouls drawn = away team's total fouls, allocated by FS shares
-    if (!is.null(gd$away_t_fouls) && !is.null(gd$home_fs_shares)) {
-      h_pidx <- gd$home_pidx; n_hp <- length(h_pidx)
-      h_shares <- gd$home_fs_shares; h_shares <- h_shares / sum(h_shares)
-      raw_fd_h <- matrix(rnb(n_hp*n_sims, rep(h_shares * mean(gd$away_t_fouls), n_sims),
-                             SOCCER_P$phi_fd), n_hp, n_sims)
-      mats$FD[h_pidx, ] <- norm_to_total(raw_fd_h, gd$away_t_fouls, n_hp)
-      mats$FD[h_pidx, ] <- pmin(mats$FD[h_pidx, ], 8L)  # per-player cap
-    }
-    # Away players' fouls drawn = home team's total fouls
-    if (!is.null(gd$home_t_fouls) && !is.null(gd$away_fs_shares)) {
-      a_pidx <- gd$away_pidx; n_ap <- length(a_pidx)
-      a_shares <- gd$away_fs_shares; a_shares <- a_shares / sum(a_shares)
-      raw_fd_a <- matrix(rnb(n_ap*n_sims, rep(a_shares * mean(gd$home_t_fouls), n_sims),
-                             SOCCER_P$phi_fd), n_ap, n_sims)
-      mats$FD[a_pidx, ] <- norm_to_total(raw_fd_a, gd$home_t_fouls, n_ap)
-      mats$FD[a_pidx, ] <- pmin(mats$FD[a_pidx, ], 8L)
-    }
-    
-    cb(sprintf("Game %d/%d: %s complete", gi, n_games, gd$game$Game),
-       pct_base + 0.72/n_games)
+    cb(sprintf("Game %d/%d complete", gi, n_games), pct_base+0.72/n_games)
   }
   
   # ── DK SCORES ──
   cb("Calculating DK scores...", 0.82)
-  # Use DK roster position for clean sheet/GK bonuses
-  dk_pos_vec <- if ("DK_RosterPos" %in% names(all_players_list)) {
-    all_players_list$DK_RosterPos
-  } else {
-    all_players_list$Pos
-  }
+  dk_pos_vec <- if("DK_RosterPos" %in% names(all_players_list)) all_players_list$DK_RosterPos else all_players_list$Pos
   dk_pos_vec[is.na(dk_pos_vec)] <- all_players_list$Pos[is.na(dk_pos_vec)]
   
   dk_mat <- dk_score_soccer_v(
-    dk_pos = rep(dk_pos_vec, n_sims),
-    goals = as.vector(mats$Goals), assists = as.vector(mats$Assists),
-    shots = as.vector(mats$Shots), sot = as.vector(mats$SOT),
-    cc = as.vector(mats$CC), passes = as.vector(mats$Passes),
-    crosses = as.vector(mats$Crosses), tklw = as.vector(mats$TKLW),
-    ints = as.vector(mats$INT), fd = as.vector(mats$FD),
-    fc = as.vector(mats$FC), yc = as.vector(mats$YC), rc = as.vector(mats$RC),
-    cs = as.vector(mats$CS), gk_saves = as.vector(mats$GK_Saves),
-    gk_gc = as.vector(mats$GK_GC), gk_win = as.vector(mats$GK_Win),
-    mins = as.vector(mats$MIN)  # per-sim actual minutes (not fixed projection)
-  )
+    dk_pos=rep(dk_pos_vec,n_sims), goals=as.vector(mats$Goals), assists=as.vector(mats$Assists),
+    shots=as.vector(mats$Shots), sot=as.vector(mats$SOT), cc=as.vector(mats$CC),
+    crosses=as.vector(mats$Crosses), tackles=as.vector(mats$Tackles),
+    fd=as.vector(mats$FD), fc=as.vector(mats$FC),
+    passes=as.vector(mats$Passes), ints=as.vector(mats$INT),
+    yc=as.vector(mats$YC), rc=as.vector(mats$RC),
+    cs=as.vector(mats$CS), gk_saves=as.vector(mats$GK_Saves),
+    gk_gc=as.vector(mats$GK_GC), gk_win=as.vector(mats$GK_Win),
+    mins=as.vector(mats$MIN))
   dk_mat <- matrix(dk_mat, n_total, n_sims)
   
-  # ── BUILD sim_results (long format with all stat components) ──
-  # dk_mat is n_total × n_sims. as.vector() reads column-major:
-  # [p1_s1, p2_s1, ..., pN_s1, p1_s2, p2_s2, ...] which matches
-  # SimID = rep(1:n_sims, each=n_total) and Player = rep(names, n_sims)
-  # DO NOT transpose — t() would give [p1_s1, p1_s2, ..., p1_sN, p2_s1, ...] 
-  # which scrambles the alignment.
-  cb("Building results table...", 0.88)
+  # ── RESULTS ──
+  cb("Building results...", 0.88)
   sim_results <- data.table(
-    SimID    = rep(seq_len(n_sims), each=n_total),
-    Player   = rep(all_players_list$Player, n_sims),
-    Team     = rep(all_players_list$Team, n_sims),
-    Pos      = rep(all_players_list$Pos, n_sims),
-    DKScore  = as.vector(dk_mat),
-    Goals    = as.vector(mats$Goals),
-    Assists  = as.vector(mats$Assists),
-    Shots    = as.vector(mats$Shots),
-    SOT      = as.vector(mats$SOT),
-    CC       = as.vector(mats$CC),
-    Passes   = as.vector(mats$Passes),
-    Crosses  = as.vector(mats$Crosses),
-    TKLW     = as.vector(mats$TKLW),
-    INT      = as.vector(mats$INT),
-    FD       = as.vector(mats$FD),
-    FC       = as.vector(mats$FC),
-    YC       = as.vector(mats$YC),
-    RC       = as.vector(mats$RC),
-    GK_Saves = as.vector(mats$GK_Saves),
-    GK_GC    = as.vector(mats$GK_GC),
-    CS       = as.vector(mats$CS),
-    GK_Win   = as.vector(mats$GK_Win)
-  )
+    SimID=rep(seq_len(n_sims), each=n_total), Player=rep(all_players_list$Player, n_sims),
+    Team=rep(all_players_list$Team, n_sims), Pos=rep(all_players_list$Pos, n_sims),
+    DKScore=as.vector(dk_mat),
+    Goals=as.vector(mats$Goals), Assists=as.vector(mats$Assists),
+    Shots=as.vector(mats$Shots), SOT=as.vector(mats$SOT), CC=as.vector(mats$CC),
+    Crosses=as.vector(mats$Crosses), Tackles=as.vector(mats$Tackles),
+    FD=as.vector(mats$FD), FC=as.vector(mats$FC),
+    Passes=as.vector(mats$Passes), INT=as.vector(mats$INT),
+    YC=as.vector(mats$YC), RC=as.vector(mats$RC),
+    GK_Saves=as.vector(mats$GK_Saves), GK_GC=as.vector(mats$GK_GC),
+    CS=as.vector(mats$CS), GK_Win=as.vector(mats$GK_Win), MIN=as.vector(mats$MIN))
   
   # ── METADATA ──
   cb("Building metadata...", 0.92)
-  
-  meta_cols <- c("Player","Team","Opp","Pos","DK_Salary","DK_ID","DK_Name","DK_RosterPos")
-  if (has_sd) meta_cols <- c(meta_cols, "CPTID","CPTSalary","SDID","SDSalary")
-  avail <- intersect(meta_cols, names(all_players_list))
-  
+  mc <- c("Player","Team","Opp","Pos","DK_Salary","DK_ID","DK_Name","DK_RosterPos")
+  if(has_sd) mc <- c(mc, "CPTID","CPTSalary","SDID","SDSalary")
+  avail <- intersect(mc, names(all_players_list))
   metadata <- unique(all_players_list[, ..avail], by="Player")
   setnames(metadata, c("DK_Salary","DK_ID"), c("DKSalary","DKID"), skip_absent=TRUE)
-  metadata[, DKOwn := 0]
-  metadata[, PosGroup := Pos]
-  # DKPos for optimizer uses DK roster position (F/UTIL, M/F/UTIL, D/UTIL, GK)
-  if ("DK_RosterPos" %in% names(metadata)) {
-    metadata[, DKPos := DK_RosterPos]
-  } else {
-    metadata[, DKPos := Pos]
-  }
-  # GameKey: use canonical game name from Games tab (same for both teams)
-  metadata[, GameKey := {
-    gm_row <- games[Home == Team | Away == Team]
-    if (nrow(gm_row)) gm_row$Game[1] else paste0(Team, " vs ", Opp)
-  }, by = Player]
-  
-  # GameRank from Games tab order (row 1 = earliest game = rank 1)
-  game_rank_map <- data.table(
-    Team_h = games$Home,
-    Team_a = games$Away,
-    rank   = seq_len(nrow(games))
-  )
-  metadata[, GameRank := {
-    r <- game_rank_map[Team_h == Team | Team_a == Team, rank]
-    if (length(r)) r[1] else 1L
-  }, by = Player]
-  
-  # ShowdownFile: map players to their SD game (SD1, SD2, etc.)
+  metadata[, DKOwn := 0]; metadata[, PosGroup := Pos]
+  metadata[, DKPos := if("DK_RosterPos" %in% names(.SD)) DK_RosterPos else Pos, .SDcols=names(metadata)]
+  metadata[, GameKey := { r<-games[Home==Team|Away==Team]; if(nrow(r)) r$Game[1] else paste0(Team," vs ",Opp) }, by=Player]
+  grm <- data.table(Th=games$Home, Ta=games$Away, rk=seq_len(nrow(games)))
+  metadata[, GameRank := { r<-grm[Th==Team|Ta==Team, rk]; if(length(r)) r[1] else 1L }, by=Player]
   metadata[, ShowdownFile := ""]
-  if (has_sd) {
-    sd_names <- names(sd_tabs)
-    for (sdn in sd_names) {
-      sd_dt <- as.data.table(sd_tabs[[sdn]])
-      sd_team_col <- intersect(c("Team","TeamAbbrev"), names(sd_dt))[1]
-      if (!is.na(sd_team_col)) {
-        sd_teams <- unique(sd_dt[[sd_team_col]])
-        metadata[Team %in% sd_teams & ShowdownFile == "", ShowdownFile := sdn]
-      }
-    }
+  if(has_sd) for(sdn in names(input_data$sd_tabs)) {
+    sd_dt<-as.data.table(input_data$sd_tabs[[sdn]]); tc<-intersect(c("Team","TeamAbbrev"),names(sd_dt))[1]
+    if(!is.na(tc)) { st<-unique(sd_dt[[tc]]); metadata[Team %in% st & ShowdownFile=="", ShowdownFile := sdn] }
   }
   
-  # ── SPORT VISUALS ──
+  # ── VISUALS ──
   cb("Building visualizations...", 0.95)
+  pm <- data.table(Player=all_players_list$Player, Team=all_players_list$Team,
+                   Pos=all_players_list$Pos, Salary=all_players_list$DK_Salary,
+                   DKAvgFP=round(rowMeans(dk_mat),2), SDFP=round(apply(dk_mat,1,sd),2),
+                   P10=round(apply(dk_mat,1,quantile,0.10),2), P50=round(apply(dk_mat,1,quantile,0.50),2),
+                   P90=round(apply(dk_mat,1,quantile,0.90),2), Ceiling=round(apply(dk_mat,1,quantile,0.99),2),
+                   AvgGoals=round(rowMeans(mats$Goals),3), AvgAst=round(rowMeans(mats$Assists),3),
+                   AvgShots=round(rowMeans(mats$Shots),1), AvgSOT=round(rowMeans(mats$SOT),1),
+                   AvgCC=round(rowMeans(mats$CC),1), AvgCross=round(rowMeans(mats$Crosses),1),
+                   AvgTackles=round(rowMeans(mats$Tackles),1), AvgFD=round(rowMeans(mats$FD),1),
+                   AvgFC=round(rowMeans(mats$FC),1), AvgPasses=round(rowMeans(mats$Passes),0),
+                   AvgINT=round(rowMeans(mats$INT),1), AvgYC=round(rowMeans(mats$YC),2),
+                   AvgSaves=round(rowMeans(mats$GK_Saves),2))
+  setorder(pm, -DKAvgFP)
   
-  player_names <- all_players_list$Player
-  player_teams <- all_players_list$Team
+  sl <- rbindlist(lapply(seq_len(n_games), function(gi) { gd<-game_info[[gi]]; data.table(Game=gd$game$Game, HG=gd$hg, AG=gd$ag) }))
+  tm <- sim_results[, .(Goals=mean(Goals), Shots=mean(Shots), SOT=mean(SOT), CC=mean(CC),
+                        Crosses=mean(Crosses), Tackles=mean(Tackles), FD=mean(FD), FC=mean(FC),
+                        Passes=mean(Passes), INT=mean(INT)), by=Team]
   
-  # Player means (stat averages across sims)
-  player_means <- data.table(
-    Player   = player_names,
-    Team     = player_teams,
-    Pos      = all_players_list$Pos,
-    Salary   = all_players_list$DK_Salary,
-    DKAvgFP  = round(rowMeans(dk_mat), 2),
-    AvgFP    = round(rowMeans(dk_mat), 2),
-    SDFP     = round(apply(dk_mat, 1, sd), 2),
-    P10      = round(apply(dk_mat, 1, quantile, 0.10), 2),
-    P25      = round(apply(dk_mat, 1, quantile, 0.25), 2),
-    P50      = round(apply(dk_mat, 1, function(x) median(x)), 2),
-    P75      = round(apply(dk_mat, 1, quantile, 0.75), 2),
-    P90      = round(apply(dk_mat, 1, quantile, 0.90), 2),
-    Ceiling  = round(apply(dk_mat, 1, quantile, 0.99), 2),
-    Floor    = round(apply(dk_mat, 1, quantile, 0.01), 2),
-    AvgGoals = round(rowMeans(mats$Goals), 3),
-    AvgAst   = round(rowMeans(mats$Assists), 3),
-    AvgShots = round(rowMeans(mats$Shots), 1),
-    AvgSOT   = round(rowMeans(mats$SOT), 1),
-    AvgCC    = round(rowMeans(mats$CC), 1),
-    AvgPass  = round(rowMeans(mats$Passes), 0),
-    AvgCross = round(rowMeans(mats$Crosses), 1),
-    AvgTKLW  = round(rowMeans(mats$TKLW), 1),
-    AvgINT   = round(rowMeans(mats$INT), 1),
-    AvgFD    = round(rowMeans(mats$FD), 1),
-    AvgFC    = round(rowMeans(mats$FC), 1),
-    AvgYC    = round(rowMeans(mats$YC), 3),
-    AvgSaves = round(rowMeans(mats$GK_Saves), 2)
-  )
-  player_means[, Value := round(DKAvgFP / pmax(Salary/1000, 1), 2)]
-  
-  # DK score component breakdown (avg pts from each stat category)
-  player_means[, `:=`(
-    Pts_Goals   = round(AvgGoals * 10, 2),
-    Pts_Assists = round(AvgAst * 6, 2),
-    Pts_Shots   = round(AvgShots * 1, 2),
-    Pts_SOT     = round(AvgSOT * 1, 2),
-    Pts_CC      = round(AvgCC * 1, 2),
-    Pts_Passes  = round(AvgPass * 0.02, 2),
-    Pts_Crosses = round(AvgCross * 0.7, 2),
-    Pts_TKLW    = round(AvgTKLW * 1, 2),
-    Pts_INT     = round(AvgINT * 0.5, 2),
-    Pts_FD      = round(AvgFD * 1, 2),
-    Pts_FC      = round(AvgFC * -0.5, 2),
-    Pts_YC      = round(AvgYC * -1.5, 2),
-    Pts_Saves   = round(AvgSaves * 2, 2)
-  )]
-  
-  setorder(player_means, -DKAvgFP)
-  
-  # Team means
-  teams <- sort(unique(player_teams))
-  team_means <- rbindlist(lapply(teams, function(tm) {
-    idx <- which(player_teams == tm)
-    data.table(
-      Team     = tm,
-      DKAvgFP  = round(mean(colSums(dk_mat[idx,,drop=FALSE])), 1),
-      AvgFP    = round(mean(colSums(dk_mat[idx,,drop=FALSE])), 1),
-      AvgGoals = round(mean(colSums(mats$Goals[idx,,drop=FALSE])), 2),
-      AvgShots = round(mean(colSums(mats$Shots[idx,,drop=FALSE])), 1),
-      AvgSOT   = round(mean(colSums(mats$SOT[idx,,drop=FALSE])), 1),
-      AvgAst   = round(mean(colSums(mats$Assists[idx,,drop=FALSE])), 2),
-      AvgFouls = round(mean(colSums(mats$FC[idx,,drop=FALSE])), 1),
-      AvgYC    = round(mean(colSums(mats$YC[idx,,drop=FALSE])), 2),
-      AvgCross = round(mean(colSums(mats$Crosses[idx,,drop=FALSE])), 1),
-      AvgPass  = round(mean(colSums(mats$Passes[idx,,drop=FALSE])), 0)
-    )
-  }))
-  setorder(team_means, -DKAvgFP)
-  
-  # Score distributions for box plots (sample for manageable size)
-  max_vis <- min(n_sims, 2000)
-  vis_cols <- sample.int(n_sims, max_vis)
-  score_dist <- data.table(
-    Player  = rep(player_names, max_vis),
-    Team    = rep(player_teams, max_vis),
-    DKScore = as.vector(dk_mat[, vis_cols])
-  )
-  
-  # Stat distributions for validation box plots
-  stat_dist <- data.table(
-    Player  = rep(player_names, max_vis),
-    Team    = rep(player_teams, max_vis),
-    Goals   = as.vector(mats$Goals[, vis_cols]),
-    Shots   = as.vector(mats$Shots[, vis_cols]),
-    SOT     = as.vector(mats$SOT[, vis_cols]),
-    Crosses = as.vector(mats$Crosses[, vis_cols]),
-    Passes  = as.vector(mats$Passes[, vis_cols]),
-    TKLW    = as.vector(mats$TKLW[, vis_cols]),
-    FC      = as.vector(mats$FC[, vis_cols]),
-    FD      = as.vector(mats$FD[, vis_cols])
-  )
-  
-  # Scoreline distributions per game
-  scoreline_data <- rbindlist(lapply(game_info, function(gd) {
-    data.table(
-      Game = gd$game$Game,
-      HG   = gd$hg, AG = gd$ag,
-      Scoreline = paste0(gd$hg, "-", gd$ag)
-    )
-  }))
-  
-  sport_visuals <- list(
-    teams          = teams,
-    player_means   = player_means,
-    team_means     = team_means,
-    score_dist     = score_dist,
-    stat_dist      = stat_dist,
-    scoreline_data = scoreline_data,
-    player_data    = metadata,
-    games          = games
-  )
-  
-  # ── Console validation ──
-  cat("\n  ========================================\n")
-  cat("  VALIDATION REPORT\n")
-  cat("  ========================================\n")
-  
-  cat("\n  --- Team Totals: Projection vs Sim ---\n")
-  cat(sprintf("  %-4s %8s %8s %8s %8s %8s %8s %8s %8s\n",
-              "Team", "G_proj", "G_sim", "S_proj", "S_sim", "FC_proj", "FC_sim", "CR_proj", "CR_sim"))
-  for (tm in teams) {
-    cat(sprintf("  %-4s %8.2f %8.2f %8.1f %8.1f %8.1f %8.1f %8.1f %8.1f\n",
-                tm,
-                sum(players[Team==tm]$G, na.rm=TRUE),  team_means[Team==tm]$AvgGoals,
-                sum(players[Team==tm]$S, na.rm=TRUE),  team_means[Team==tm]$AvgShots,
-                sum(players[Team==tm]$FC, na.rm=TRUE), team_means[Team==tm]$AvgFouls,
-                sum(players[Team==tm]$CR, na.rm=TRUE), team_means[Team==tm]$AvgCross))
-  }
-  
-  cat("\n  --- Scoreline Distributions ---\n")
-  for (gi in seq_len(n_games)) {
-    gd <- game_info[[gi]]
-    sl <- table(paste0(gd$hg, "-", gd$ag))
-    sl <- sort(sl, decreasing=TRUE)
-    hw <- mean(gd$hg > gd$ag); dr <- mean(gd$hg == gd$ag); aw <- mean(gd$hg < gd$ag)
-    cat(sprintf("\n  %s (%.2f vs %.2f): Home %.0f%% | Draw %.0f%% | Away %.0f%%\n",
-                gd$game$Game, gd$game$Home_Lambda, gd$game$Away_Lambda,
-                hw*100, dr*100, aw*100))
-    for (s in names(head(sl, 8)))
-      cat(sprintf("    %-5s %5.1f%%\n", s, sl[s]/n_sims*100))
-  }
-  
-  cat("\n  --- Top 15 Players: DK Score Breakdown ---\n")
-  top15 <- player_means[1:min(15, nrow(player_means))]
-  cat(sprintf("  %-18s %-4s %5s %5s | %5s %5s %5s %5s %5s %5s %5s %5s %5s %5s | %5s\n",
-              "Player","Pos","Sal","Mean",
-              "Goals","Ast","Shots","SOT","CC","Pass","Cross","Tkl","FD","FC","Saves"))
-  for (i in seq_len(nrow(top15))) {
-    r <- top15[i]
-    cat(sprintf("  %-18s %-4s %5.0f %5.1f | %5.2f %5.2f %5.2f %5.2f %5.2f %5.2f %5.2f %5.2f %5.2f %5.2f | %5.2f\n",
-                substr(r$Player, 1, 18), r$Pos, r$Salary/1000, r$DKAvgFP,
-                r$Pts_Goals, r$Pts_Assists, r$Pts_Shots, r$Pts_SOT,
-                r$Pts_CC, r$Pts_Passes, r$Pts_Crosses, r$Pts_TKLW,
-                r$Pts_FD, r$Pts_FC, r$Pts_Saves))
-  }
-  
-  cat("\n  --- GK Breakdown ---\n")
-  gk_rows <- player_means[grepl("^G", Pos)]
-  if (nrow(gk_rows)) {
-    cat(sprintf("  %-18s %5s | %5s %5s %5s\n",
-                "GK","Mean","AvgSv","AvgGC","CS%"))
-    for (i in seq_len(nrow(gk_rows))) {
-      r <- gk_rows[i]
-      pk <- which(player_names == r$Player)[1]
-      avg_gc <- if (!is.null(pk) && !is.na(pk)) mean(mats$GK_GC[pk, ]) else 0
-      cs_pct <- if (!is.null(pk) && !is.na(pk)) mean(mats$CS[pk, ] == 1) * 100 else 0
-      cat(sprintf("  %-18s %5.1f | %5.2f %5.2f %5.1f%%\n",
-                  substr(r$Player, 1, 18), r$DKAvgFP,
-                  r$AvgSaves, avg_gc, cs_pct))
-    }
-  }
-  
-  elapsed <- round((proc.time()["elapsed"] - t0)[1], 1)
-  cat(sprintf("\n  Complete: %d players | %s sims | %.1fs (%.0f sims/sec)\n",
-              n_total, format(n_sims, big.mark=","), elapsed, n_sims/elapsed))
+  elapsed <- as.numeric(proc.time()["elapsed"]-t0)
+  cat(sprintf("\n  Complete: %d players | %s sims | %.1fs (%.0f sims/sec)\n", n_total, format(n_sims,big.mark=","), elapsed, n_sims/elapsed))
   cb("Complete", 1.0)
   
-  list(
-    sim_results   = sim_results,
-    metadata      = metadata,
-    sport_visuals = sport_visuals,
-    has_fd        = FALSE,
-    has_sd        = has_sd
-  )
+  list(sim_results=sim_results, metadata=metadata, dk_mat=dk_mat,
+       sport_visuals=list(player_means=pm, team_means=tm, scoreline_data=sl, games=games))
 }
 
-# ── LINEUP METRICS ───────────────────────────────────────────────────────────
+# ── LINEUP FUNCTIONS (unchanged from v2) ─────────────────────────────────────
 
-calculate_soccer_lineup_metrics <- function(scored_lineups, sim_results, metadata) {
-  scored_lineups
-}
-
-
-# ============================================================================
-# POSITION ASSIGNMENT — LATE-SWAP OPTIMIZED
-# Sorted by game_rank (earliest game first) so UTIL gets latest-game player
-# Slots: GK, D, D, M, M, F, F, UTIL
-# ============================================================================
+calculate_soccer_lineup_metrics <- function(scored_lineups, sim_results, metadata) { scored_lineups }
 
 assign_soccer_slots_dk <- function(cm) {
   setorder(cm, game_rank, Player)
-  slots <- list(F1=NA_character_, F2=NA_character_,
-                M1=NA_character_, M2=NA_character_,
-                D1=NA_character_, D2=NA_character_,
-                GK=NA_character_, UTIL=NA_character_)
-  
-  fill_slot <- function(player, pos) {
+  slots <- list(F1=NA_character_,F2=NA_character_,M1=NA_character_,M2=NA_character_,
+                D1=NA_character_,D2=NA_character_,GK=NA_character_,UTIL=NA_character_)
+  fill <- function(player, pos) {
     cands <- character(0)
-    if (grepl("GK|^G$", pos))                      cands <- c(cands, "GK")
-    if (grepl("^F$|^F/|F/M|F/UTIL|M/F", pos))     cands <- c(cands, "F1", "F2")
-    if (grepl("^M$|^M/|M/F|M/D|M/UTIL", pos))     cands <- c(cands, "M1", "M2")
-    if (grepl("^D$|^D/|D/UTIL", pos))              cands <- c(cands, "D1", "D2")
-    # Everything except GK can go to UTIL
-    if (!grepl("GK|^G$", pos)) cands <- c(unique(cands), "UTIL")
-    for (sl in cands) {
-      if (sl %in% names(slots) && is.na(slots[[sl]])) {
-        slots[[sl]] <<- player; return(TRUE)
-      }
-    }
+    if(grepl("GK",pos)) cands<-c(cands,"GK")
+    if(grepl("F",pos)&!grepl("FLEX",pos)) cands<-c(cands,"F1","F2")
+    if(grepl("M",pos)) cands<-c(cands,"M1","M2")
+    if(grepl("D",pos)&!grepl("GK",pos)) cands<-c(cands,"D1","D2")
+    if(!grepl("GK",pos)) cands<-c(unique(cands),"UTIL")
+    for(sl in cands) if(sl %in% names(slots) && is.na(slots[[sl]])) { slots[[sl]]<<-player; return(TRUE) }
     FALSE
   }
-  
-  for (idx in seq_len(nrow(cm))) {
-    if (!fill_slot(cm$Player[idx], cm$DKPos[idx])) return(NULL)
-  }
-  if (any(sapply(slots, is.na))) return(NULL)
-  slots
+  for(i in seq_len(nrow(cm))) if(!fill(cm$Player[i], cm$DKPos[i])) return(NULL)
+  if(any(sapply(slots, is.na))) return(NULL); slots
 }
-
-
-# ============================================================================
-# SOCCER DK CLASSIC OPTIMIZER (per-sim LP)
-# 8 players: GK, D, D, M, M, F, F, UTIL | $50K | 3+ teams | 2+ games
-# ============================================================================
 
 find_optimal_lineups_soccer <- function(sim_results, metadata, config, verbose=TRUE) {
-  if (verbose) cat("\nPhase 1: Soccer DK lineups (per-sim LP)...\n")
+  if(verbose) cat("\nPhase 1: Soccer DK lineups...\n")
   setDT(sim_results); setDT(metadata)
-  salary_cap  <- config$salary_cap
-  max_lineups <- config$max_lineups %||% 5000L
-  
-  meta <- unique(metadata[, .(Player, DKSalary, DKPos, Team, GameKey)], by = "Player")
-  # Position eligibility from DK roster position
-  meta[, gk_elig := as.integer(grepl("GK|^G$", DKPos))]
-  meta[, d_elig  := as.integer(grepl("D", DKPos) & !grepl("GK", DKPos))]
-  meta[, m_elig  := as.integer(grepl("M", DKPos))]
-  meta[, f_elig  := as.integer(grepl("F", DKPos) & !grepl("FLEX", DKPos))]
-  
-  # Game rank for late-swap assignment
-  if ("GameRank" %in% names(metadata)) {
-    meta <- merge(meta, unique(metadata[, .(Player, GameRank)]), by = "Player", all.x = TRUE)
-    meta[, game_rank := GameRank][is.na(game_rank), game_rank := 1L][, GameRank := NULL]
-  } else {
-    meta[, game_rank := 1L]
+  sc <- config$salary_cap; ml <- config$max_lineups %||% 5000L
+  meta <- unique(metadata[, .(Player,DKSalary,DKPos,Team,GameKey)], by="Player")
+  meta[, gk_elig := as.integer(grepl("GK",DKPos))]
+  meta[, d_elig := as.integer(grepl("D",DKPos)&!grepl("GK",DKPos))]
+  meta[, m_elig := as.integer(grepl("M",DKPos))]
+  meta[, f_elig := as.integer(grepl("F",DKPos)&!grepl("FLEX",DKPos))]
+  if("GameRank" %in% names(metadata)) meta<-merge(meta,unique(metadata[,.(Player,GameRank)]),by="Player",all.x=TRUE)
+  meta[, game_rank := fifelse(is.na(GameRank),1L,GameRank)][, GameRank := NULL]
+  od <- merge(sim_results[,.(SimID,Player,FP=DKScore)], meta[,.(Player,Sal=DKSalary,gk_elig,d_elig,m_elig,f_elig,game_rank,DKPos,Team,GameKey)], by="Player")
+  od <- od[Sal>0&!is.na(Sal)&!is.na(FP)]; setkey(od, SimID)
+  sids <- unique(od$SimID); ns <- length(sids)
+  if(verbose) cat(sprintf("  %d players | %s sims\n", nrow(meta), format(ns,big.mark=",")))
+  st <- Sys.time(); pf <- max(1L, ns%/%20L); ll <- vector("list", ns)
+  for(i in seq_along(sids)) {
+    sid<-sids[i]; pool<-od[.(sid)]; np<-nrow(pool); if(np<8L) next
+    gkp<-unique(pool$GameKey); gc<-if(length(gkp)>=2) lapply(gkp,function(g) as.integer(pool$GameKey==g)) else list()
+    tms<-unique(pool$Team); tc<-if(length(tms)>=3) lapply(tms,function(t) as.integer(pool$Team==t)) else list()
+    fc<-rbind(rep(1L,np),pool$Sal,pool$gk_elig,pool$d_elig,pool$m_elig,pool$f_elig,
+              if(length(gc)) do.call(rbind,gc) else matrix(nrow=0,ncol=np),
+              if(length(tc)) do.call(rbind,tc) else matrix(nrow=0,ncol=np))
+    fd<-c("==","<=","==",">=",">=",">=",rep("<=",length(gc)),rep("<=",length(tc)))
+    fr<-c(8L,sc,1L,2L,2L,2L,rep(7L,length(gc)),rep(5L,length(tc)))
+    sol<-tryCatch(lpSolve::lp("max",pool$FP,fc,fd,fr,all.bin=TRUE)$solution, error=function(e) NULL)
+    if(is.null(sol)||sum(sol)<8L) next; ch<-pool[sol==1]
+    if(length(unique(ch$Team))<3L) next
+    ll[[i]]<-data.table(Lineup=paste(sort(ch$Player),collapse="|"),TotalSalary=sum(ch$Sal),TotalScore=sum(ch$FP))
+    if(verbose&&i%%pf==0L) { cat(sprintf("\r  Phase 1: %d%%",round(i/ns*100))); flush.console() }
   }
-  
-  opt_data <- merge(sim_results[, .(SimID, Player, FantasyPoints = DKScore)],
-                    meta[, .(Player, Salary = DKSalary, gk_elig, d_elig, m_elig, f_elig,
-                             game_rank, DKPos, Team, GameKey)],
-                    by = "Player")
-  opt_data <- opt_data[Salary > 0 & !is.na(Salary) & !is.na(FantasyPoints)]
-  setkey(opt_data, SimID)
-  
-  sim_ids <- unique(opt_data$SimID); n_sims <- length(sim_ids)
-  if (verbose) cat(sprintf("  %d players | %s sims | $%s cap\n",
-                           nrow(meta), format(n_sims, big.mark = ","),
-                           format(salary_cap, big.mark = ",")))
-  
-  start_t <- Sys.time(); prog_freq <- max(1L, n_sims %/% 20L)
-  lineup_list <- vector("list", n_sims)
-  
-  for (i in seq_along(sim_ids)) {
-    sid <- sim_ids[i]; pool <- opt_data[.(sid)]; n_p <- nrow(pool)
-    if (n_p < 8L) next
-    
-    # Game constraints (max 7 from any game → forces 2+ games)
-    gkp <- unique(pool$GameKey)
-    gc <- if (length(gkp) >= 2L) lapply(gkp, function(gk) as.integer(pool$GameKey == gk)) else list()
-    
-    # Team constraints (max 5 from any team → helps force 3+ teams)
-    teams <- unique(pool$Team)
-    tc <- if (length(teams) >= 3L) lapply(teams, function(t) as.integer(pool$Team == t)) else list()
-    
-    f_con <- rbind(
-      rep(1L, n_p),           # total players
-      pool$Salary,            # salary
-      pool$gk_elig,           # GK
-      pool$d_elig,            # D
-      pool$m_elig,            # M
-      pool$f_elig,            # F
-      if (length(gc)) do.call(rbind, gc) else matrix(nrow = 0, ncol = n_p),
-      if (length(tc)) do.call(rbind, tc) else matrix(nrow = 0, ncol = n_p)
-    )
-    
-    f_dir <- c("==", "<=", "==", ">=", ">=", ">=",
-               rep("<=", length(gc)),
-               rep("<=", length(tc)))
-    f_rhs <- c(8L, salary_cap, 1L, 2L, 2L, 2L,
-               rep(7L, length(gc)),
-               rep(5L, length(tc)))
-    
-    sol <- tryCatch(
-      lp("max", pool$FantasyPoints, f_con, f_dir, f_rhs, all.bin = TRUE)$solution,
-      error = function(e) NULL
-    )
-    if (is.null(sol) || sum(sol) < 8L) next
-    
-    chosen <- pool[sol == 1]
-    # Verify 3+ teams
-    if (length(unique(chosen$Team)) < 3L) next
-    
-    sig <- paste(sort(chosen$Player), collapse = "|")
-    lineup_list[[i]] <- data.table(Lineup = sig, TotalSalary = sum(chosen$Salary),
-                                   TotalScore = sum(chosen$FantasyPoints))
-    
-    if (verbose && i %% prog_freq == 0L) {
-      cat(sprintf("\r  Phase 1: %d%% | %.1fs", round(i / n_sims * 100),
-                  as.numeric(difftime(Sys.time(), start_t, units = "secs"))))
-      flush.console()
-    }
-  }
-  if (verbose) cat("\n")
-  
-  valid <- lineup_list[!sapply(lineup_list, is.null)]
-  if (!length(valid)) stop("No valid Soccer DK lineups found.")
-  all_dt <- rbindlist(valid)
-  
-  counts <- all_dt[, .(Top1Count = .N, TotalSalary = TotalSalary[1],
-                       AvgScore = mean(TotalScore)), by = Lineup]
-  counts[, rand := runif(.N)]; setorder(counts, -Top1Count, rand); counts[, rand := NULL]
-  
-  # Assign slots with late-swap optimization
-  slot_list <- vector("list", nrow(counts))
-  for (li in seq_len(nrow(counts))) {
-    players <- strsplit(counts$Lineup[li], "\\|")[[1]]
-    cm <- meta[Player %in% players, .(Player, DKPos, game_rank)]
-    slots <- assign_soccer_slots_dk(cm)
-    if (!is.null(slots))
-      slot_list[[li]] <- as.data.table(c(list(Lineup = counts$Lineup[li]), slots))
-  }
-  
-  slot_dt <- rbindlist(slot_list[!sapply(slot_list, is.null)])
-  counts <- merge(counts, slot_dt, by = "Lineup", all.x = TRUE)
-  
-  unique_lineups <- counts[!is.na(F1), .(
-    TotalSalary, Top1Count, AvgScore,
-    Player1 = F1, Player2 = F2,
-    Player3 = M1, Player4 = M2,
-    Player5 = D1, Player6 = D2,
-    Player7 = GK, Player8 = UTIL
-  )]
-  if (nrow(unique_lineups) > max_lineups) unique_lineups <- unique_lineups[1:max_lineups]
-  
-  elapsed <- as.numeric(difftime(Sys.time(), start_t, units = "secs"))
-  if (verbose) cat(sprintf("  ✓ %s DK lineups | %.1fs\n",
-                           format(nrow(unique_lineups), big.mark = ","), elapsed))
-  
-  list(unique_lineups = unique_lineups, n_sims = n_sims, config = config, mode = "soccer_dk")
+  if(verbose) cat("\n")
+  valid<-ll[!sapply(ll,is.null)]; if(!length(valid)) stop("No valid lineups.")
+  ad<-rbindlist(valid); ct<-ad[,.(Top1Count=.N,TotalSalary=TotalSalary[1],AvgScore=mean(TotalScore)),by=Lineup]
+  ct[,rand:=runif(.N)]; setorder(ct,-Top1Count,rand); ct[,rand:=NULL]
+  sl2<-vector("list",nrow(ct))
+  for(li in seq_len(nrow(ct))) { ps<-strsplit(ct$Lineup[li],"\\|")[[1]]; cm<-meta[Player%in%ps,.(Player,DKPos,game_rank)]
+  s<-assign_soccer_slots_dk(cm); if(!is.null(s)) sl2[[li]]<-as.data.table(c(list(Lineup=ct$Lineup[li]),s)) }
+  sd2<-rbindlist(sl2[!sapply(sl2,is.null)]); ct<-merge(ct,sd2,by="Lineup",all.x=TRUE)
+  ul<-ct[!is.na(F1),.(TotalSalary,Top1Count,AvgScore,Player1=F1,Player2=F2,Player3=M1,Player4=M2,Player5=D1,Player6=D2,Player7=GK,Player8=UTIL)]
+  if(nrow(ul)>ml) ul<-ul[1:ml]
+  el<-as.numeric(difftime(Sys.time(),st,units="secs"))
+  if(verbose) cat(sprintf("  Done: %s lineups | %.1fs\n", format(nrow(ul),big.mark=","), el))
+  list(unique_lineups=ul, n_sims=ns, config=config, mode="soccer_dk")
 }
 
-
-# ============================================================================
-# SOCCER SHOWDOWN OPTIMIZER
-# CPT x1.5 + 5 FLEX | $50K | both teams required
-# ============================================================================
-
 find_optimal_lineups_soccer_sd <- function(sim_results, metadata, config, verbose=TRUE) {
-  if (verbose) cat("\nPhase 1: Soccer Showdown lineups...\n")
+  if(verbose) cat("\nPhase 1: Soccer SD lineups...\n")
   setDT(sim_results); setDT(metadata)
-  salary_cap  <- config$salary_cap
-  max_lineups <- config$max_lineups %||% 5000L
-  cpt_mult    <- 1.5
-  
-  meta <- unique(metadata[!is.na(CPTSalary) & CPTSalary > 0 & !is.na(SDSalary) & SDSalary > 0,
-                          .(Player, Team, CPTSalary, SDSalary, GameKey)], by = "Player")
-  if (!nrow(meta)) stop("No SD-eligible players. Check CPTSalary/SDSalary columns.")
-  
-  np       <- nrow(meta)
-  players  <- meta$Player
-  cpt_sals <- as.numeric(meta$CPTSalary)
-  sd_sals  <- as.numeric(meta$SDSalary)
-  team_ids <- as.integer(factor(meta$Team))
-  
-  # Build player x sim score matrix
-  opt <- merge(sim_results[, .(SimID, Player, DKScore)], meta[, .(Player)], by = "Player")
-  opt <- opt[!is.na(DKScore)]
-  sim_ids <- sort(unique(opt$SimID)); ns <- length(sim_ids)
-  p_map   <- match(opt$Player, players)
-  s_map   <- match(opt$SimID, sim_ids)
-  score_mat <- matrix(0, np, ns)
-  score_mat[cbind(p_map, s_map)] <- opt$DKScore
-  
-  if (verbose) cat(sprintf("  %d players | %s sims | $%s cap\n",
-                           np, format(ns, big.mark=","), format(salary_cap, big.mark=",")))
-  start_t <- Sys.time()
-  
-  # Pre-compute rank order per sim (descending score)
-  rank_order <- apply(score_mat, 2, order, decreasing = TRUE)
-  
-  # Track best lineup per sim using pre-allocated arrays (no lists)
-  best_scores <- rep(-Inf, ns)
-  best_cpt    <- integer(ns)
-  best_flex   <- matrix(0L, 5, ns)
-  best_sal    <- numeric(ns)
-  
-  # Try CPT candidates in order of avg CPT score
-  cpt_order <- order(-rowMeans(score_mat))
-  n_cpt_try <- min(np, 12L)
-  
-  for (ci in seq_len(n_cpt_try)) {
-    cx <- cpt_order[ci]
-    if (cpt_sals[cx] > salary_cap) next
-    rem_cap <- salary_cap - cpt_sals[cx]
-    cpt_tid <- team_ids[cx]
-    cpt_sc  <- score_mat[cx, ] * cpt_mult
-    
-    # Upper bound pruning: skip sims where this CPT can't beat current best
-    # Approximate top 5 non-CPT scores (ignoring salary)
-    top5_ub <- numeric(ns)
-    for (s in seq_len(ns)) {
-      cnt <- 0L; sm <- 0
-      for (ri in seq_len(np)) {
-        pi <- rank_order[ri, s]
-        if (pi == cx) next
-        cnt <- cnt + 1L; sm <- sm + score_mat[pi, s]
-        if (cnt == 5L) break
-      }
-      top5_ub[s] <- sm
-    }
-    cand <- which(cpt_sc + top5_ub > best_scores)
-    if (!length(cand)) next
-    
-    if (verbose && ci %% 3 == 0) {
-      cat(sprintf("\r  CPT %d/%d (%s) | %d candidate sims...",
-                  ci, n_cpt_try, substr(players[cx],1,15), length(cand)))
-      flush.console()
-    }
-    
-    for (s in cand) {
-      ranked <- rank_order[, s]
-      flex_sal <- 0; flex_score <- 0; n_pk <- 0L
-      flex_idx <- integer(5)
-      has_other_team <- FALSE
-      
-      for (ri in seq_len(np)) {
-        if (n_pk == 5L) break
-        pi <- ranked[ri]
-        if (pi == cx) next
-        if (flex_sal + sd_sals[pi] > rem_cap) next
-        n_pk <- n_pk + 1L
-        flex_idx[n_pk] <- pi
-        flex_sal <- flex_sal + sd_sals[pi]
-        flex_score <- flex_score + score_mat[pi, s]
-        if (team_ids[pi] != cpt_tid) has_other_team <- TRUE
-      }
-      if (n_pk < 5L || !has_other_team) next
-      
-      total <- cpt_sc[s] + flex_score
-      if (total > best_scores[s]) {
-        best_scores[s] <- total
-        best_cpt[s]    <- cx
-        best_flex[, s] <- flex_idx
-        best_sal[s]    <- cpt_sals[cx] + flex_sal
-      }
+  sc<-config$salary_cap; ml<-config$max_lineups%||%5000L; cm<-1.5
+  meta<-unique(metadata[!is.na(CPTSalary)&CPTSalary>0&!is.na(SDSalary)&SDSalary>0,.(Player,Team,CPTSalary,SDSalary,GameKey)],by="Player")
+  if(!nrow(meta)) stop("No SD players.")
+  np<-nrow(meta); pl<-meta$Player; cs<-as.numeric(meta$CPTSalary); ss<-as.numeric(meta$SDSalary); tid<-as.integer(factor(meta$Team))
+  opt<-merge(sim_results[,.(SimID,Player,DKScore)],meta[,.(Player)],by="Player"); opt<-opt[!is.na(DKScore)]
+  sids<-sort(unique(opt$SimID)); ns<-length(sids)
+  sm<-matrix(0,np,ns); sm[cbind(match(opt$Player,pl),match(opt$SimID,sids))]<-opt$DKScore
+  if(verbose) cat(sprintf("  %d players | %s sims\n",np,format(ns,big.mark=",")))
+  st<-Sys.time(); ro<-apply(sm,2,order,decreasing=TRUE)
+  bs<-rep(-Inf,ns); bc<-integer(ns); bf<-matrix(0L,5,ns); bsal<-numeric(ns)
+  co<-order(-rowMeans(sm))
+  for(ci in seq_len(min(np,12L))) {
+    cx<-co[ci]; if(cs[cx]>sc) next; rc<-sc-cs[cx]; ctid<-tid[cx]; csc<-sm[cx,]*cm
+    for(s in seq_len(ns)) {
+      rk<-ro[,s]; fsal<-0;fsc<-0;npk<-0L;fi<-integer(5);ho<-FALSE
+      for(ri in seq_len(np)) { if(npk==5L) break; pi<-rk[ri]; if(pi==cx) next; if(fsal+ss[pi]>rc) next
+      npk<-npk+1L; fi[npk]<-pi; fsal<-fsal+ss[pi]; fsc<-fsc+sm[pi,s]; if(tid[pi]!=ctid) ho<-TRUE }
+      if(npk<5L||!ho) next; tot<-csc[s]+fsc
+      if(tot>bs[s]) { bs[s]<-tot; bc[s]<-cx; bf[,s]<-fi; bsal[s]<-cs[cx]+fsal }
     }
   }
-  if (verbose) cat("\n")
-  
-  # Build output from pre-allocated arrays
-  valid <- which(best_cpt > 0)
-  if (!length(valid)) stop("No valid Soccer SD lineups found.")
-  
-  lineup_strs <- character(length(valid))
-  cpt_names <- character(length(valid))
-  u1 <- u2 <- u3 <- u4 <- u5 <- character(length(valid))
-  for (vi in seq_along(valid)) {
-    s <- valid[vi]
-    fp <- sort(players[best_flex[, s]])
-    cpt_names[vi] <- players[best_cpt[s]]
-    lineup_strs[vi] <- paste(c(cpt_names[vi], fp), collapse = "|")
-    u1[vi] <- fp[1]; u2[vi] <- fp[2]; u3[vi] <- fp[3]
-    u4[vi] <- fp[4]; u5[vi] <- fp[5]
-  }
-  
-  all_dt <- data.table(Lineup = lineup_strs, TotalSalary = best_sal[valid],
-                       TotalScore = best_scores[valid], Captain = cpt_names,
-                       Util1 = u1, Util2 = u2, Util3 = u3, Util4 = u4, Util5 = u5)
-  
-  counts <- all_dt[, .(Top1Count = .N, TotalSalary = TotalSalary[1],
-                       AvgScore = mean(TotalScore),
-                       Captain = Captain[1], Util1 = Util1[1], Util2 = Util2[1],
-                       Util3 = Util3[1], Util4 = Util4[1], Util5 = Util5[1]),
-                   by = Lineup]
-  counts[, rand := runif(.N)]; setorder(counts, -Top1Count, rand); counts[, rand := NULL]
-  if (nrow(counts) > max_lineups) counts <- counts[1:max_lineups]
-  
-  unique_lineups <- counts[, .(TotalSalary, Top1Count, AvgScore,
-                               Captain, Util1, Util2, Util3, Util4, Util5)]
-  elapsed <- as.numeric(difftime(Sys.time(), start_t, units = "secs"))
-  if (verbose) cat(sprintf("  \u2713 %s SD lineups | %.1fs\n",
-                           format(nrow(unique_lineups), big.mark = ","), elapsed))
-  
-  list(unique_lineups = unique_lineups, n_sims = ns, config = config, mode = "captain")
+  valid<-which(bc>0); if(!length(valid)) stop("No valid SD lineups.")
+  lu<-cn<-u1<-u2<-u3<-u4<-u5<-character(length(valid))
+  for(vi in seq_along(valid)) { s<-valid[vi]; fp<-sort(pl[bf[,s]]); cn[vi]<-pl[bc[s]]
+  lu[vi]<-paste(c(cn[vi],fp),collapse="|"); u1[vi]<-fp[1];u2[vi]<-fp[2];u3[vi]<-fp[3];u4[vi]<-fp[4];u5[vi]<-fp[5] }
+  ad<-data.table(Lineup=lu,TotalSalary=bsal[valid],TotalScore=bs[valid],Captain=cn,Util1=u1,Util2=u2,Util3=u3,Util4=u4,Util5=u5)
+  ct<-ad[,.(Top1Count=.N,TotalSalary=TotalSalary[1],AvgScore=mean(TotalScore),Captain=Captain[1],Util1=Util1[1],Util2=Util2[1],Util3=Util3[1],Util4=Util4[1],Util5=Util5[1]),by=Lineup]
+  ct[,rand:=runif(.N)]; setorder(ct,-Top1Count,rand); ct[,rand:=NULL]
+  if(nrow(ct)>ml) ct<-ct[1:ml]
+  ul<-ct[,.(TotalSalary,Top1Count,AvgScore,Captain,Util1,Util2,Util3,Util4,Util5)]
+  el<-as.numeric(difftime(Sys.time(),st,units="secs"))
+  if(verbose) cat(sprintf("  Done: %s SD lineups | %.1fs\n",format(nrow(ul),big.mark=","),el))
+  list(unique_lineups=ul, n_sims=ns, config=config, mode="captain")
 }
