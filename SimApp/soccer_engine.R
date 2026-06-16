@@ -151,7 +151,8 @@ read_soccer_input <- function(file_path) {
   
   cat(sprintf("Soccer: %d players | %d games | %d SD tabs\n", nrow(pl), nrow(gm), length(sd_tabs)))
   list(Players=pl, Games=gm, IDs=data$IDs, sd_tabs=sd_tabs, games=gm,
-       distributions=distributions, wc_bootstrap=wc_bootstrap, all_sheets=data)
+       distributions=distributions, wc_bootstrap=wc_bootstrap, all_sheets=data,
+       has_sd = length(sd_tabs) > 0)
 }
 
 
@@ -198,6 +199,12 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
       }; has_sd <- TRUE
     }
     if(has_sd) cat("  SD merged\n")
+    # SD diagnostic
+    cat(sprintf("  SD tabs: %d | has_sd=%s\n", length(input_data$sd_tabs), has_sd))
+    for(sdn in names(input_data$sd_tabs)) {
+      sd_dt <- as.data.table(input_data$sd_tabs[[sdn]])
+      cat(sprintf("    %s: %d rows | cols: %s\n", sdn, nrow(sd_dt), paste(head(names(sd_dt),6), collapse=", ")))
+    }
   }
   
   n_games <- nrow(games); all_players_list <- copy(players); n_total <- nrow(all_players_list)
@@ -570,6 +577,8 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
     sd_dt<-as.data.table(input_data$sd_tabs[[sdn]]); tc<-intersect(c("Team","TeamAbbrev"),names(sd_dt))[1]
     if(!is.na(tc)) { st<-unique(sd_dt[[tc]]); metadata[Team %in% st & ShowdownFile=="", ShowdownFile := sdn] }
   }
+  cat(sprintf("  ShowdownFile on games: %s\n", paste(games$ShowdownFile, collapse=", ")))
+  cat(sprintf("  ShowdownFile on metadata: %d with SD\n", sum(metadata$ShowdownFile != "")))
   
   # ── VISUALS ──
   cb("Building visualizations...", 0.95)
@@ -597,7 +606,8 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
   cb("Complete", 1.0)
   
   list(sim_results=sim_results, metadata=metadata, dk_mat=dk_mat,
-       sport_visuals=list(player_means=pm, team_means=tm, scoreline_data=sl, games=games))
+       sport_visuals=list(player_means=pm, team_means=tm, scoreline_data=sl, games=games),
+       has_sd=has_sd)
 }
 
 # ── LINEUP FUNCTIONS (unchanged from v2) ─────────────────────────────────────
@@ -649,7 +659,8 @@ find_optimal_lineups_soccer <- function(sim_results, metadata, config, verbose=T
     fr<-c(8L,sc,1L,2L,2L,2L,rep(7L,length(gc)),rep(5L,length(tc)))
     sol<-tryCatch(lpSolve::lp("max",pool$FP,fc,fd,fr,all.bin=TRUE)$solution, error=function(e) NULL)
     if(is.null(sol)||sum(sol)<8L) next; ch<-pool[sol==1]
-    if(length(unique(ch$Team))<3L) next
+    n_slate_teams <- length(unique(meta$Team))
+    if(n_slate_teams >= 3 && length(unique(ch$Team))<3L) next
     ll[[i]]<-data.table(Lineup=paste(sort(ch$Player),collapse="|"),TotalSalary=sum(ch$Sal),TotalScore=sum(ch$FP))
     if(verbose&&i%%pf==0L) { cat(sprintf("\r  Phase 1: %d%%",round(i/ns*100))); flush.console() }
   }
