@@ -7,6 +7,7 @@
 # ============================================================================
 
 library(data.table)
+if(!requireNamespace("openxlsx", quietly=TRUE)) install.packages("openxlsx", repos="https://cloud.r-project.org")
 library(openxlsx)
 
 SOCCER_P <- list(
