@@ -525,8 +525,19 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
     
     # ── CROSS-REFERENCE: GK saves + Fouls drawn ──
     gd <- game_info[[gi]]
-    if(length(gd$home_gk) && !is.null(gd$away_t_sot)) { pk<-gd$home_pidx[gd$home_gk[1]]; mats$GK_Saves[pk,]<-pmax(gd$away_t_sot-gd$ag, 0); mats$GK_GC[pk,]<-gd$ag }
-    if(length(gd$away_gk) && !is.null(gd$home_t_sot)) { pk<-gd$away_pidx[gd$away_gk[1]]; mats$GK_Saves[pk,]<-pmax(gd$home_t_sot-gd$hg, 0); mats$GK_GC[pk,]<-gd$hg }
+    # Compute saves from ACTUAL allocated SOT (after SOT ≤ Shots constraint)
+    if(length(gd$home_gk) && !is.null(gd$away_pidx)) {
+      pk <- gd$home_pidx[gd$home_gk[1]]
+      actual_away_sot <- colSums(mats$SOT[gd$away_pidx, , drop=FALSE])
+      mats$GK_Saves[pk,] <- pmax(actual_away_sot - gd$ag, 0)
+      mats$GK_GC[pk,] <- gd$ag
+    }
+    if(length(gd$away_gk) && !is.null(gd$home_pidx)) {
+      pk <- gd$away_pidx[gd$away_gk[1]]
+      actual_home_sot <- colSums(mats$SOT[gd$home_pidx, , drop=FALSE])
+      mats$GK_Saves[pk,] <- pmax(actual_home_sot - gd$hg, 0)
+      mats$GK_GC[pk,] <- gd$hg
+    }
     
     # FD: your fouls drawn = opponent's fouls committed
     if(!is.null(gd$away_t_fouls)&&!is.null(gd$home_fd_share)) {
