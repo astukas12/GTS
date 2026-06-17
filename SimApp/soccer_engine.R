@@ -56,9 +56,9 @@ SOCCER_P <- list(
   tempo_sd = 0.15,
   
   # Position weights (from Big 5 player data)
-  cross_wt = c(F=0.60, W=2.50, AM=1.00, CM=0.70, DM=0.40, WB=5.00, CB=0.15, GK=0.00),
-  int_wt   = c(F=0.15, W=0.20, AM=0.25, CM=0.55, DM=0.80, WB=0.45, CB=0.70, GK=0.00),
-  pass_wt  = c(F=17,   W=22,   AM=28,   CM=42,   DM=45,   WB=38,   CB=48,   GK=26)
+  cross_wt = c(F=0.60, W=2.50, AM=1.00, CM=0.70, DM=0.40, WB=6.00, FB=2.50, CB=0.15, GK=0.00),
+  int_wt   = c(F=0.15, W=0.20, AM=0.25, CM=0.55, DM=0.80, WB=0.45, FB=0.55, CB=0.70, GK=0.00),
+  pass_wt  = c(F=17,   W=22,   AM=28,   CM=42,   DM=45,   WB=38,   FB=35,   CB=48,   GK=26)
 )
 
 
@@ -243,7 +243,6 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
   mats <- setNames(lapply(stat_names, function(s) matrix(0, n_total, n_sims)), stat_names)
   
   cb("Simulating matches...", 0.08)
-  player_offset <- 0L
   
   for(gi in seq_len(n_games)) {
     gd <- game_info[[gi]]; pct_base <- 0.08 + (gi-1)/n_games*0.72
@@ -259,7 +258,15 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
       n_p <- nrow(pl); if(n_p==0) next
       team_goals <- if(side=="home") gd$hg else gd$ag
       opp_goals  <- if(side=="home") gd$ag else gd$hg
-      pidx <- (player_offset+1):(player_offset+n_p)
+      
+      # Get actual row indices in all_players_list
+      tn <- if(side=="home") gd$game$Home else gd$game$Away
+      opp_tn <- if(side=="home") gd$game$Away else gd$game$Home
+      pidx <- which(all_players_list$Team == tn & all_players_list$Opp == opp_tn)
+      if(length(pidx) != n_p) {
+        cat(sprintf("  WARNING: pidx mismatch for %s: expected %d, got %d\n", tn, n_p, length(pidx)))
+        next
+      }
       
       # Minutes: fixed from input
       mins <- pl$MIN; ms <- mins/90
@@ -270,7 +277,6 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
       opp_gi <- pmin(opp_goals,4L)+1L
       
       # Market PMF lookup keys
-      tn <- if(side=="home") gd$game$Home else gd$game$Away
       gk1 <- paste0(gd$game$Home,"vs",gd$game$Away); gk2 <- paste0(gd$game$Away,"vs",gd$game$Home)
       get_pmf <- function(stat) {
         p <- market_dists[[paste(gk1,tn,stat,sep="|")]]
@@ -341,18 +347,23 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
       } else { t_fouls <- rnb(n_sims, 12.5, SOCCER_P$phi_fouls) }
       t_fouls <- pmax(t_fouls, 2L); t_fouls <- pmin(t_fouls, 25L)
       
-      # ── TEAM CORNERS → CROSSES (linear model from WC data) ──
+      # ── TEAM CORNERS → CROSSES (team style × corner activity) ──
       crp <- get_pmf("Corners")
+      corner_mu <- if(side=="home" && "Home_Corners" %in% names(gd$game)) gd$game$Home_Corners
+      else if(side=="away" && "Away_Corners" %in% names(gd$game)) gd$game$Away_Corners
+      else 4.5
       if(!is.null(crp)) {
         t_corners <- as.integer(sample(crp$k, n_sims, replace=TRUE, prob=crp$prob))
       } else {
-        corner_mu <- if(side=="home" && "Home_Corners" %in% names(gd$game)) gd$game$Home_Corners
-        else if(side=="away" && "Away_Corners" %in% names(gd$game)) gd$game$Away_Corners
-        else 4.5
         t_corners <- rnb(n_sims, corner_mu, 7.5)
       }
-      # Linear model: crosses ≈ 9.5 + 2.0 × corners (from WC data, r=0.694)
-      t_crosses <- as.integer(round(9.5 + 2.0*t_corners + rnorm(n_sims, 0, 4)))
+      # Team cross base from player data (sum of starters' crosses_p90)
+      cross_base <- if(side=="home" && "Home_Cross_Base" %in% names(gd$game)) gd$game$Home_Cross_Base
+      else if(side=="away" && "Away_Cross_Base" %in% names(gd$game)) gd$game$Away_Cross_Base
+      else 18.3  # WC average fallback
+      # Scale by corner activity: more corners → more crosses
+      corner_ratio <- t_corners / pmax(corner_mu, 1)
+      t_crosses <- as.integer(round(cross_base * corner_ratio + rnorm(n_sims, 0, 3)))
       t_crosses <- pmax(t_crosses, SOCCER_P$team_min_crosses)
       t_crosses <- pmin(t_crosses, SOCCER_P$team_max_crosses)
       
@@ -431,11 +442,15 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
       # Shots
       raw <- matrix(rnb(n_p*n_sims, rep(ss*mean(t_shots), n_sims), SOCCER_P$phi_shots), n_p, n_sims)
       mats$Shots[pidx,] <- pmin(norm_to_total(raw, t_shots, n_p), 12L)
+      # Goals count as shots — ensure Shots >= Goals
+      mats$Shots[pidx,] <- pmax(mats$Shots[pidx,], goals_m)
       
       # SOT (saved = SOT - goals, allocate saved by SOT share, add goals back)
       saved <- pmax(t_sot - colSums(goals_m), 0)
       raw_sot <- matrix(rnb(n_p*n_sims, rep(sots*mean(saved), n_sims), SOCCER_P$phi_shots), n_p, n_sims)
       mats$SOT[pidx,] <- goals_m + norm_to_total(raw_sot, saved, n_p)
+      # Constrain: player SOT cannot exceed player Shots
+      mats$SOT[pidx,] <- pmin(mats$SOT[pidx,], mats$Shots[pidx,])
       
       # CC (allocate by assist share)
       raw_cc <- matrix(rnb(n_p*n_sims, rep(as_s*mean(t_cc), n_sims), SOCCER_P$phi_def), n_p, n_sims)
@@ -490,7 +505,6 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
         game_info[[gi]]$away_gk <- which(grepl("GK", pl$DK_RosterPos) & mins >= 60)
         game_info[[gi]]$away_fd_share <- get_share("FD_Share")
       }
-      player_offset <- player_offset + n_p
     }
     
     # ── CROSS-REFERENCE: GK saves + Fouls drawn ──
