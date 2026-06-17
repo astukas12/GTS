@@ -35,6 +35,11 @@ SOCCER_P <- list(
   p_second_yc = 0.018, p_straight_red = 0.0026,
   p_assist = 0.709,
   
+  # Tail sharpness (Dirichlet-Multinomial for goals)
+  alpha_goals = 5.0,  # lower = lumpier, more multi-goal games for elite players
+  # Stat correlation: players who score get boosted shot/SOT/CC in same sim
+  scorer_corr = 0.4,  # 40% boost per goal to other attacking stats
+  
   # YC frustration by opp goals (indexed opp_goals+1)
   # Conceded 0:1.38, 1:1.58, 2:2.13, 3:2.62 → relative to mean 1.77
   yc_frustration = c(0.78, 0.89, 1.20, 1.48, 1.48, 1.48),
@@ -416,11 +421,15 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
         }
       }
       
-      # Goals (multinomial per sim)
+      # Goals (Dirichlet-Multinomial: varies shares per sim for fatter tails)
       goals_m <- matrix(0L, n_p, n_sims)
       for(s in seq_len(n_sims)) {
         tg <- team_goals[s]; if(tg==0) next
-        goals_m[,s] <- rmultinom(1, size=tg, prob=gs)[,1]
+        # Dirichlet variation: some sims Mbappe's share is 0.50, others 0.20, avg 0.35
+        gs_sim <- rgamma(n_p, shape = SOCCER_P$alpha_goals * gs)
+        gs_sim[gs_sim < 1e-10] <- 1e-10
+        gs_sim <- gs_sim / sum(gs_sim)
+        goals_m[,s] <- rmultinom(1, size=tg, prob=gs_sim)[,1]
       }
       mats$Goals[pidx,] <- goals_m
       
@@ -440,21 +449,27 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
       }
       mats$Assists[pidx,] <- ast_m
       
-      # Shots
-      raw <- matrix(rnb(n_p*n_sims, rep(ss*mean(t_shots), n_sims), SOCCER_P$phi_shots), n_p, n_sims)
-      mats$Shots[pidx,] <- pmin(norm_to_total(raw, t_shots, n_p), 12L)
-      # Goals count as shots — ensure Shots >= Goals
-      mats$Shots[pidx,] <- pmax(mats$Shots[pidx,], goals_m)
+      # Scorer correlation: players who scored get boosted attacking stats this sim
+      scorer_boost <- 1 + SOCCER_P$scorer_corr * goals_m
       
-      # SOT (saved = SOT - goals, allocate saved by SOT share, add goals back)
-      saved <- pmax(t_sot - colSums(goals_m), 0)
-      raw_sot <- matrix(rnb(n_p*n_sims, rep(sots*mean(saved), n_sims), SOCCER_P$phi_shots), n_p, n_sims)
-      mats$SOT[pidx,] <- goals_m + norm_to_total(raw_sot, saved, n_p)
-      # Constrain: player SOT cannot exceed player Shots
+      # Shots: goals are shots. Allocate EXTRA non-goal shots on top.
+      extra_shots <- pmax(t_shots - colSums(goals_m), 0)
+      raw <- matrix(rnb(n_p*n_sims, rep(ss*mean(extra_shots), n_sims), SOCCER_P$phi_shots), n_p, n_sims)
+      raw <- raw * scorer_boost
+      mats$Shots[pidx,] <- goals_m + pmin(norm_to_total(raw, extra_shots, n_p), 10L)
+      
+      # SOT: goals are SOT. Allocate EXTRA saved-SOT on top.
+      extra_sot <- pmax(t_sot - colSums(goals_m), 0)
+      raw_sot <- matrix(rnb(n_p*n_sims, rep(sots*mean(extra_sot), n_sims), SOCCER_P$phi_shots), n_p, n_sims)
+      raw_sot <- raw_sot * scorer_boost
+      mats$SOT[pidx,] <- goals_m + norm_to_total(raw_sot, extra_sot, n_p)
+      # Constrain: SOT cannot exceed Shots
       mats$SOT[pidx,] <- pmin(mats$SOT[pidx,], mats$Shots[pidx,])
       
-      # CC (allocate by assist share)
+      # CC (allocate by assist share, boosted for scorers/assisters)
       raw_cc <- matrix(rnb(n_p*n_sims, rep(as_s*mean(t_cc), n_sims), SOCCER_P$phi_def), n_p, n_sims)
+      assist_boost <- 1 + SOCCER_P$scorer_corr * ast_m  # assisters also get CC boost
+      raw_cc <- raw_cc * pmax(scorer_boost, assist_boost)
       mats$CC[pidx,] <- pmin(norm_to_total(raw_cc, t_cc, n_p), 8L)
       
       # Crosses
