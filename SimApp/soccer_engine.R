@@ -549,7 +549,7 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
   cb("Building results...", 0.88)
   sim_results <- data.table(
     SimID=rep(seq_len(n_sims), each=n_total), Player=rep(all_players_list$Player, n_sims),
-    Team=rep(all_players_list$Team, n_sims), Pos=rep(all_players_list$Pos, n_sims),
+    Team=rep(all_players_list$Team, n_sims), Pos=rep(all_players_list$DK_RosterPos, n_sims),
     DKScore=as.vector(dk_mat),
     Goals=as.vector(mats$Goals), Assists=as.vector(mats$Assists),
     Shots=as.vector(mats$Shots), SOT=as.vector(mats$SOT), CC=as.vector(mats$CC),
@@ -567,7 +567,7 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
   avail <- intersect(mc, names(all_players_list))
   metadata <- unique(all_players_list[, ..avail], by="Player")
   setnames(metadata, c("DK_Salary","DK_ID"), c("DKSalary","DKID"), skip_absent=TRUE)
-  metadata[, DKOwn := 0]; metadata[, PosGroup := Pos]
+  metadata[, DKOwn := 0]; metadata[, PosGroup := DK_RosterPos]
   metadata[, DKPos := if("DK_RosterPos" %in% names(.SD)) DK_RosterPos else Pos, .SDcols=names(metadata)]
   metadata[, GameKey := { r<-games[Home==Team|Away==Team]; if(nrow(r)) r$Game[1] else paste0(Team," vs ",Opp) }, by=Player]
   grm <- data.table(Th=games$Home, Ta=games$Away, rk=seq_len(nrow(games)))
@@ -581,7 +581,7 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
   # ── VISUALS ──
   cb("Building visualizations...", 0.95)
   pm <- data.table(Player=all_players_list$Player, Team=all_players_list$Team,
-                   Pos=all_players_list$Pos, Salary=all_players_list$DK_Salary,
+                   Pos=all_players_list$DK_RosterPos, Salary=all_players_list$DK_Salary,
                    DKAvgFP=round(rowMeans(dk_mat),2), SDFP=round(apply(dk_mat,1,sd),2),
                    P10=round(apply(dk_mat,1,quantile,0.10),2), P50=round(apply(dk_mat,1,quantile,0.50),2),
                    P90=round(apply(dk_mat,1,quantile,0.90),2), Ceiling=round(apply(dk_mat,1,quantile,0.99),2),

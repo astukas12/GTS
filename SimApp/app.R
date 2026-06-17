@@ -621,15 +621,27 @@ server <- function(input, output, session) {
         rv$has_dk <- TRUE
         rv$has_fd <- all(c("FDSalary", "FDID", "FDName") %in% driver_cols)
       } else {
-        # Detect platforms from Fights sheet columns
-        fights_cols <- tryCatch(
-          names(readxl::read_excel(input$input_file$datapath, sheet="Fights", n_max=1)),
-          error = function(e) character(0)
-        )
-        rv$has_dk <- any(c("DKSalary","DKID") %in% fights_cols)
-        rv$has_fd <- any(c("FDSalary","FDID") %in% fights_cols)
-        rv$has_sd <- any(c("SDSal","SDID","CPTID") %in% fights_cols)
+        # Detect platforms by scanning all sheets for platform columns.
+        # (MMA uses a "Fights" sheet, Tennis/others use "Player" - don't hardcode.)
+        all_cols <- tryCatch({
+          sheets <- readxl::excel_sheets(input$input_file$datapath)
+          unique(unlist(lapply(sheets, function(s) {
+            tryCatch(names(readxl::read_excel(input$input_file$datapath, sheet=s, n_max=1)),
+                     error = function(e) character(0))
+          })))
+        }, error = function(e) character(0))
+        rv$has_dk <- any(c("DKSalary","DKID") %in% all_cols)
+        rv$has_fd <- any(c("FDSalary","FDID") %in% all_cols)
+        rv$has_sd <- any(c("SDSalary","SDID","CPTID") %in% all_cols)
         
+        # Fall back to the sport's declared platforms if no platform columns
+        # are found (e.g. inputs without explicit DK*/FD* headers).
+        if (!any(rv$has_dk, rv$has_fd, rv$has_sd)) {
+          decl <- rv$config$platforms
+          rv$has_dk <- "DK" %in% decl
+          rv$has_fd <- "FD" %in% decl
+          rv$has_sd <- "SD" %in% decl
+        }
       }
       
       rv$input_data <- load_sport_input(input$input_file$datapath, rv$sport, rv$config)
