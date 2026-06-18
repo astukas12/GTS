@@ -22,10 +22,18 @@ SOCCER_P <- list(
   shots_scale = c(0.857, 0.962, 1.048, 1.164, 1.281, 1.426),
   opp_shots_scale = c(1.04, 1.02, 1.00, 0.94, 0.88),  # indexed by opp_goals+1
   
-  # SOT rate scaling by own goals (from WC data)
+  # SOT rate scaling by own goals (from WC data) — fallback path only
   # 0G: 24.7%, 1G: 35.3%, 2G: 38.0%, 3G: 46.7%
   sot_rate_scale = c(0.716, 1.023, 1.101, 1.354, 1.400, 1.400),
   sot_kappa = 7.7,
+  
+  # Team shots/SOT/goals copula correlations (normal-space).
+  # Used to couple the market-PMF draws so high-shot sims are high-SOT and
+  # high-goal sims. Defaults below are overridden per-slate by the Correlations
+  # sheet written by InputMaker (computed from team_game_log / wc22_game_flat).
+  corr_shots_goals = 0.55,
+  corr_sot_goals   = 0.62,
+  corr_sot_shots   = 0.78,
   
   # CC = shots × rate
   cc_rate = 0.74, cc_kappa = 10,
@@ -35,10 +43,25 @@ SOCCER_P <- list(
   p_second_yc = 0.018, p_straight_red = 0.0026,
   p_assist = 0.709,
   
-  # Tail sharpness (Dirichlet-Multinomial for goals)
-  alpha_goals = 5.0,  # lower = lumpier, more multi-goal games for elite players
-  # Stat correlation: players who score get boosted shot/SOT/CC in same sim
-  scorer_corr = 0.4,  # 40% boost per goal to other attacking stats
+  # ── SUBSTITUTIONS ──────────────────────────────────────────────────────
+  # Subs are real but unrostered: they absorb a share of the team's production
+  # in the minutes they play, and that production LEAVES the rosterable pool
+  # (lowering starters' totals). Modeled as a phantom "sub bucket" that takes a
+  # per-sim share of each team total, then is discarded. The mean fraction of
+  # outfield minutes played by subs ~ 5 subs × ~18 min / (10 × 90) ≈ 0.10–0.16.
+  sub_share_mean = 0.14,   # mean fraction of team production absorbed by subs
+  sub_share_sd   = 0.05,   # per-sim variation (Beta-distributed around the mean)
+  # Position skew of WHAT subs absorb: teams chase games with attackers, so the
+  # sub bucket takes disproportionately more attacking output and less defensive.
+  # Multipliers on the base sub share, by stat family (1.0 = neutral).
+  sub_skew_attack  = 1.45,  # goals/shots/SOT/CC/crosses (subs are mostly attackers)
+  sub_skew_passes  = 1.00,  # passes (neutral — subs play across the pitch)
+  sub_skew_defense = 0.65,  # tackles/INT/fouls (defenders rarely subbed)
+  
+  # Goal allocation: plain multinomial over goal-share (team total fixed by
+  # scoreline). No per-sim Dirichlet resampling, no scorer boost — correlation
+  # between attacking stats comes from the mechanical nesting (goals ⊂ SOT ⊂
+  # shots; CC/assists attach to OTHER players' shots), not artificial multipliers.
   
   # YC frustration by opp goals (indexed opp_goals+1)
   # Conceded 0:1.38, 1:1.58, 2:2.13, 3:2.62 → relative to mean 1.77
@@ -103,6 +126,77 @@ norm_to_total <- function(raw, totals, n_p) {
 # Interpolation helper
 interp <- function(x, xp, yp) approx(xp, yp, xout=pmin(pmax(x, min(xp)), max(xp)), rule=2)$y
 
+# Inverse-CDF sampler: given uniforms u and a PMF (support k, prob p), return the
+# count whose CDF first reaches u. Preserves the PMF as the exact marginal.
+inv_cdf_pmf <- function(u, k, p) {
+  cdf <- cumsum(p/sum(p))
+  idx <- findInterval(u, cdf, left.open=FALSE) + 1L
+  idx <- pmin(pmax(idx, 1L), length(k))
+  k[idx]
+}
+
+# Draw team shots & SOT from their market PMFs, coupled to the (already-drawn)
+# team goals via a Gaussian copula so the three move together at historical
+# correlation. Goals are NOT redrawn — they are rank-mapped to a latent normal
+# and shots/SOT are drawn conditional on it. Returns list(shots, sot).
+#  team_goals : integer vector (fixed, from scoreline)
+#  shots_pmf, sot_pmf : list(k=, prob=) market PMFs (may be NULL -> caller falls back)
+copula_shots_sot <- function(team_goals, shots_pmf, sot_pmf,
+                             rsg, rtg, rst, n_sims) {
+  # latent for goals: rank -> uniform -> normal (jitter breaks ties)
+  jit <- team_goals + runif(n_sims, 0, 1e-6)
+  u_g <- (rank(jit, ties.method="first") - 0.5) / n_sims
+  z_g <- qnorm(u_g)
+  # conditional MVN for (z_shots, z_sot) given z_g, target corr matrix R
+  R_ba <- c(rsg, rtg)                       # corr of (shots,sot) with goals
+  R_bb <- matrix(c(1, rst, rst, 1), 2, 2)   # corr between shots & sot
+  cov_b <- R_bb - outer(R_ba, R_ba)         # R_aa = 1
+  # guard PD (clamp if user-supplied corrs are inconsistent)
+  ev <- eigen(cov_b, symmetric=TRUE, only.values=TRUE)$values
+  if(min(ev) <= 1e-6) cov_b <- cov_b + diag(2) * (1e-6 - min(ev))
+  L <- chol(cov_b)                          # upper-tri; t(L) is lower
+  eps <- matrix(rnorm(n_sims*2), n_sims, 2) %*% L
+  z_s <- z_g * R_ba[1] + eps[,1]
+  z_t <- z_g * R_ba[2] + eps[,2]
+  u_s <- pnorm(z_s); u_t <- pnorm(z_t)
+  shots <- as.integer(inv_cdf_pmf(u_s, shots_pmf$k, shots_pmf$prob))
+  sot   <- as.integer(inv_cdf_pmf(u_t, sot_pmf$k,   sot_pmf$prob))
+  list(shots=shots, sot=sot)
+}
+
+# Allocate per-column totals by raw weights, but cap each player at caps[,s]
+# (used for nested subsets: SOT<=Shots, Goals<=SOT). Overflow beyond a player's
+# cap is redistributed to players with remaining headroom, weighted by `share`.
+# Guarantees: result <= caps elementwise, colSums(result) == round(totals)
+# whenever total capacity colSums(caps) >= totals (true for our nested totals).
+alloc_capped <- function(raw, totals, caps, share, n_p) {
+  alloc <- norm_to_total(raw, totals, n_p)
+  over <- pmax(alloc - caps, 0L); alloc <- alloc - over
+  spill <- colSums(over)
+  if(any(spill > 0)) {
+    headroom <- caps - alloc
+    for(s in which(spill > 0)) {
+      need <- spill[s]; cap <- headroom[,s]
+      elig <- which(cap > 0); if(!length(elig)) next
+      w <- share[elig]; if(sum(w)==0) w <- rep(1, length(elig))
+      add <- pmin(cap[elig], as.integer(round(need * w/sum(w))))
+      place <- min(need, sum(cap[elig]))
+      d <- place - sum(add)
+      if(d != 0) {
+        ord <- elig[order(-(cap[elig]-add))]; i <- 1L
+        while(d != 0 && i <= length(ord)) {
+          j <- match(ord[i], elig)
+          if(d > 0 && add[j] < cap[ord[i]]) { add[j] <- add[j]+1L; d <- d-1L }
+          else if(d < 0 && add[j] > 0)      { add[j] <- add[j]-1L; d <- d+1L }
+          i <- i+1L; if(i > length(ord)) i <- 1L
+        }
+      }
+      alloc[elig, s] <- alloc[elig, s] + add
+    }
+  }
+  alloc
+}
+
 
 # ── DK SCORING ───────────────────────────────────────────────────────────────
 
@@ -152,6 +246,13 @@ read_soccer_input <- function(file_path) {
   distributions <- NULL
   if("Distributions" %in% sheets) { distributions <- as.data.table(data[["Distributions"]]); cat(sprintf("  Market PMFs: %d\n", nrow(distributions))) }
   
+  # Correlations (shots/SOT/goals coupling, computed by InputMaker from history)
+  correlations <- NULL
+  if("Correlations" %in% sheets) {
+    correlations <- as.data.table(data[["Correlations"]])
+    cat(sprintf("  Correlations: %d rows\n", nrow(correlations)))
+  }
+  
   # WC bootstrap
   wc_bootstrap <- NULL
   wc_path <- "~/GTS/Soccer/data/wc22_game_flat.parquet"
@@ -159,7 +260,8 @@ read_soccer_input <- function(file_path) {
   
   cat(sprintf("Soccer: %d players | %d games | %d SD tabs\n", nrow(pl), nrow(gm), length(sd_tabs)))
   list(Players=pl, Games=gm, IDs=data$IDs, sd_tabs=sd_tabs, games=gm,
-       distributions=distributions, wc_bootstrap=wc_bootstrap, all_sheets=data,
+       distributions=distributions, correlations=correlations,
+       wc_bootstrap=wc_bootstrap, all_sheets=data,
        has_sd = length(sd_tabs) > 0)
 }
 
@@ -185,6 +287,36 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
     }
     if(length(market_dists)) cat(sprintf("  Market PMFs: %d\n", length(market_dists)))
   }
+  
+  # Resolve shots/SOT/goals copula correlations: per-slate values from the
+  # Correlations sheet override the SOCCER_P defaults. Expected long format with
+  # columns Stat1, Stat2, Rho (e.g. Shots/SOT/0.78). Missing -> default.
+  corr_sg <- SOCCER_P$corr_shots_goals
+  corr_tg <- SOCCER_P$corr_sot_goals
+  corr_ts <- SOCCER_P$corr_sot_shots
+  if(!is.null(input_data$correlations) && nrow(input_data$correlations) > 0) {
+    cdt <- as.data.table(input_data$correlations)
+    cn <- names(cdt)
+    s1 <- grep("^Stat1$", cn, ignore.case=TRUE, value=TRUE)[1]
+    s2 <- grep("^Stat2$", cn, ignore.case=TRUE, value=TRUE)[1]
+    rc <- grep("^Rho$|^Corr",  cn, ignore.case=TRUE, value=TRUE)[1]
+    if(!is.na(s1) && !is.na(s2) && !is.na(rc)) {
+      lk <- function(a, b) {
+        v <- cdt[(toupper(get(s1))==a & toupper(get(s2))==b) |
+                   (toupper(get(s1))==b & toupper(get(s2))==a), as.numeric(get(rc))]
+        if(length(v) && is.finite(v[1])) v[1] else NA_real_
+      }
+      v <- lk("SHOTS","GOALS"); if(!is.na(v)) corr_sg <- v
+      v <- lk("SOT","GOALS");   if(!is.na(v)) corr_tg <- v
+      v <- lk("SOT","SHOTS");   if(!is.na(v)) corr_ts <- v
+      cat(sprintf("  Correlations: shots~goals=%.2f sot~goals=%.2f sot~shots=%.2f\n",
+                  corr_sg, corr_tg, corr_ts))
+    }
+  }
+  # Clamp to valid range
+  corr_sg <- min(max(corr_sg, -0.95), 0.95)
+  corr_tg <- min(max(corr_tg, -0.95), 0.95)
+  corr_ts <- min(max(corr_ts, -0.95), 0.95)
   
   wc_boot <- input_data$wc_bootstrap; has_wc <- !is.null(wc_boot) && nrow(wc_boot) > 0
   
@@ -274,9 +406,37 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
         next
       }
       
-      # Minutes: fixed from input
-      mins <- pl$MIN; ms <- mins/90
-      mats$MIN[pidx,] <- matrix(rep(mins, n_sims), n_p, n_sims)
+      # ── MINUTES & SUBSTITUTIONS ──────────────────────────────────────────
+      # Expected minutes per starter from input (position-aware, set in
+      # InputMaker). Each starter's REALIZED minutes vary per sim (a striker
+      # hooked at 65', a CB playing all 90), so within the starters the split
+      # tilts toward those who stayed on.
+      exp_mins <- pmin(pmax(as.numeric(pl$MIN), 1), 90)
+      mins <- exp_mins                          # expected, for the >=60 gates below
+      mins_mat <- matrix(90L, n_p, n_sims)
+      for(p in seq_len(n_p)) {
+        em <- exp_mins[p]
+        if(em >= 89) { mins_mat[p,] <- 90L; next }   # nailed-on (e.g. GK)
+        mu_frac <- em/90
+        kappa   <- 6 + 14*mu_frac                 # higher expected min => tighter
+        fr <- rbeta(n_sims, mu_frac*kappa, (1-mu_frac)*kappa)
+        mins_mat[p,] <- as.integer(pmin(pmax(round(fr*90), 0L), 90L))
+      }
+      mats$MIN[pidx,] <- mins_mat
+      ms_mat <- mins_mat / 90                     # per-sim minutes weight for shares
+      
+      # Per-sim team SUB SHARE: the fraction of team production absorbed by
+      # (unrostered) substitutes this sim. Beta around the mean so it varies.
+      ssm <- SOCCER_P$sub_share_mean; sssd <- SOCCER_P$sub_share_sd
+      sub_kappa <- max(ssm*(1-ssm)/(sssd^2) - 1, 2)
+      sub_f <- rbeta(n_sims, ssm*sub_kappa, (1-ssm)*sub_kappa)   # length n_sims
+      # Stat-family absorbed fractions (subs skew attacking). Clamp < 0.6 so the
+      # starters always retain the majority of any team total.
+      f_atk <- pmin(sub_f * SOCCER_P$sub_skew_attack,  0.60)
+      f_pas <- pmin(sub_f * SOCCER_P$sub_skew_passes,  0.60)
+      f_def <- pmin(sub_f * SOCCER_P$sub_skew_defense, 0.60)
+      # Retained-by-starters multipliers (what's left after subs take their cut)
+      keep_atk <- 1 - f_atk; keep_pas <- 1 - f_pas; keep_def <- 1 - f_def
       
       # Scoreline indices
       gi_vec <- pmin(team_goals,5L)+1L
@@ -290,32 +450,48 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
         p
       }
       
-      # ── TEAM SHOTS (market PMF × scoreline scale) ──
+      # ── TEAM SHOTS & SOT (market PMFs coupled to goals via Gaussian copula) ──
+      # When both PMFs exist, draw shots and SOT directly from the market
+      # distributions, correlated with each other and with the (already-drawn)
+      # team goals at historical strength. Preserves both marginals exactly.
       sp <- get_pmf("Shots")
+      tp <- get_pmf("SOT")
       shots_mu <- if(side=="home") gd$game$Home_Shots else gd$game$Away_Shots
-      if(!is.null(sp)) {
+      sot_mu   <- if(side=="home") gd$game$Home_SOT   else gd$game$Away_SOT
+      
+      if(!is.null(sp) && !is.null(tp)) {
+        cop <- copula_shots_sot(team_goals, sp, tp,
+                                corr_sg, corr_tg, corr_ts, n_sims)
+        t_shots <- cop$shots
+        t_sot   <- cop$sot
+        # Light scoreline tilt on shots (teams that score more tend to shoot more)
+        em <- SOCCER_P$shots_scale[gi_vec] * SOCCER_P$opp_shots_scale[opp_gi]
+        t_shots <- as.integer(round(t_shots * em / mean(em)))
+      } else if(!is.null(sp)) {
+        # Shots PMF only — SOT via accuracy rate fallback
         bs <- sample(sp$k, n_sims, replace=TRUE, prob=sp$prob)
         em <- SOCCER_P$shots_scale[gi_vec] * SOCCER_P$opp_shots_scale[opp_gi]
         t_shots <- as.integer(round(bs * em / mean(em)))
+        base_sot_rate <- pmin(pmax(sot_mu / pmax(shots_mu, 1), 0.15), 0.60)
+        sim_sot_rate <- pmin(pmax(base_sot_rate * SOCCER_P$sot_rate_scale[gi_vec], 0.10), 0.70)
+        sot_rates <- pmin(pmax(rbeta(n_sims, sim_sot_rate*SOCCER_P$sot_kappa,
+                                     (1-sim_sot_rate)*SOCCER_P$sot_kappa), 0.10), 0.70)
+        t_sot <- rbinom(n_sims, pmax(t_shots,0L), sot_rates)
       } else {
+        # No PMFs — full parametric fallback (original behavior)
         t_shots <- rnb(n_sims, shots_mu*SOCCER_P$shots_scale[gi_vec]*SOCCER_P$opp_shots_scale[opp_gi], SOCCER_P$phi_shots)
+        base_sot_rate <- pmin(pmax(sot_mu / pmax(shots_mu, 1), 0.15), 0.60)
+        sim_sot_rate <- pmin(pmax(base_sot_rate * SOCCER_P$sot_rate_scale[gi_vec], 0.10), 0.70)
+        sot_rates <- pmin(pmax(rbeta(n_sims, sim_sot_rate*SOCCER_P$sot_kappa,
+                                     (1-sim_sot_rate)*SOCCER_P$sot_kappa), 0.10), 0.70)
+        t_sot <- rbinom(n_sims, pmax(t_shots,0L), sot_rates)
       }
+      
+      # ── Enforce team-level hierarchy: goals <= SOT <= shots, plus caps ──
       t_shots <- pmax(t_shots, team_goals, SOCCER_P$team_min_shots)
       t_shots <- pmin(t_shots, SOCCER_P$team_max_shots)
-      
-      # ── TEAM SOT (derived from shots × accuracy rate × scoreline) ──
-      sot_mu <- if(side=="home") gd$game$Home_SOT else gd$game$Away_SOT
-      base_sot_rate <- pmin(pmax(sot_mu / pmax(shots_mu, 1), 0.15), 0.60)
-      # Scale rate by scoreline (teams that score more are more clinical)
-      sim_sot_rate <- base_sot_rate * SOCCER_P$sot_rate_scale[gi_vec]
-      sim_sot_rate <- pmin(pmax(sim_sot_rate, 0.10), 0.70)
-      # Add Beta variance
-      alpha_s <- sim_sot_rate * SOCCER_P$sot_kappa
-      beta_s <- (1-sim_sot_rate) * SOCCER_P$sot_kappa
-      sot_rates <- pmin(pmax(rbeta(n_sims, alpha_s, beta_s), 0.10), 0.70)
-      t_sot <- rbinom(n_sims, t_shots, sot_rates)
-      t_sot <- pmax(t_sot, team_goals)
-      t_sot <- pmin(t_sot, t_shots, SOCCER_P$team_max_sot)
+      t_sot   <- pmax(t_sot, team_goals)               # every goal is on target
+      t_sot   <- pmin(t_sot, t_shots, SOCCER_P$team_max_sot)
       
       # ── TEAM CC (74% of shots) ──
       cc_rates <- rbeta(n_sims, SOCCER_P$cc_rate*SOCCER_P$cc_kappa,
@@ -421,56 +597,83 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
         }
       }
       
-      # Goals (Dirichlet-Multinomial: varies shares per sim for fatter tails)
-      goals_m <- matrix(0L, n_p, n_sims)
-      for(s in seq_len(n_sims)) {
-        tg <- team_goals[s]; if(tg==0) next
-        # Dirichlet variation: some sims Mbappe's share is 0.50, others 0.20, avg 0.35
-        gs_sim <- rgamma(n_p, shape = SOCCER_P$alpha_goals * gs)
-        gs_sim[gs_sim < 1e-10] <- 1e-10
-        gs_sim <- gs_sim / sum(gs_sim)
-        goals_m[,s] <- rmultinom(1, size=tg, prob=gs_sim)[,1]
+      # ════════════════════════════════════════════════════════════════════
+      # ATTACKING CASCADE — shots first, then carve subsets out of them.
+      # Hierarchy: GOALS ⊂ SOT ⊂ SHOTS. A goal is one of the shots a player was
+      # already going to take that happened to go in — NOT a shot added on top
+      # of his share. This avoids inflating shooters' volume on scoring sims;
+      # the (correct) shots/goals correlation emerges from selection, not a boost.
+      # ════════════════════════════════════════════════════════════════════
+      
+      # ── SUB THINNING: subs absorb a per-sim attacking share. We allocate only
+      # the STARTERS' portion of each team total; the rest is scored/taken by
+      # (unrostered) subs and leaves the pool. Integer counts preserved via
+      # binomial thinning. Starters' own minutes (ms_mat) then tilt the split
+      # toward players who stayed on the pitch.
+      ts_shots <- rbinom(n_sims, t_shots, keep_atk)
+      ts_sot   <- pmin(rbinom(n_sims, t_sot, keep_atk), ts_shots)
+      ts_goals <- pmin(rbinom(n_sims, team_goals, keep_atk), ts_sot)
+      
+      # ── SHOTS: allocate the starters' portion by shot share × per-sim minutes ──
+      raw <- matrix(rnb(n_p*n_sims, rep(ss*mean(pmax(ts_shots,1)), n_sims), SOCCER_P$phi_shots), n_p, n_sims) * ms_mat
+      shots_m <- pmin(norm_to_total(raw, ts_shots, n_p), 10L)
+      deficit <- ts_shots - colSums(shots_m)
+      if(any(deficit > 0)) {
+        head_sh <- 10L - shots_m
+        shots_m <- shots_m + alloc_capped(
+          matrix(rep(ss, n_sims), n_p, n_sims) * ms_mat * (head_sh > 0),
+          pmax(deficit, 0L), head_sh, ss, n_p)
       }
+      mats$Shots[pidx,] <- shots_m
+      
+      # ── SOT ⊂ SHOTS ──
+      raw_sot <- matrix(rnb(n_p*n_sims, rep(sots*mean(pmax(ts_sot,1)), n_sims), SOCCER_P$phi_shots), n_p, n_sims) * ms_mat
+      sot_m <- alloc_capped(raw_sot, ts_sot, shots_m, sots, n_p)
+      mats$SOT[pidx,] <- sot_m
+      
+      # ── GOALS ⊂ SOT (starters' portion; sub-scored goals already removed) ──
+      raw_g <- matrix(rnb(n_p*n_sims, rep(gs*pmax(mean(ts_goals),0.01), n_sims), SOCCER_P$phi_def), n_p, n_sims)
+      raw_g <- raw_g * (sot_m > 0L) * ms_mat   # must have an SOT this sim, weight by minutes
+      goals_m <- alloc_capped(raw_g, as.numeric(ts_goals), sot_m, gs, n_p)
       mats$Goals[pidx,] <- goals_m
       
-      # Assists (per goal, exclude scorer)
+      # ── ASSISTS: assist on each STARTER goal, credited to a starter != scorer.
+      # (Goals scored by subs, and their assists, have already left the pool.) ──
       ast_m <- matrix(0L, n_p, n_sims)
       for(s in seq_len(n_sims)) {
-        tg <- team_goals[s]; if(tg==0) next
+        tg <- ts_goals[s]; if(tg==0) next
         gr <- goals_m[,s]
         for(g_i in seq_len(tg)) {
           sc <- which(gr>0); if(!length(sc)) next
           scorer <- if(length(sc)==1) sc else sample(sc,1,prob=gr[sc])
           gr[scorer] <- gr[scorer]-1L
-          if(runif(1)>SOCCER_P$p_assist) next
-          ap <- as_s; ap[scorer] <- 0; if(sum(ap)==0) next
+          if(runif(1)>SOCCER_P$p_assist) next        # not every goal is assisted
+          ap <- as_s * ms_mat[,s]; ap[scorer] <- 0    # assister != scorer, weight by minutes
+          if(sum(ap)==0) next
           ast_m[sample.int(n_p,1,prob=ap), s] <- ast_m[sample.int(n_p,1,prob=ap), s] + 1L
         }
       }
       mats$Assists[pidx,] <- ast_m
       
-      # Scorer correlation: players who scored get boosted attacking stats this sim
-      scorer_boost <- 1 + SOCCER_P$scorer_corr * goals_m
-      
-      # Shots: goals are shots. Allocate EXTRA non-goal shots on top.
-      extra_shots <- pmax(t_shots - colSums(goals_m), 0)
-      raw <- matrix(rnb(n_p*n_sims, rep(ss*mean(extra_shots), n_sims), SOCCER_P$phi_shots), n_p, n_sims)
-      raw <- raw * scorer_boost
-      mats$Shots[pidx,] <- goals_m + pmin(norm_to_total(raw, extra_shots, n_p), 10L)
-      
-      # SOT: goals are SOT. Allocate EXTRA saved-SOT on top.
-      extra_sot <- pmax(t_sot - colSums(goals_m), 0)
-      raw_sot <- matrix(rnb(n_p*n_sims, rep(sots*mean(extra_sot), n_sims), SOCCER_P$phi_shots), n_p, n_sims)
-      raw_sot <- raw_sot * scorer_boost
-      mats$SOT[pidx,] <- goals_m + norm_to_total(raw_sot, extra_sot, n_p)
-      # Constrain: SOT cannot exceed Shots
-      mats$SOT[pidx,] <- pmin(mats$SOT[pidx,], mats$Shots[pidx,])
-      
-      # CC (allocate by assist share, boosted for scorers/assisters)
-      raw_cc <- matrix(rnb(n_p*n_sims, rep(as_s*mean(t_cc), n_sims), SOCCER_P$phi_def), n_p, n_sims)
-      assist_boost <- 1 + SOCCER_P$scorer_corr * ast_m  # assisters also get CC boost
-      raw_cc <- raw_cc * pmax(scorer_boost, assist_boost)
-      mats$CC[pidx,] <- pmin(norm_to_total(raw_cc, t_cc, n_p), 8L)
+      # ── CC (chances created attach to OTHER players' shots) ──
+      # A created chance is the pass/cross feeding a shot taken by a DIFFERENT
+      # player. Allocate team CC by creation (assist) share, but suppress each
+      # player's CC by how much of the team's shooting they did this sim — the
+      # primary finisher creates few of his own chances. This enforces the
+      # shooter != creator linkage at the player level without a per-chance loop.
+      total_shots_sim <- colSums(mats$Shots[pidx,,drop=FALSE])
+      shot_frac <- sweep(mats$Shots[pidx,,drop=FALSE], 2,
+                         pmax(total_shots_sim, 1), `/`)   # each player's share of shots
+      create_weight <- matrix(rep(as_s, n_sims), n_p, n_sims) * (1 - shot_frac) * ms_mat
+      # renormalize per sim; if a column collapses, fall back to flat creation share
+      cw_cs <- colSums(create_weight)
+      for(s in which(cw_cs <= 0)) create_weight[,s] <- as_s
+      ts_cc <- rbinom(n_sims, t_cc, keep_atk)            # subs absorb attacking CC
+      raw_cc <- matrix(rnb(n_p*n_sims, rep(as_s*mean(pmax(ts_cc,1)), n_sims), SOCCER_P$phi_def), n_p, n_sims)
+      raw_cc <- raw_cc * create_weight
+      mats$CC[pidx,] <- pmin(norm_to_total(raw_cc, ts_cc, n_p), 8L)
+      # Assist is a subset of CC: a player's CC must be at least their assists.
+      mats$CC[pidx,] <- pmax(mats$CC[pidx,], ast_m)
       
       # Crosses: split into set piece (corners) and open play
       set_shares <- if("Set_Pct" %in% names(pl)) as.numeric(pl$Set_Pct) else rep(0, n_p)
@@ -478,46 +681,53 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
       has_set <- sum(set_shares) > 0
       
       if(has_set) {
-        # Set piece crosses = corners, allocated by SET%
-        set_shares_norm <- set_shares / sum(set_shares)
+        # Set piece crosses = corners, allocated by SET% × minutes
         set_crosses <- matrix(0L, n_p, n_sims)
         for(s in seq_len(n_sims)) {
           nc <- t_corners[s]; if(nc == 0) next
-          set_crosses[,s] <- rmultinom(1, size=nc, prob=set_shares_norm)[,1]
+          w <- set_shares * ms_mat[,s]
+          if(sum(w) <= 0) w <- set_shares
+          set_crosses[,s] <- rmultinom(1, size=nc, prob=w/sum(w))[,1]
         }
-        # Open play crosses = total - corners
+        # Open play crosses = total - corners (attacking → subs absorb a share)
         open_play <- pmax(t_crosses - t_corners, 0L)
-        raw_cr <- matrix(rnb(n_p*n_sims, rep(crs*mean(open_play), n_sims), SOCCER_P$phi_crosses), n_p, n_sims)
+        open_play <- rbinom(n_sims, open_play, keep_atk)
+        raw_cr <- matrix(rnb(n_p*n_sims, rep(crs*mean(pmax(open_play,1)), n_sims), SOCCER_P$phi_crosses), n_p, n_sims) * ms_mat
         open_crosses <- norm_to_total(raw_cr, open_play, n_p)
         mats$Crosses[pidx,] <- pmin(set_crosses + open_crosses, 15L)
       } else {
-        # No set piece data — allocate all crosses by Cross_Share
-        raw_cr <- matrix(rnb(n_p*n_sims, rep(crs*mean(t_crosses), n_sims), SOCCER_P$phi_crosses), n_p, n_sims)
-        mats$Crosses[pidx,] <- pmin(norm_to_total(raw_cr, t_crosses, n_p), 15L)
+        # No set piece data — allocate all crosses by Cross_Share (attacking)
+        tc_cr <- rbinom(n_sims, t_crosses, keep_atk)
+        raw_cr <- matrix(rnb(n_p*n_sims, rep(crs*mean(pmax(tc_cr,1)), n_sims), SOCCER_P$phi_crosses), n_p, n_sims) * ms_mat
+        mats$Crosses[pidx,] <- pmin(norm_to_total(raw_cr, tc_cr, n_p), 15L)
       }
       
-      # Tackles
-      raw_tk <- matrix(rnb(n_p*n_sims, rep(tks*mean(t_tackles), n_sims), SOCCER_P$phi_tackles), n_p, n_sims)
-      mats$Tackles[pidx,] <- pmin(norm_to_total(raw_tk, t_tackles, n_p), 10L)
+      # Tackles (defensive → subs absorb little)
+      ts_tk <- rbinom(n_sims, t_tackles, keep_def)
+      raw_tk <- matrix(rnb(n_p*n_sims, rep(tks*mean(pmax(ts_tk,1)), n_sims), SOCCER_P$phi_tackles), n_p, n_sims) * ms_mat
+      mats$Tackles[pidx,] <- pmin(norm_to_total(raw_tk, ts_tk, n_p), 10L)
       
-      # Fouls committed
-      raw_fc <- matrix(rnb(n_p*n_sims, rep(fcs*mean(t_fouls), n_sims), SOCCER_P$phi_fouls), n_p, n_sims)
-      player_fc <- pmin(norm_to_total(raw_fc, t_fouls, n_p), 6L)
+      # Fouls committed (defensive)
+      ts_fc <- rbinom(n_sims, t_fouls, keep_def)
+      raw_fc <- matrix(rnb(n_p*n_sims, rep(fcs*mean(pmax(ts_fc,1)), n_sims), SOCCER_P$phi_fouls), n_p, n_sims) * ms_mat
+      player_fc <- pmin(norm_to_total(raw_fc, ts_fc, n_p), 6L)
       mats$FC[pidx,] <- player_fc
       
-      # Passes
-      raw_pa <- matrix(rnb(n_p*n_sims, rep(pas*mean(t_passes), n_sims), 7.0), n_p, n_sims)
-      mats$Passes[pidx,] <- norm_to_total(raw_pa, t_passes, n_p)
+      # Passes (neutral — subs absorb their minutes share)
+      ts_pa <- rbinom(n_sims, t_passes, keep_pas)
+      raw_pa <- matrix(rnb(n_p*n_sims, rep(pas*mean(pmax(ts_pa,1)), n_sims), 7.0), n_p, n_sims) * ms_mat
+      mats$Passes[pidx,] <- norm_to_total(raw_pa, ts_pa, n_p)
       
-      # INT
-      raw_in <- matrix(rnb(n_p*n_sims, rep(ints*mean(t_int), n_sims), SOCCER_P$phi_def), n_p, n_sims)
-      mats$INT[pidx,] <- pmin(norm_to_total(raw_in, t_int, n_p), 8L)
+      # INT (defensive)
+      ts_in <- rbinom(n_sims, t_int, keep_def)
+      raw_in <- matrix(rnb(n_p*n_sims, rep(ints*mean(pmax(ts_in,1)), n_sims), SOCCER_P$phi_def), n_p, n_sims) * ms_mat
+      mats$INT[pidx,] <- pmin(norm_to_total(raw_in, ts_in, n_p), 8L)
       
       # Cards (YC allocated by YC share from market, constrained by fouls)
       yc_mat <- matrix(0L, n_p, n_sims)
       rc_mat <- matrix(0L, n_p, n_sims)
-      # Allocate team YC to players by YC_Share
-      raw_yc <- matrix(rnb(n_p*n_sims, rep(ycs*mean(t_yc), n_sims), 5.0), n_p, n_sims)
+      # Allocate team YC to players by YC_Share × minutes (benched players can't be booked)
+      raw_yc <- matrix(rnb(n_p*n_sims, rep(ycs*mean(t_yc), n_sims), 5.0), n_p, n_sims) * ms_mat
       yc_mat <- pmin(norm_to_total(raw_yc, t_yc, n_p), 2L)
       # Straight reds (rare, from high-foul players)
       fc_flat <- as.vector(player_fc)
@@ -640,17 +850,126 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
                    AvgSaves=round(rowMeans(mats$GK_Saves),2))
   setorder(pm, -DKAvgFP)
   
-  sl <- rbindlist(lapply(seq_len(n_games), function(gi) { gd<-game_info[[gi]]; data.table(Game=gd$game$Game, HG=gd$hg, AG=gd$ag) }))
+  sl <- rbindlist(lapply(seq_len(n_games), function(gi) { gd<-game_info[[gi]]
+  data.table(Game=gd$game$Game, HG=gd$hg, AG=gd$ag, Scoreline=paste0(gd$hg,"-",gd$ag)) }))
   tm <- sim_results[, .(Goals=mean(Goals), Shots=mean(Shots), SOT=mean(SOT), CC=mean(CC),
                         Crosses=mean(Crosses), Tackles=mean(Tackles), FD=mean(FD), FC=mean(FC),
                         Passes=mean(Passes), INT=mean(INT)), by=Team]
+  
+  # ── COMPREHENSIVE VISUALS ──
+  team_list <- unique(all_players_list$Team)
+  vis_sims <- min(n_sims, 1000); vis_idx <- sort(sample.int(n_sims, vis_sims))
+  
+  # Score distribution (sampled for plots)
+  score_dist <- data.table(
+    Player=rep(all_players_list$Player, vis_sims),
+    Team=rep(all_players_list$Team, vis_sims),
+    DKScore=as.vector(dk_mat[, vis_idx]))
+  
+  # Stat distribution for validation
+  stat_dist <- data.table(
+    Player=rep(all_players_list$Player, vis_sims),
+    Team=rep(all_players_list$Team, vis_sims),
+    Goals=as.vector(mats$Goals[, vis_idx]),
+    Assists=as.vector(mats$Assists[, vis_idx]),
+    Shots=as.vector(mats$Shots[, vis_idx]),
+    SOT=as.vector(mats$SOT[, vis_idx]),
+    CC=as.vector(mats$CC[, vis_idx]),
+    Crosses=as.vector(mats$Crosses[, vis_idx]),
+    TKLW=as.vector(mats$Tackles[, vis_idx]),
+    FD=as.vector(mats$FD[, vis_idx]),
+    FC=as.vector(mats$FC[, vis_idx]),
+    Passes=as.vector(mats$Passes[, vis_idx]),
+    INT=as.vector(mats$INT[, vis_idx]),
+    YC=as.vector(mats$YC[, vis_idx]),
+    GK_Saves=as.vector(mats$GK_Saves[, vis_idx]))
+  
+  # Game overview: scoreline grid, outcomes, CS rates
+  game_overview <- lapply(seq_len(n_games), function(gi) {
+    gd <- game_info[[gi]]; ht <- gd$game$Home; at <- gd$game$Away
+    hg <- gd$hg; ag <- gd$ag
+    # Scoreline grid (probability heatmap)
+    grid <- data.table(HG=hg, AG=ag)[, .(Prob=round(.N/n_sims*100,1)), by=.(HG,AG)]
+    # Outcomes
+    h_win <- round(mean(hg>ag)*100,1); draw <- round(mean(hg==ag)*100,1); a_win <- round(mean(hg<ag)*100,1)
+    # Clean sheet rates
+    h_cs <- round(mean(ag==0)*100,1); a_cs <- round(mean(hg==0)*100,1)
+    # Total goals distribution
+    tg <- hg+ag; tg_dist <- data.table(TotalGoals=tg)[, .(Prob=round(.N/n_sims*100,1)), by=TotalGoals][order(TotalGoals)]
+    # Avg goals
+    avg_hg <- round(mean(hg),2); avg_ag <- round(mean(ag),2)
+    list(game=gd$game$Game, home=ht, away=at, grid=grid,
+         h_win=h_win, draw=draw, a_win=a_win,
+         h_cs=h_cs, a_cs=a_cs, avg_hg=avg_hg, avg_ag=avg_ag,
+         total_goals_dist=tg_dist)
+  })
+  
+  # Team stat distributions (per-sim team totals for histograms)
+  team_sim_stats <- list()
+  for(tname in team_list) {
+    tidx <- which(all_players_list$Team == tname)
+    team_sim_stats[[tname]] <- data.table(
+      Team=tname,
+      Goals=colSums(mats$Goals[tidx, vis_idx, drop=FALSE]),
+      Shots=colSums(mats$Shots[tidx, vis_idx, drop=FALSE]),
+      SOT=colSums(mats$SOT[tidx, vis_idx, drop=FALSE]),
+      CC=colSums(mats$CC[tidx, vis_idx, drop=FALSE]),
+      Crosses=colSums(mats$Crosses[tidx, vis_idx, drop=FALSE]),
+      TKLW=colSums(mats$Tackles[tidx, vis_idx, drop=FALSE]),
+      FD=colSums(mats$FD[tidx, vis_idx, drop=FALSE]),
+      FC=colSums(mats$FC[tidx, vis_idx, drop=FALSE]),
+      Passes=colSums(mats$Passes[tidx, vis_idx, drop=FALSE]),
+      INT=colSums(mats$INT[tidx, vis_idx, drop=FALSE]),
+      YC=colSums(mats$YC[tidx, vis_idx, drop=FALSE]))
+  }
+  team_sim_dt <- rbindlist(team_sim_stats)
+  
+  # Player goal frequency (0G/1G/2G/3G+ per player)
+  goal_freq <- data.table(
+    Player=all_players_list$Player, Team=all_players_list$Team,
+    Pos=all_players_list$DK_RosterPos, Salary=all_players_list$DK_Salary,
+    G0=round(rowMeans(mats$Goals==0)*100,1), G1=round(rowMeans(mats$Goals==1)*100,1),
+    G2=round(rowMeans(mats$Goals==2)*100,1), G3plus=round(rowMeans(mats$Goals>=3)*100,1),
+    A0=round(rowMeans(mats$Assists==0)*100,1), A1plus=round(rowMeans(mats$Assists>=1)*100,1))
+  setorder(goal_freq, G0)
+  
+  # Cross-reference validation
+  xref <- list()
+  for(gi in seq_len(n_games)) {
+    gd <- game_info[[gi]]; ht <- gd$game$Home; at <- gd$game$Away
+    h_idx <- which(all_players_list$Team==ht); a_idx <- which(all_players_list$Team==at)
+    h_sot <- colSums(mats$SOT[h_idx,,drop=FALSE]); a_sot <- colSums(mats$SOT[a_idx,,drop=FALSE])
+    h_g <- colSums(mats$Goals[h_idx,,drop=FALSE]); a_g <- colSums(mats$Goals[a_idx,,drop=FALSE])
+    h_fc <- colSums(mats$FC[h_idx,,drop=FALSE]); a_fc <- colSums(mats$FC[a_idx,,drop=FALSE])
+    h_fd <- colSums(mats$FD[h_idx,,drop=FALSE]); a_fd <- colSums(mats$FD[a_idx,,drop=FALSE])
+    h_gk_idx <- which(all_players_list$Team==ht & grepl("GK",all_players_list$DK_RosterPos))
+    a_gk_idx <- which(all_players_list$Team==at & grepl("GK",all_players_list$DK_RosterPos))
+    h_sv <- if(length(h_gk_idx)) rowMeans(mats$GK_Saves[h_gk_idx,,drop=FALSE]) else 0
+    a_sv <- if(length(a_gk_idx)) rowMeans(mats$GK_Saves[a_gk_idx,,drop=FALSE]) else 0
+    xref[[gi]] <- data.table(
+      Game=gd$game$Game,
+      Check=c("FC↔FD", "FC↔FD", "SOT-G=Sv", "SOT-G=Sv", "CC/Shots", "CC/Shots"),
+      Team=c(ht, at, ht, at, ht, at),
+      Value=round(c(mean(h_fc), mean(a_fc), mean(h_sot)-mean(h_g), mean(a_sot)-mean(a_g),
+                    mean(colSums(mats$CC[h_idx,,drop=FALSE]))/mean(h_sot+h_g), mean(colSums(mats$CC[a_idx,,drop=FALSE]))/mean(a_sot+a_g)),2),
+      ShouldEqual=round(c(mean(a_fd), mean(h_fd), a_sv, h_sv,
+                          0.74, 0.74),2),
+      Match=c(abs(mean(h_fc)-mean(a_fd))<0.5, abs(mean(a_fc)-mean(h_fd))<0.5,
+              abs(mean(h_sot)-mean(h_g)-a_sv)<0.3, abs(mean(a_sot)-mean(a_g)-h_sv)<0.3,
+              TRUE, TRUE))
+  }
+  xref_dt <- rbindlist(xref)
   
   elapsed <- as.numeric(proc.time()["elapsed"]-t0)
   cat(sprintf("\n  Complete: %d players | %s sims | %.1fs (%.0f sims/sec)\n", n_total, format(n_sims,big.mark=","), elapsed, n_sims/elapsed))
   cb("Complete", 1.0)
   
   list(sim_results=sim_results, metadata=metadata, dk_mat=dk_mat,
-       sport_visuals=list(player_means=pm, team_means=tm, scoreline_data=sl, games=games),
+       sport_visuals=list(
+         player_means=pm, team_means=tm, scoreline_data=sl, games=games,
+         teams=team_list, score_dist=score_dist, stat_dist=stat_dist,
+         game_overview=game_overview, team_sim_stats=team_sim_dt,
+         goal_freq=goal_freq, xref=xref_dt),
        has_sd=has_sd)
 }
 
