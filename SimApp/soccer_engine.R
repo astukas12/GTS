@@ -133,7 +133,7 @@ read_soccer_input <- function(file_path) {
   
   # Numeric coercion
   num_p <- c("MIN","DK_Salary","Goal_Share","Assist_Share","Shot_Share","SOT_Share",
-             "Tackle_Share","Foul_Share","FD_Share","YC_Share","Cross_Share","INT_Share","Pass_Share")
+             "Tackle_Share","Foul_Share","FD_Share","YC_Share","Cross_Share","INT_Share","Pass_Share","Set_Pct")
   for(col in intersect(num_p, names(pl))) pl[[col]] <- as.numeric(pl[[col]])
   num_g <- c("Home_Lambda","Away_Lambda","Home_Shots","Away_Shots","Home_SOT","Away_SOT")
   for(col in intersect(num_g, names(gm))) gm[[col]] <- as.numeric(gm[[col]])
@@ -472,9 +472,29 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
       raw_cc <- raw_cc * pmax(scorer_boost, assist_boost)
       mats$CC[pidx,] <- pmin(norm_to_total(raw_cc, t_cc, n_p), 8L)
       
-      # Crosses
-      raw_cr <- matrix(rnb(n_p*n_sims, rep(crs*mean(t_crosses), n_sims), SOCCER_P$phi_crosses), n_p, n_sims)
-      mats$Crosses[pidx,] <- pmin(norm_to_total(raw_cr, t_crosses, n_p), 15L)
+      # Crosses: split into set piece (corners) and open play
+      set_shares <- if("Set_Pct" %in% names(pl)) as.numeric(pl$Set_Pct) else rep(0, n_p)
+      set_shares[is.na(set_shares)] <- 0
+      has_set <- sum(set_shares) > 0
+      
+      if(has_set) {
+        # Set piece crosses = corners, allocated by SET%
+        set_shares_norm <- set_shares / sum(set_shares)
+        set_crosses <- matrix(0L, n_p, n_sims)
+        for(s in seq_len(n_sims)) {
+          nc <- t_corners[s]; if(nc == 0) next
+          set_crosses[,s] <- rmultinom(1, size=nc, prob=set_shares_norm)[,1]
+        }
+        # Open play crosses = total - corners
+        open_play <- pmax(t_crosses - t_corners, 0L)
+        raw_cr <- matrix(rnb(n_p*n_sims, rep(crs*mean(open_play), n_sims), SOCCER_P$phi_crosses), n_p, n_sims)
+        open_crosses <- norm_to_total(raw_cr, open_play, n_p)
+        mats$Crosses[pidx,] <- pmin(set_crosses + open_crosses, 15L)
+      } else {
+        # No set piece data — allocate all crosses by Cross_Share
+        raw_cr <- matrix(rnb(n_p*n_sims, rep(crs*mean(t_crosses), n_sims), SOCCER_P$phi_crosses), n_p, n_sims)
+        mats$Crosses[pidx,] <- pmin(norm_to_total(raw_cr, t_crosses, n_p), 15L)
+      }
       
       # Tackles
       raw_tk <- matrix(rnb(n_p*n_sims, rep(tks*mean(t_tackles), n_sims), SOCCER_P$phi_tackles), n_p, n_sims)
