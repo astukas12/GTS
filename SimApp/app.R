@@ -626,15 +626,30 @@ server <- function(input, output, session) {
         rv$has_fd <- FALSE
         rv$has_sd <- TRUE
       } else {
-        # Detect platforms from Fights sheet columns
-        fights_cols <- tryCatch(
-          names(readxl::read_excel(input$input_file$datapath, sheet="Fights", n_max=1)),
-          error = function(e) character(0)
-        )
-        rv$has_dk <- any(c("DKSalary","DKID") %in% fights_cols)
-        rv$has_fd <- any(c("FDSalary","FDID") %in% fights_cols)
-        rv$has_sd <- any(c("SDSal","SDID","CPTID") %in% fights_cols)
-        
+        # Default each platform flag from the sport's DECLARED platforms in the
+        # config (the source of truth). available_platforms() starts from
+        # rv$config$platforms and only removes a platform when its flag is FALSE,
+        # so a sport's required platforms (e.g. tennis = DK only) must stay TRUE.
+        decl <- rv$config$platforms %||% c("DK")
+        rv$has_dk <- "DK" %in% decl
+        rv$has_fd <- "FD" %in% decl
+        rv$has_sd <- "SD" %in% decl
+        # Refine the OPTIONAL platforms (FD/SD) by checking the player sheet for
+        # their salary columns — present columns keep the flag, absent ones drop
+        # it. DK is the base format and is never downgraded here. Only applies to
+        # sheet-based sports that carry per-platform salary columns (e.g. MMA's
+        # Fights sheet); sports without such columns keep their declared flags.
+        psheet <- rv$config$input_file$player_sheet %||% NA_character_
+        if (!is.na(psheet) && (rv$has_fd || rv$has_sd)) {
+          pcols <- tryCatch(
+            names(readxl::read_excel(input$input_file$datapath, sheet = psheet, n_max = 1)),
+            error = function(e) NULL
+          )
+          if (!is.null(pcols)) {
+            if (rv$has_fd) rv$has_fd <- any(c("FDSalary","FDSal","FDID") %in% pcols)
+            if (rv$has_sd) rv$has_sd <- any(c("SDSal","SDSalary","SDID","CPTID") %in% pcols)
+          }
+        }
       }
       
       rv$input_data <- load_sport_input(input$input_file$datapath, rv$sport, rv$config)
