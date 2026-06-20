@@ -1355,6 +1355,9 @@ server <- function(input, output, session) {
                                                         ownership_data=own_data, verbose=TRUE)
         progress$set(detail="Phase 3: Adding custom metrics...", value=0.90)
         final_results <- add_custom_metrics(final_results, rv$sim_metadata, rv$config)
+        # Strip MMA win-count metrics (not needed for lineup building)
+        for (wc in intersect(c("TotalEW","Win6Pct","Win5PlusPct"), names(final_results)))
+          final_results[, (wc) := NULL]
         rv$dk_optimal_lineups <- final_results
       }
       
@@ -1477,6 +1480,8 @@ server <- function(input, output, session) {
                                                         ownership_data=own_data, verbose=TRUE)
         progress$set(detail="Phase 3: Adding custom metrics...", value=0.90)
         final_results <- add_custom_metrics(final_results, rv$sim_metadata, rv$config)
+        for (wc in intersect(c("TotalEW","Win6Pct","Win5PlusPct"), names(final_results)))
+          final_results[, (wc) := NULL]
         rv$fd_optimal_lineups <- final_results
       }
       
@@ -1612,8 +1617,11 @@ server <- function(input, output, session) {
         progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
         own_data <- copy(rv$sim_metadata)
         # Use SDOwn for showdown ownership; fall back to DKOwn for standard slates
-        own_col_sd <- if ("SDOwn" %in% names(own_data) && !all(is.na(own_data$SDOwn))) "SDOwn"
-        else if ("DKOwn" %in% names(own_data)) "DKOwn" else NULL
+        own_col_sd <- if ("SDOwn" %in% names(own_data) && !all(is.na(own_data$SDOwn))) {
+          "SDOwn"
+        } else if ("DKOwn" %in% names(own_data) && !all(is.na(own_data$DKOwn))) {
+          "DKOwn"
+        } else { NULL }
         if (!is.null(own_col_sd)) {
           setnames(own_data, own_col_sd, "Own")
           if (max(own_data$Own, na.rm=TRUE) > 1) own_data[, Own := Own / 100]
@@ -1622,6 +1630,8 @@ server <- function(input, output, session) {
                                                         ownership_data=own_data, verbose=TRUE)
         progress$set(detail="Phase 3: Adding custom metrics...", value=0.90)
         final_results <- add_custom_metrics(final_results, rv$sim_metadata, rv$config)
+        for (wc in intersect(c("TotalEW","Win6Pct","Win5PlusPct"), names(final_results)))
+          final_results[, (wc) := NULL]
         rv$sd_optimal_lineups <- final_results
       }
       progress$set(detail="Complete!", value=1.0)
@@ -1938,7 +1948,8 @@ server <- function(input, output, session) {
       ver <- rv[[paste0(lp,"_slider_v")]]
       num_cols  <- names(optimal)[sapply(optimal, is.numeric)]
       num_cols  <- setdiff(num_cols, grep("^Player|^Captain|^MVP", names(optimal), value=TRUE))
-      range_cols <- setdiff(num_cols, c("WinRate","Top1Pct","Top5Pct","Top10Pct","Top20Pct","ExpectedCuts"))
+      range_cols <- setdiff(num_cols, c("WinRate","Top1Pct","Top5Pct","Top10Pct","Top20Pct","ExpectedCuts",
+                                        "TotalEW","Win6Pct","Win5PlusPct"))
       cfg_map <- list(
         TotalSalary=list(label="Salary",format="k",step=0.1),
         AvgOwn=list(label="Avg Own",format="decimal",step=0.1),
@@ -1947,7 +1958,10 @@ server <- function(input, output, session) {
         AvgStart=list(label="Avg Start",format="decimal",step=0.1),
         AtLeast6=list(label="All 6 Cut%",format="decimal",step=1),
         AtLeast5=list(label="5+ Cut%",format="decimal",step=1),
-        EarlyLateCount=list(label="Early/Late Golfers",format="whole",step=1)
+        EarlyLateCount=list(label="Early/Late Golfers",format="whole",step=1),
+        TotalEW=list(label="Exp Wins",format="decimal",step=0.1),
+        Win6Pct=list(label="All Win%",format="decimal",step=1),
+        Win5PlusPct=list(label="5+ Win%",format="decimal",step=1)
       )
       sliders <- Filter(Negate(is.null), lapply(range_cols, function(col) {
         cfg <- cfg_map[[col]] %||% list(label=col,format="decimal",step=0.1)
@@ -2065,8 +2079,8 @@ server <- function(input, output, session) {
       is_cbb     <- isTRUE(rv$sport %in% c("CBB","NBA"))
       is_nba     <- isTRUE(rv$sport == "NBA")
       is_sd      <- platform == "SD"
-      salary_col <- if (is_sd) "SDSalary" else paste0(platform, "Salary")
-      own_col    <- if (is_sd) "SDOwn"    else paste0(platform, "Own")
+      salary_col <- if (is_sd) "DKSalary" else paste0(platform, "Salary")
+      own_col    <- if (is_sd) NULL        else paste0(platform, "Own")
       cpt_cols  <- grep("^Captain", names(filtered), value=TRUE)
       util_cols <- grep("^Util",    names(filtered), value=TRUE)
       all_pc    <- grep("^Player|^Captain|^MVP|^Util|^G[1-4]$|^F[1-3]$|^C1$", names(filtered), value=TRUE)
@@ -2083,7 +2097,7 @@ server <- function(input, output, session) {
         p <- exp_tbl$Player[i]
         if (p %in% names(all_counts)) exp_tbl$Exposure[i] <- as.numeric(all_counts[p]) / n_lineups * 100
       }
-      if (is_f1 || (is_cbb && has_captain) || (is_sd && has_captain)) {
+      if (is_f1 || (is_cbb && has_captain) || (is_nba && is_sd && has_captain)) {
         cpt_counts  <- if (length(cpt_cols))  table(unlist(filtered[, ..cpt_cols]))  else table(character(0))
         util_counts <- if (length(util_cols)) table(unlist(filtered[, ..util_cols])) else table(character(0))
         exp_tbl[, CptExp  := 0]
@@ -2153,7 +2167,7 @@ server <- function(input, output, session) {
       } else if (is_nba) {
         pos_col_nba <- if (platform == "FD") "FDPos" else "DKPos"
         if (salary_col %in% names(exp_tbl)) setnames(exp_tbl, salary_col, "Sal")
-        if (!is.null(own_col) && own_col %in% names(exp_tbl)) {
+        if (!is_sd && !is.null(own_col) && own_col %in% names(exp_tbl)) {
           setnames(exp_tbl, own_col, "OwnProj")
           if (max(exp_tbl$OwnProj, na.rm = TRUE) <= 1) exp_tbl[, OwnProj := OwnProj * 100]
           exp_tbl[, OwnProj  := round(OwnProj, 1)]
@@ -2165,7 +2179,7 @@ server <- function(input, output, session) {
         setcolorder(exp_tbl, c(meta_order, split_cols, metrics_order))
       } else {
         if (salary_col %in% names(exp_tbl)) setnames(exp_tbl, salary_col, "Salary")
-        if (!is.null(own_col) && own_col %in% names(exp_tbl)) {
+        if (!is_sd && !is.null(own_col) && own_col %in% names(exp_tbl)) {
           setnames(exp_tbl, own_col, "OwnProj")
           if (max(exp_tbl$OwnProj, na.rm = TRUE) <= 1) exp_tbl[, OwnProj := OwnProj * 100]
           exp_tbl[, OwnProj  := round(OwnProj, 1)]
@@ -2364,8 +2378,8 @@ server <- function(input, output, session) {
       is_cbb <- isTRUE(rv$sport %in% c("CBB","NBA"))
       is_nba <- isTRUE(rv$sport == "NBA")
       is_sd  <- platform == "SD"
-      salary_col <- if (is_sd) "SDSalary" else paste0(platform, "Salary")
-      own_col    <- if (is_sd) "SDOwn"    else paste0(platform, "Own")
+      salary_col <- if (is_sd) "DKSalary" else paste0(platform, "Salary")
+      own_col    <- if (is_sd) NULL        else paste0(platform, "Own")
       cpt_cols  <- grep("^Captain", names(port), value=TRUE)
       util_cols <- grep("^Util",    names(port), value=TRUE)
       all_pc    <- grep("^Player|^Captain|^MVP|^Util|^G[1-4]$|^F[1-3]$|^C1$", names(port), value=TRUE)
@@ -2453,7 +2467,7 @@ server <- function(input, output, session) {
         } else if (is_nba) {
           pos_col_nba <- if (platform == "FD") "FDPos" else "DKPos"
           if (salary_col %in% names(exp_tbl)) setnames(exp_tbl, salary_col, "Sal")
-          if (!is.null(own_col) && own_col %in% names(exp_tbl)) {
+          if (!is_sd && !is.null(own_col) && own_col %in% names(exp_tbl)) {
             setnames(exp_tbl, own_col, "OwnProj")
             if (max(exp_tbl$OwnProj, na.rm = TRUE) <= 1) exp_tbl[, OwnProj := OwnProj * 100]
             exp_tbl[, OwnProj  := round(OwnProj, 1)]
@@ -2465,7 +2479,7 @@ server <- function(input, output, session) {
           setcolorder(exp_tbl, c(meta_order, split_cols, metrics_order))
         } else {
           if (salary_col %in% names(exp_tbl)) setnames(exp_tbl, salary_col, "Salary")
-          if (!is.null(own_col) && own_col %in% names(exp_tbl)) {
+          if (!is_sd && !is.null(own_col) && own_col %in% names(exp_tbl)) {
             setnames(exp_tbl, own_col, "OwnProj")
             if (max(exp_tbl$OwnProj, na.rm = TRUE) <= 1) exp_tbl[, OwnProj := OwnProj * 100]
             exp_tbl[, OwnProj  := round(OwnProj, 1)]
@@ -2550,7 +2564,7 @@ server <- function(input, output, session) {
         } else if (is_nba) {
           pos_col_nba <- if (platform == "FD") "FDPos" else "DKPos"
           if (salary_col %in% names(exp_tbl)) setnames(exp_tbl, salary_col, "Sal")
-          if (!is.null(own_col) && own_col %in% names(exp_tbl)) {
+          if (!is_sd && !is.null(own_col) && own_col %in% names(exp_tbl)) {
             setnames(exp_tbl, own_col, "OwnProj")
             if (max(exp_tbl$OwnProj, na.rm = TRUE) <= 1) exp_tbl[, OwnProj := OwnProj * 100]
             exp_tbl[, OwnProj  := round(OwnProj, 1)]
@@ -2562,7 +2576,7 @@ server <- function(input, output, session) {
           setcolorder(exp_tbl, c(meta_order, split_cols, metrics_order))
         } else {
           if (salary_col %in% names(exp_tbl)) setnames(exp_tbl, salary_col, "Salary")
-          if (!is.null(own_col) && own_col %in% names(exp_tbl)) {
+          if (!is_sd && !is.null(own_col) && own_col %in% names(exp_tbl)) {
             setnames(exp_tbl, own_col, "OwnProj")
             if (max(exp_tbl$OwnProj, na.rm = TRUE) <= 1) exp_tbl[, OwnProj := OwnProj * 100]
             exp_tbl[, OwnProj  := round(OwnProj, 1)]

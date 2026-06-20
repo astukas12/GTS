@@ -126,12 +126,7 @@ create_mma_metadata <- function(fights_data) {
     WinProb  = as.numeric(player_lookup$DeViggedProb)
   )
   
-  cat(sprintf("  Metadata: %d players, SDSalary range: %s-%s, SDOwn range: %s-%s\n",
-              nrow(meta),
-              round(min(meta$SDSalary, na.rm=TRUE)),
-              round(max(meta$SDSalary, na.rm=TRUE)),
-              round(min(meta$SDOwn, na.rm=TRUE), 1),
-              round(max(meta$SDOwn, na.rm=TRUE), 1)))
+  cat(sprintf("  Metadata: %d players\n", nrow(meta)))
   meta
 }
 
