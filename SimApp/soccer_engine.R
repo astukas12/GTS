@@ -14,7 +14,7 @@ SOCCER_P <- list(
   rho = -0.13, max_goals = 5,
   
   # Fallback NegBin phi values
-  phi_shots = 10.5, phi_crosses = 8.2, phi_fouls = 47.5,
+  phi_shots = 10.5, phi_crosses = 8.2, phi_fouls = 6.5,
   phi_tackles = 8.0, phi_def = 5.0,
   tackle_win_rate = 0.60,  # market shows attempts, DK scores wins only
   
@@ -526,7 +526,14 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
           t_fouls[si] <- pool$fouls[sample.int(nrow(pool), length(si), replace=TRUE)]
         }
         t_fouls <- as.integer(t_fouls)
-      } else { t_fouls <- rnb(n_sims, 12.5, SOCCER_P$phi_fouls) }
+      } else {
+        # Fallback: use market team-fouls mean from Games tab if present
+        fl_mu <- if("Home_Fouls" %in% names(gd$game)) {
+          v <- if(side=="home") gd$game$Home_Fouls else gd$game$Away_Fouls
+          if(is.na(v)) 12.5 else v
+        } else 12.5
+        t_fouls <- rnb(n_sims, fl_mu, SOCCER_P$phi_fouls)
+      }
       t_fouls <- pmax(t_fouls, 2L); t_fouls <- pmin(t_fouls, 25L)
       
       # ── TEAM CORNERS → CROSSES (team style × corner activity) ──
