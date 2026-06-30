@@ -65,6 +65,16 @@ SOCCER_P <- list(
   
   # YC frustration by opp goals (indexed opp_goals+1)
   # Conceded 0:1.38, 1:1.58, 2:2.13, 3:2.62 → relative to mean 1.77
+  # ── EXTRA TIME (knockout) ──────────────────────────────────────────────
+  # Applied ONLY to sims tied after 90' (hg==ag), identified from the scoreline
+  # draw. The fraction of sims that trigger ET is therefore the correct-score
+  # market's draw mass — self-scaling per game (lopsided games rarely trigger).
+  et_enable = TRUE,        # master switch for ET modeling
+  et_minutes = 30,         # length of extra time
+  et_goal_intensity = 0.65,# ET goals per-minute rate vs regulation (lower tempo)
+  et_stat_intensity = 0.85,# ET counting-stat per-minute exposure vs regulation
+  # Penalties are NEVER simulated: if still level after ET, no GK win is awarded.
+  
   yc_frustration = c(0.78, 0.89, 1.20, 1.48, 1.48, 1.48),
   
   # Possession lookup (from WC data, indexed by shot_share bins)
@@ -714,10 +724,12 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
       raw_tk <- matrix(rnb(n_p*n_sims, rep(tks*mean(pmax(ts_tk,1)), n_sims), SOCCER_P$phi_tackles), n_p, n_sims) * ms_mat
       mats$Tackles[pidx,] <- pmin(norm_to_total(raw_tk, ts_tk, n_p), 10L)
       
-      # Fouls committed (defensive)
+      # Fouls committed (defensive). alloc_capped redistributes the per-player
+      # cap overflow instead of clipping it (clipping leaked fouls and broke the
+      # FC=FD identity). Cap raised to 8 to match the FD cap basis.
       ts_fc <- rbinom(n_sims, t_fouls, keep_def)
       raw_fc <- matrix(rnb(n_p*n_sims, rep(fcs*mean(pmax(ts_fc,1)), n_sims), SOCCER_P$phi_fouls), n_p, n_sims) * ms_mat
-      player_fc <- pmin(norm_to_total(raw_fc, ts_fc, n_p), 6L)
+      player_fc <- alloc_capped(raw_fc, ts_fc, matrix(8L,n_p,n_sims), fcs, n_p)
       mats$FC[pidx,] <- player_fc
       
       # Passes (neutral — subs absorb their minutes share)
@@ -749,14 +761,22 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
       # Store for cross-reference
       if(side=="home") {
         game_info[[gi]]$home_t_sot <- t_sot; game_info[[gi]]$home_t_fouls <- t_fouls
+        game_info[[gi]]$home_ts_fc <- ts_fc  # rostered committed fouls (sub-thinned)
         game_info[[gi]]$home_pidx <- pidx
         game_info[[gi]]$home_gk <- which(grepl("GK", pl$DK_RosterPos) & mins >= 60)
         game_info[[gi]]$home_fd_share <- get_share("FD_Share")
+        game_info[[gi]]$home_gs <- gs; game_info[[gi]]$home_ss <- ss
+        game_info[[gi]]$home_sots <- sots; game_info[[gi]]$home_ms <- ms_mat
+        game_info[[gi]]$home_et_ok <- as.numeric(pl$MIN) >= 90  # finishes match -> plays ET
       } else {
         game_info[[gi]]$away_t_sot <- t_sot; game_info[[gi]]$away_t_fouls <- t_fouls
+        game_info[[gi]]$away_ts_fc <- ts_fc  # rostered committed fouls (sub-thinned)
         game_info[[gi]]$away_pidx <- pidx
         game_info[[gi]]$away_gk <- which(grepl("GK", pl$DK_RosterPos) & mins >= 60)
         game_info[[gi]]$away_fd_share <- get_share("FD_Share")
+        game_info[[gi]]$away_gs <- gs; game_info[[gi]]$away_ss <- ss
+        game_info[[gi]]$away_sots <- sots; game_info[[gi]]$away_ms <- ms_mat
+        game_info[[gi]]$away_et_ok <- as.numeric(pl$MIN) >= 90  # finishes match -> plays ET
       }
     }
     
@@ -776,16 +796,151 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
       mats$GK_GC[pk,] <- gd$hg
     }
     
-    # FD: your fouls drawn = opponent's fouls committed
-    if(!is.null(gd$away_t_fouls)&&!is.null(gd$home_fd_share)) {
+    # FD: your fouls drawn = opponent's fouls committed. Normalize to the
+    # opponent's ROSTERED committed total (ts_fc, sub-thinned) so that across the
+    # rostered players FD == FC at the game level. alloc_capped redistributes the
+    # per-player cap overflow rather than clipping (clipping leaked fouls).
+    away_fc_tot <- gd$away_ts_fc %||% gd$away_t_fouls
+    home_fc_tot <- gd$home_ts_fc %||% gd$home_t_fouls
+    if(!is.null(away_fc_tot)&&!is.null(gd$home_fd_share)) {
       hp<-gd$home_pidx; nh<-length(hp); hs<-gd$home_fd_share
-      raw_fd<-matrix(rnb(nh*n_sims,rep(hs*mean(gd$away_t_fouls),n_sims),SOCCER_P$phi_fouls),nh,n_sims)
-      mats$FD[hp,] <- pmin(norm_to_total(raw_fd, gd$away_t_fouls, nh), 8L)
+      raw_fd<-matrix(rnb(nh*n_sims,rep(hs*mean(away_fc_tot),n_sims),SOCCER_P$phi_fouls),nh,n_sims)
+      capm<-matrix(8L,nh,n_sims)
+      mats$FD[hp,] <- alloc_capped(raw_fd, away_fc_tot, capm, hs, nh)
     }
-    if(!is.null(gd$home_t_fouls)&&!is.null(gd$away_fd_share)) {
+    if(!is.null(home_fc_tot)&&!is.null(gd$away_fd_share)) {
       ap<-gd$away_pidx; na_p<-length(ap); as2<-gd$away_fd_share
-      raw_fd<-matrix(rnb(na_p*n_sims,rep(as2*mean(gd$home_t_fouls),n_sims),SOCCER_P$phi_fouls),na_p,n_sims)
-      mats$FD[ap,] <- pmin(norm_to_total(raw_fd, gd$home_t_fouls, na_p), 8L)
+      raw_fd<-matrix(rnb(na_p*n_sims,rep(as2*mean(home_fc_tot),n_sims),SOCCER_P$phi_fouls),na_p,n_sims)
+      capm<-matrix(8L,na_p,n_sims)
+      mats$FD[ap,] <- alloc_capped(raw_fd, home_fc_tot, capm, as2, na_p)
+    }
+    
+    # ── EXTRA TIME (game-level; tied sims only) ──────────────────────────
+    if(isTRUE(SOCCER_P$et_enable)) {
+      tied <- which(gd$hg == gd$ag)
+      if(!exists("et_went")) et_went <- logical(n_sims)  # per-sim ET flag (any game)
+      if(length(tied)) {
+        et_went[tied] <- TRUE
+        hl <- gd$game$Home_Lambda; al <- gd$game$Away_Lambda
+        gsc <- (SOCCER_P$et_minutes/90) * SOCCER_P$et_goal_intensity   # goal-rate scale
+        ssc <- (SOCCER_P$et_minutes/90) * SOCCER_P$et_stat_intensity   # shot exposure scale
+        # Team ET shots over the 30', from each team's regulation shot level.
+        hsh <- gd$game$Home_Shots %||% (hl*8); ash <- gd$game$Away_Shots %||% (al*8)
+        # ── COUPLED ET DRAW (preserve goals<->shots correlation) ──
+        # Draw team ET shots first, then ET goals CONDITIONAL on those shots, so
+        # a team with more ET shots is proportionally more likely to score in ET
+        # (the same goals-within-shots nesting the regulation pass uses).
+        et_h_shots <- integer(n_sims); et_a_shots <- integer(n_sims)
+        et_hg <- integer(n_sims); et_ag <- integer(n_sims)
+        nt <- length(tied)
+        et_h_shots[tied] <- rpois(nt, max(hsh,1)*ssc)
+        et_a_shots[tied] <- rpois(nt, max(ash,1)*ssc)
+        # conversion rate = team goal-rate / team shot-rate (goals per shot), so
+        # E[ET goals] = ET shots * conv = matches the intended ET goal expectation,
+        # but now realized goals scale WITH the realized ET shots (coupling).
+        conv_h <- min(max((hl*gsc) / max(hsh*ssc, 1e-6), 0), 0.6)
+        conv_a <- min(max((al*gsc) / max(ash*ssc, 1e-6), 0), 0.6)
+        et_hg[tied] <- rbinom(nt, et_h_shots[tied], conv_h)
+        et_ag[tied] <- rbinom(nt, et_a_shots[tied], conv_a)
+        
+        # Allocate ET goals/shots to players who FINISH the match. A player is on
+        # for extra time iff his input MIN >= 90 (the user lowers MIN to mark a
+        # starter as subbed off). Players under 90 get ZERO ET production. Within
+        # the finishers, distribute by stat share (no minutes weighting needed —
+        # they all play the full 30).
+        alloc_et <- function(pidx, gs, ss, sots, et_ok, et_g, et_sh) {
+          if(is.null(pidx) || !length(pidx)) return(invisible(NULL))
+          np <- length(pidx)
+          if(is.null(et_ok)) et_ok <- rep(TRUE, np)
+          gate <- as.numeric(et_ok)                    # 1 if finishes match, else 0
+          if(sum(gate) <= 0) return(invisible(NULL))   # nobody left on -> no ET production
+          wsh <- ss * gate; wg <- gs * gate
+          for(s in tied) {
+            nsh <- et_sh[s]
+            if(nsh > 0L && sum(wsh) > 0) {
+              sa <- sample.int(np, nsh, replace=TRUE, prob=wsh/sum(wsh))
+              for(z in sa) mats$Shots[pidx[z], s] <- mats$Shots[pidx[z], s] + 1L
+            }
+            ng <- et_g[s]; if(ng == 0L) next
+            if(sum(wg) <= 0) next
+            sc <- sample.int(np, ng, replace=TRUE, prob=wg/sum(wg))
+            for(z in sc) {
+              mats$Goals[pidx[z], s] <- mats$Goals[pidx[z], s] + 1L
+              mats$SOT[pidx[z], s]   <- mats$SOT[pidx[z], s] + 1L
+              if(mats$Shots[pidx[z], s] < mats$SOT[pidx[z], s])
+                mats$Shots[pidx[z], s] <- mats$SOT[pidx[z], s]
+            }
+          }
+        }
+        alloc_et(gd$home_pidx, gd$home_gs, gd$home_ss, gd$home_sots, gd$home_et_ok, et_hg, et_h_shots)
+        alloc_et(gd$away_pidx, gd$away_gs, gd$away_ss, gd$away_sots, gd$away_et_ok, et_ag, et_a_shots)
+        
+        # Extend exposure for the extra 30' for non-goal-coupled counting stats,
+        # ONLY for players who finish the match (input MIN>=90). Players marked
+        # subbed off (MIN<90) get no ET stat bump. Shots/SOT are not bumped here
+        # (they come from the coupled team ET-shot draw above).
+        et_bump <- (SOCCER_P$et_minutes/90) * SOCCER_P$et_stat_intensity
+        bump_side <- function(pidx, et_ok) {
+          if(is.null(pidx) || !length(pidx)) return(invisible(NULL))
+          if(is.null(et_ok)) et_ok <- rep(TRUE, length(pidx))
+          gate <- as.numeric(et_ok)                    # 1 if finishes, else 0
+          for(stat in c("Tackles","Passes","INT","Crosses","FC")) {
+            M <- mats[[stat]]; if(is.null(M)) next
+            sub <- M[pidx, tied, drop=FALSE]
+            pr  <- pmin(et_bump * gate, 0.95)          # per-player bump prob (0 if subbed off)
+            prmat <- matrix(rep(pr, length(tied)), nrow(sub), ncol(sub))
+            add <- rbinom(length(sub), as.integer(sub), as.vector(prmat))
+            M[pidx, tied] <- sub + matrix(add, nrow(sub), ncol(sub))
+            mats[[stat]] <<- M
+          }
+        }
+        bump_side(gd$home_pidx, gd$home_et_ok)
+        bump_side(gd$away_pidx, gd$away_et_ok)
+        # SOT grows with the ET shots a player picked up (on-target fraction),
+        # in the tied sims only, then enforce nesting goals<=SOT<=shots.
+        for(pidx in list(gd$home_pidx, gd$away_pidx)) {
+          if(is.null(pidx)||!length(pidx)) next
+          # headroom = shots not yet counted as SOT; convert ~38% of it to SOT
+          head <- pmax(mats$Shots[pidx,tied,drop=FALSE] - mats$SOT[pidx,tied,drop=FALSE], 0L)
+          addsot <- rbinom(length(head), as.integer(head), 0.38)
+          mats$SOT[pidx,tied] <- mats$SOT[pidx,tied,drop=FALSE] + matrix(addsot, nrow(head), ncol(head))
+          mats$SOT[pidx,]   <- pmin(mats$SOT[pidx,], mats$Shots[pidx,])
+          mats$Goals[pidx,] <- pmin(mats$Goals[pidx,], mats$SOT[pidx,])
+        }
+        
+        # Final score after ET, and terminal GK-win / clean-sheet rules.
+        final_h <- gd$hg + et_hg; final_a <- gd$ag + et_ag
+        # CS holds through full match (incl ET); ET goal conceded wipes it.
+        if(!is.null(gd$home_pidx))
+          mats$CS[gd$home_pidx,] <- matrix(rep(as.integer(final_a==0), each=length(gd$home_pidx)), length(gd$home_pidx), n_sims)
+        if(!is.null(gd$away_pidx))
+          mats$CS[gd$away_pidx,] <- matrix(rep(as.integer(final_h==0), each=length(gd$away_pidx)), length(gd$away_pidx), n_sims)
+        # GK win from FINAL score; if STILL tied after ET -> penalties -> no win.
+        home_win <- as.integer(final_h > final_a)   # 0 when still level (penalties)
+        away_win <- as.integer(final_a > final_h)
+        if(!is.null(gd$home_pidx))
+          mats$GK_Win[gd$home_pidx,] <- matrix(rep(home_win, each=length(gd$home_pidx)), length(gd$home_pidx), n_sims)
+        if(!is.null(gd$away_pidx))
+          mats$GK_Win[gd$away_pidx,] <- matrix(rep(away_win, each=length(gd$away_pidx)), length(gd$away_pidx), n_sims)
+        # Update GK conceded + SAVES to full-match (post-ET) values, so the
+        # identity opponent_SOT - opponent_goals = keeper_saves holds through ET.
+        # Saves are recomputed from the post-ET opponent SOT (which now includes
+        # ET shots on target) minus the final goals conceded.
+        if(length(gd$home_gk) && !is.null(gd$home_pidx)) {
+          pk <- gd$home_pidx[gd$home_gk[1]]
+          away_sot_final <- colSums(mats$SOT[gd$away_pidx, , drop=FALSE])
+          mats$GK_GC[pk,]    <- final_a
+          mats$GK_Saves[pk,] <- pmax(away_sot_final - final_a, 0)
+        }
+        if(length(gd$away_gk) && !is.null(gd$away_pidx)) {
+          pk <- gd$away_pidx[gd$away_gk[1]]
+          home_sot_final <- colSums(mats$SOT[gd$home_pidx, , drop=FALSE])
+          mats$GK_GC[pk,]    <- final_h
+          mats$GK_Saves[pk,] <- pmax(home_sot_final - final_h, 0)
+        }
+        et_rate <- length(tied)/n_sims
+        cat(sprintf("  %s: ET in %.1f%% of sims (tied after 90)\n", gd$game$Game, 100*et_rate))
+      }
     }
     
     cb(sprintf("Game %d/%d complete", gi, n_games), pct_base+0.72/n_games)
@@ -971,7 +1126,78 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
   cat(sprintf("\n  Complete: %d players | %s sims | %.1fs (%.0f sims/sec)\n", n_total, format(n_sims,big.mark=","), elapsed, n_sims/elapsed))
   cb("Complete", 1.0)
   
+  # ── CORRELATION VALIDATION ───────────────────────────────────────────────
+  # Compute realized correlations from the simulated per-sim totals, split by
+  # whether the sim went to extra time, so ET fidelity can be verified.
+  if(!exists("et_went")) et_went <- logical(n_sims)
+  corr_diag <- tryCatch({
+    sr <- sim_results
+    # team totals per (Team, SimID)
+    tt <- sr[, .(G=sum(Goals), Sh=sum(Shots), ST=sum(SOT)), by=.(Team, SimID)]
+    teams_u <- unique(tt$Team)
+    et_by_sim <- data.table(SimID=seq_len(n_sims), ET=et_went)
+    tt <- merge(tt, et_by_sim, by="SimID")
+    block <- function(dt, lbl) {
+      if(nrow(dt) < 50) return(NULL)
+      data.table(Subset=lbl, N=nrow(dt),
+                 cor_G_Sh = round(suppressWarnings(cor(dt$G, dt$Sh)), 3),
+                 cor_G_ST = round(suppressWarnings(cor(dt$G, dt$ST)), 3),
+                 cor_Sh_ST= round(suppressWarnings(cor(dt$Sh, dt$ST)), 3))
+    }
+    team_corr <- rbindlist(list(
+      block(tt, "ALL"),
+      block(tt[ET==FALSE], "NoET"),
+      block(tt[ET==TRUE],  "ET")), use.names=TRUE, fill=TRUE)
+    # opponent anti-correlation: home goals vs away goals, per game per sim
+    opp <- NULL
+    g_meta <- unique(sr[, .(Team)])
+    # team goals wide per sim
+    gw <- dcast(tt, SimID + ET ~ Team, value.var="G")
+    if(length(teams_u) >= 2) {
+      pairs_list <- list()
+      for(a in 1:(length(teams_u)-1)) for(b in (a+1):length(teams_u)) {
+        ta <- teams_u[a]; tb <- teams_u[b]
+        x <- gw[[ta]]; y <- gw[[tb]]
+        ok <- !is.na(x) & !is.na(y)
+        if(sum(ok) > 50 && sd(x[ok])>0 && sd(y[ok])>0) {
+          pairs_list[[length(pairs_list)+1]] <- data.table(
+            TeamA=ta, TeamB=tb,
+            cor_goals_all = round(cor(x[ok], y[ok]), 3),
+            cor_goals_ET  = { e<-gw$ET&ok; if(sum(e)>50 && sd(x[e])>0 && sd(y[e])>0) round(cor(x[e],y[e]),3) else NA_real_ })
+        }
+      }
+      opp <- rbindlist(pairs_list, fill=TRUE)
+    }
+    # Per-stat means / p95 ceilings, split ET vs non-ET (player-level), to check
+    # ET isn't distorting ceilings unexpectedly.
+    sr2 <- merge(sr, et_by_sim, by="SimID")
+    stat_split <- sr2[, .(
+      mean_DK = round(mean(DKScore),2),
+      p95_DK  = round(quantile(DKScore, .95),1),
+      mean_Sh = round(mean(Shots),2),
+      mean_G  = round(mean(Goals),3)
+    ), by=ET][order(ET)]
+    
+    out <- list(team_corr=team_corr, opp_corr=opp, stat_split=stat_split,
+                et_rate=mean(et_went), n_sims=n_sims)
+    # ── Console dump (copy/paste to verify behavior) ──
+    cat("\n================ CORRELATION DIAGNOSTIC ================\n")
+    cat(sprintf("ET rate (sims that went to extra time): %.1f%%\n", 100*mean(et_went)))
+    cat("\nTeam stat correlations (split by ET):\n")
+    print(team_corr)
+    if(!is.null(opp) && nrow(opp)) { cat("\nOpponent goals correlation (NOTE: ET-subset is naturally HIGH — tied sims have hg==ag by definition, ET pulls it down from 1.0; read the ALL column):\n"); print(opp) }
+    cat("\nPer-stat means / ceilings (ET vs non-ET sims):\n")
+    print(stat_split)
+    cat("=======================================================\n")
+    cat("To validate ET: run once with SOCCER_P$et_enable=FALSE and once TRUE,\n")
+    cat("then send both dumps. NoET correlations should be IDENTICAL between runs;\n")
+    cat("only the ET-subset rows should differ.\n")
+    cat("=======================================================\n\n")
+    out
+  }, error=function(e) { cat(sprintf("\n[corr_diag error: %s]\n", conditionMessage(e))); list(error=conditionMessage(e)) })
+  
   list(sim_results=sim_results, metadata=metadata, dk_mat=dk_mat,
+       corr_diag=corr_diag,
        sport_visuals=list(
          player_means=pm, team_means=tm, scoreline_data=sl, games=games,
          teams=team_list, score_dist=score_dist, stat_dist=stat_dist,
