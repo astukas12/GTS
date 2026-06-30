@@ -761,6 +761,7 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
       # Store for cross-reference
       if(side=="home") {
         game_info[[gi]]$home_t_sot <- t_sot; game_info[[gi]]$home_t_fouls <- t_fouls
+        game_info[[gi]]$home_ts_sot <- ts_sot  # rostered (sub-thinned) regulation SOT
         game_info[[gi]]$home_ts_fc <- ts_fc  # rostered committed fouls (sub-thinned)
         game_info[[gi]]$home_pidx <- pidx
         game_info[[gi]]$home_gk <- which(grepl("GK", pl$DK_RosterPos) & mins >= 60)
@@ -770,6 +771,7 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
         game_info[[gi]]$home_et_ok <- as.numeric(pl$MIN) >= 90  # finishes match -> plays ET
       } else {
         game_info[[gi]]$away_t_sot <- t_sot; game_info[[gi]]$away_t_fouls <- t_fouls
+        game_info[[gi]]$away_ts_sot <- ts_sot  # rostered (sub-thinned) regulation SOT
         game_info[[gi]]$away_ts_fc <- ts_fc  # rostered committed fouls (sub-thinned)
         game_info[[gi]]$away_pidx <- pidx
         game_info[[gi]]$away_gk <- which(grepl("GK", pl$DK_RosterPos) & mins >= 60)
@@ -910,6 +912,7 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
         
         # Final score after ET, and terminal GK-win / clean-sheet rules.
         final_h <- gd$hg + et_hg; final_a <- gd$ag + et_ag
+        game_info[[gi]]$et_hg <- et_hg; game_info[[gi]]$et_ag <- et_ag  # for keeper conceded
         # CS holds through full match (incl ET); ET goal conceded wipes it.
         if(!is.null(gd$home_pidx))
           mats$CS[gd$home_pidx,] <- matrix(rep(as.integer(final_a==0), each=length(gd$home_pidx)), length(gd$home_pidx), n_sims)
@@ -922,21 +925,14 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
           mats$GK_Win[gd$home_pidx,] <- matrix(rep(home_win, each=length(gd$home_pidx)), length(gd$home_pidx), n_sims)
         if(!is.null(gd$away_pidx))
           mats$GK_Win[gd$away_pidx,] <- matrix(rep(away_win, each=length(gd$away_pidx)), length(gd$away_pidx), n_sims)
-        # Update GK conceded + SAVES to full-match (post-ET) values, so the
-        # identity opponent_SOT - opponent_goals = keeper_saves holds through ET.
-        # Saves are recomputed from the post-ET opponent SOT (which now includes
-        # ET shots on target) minus the final goals conceded.
+        # GK conceded updated to full-match (post-ET). Saves are recomputed once,
+        # after all games, from final SOT and final goals (single source of truth,
+        # consistent with the validation frame) — see post-loop saves pass.
         if(length(gd$home_gk) && !is.null(gd$home_pidx)) {
-          pk <- gd$home_pidx[gd$home_gk[1]]
-          away_sot_final <- colSums(mats$SOT[gd$away_pidx, , drop=FALSE])
-          mats$GK_GC[pk,]    <- final_a
-          mats$GK_Saves[pk,] <- pmax(away_sot_final - final_a, 0)
+          pk <- gd$home_pidx[gd$home_gk[1]]; mats$GK_GC[pk,] <- final_a
         }
         if(length(gd$away_gk) && !is.null(gd$away_pidx)) {
-          pk <- gd$away_pidx[gd$away_gk[1]]
-          home_sot_final <- colSums(mats$SOT[gd$home_pidx, , drop=FALSE])
-          mats$GK_GC[pk,]    <- final_h
-          mats$GK_Saves[pk,] <- pmax(home_sot_final - final_h, 0)
+          pk <- gd$away_pidx[gd$away_gk[1]]; mats$GK_GC[pk,] <- final_h
         }
         et_rate <- length(tied)/n_sims
         cat(sprintf("  %s: ET in %.1f%% of sims (tied after 90)\n", gd$game$Game, 100*et_rate))
@@ -944,6 +940,37 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
     }
     
     cb(sprintf("Game %d/%d complete", gi, n_games), pct_base+0.72/n_games)
+  }
+  
+  # ── FINAL GK SAVES (single source of truth, FULL team totals) ─────────────
+  # The keeper is rostered and on the pitch the whole match, so he faces the
+  # ENTIRE opposing attack — rostered starters AND the unrostered sub bucket.
+  # His saves/conceded therefore derive from the FULL team SOT and FULL team
+  # goals (market totals incl ET), NOT the sub-thinned rostered SOT. The sub
+  # bucket = full regulation total minus the rostered (thinned) total; ET
+  # production goes only to finishers so it is already in the rostered colSums.
+  for(gi in seq_len(n_games)) {
+    gd <- game_info[[gi]]; ht <- gd$game$Home; at <- gd$game$Away
+    h_idx <- which(all_players_list$Team==ht); a_idx <- which(all_players_list$Team==at)
+    if(!length(h_idx) || !length(a_idx)) next
+    # rostered SOT/goals after all passes (includes ET, which only finishers get)
+    h_sot_r <- colSums(mats$SOT[h_idx,,drop=FALSE]); a_sot_r <- colSums(mats$SOT[a_idx,,drop=FALSE])
+    h_g_r   <- colSums(mats$Goals[h_idx,,drop=FALSE]); a_g_r <- colSums(mats$Goals[a_idx,,drop=FALSE])
+    # sub-bucket SOT (regulation only) = full regulation total - rostered regulation
+    h_sub_sot <- pmax((gd$home_t_sot %||% h_sot_r) - (gd$home_ts_sot %||% h_sot_r), 0)
+    a_sub_sot <- pmax((gd$away_t_sot %||% a_sot_r) - (gd$away_ts_sot %||% a_sot_r), 0)
+    # FULL team SOT the opposing keeper faces = rostered(final, incl ET) + sub bucket
+    h_sot_full <- h_sot_r + h_sub_sot
+    a_sot_full <- a_sot_r + a_sub_sot
+    # FULL team goals conceded = final scoreline (incl ET), which already counts
+    # any sub-bucket goals (scoreline is the market total, not the rostered sum)
+    h_g_full <- gd$hg + (if(!is.null(gd$et_hg)) gd$et_hg else 0L)
+    a_g_full <- gd$ag + (if(!is.null(gd$et_ag)) gd$et_ag else 0L)
+    h_gk <- which(all_players_list$Team==ht & grepl("GK", all_players_list$DK_RosterPos))
+    a_gk <- which(all_players_list$Team==at & grepl("GK", all_players_list$DK_RosterPos))
+    # home keeper faces away attack; away keeper faces home attack
+    if(length(h_gk)) { mats$GK_Saves[h_gk[1],] <- pmax(a_sot_full - a_g_full, 0); mats$GK_GC[h_gk[1],] <- a_g_full }
+    if(length(a_gk)) { mats$GK_Saves[a_gk[1],] <- pmax(h_sot_full - h_g_full, 0); mats$GK_GC[a_gk[1],] <- h_g_full }
   }
   
   # ── DK SCORES ──
@@ -1104,6 +1131,12 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
     h_g <- colSums(mats$Goals[h_idx,,drop=FALSE]); a_g <- colSums(mats$Goals[a_idx,,drop=FALSE])
     h_fc <- colSums(mats$FC[h_idx,,drop=FALSE]); a_fc <- colSums(mats$FC[a_idx,,drop=FALSE])
     h_fd <- colSums(mats$FD[h_idx,,drop=FALSE]); a_fd <- colSums(mats$FD[a_idx,,drop=FALSE])
+    # FULL team totals (rostered + sub bucket, incl ET) — what the keeper faces.
+    h_sub_sot <- pmax((gd$home_t_sot %||% h_sot) - (gd$home_ts_sot %||% h_sot), 0)
+    a_sub_sot <- pmax((gd$away_t_sot %||% a_sot) - (gd$away_ts_sot %||% a_sot), 0)
+    h_sot_full <- h_sot + h_sub_sot; a_sot_full <- a_sot + a_sub_sot
+    h_g_full <- gd$hg + (if(!is.null(gd$et_hg)) gd$et_hg else 0L)
+    a_g_full <- gd$ag + (if(!is.null(gd$et_ag)) gd$et_ag else 0L)
     h_gk_idx <- which(all_players_list$Team==ht & grepl("GK",all_players_list$DK_RosterPos))
     a_gk_idx <- which(all_players_list$Team==at & grepl("GK",all_players_list$DK_RosterPos))
     h_sv <- if(length(h_gk_idx)) rowMeans(mats$GK_Saves[h_gk_idx,,drop=FALSE]) else 0
@@ -1112,7 +1145,8 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
       Game=gd$game$Game,
       Check=c("FC↔FD", "FC↔FD", "SOT-G=Sv", "SOT-G=Sv", "CC/Shots", "CC/Shots"),
       Team=c(ht, at, ht, at, ht, at),
-      Value=round(c(mean(h_fc), mean(a_fc), mean(h_sot)-mean(h_g), mean(a_sot)-mean(a_g),
+      # SOT-G=Sv now checks FULL opponent attack vs keeper saves (keeper faces all).
+      Value=round(c(mean(h_fc), mean(a_fc), mean(h_sot_full)-mean(h_g_full), mean(a_sot_full)-mean(a_g_full),
                     mean(colSums(mats$CC[h_idx,,drop=FALSE]))/mean(h_sot+h_g), mean(colSums(mats$CC[a_idx,,drop=FALSE]))/mean(a_sot+a_g)),2),
       ShouldEqual=round(c(mean(a_fd), mean(h_fd), a_sv, h_sv,
                           0.74, 0.74),2),
