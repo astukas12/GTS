@@ -1151,7 +1151,7 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
       ShouldEqual=round(c(mean(a_fd), mean(h_fd), a_sv, h_sv,
                           0.74, 0.74),2),
       Match=c(abs(mean(h_fc)-mean(a_fd))<0.5, abs(mean(a_fc)-mean(h_fd))<0.5,
-              abs(mean(h_sot)-mean(h_g)-a_sv)<0.3, abs(mean(a_sot)-mean(a_g)-h_sv)<0.3,
+              abs(mean(h_sot_full)-mean(h_g_full)-a_sv)<0.3, abs(mean(a_sot_full)-mean(a_g_full)-h_sv)<0.3,
               TRUE, TRUE))
   }
   xref_dt <- rbindlist(xref)
