@@ -71,8 +71,22 @@ SOCCER_P <- list(
   # market's draw mass — self-scaling per game (lopsided games rarely trigger).
   et_enable = TRUE,        # master switch for ET modeling
   et_minutes = 30,         # length of extra time
-  et_goal_intensity = 0.65,# ET goals per-minute rate vs regulation (lower tempo)
-  et_stat_intensity = 0.85,# ET counting-stat per-minute exposure vs regulation
+  # ── ET per-minute intensity vs regulation, by stat ──
+  # Grounded in ET sports-science findings (Field/Harper systematic review):
+  #  - goals ~ regulation per-minute rate (EURO2020: 0.0292 vs 0.0294/min)
+  #  - shooting velocity/volume down modestly; passes ~ -30%; dribbles ~ -36%;
+  #    tackling ratio lower; ball-in-play ~ -16% (a floor on all event drops).
+  # Values lean CONSERVATIVE (under-add) on every stat except goals, where the
+  # data is firm that ET ~ regulation rate. All applied only to tied sims.
+  et_goal_intensity = 0.90,
+  et_int_shots  = 0.82,
+  et_int_sot    = 0.82,
+  et_int_tackle = 0.78,
+  et_int_foul   = 0.80,
+  et_int_pass   = 0.70,
+  et_int_cross  = 0.68,
+  et_int_int    = 0.78,
+  et_int_default= 0.78,    # any stat not listed
   # Penalties are NEVER simulated: if still level after ET, no GK win is awarded.
   
   yc_frustration = c(0.78, 0.89, 1.20, 1.48, 1.48, 1.48),
@@ -508,6 +522,15 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
                         (1-SOCCER_P$cc_rate)*SOCCER_P$cc_kappa)
       cc_rates <- pmin(pmax(cc_rates, 0.40), 0.95)
       t_cc <- pmin(as.integer(round(t_shots * cc_rates)), t_shots)
+      # Team-style anchor: if Team.csv gave a real CC-per-game rate, recentre the
+      # team CC total on it (keeping the per-sim variance), since team chance-
+      # creation style is better captured by the season rate than shots alone.
+      cc_anchor <- if(side=="home" && "Home_CC_Base" %in% names(gd$game)) gd$game$Home_CC_Base
+      else if(side=="away" && "Away_CC_Base" %in% names(gd$game)) gd$game$Away_CC_Base
+      else NA_real_
+      if(!is.na(cc_anchor) && cc_anchor > 0) {
+        cur_mu <- mean(t_cc); if(cur_mu > 0) t_cc <- pmin(as.integer(round(t_cc * (cc_anchor/cur_mu))), t_shots)
+      }
       
       # ── TEAM TACKLES (market PMF, independent) ──
       tkp <- get_pmf("Tackles")
@@ -578,6 +601,13 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
       t_passes <- pmax(t_passes, 100L); t_passes <- pmin(t_passes, 800L)
       t_int <- as.integer(round(interp(poss_est, SOCCER_P$poss_for_passes, SOCCER_P$int_by_poss) +
                                   rnorm(n_sims, 0, 1.5)))
+      # Team-style anchor: recentre INT on the real Team.csv per-game rate if given.
+      int_anchor <- if(side=="home" && "Home_INT_Base" %in% names(gd$game)) gd$game$Home_INT_Base
+      else if(side=="away" && "Away_INT_Base" %in% names(gd$game)) gd$game$Away_INT_Base
+      else NA_real_
+      if(!is.na(int_anchor) && int_anchor > 0) {
+        cur_mu <- mean(t_int); if(cur_mu > 0) t_int <- as.integer(round(t_int * (int_anchor/cur_mu)))
+      }
       t_int <- pmax(t_int, 0L); t_int <- pmin(t_int, 15L)
       
       # ── CARDS (from team fouls × rate × frustration) ──
@@ -825,7 +855,7 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
         et_went[tied] <- TRUE
         hl <- gd$game$Home_Lambda; al <- gd$game$Away_Lambda
         gsc <- (SOCCER_P$et_minutes/90) * SOCCER_P$et_goal_intensity   # goal-rate scale
-        ssc <- (SOCCER_P$et_minutes/90) * SOCCER_P$et_stat_intensity   # shot exposure scale
+        ssc <- (SOCCER_P$et_minutes/90) * SOCCER_P$et_int_shots        # shot exposure scale
         # Team ET shots over the 30', from each team's regulation shot level.
         hsh <- gd$game$Home_Shots %||% (hl*8); ash <- gd$game$Away_Shots %||% (al*8)
         # ── COUPLED ET DRAW (preserve goals<->shots correlation) ──
@@ -878,16 +908,25 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
         alloc_et(gd$away_pidx, gd$away_gs, gd$away_ss, gd$away_sots, gd$away_et_ok, et_ag, et_a_shots)
         
         # Extend exposure for the extra 30' for non-goal-coupled counting stats,
-        # ONLY for players who finish the match (input MIN>=90). Players marked
-        # subbed off (MIN<90) get no ET stat bump. Shots/SOT are not bumped here
-        # (they come from the coupled team ET-shot draw above).
-        et_bump <- (SOCCER_P$et_minutes/90) * SOCCER_P$et_stat_intensity
+        # ONLY for players who finish the match (input MIN>=90). Each stat uses
+        # its own research-grounded ET intensity (passes/crosses fall hardest,
+        # tackles/fouls moderately, per the ET sports-science findings).
+        et_factor <- function(stat) {
+          switch(stat,
+                 Tackles = SOCCER_P$et_int_tackle,
+                 FC      = SOCCER_P$et_int_foul,
+                 Passes  = SOCCER_P$et_int_pass,
+                 Crosses = SOCCER_P$et_int_cross,
+                 INT     = SOCCER_P$et_int_int,
+                 SOCCER_P$et_int_default)
+        }
         bump_side <- function(pidx, et_ok) {
           if(is.null(pidx) || !length(pidx)) return(invisible(NULL))
           if(is.null(et_ok)) et_ok <- rep(TRUE, length(pidx))
           gate <- as.numeric(et_ok)                    # 1 if finishes, else 0
           for(stat in c("Tackles","Passes","INT","Crosses","FC")) {
             M <- mats[[stat]]; if(is.null(M)) next
+            et_bump <- (SOCCER_P$et_minutes/90) * et_factor(stat)
             sub <- M[pidx, tied, drop=FALSE]
             pr  <- pmin(et_bump * gate, 0.95)          # per-player bump prob (0 if subbed off)
             prmat <- matrix(rep(pr, length(tied)), nrow(sub), ncol(sub))
