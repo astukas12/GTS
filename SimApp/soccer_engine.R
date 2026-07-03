@@ -14,7 +14,7 @@ SOCCER_P <- list(
   rho = -0.13, max_goals = 5,
   
   # Fallback NegBin phi values
-  phi_shots = 10.5, phi_crosses = 8.2, phi_fouls = 6.5,
+  phi_shots = 6.0, phi_crosses = 8.2, phi_fouls = 6.5,
   phi_tackles = 8.0, phi_def = 5.0,
   tackle_win_rate = 0.60,  # market shows attempts, DK scores wins only
   
@@ -32,7 +32,7 @@ SOCCER_P <- list(
   # high-goal sims. Defaults below are overridden per-slate by the Correlations
   # sheet written by InputMaker (computed from team_game_log / wc22_game_flat).
   corr_shots_goals = 0.55,
-  corr_sot_goals   = 0.62,
+  corr_sot_goals   = 0.75,
   corr_sot_shots   = 0.78,
   
   # CC = shots × rate
@@ -69,7 +69,7 @@ SOCCER_P <- list(
   # Applied ONLY to sims tied after 90' (hg==ag), identified from the scoreline
   # draw. The fraction of sims that trigger ET is therefore the correct-score
   # market's draw mass — self-scaling per game (lopsided games rarely trigger).
-  et_enable = FALSE,        # master switch for ET modeling
+  et_enable = TRUE,        # master switch for ET modeling
   et_minutes = 30,         # length of extra time
   # ── ET per-minute intensity vs regulation, by stat ──
   # Grounded in ET sports-science findings (Field/Harper systematic review):
@@ -78,9 +78,9 @@ SOCCER_P <- list(
   #    tackling ratio lower; ball-in-play ~ -16% (a floor on all event drops).
   # Values lean CONSERVATIVE (under-add) on every stat except goals, where the
   # data is firm that ET ~ regulation rate. All applied only to tied sims.
-  et_goal_intensity = 0.70,
-  et_int_shots  = 0.52,
-  et_int_sot    = 0.52,
+  et_goal_intensity = 0.90,
+  et_int_shots  = 0.70,
+  et_int_sot    = 0.70,
   et_int_tackle = 0.78,
   et_int_foul   = 0.80,
   et_int_pass   = 0.70,
