@@ -69,7 +69,7 @@ SOCCER_P <- list(
   # Applied ONLY to sims tied after 90' (hg==ag), identified from the scoreline
   # draw. The fraction of sims that trigger ET is therefore the correct-score
   # market's draw mass — self-scaling per game (lopsided games rarely trigger).
-  et_enable = TRUE,        # master switch for ET modeling
+  et_enable = FALSE,        # master switch for ET modeling
   et_minutes = 30,         # length of extra time
   # ── ET per-minute intensity vs regulation, by stat ──
   # Grounded in ET sports-science findings (Field/Harper systematic review):
@@ -78,9 +78,9 @@ SOCCER_P <- list(
   #    tackling ratio lower; ball-in-play ~ -16% (a floor on all event drops).
   # Values lean CONSERVATIVE (under-add) on every stat except goals, where the
   # data is firm that ET ~ regulation rate. All applied only to tied sims.
-  et_goal_intensity = 0.90,
-  et_int_shots  = 0.82,
-  et_int_sot    = 0.82,
+  et_goal_intensity = 0.70,
+  et_int_shots  = 0.52,
+  et_int_sot    = 0.52,
   et_int_tackle = 0.78,
   et_int_foul   = 0.80,
   et_int_pass   = 0.70,
