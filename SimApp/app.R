@@ -621,10 +621,12 @@ server <- function(input, output, session) {
         rv$has_dk <- TRUE
         rv$has_fd <- all(c("FDSalary", "FDID", "FDName") %in% driver_cols)
       } else if (rv$sport == "SOCCER") {
-        # Soccer is SHOWDOWN-ONLY by design — never offer DK classic or FD.
-        rv$has_dk <- FALSE
+        # Soccer supports Showdown (always) and DK Classic (when Classic_IDs sheet
+        # is present in the combined input file).
         rv$has_fd <- FALSE
         rv$has_sd <- TRUE
+        soccer_sheets <- tryCatch(readxl::excel_sheets(input$input_file$datapath), error=function(e) character(0))
+        rv$has_dk <- "Classic_IDs" %in% soccer_sheets
       } else {
         # Default each platform flag from the sport's DECLARED platforms in the
         # config (the source of truth). available_platforms() starts from
@@ -831,12 +833,10 @@ server <- function(input, output, session) {
           rv$has_fd           <- FALSE
           rv$has_sd           <- FALSE
         } else if (rv$sport == "SOCCER") {
-          # Soccer is SHOWDOWN-ONLY by design — DraftKings classic is never
-          # offered. SD is the only contest format for soccer slates.
           rv$full_sim_results <- NULL
-          rv$has_dk <- FALSE
           rv$has_fd <- FALSE
           rv$has_sd <- TRUE
+          rv$has_dk <- isTRUE(result$has_classic)
         } else {
           rv$full_sim_results <- NULL
           # Keep platform flags from upload-time detection
@@ -1178,12 +1178,6 @@ server <- function(input, output, session) {
   
   observeEvent(input$run_dk_optimization, {
     req(rv$simulation_results, rv$sim_metadata, rv$config)
-    # Soccer is showdown-only — there is no DraftKings classic path. Ignore any
-    # DK-optimization trigger for soccer slates.
-    if (isTRUE(rv$sport == "SOCCER")) {
-      showNotification("Soccer is showdown-only — use the Showdown optimizer.", type = "message", duration = 5)
-      return(invisible(NULL))
-    }
     rv$dk_optimal_lineups <- NULL
     rv$dk_portfolio <- NULL; rv$dk_builds <- list(); rv$dk_build_counter <- 0
     rv$dk_lock_v <- 0L

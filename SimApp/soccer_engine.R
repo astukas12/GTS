@@ -256,9 +256,13 @@ read_soccer_input <- function(file_path) {
   num_g <- c("Home_Lambda","Away_Lambda","Home_Shots","Away_Shots","Home_SOT","Away_SOT")
   for(col in intersect(num_g, names(gm))) gm[[col]] <- as.numeric(gm[[col]])
   
-  # SD tabs
+  # SD tabs — match both old pattern (SD1_IDs) and combined pattern (SD1_GameKey)
   sd_tabs <- list()
-  for(sn in grep("^SD\\d+_IDs$", sheets, value=TRUE)) sd_tabs[[sub("_IDs$","",sn)]] <- data[[sn]]
+  sd_pattern <- "^SD\\d+_"
+  for(sn in grep(sd_pattern, sheets, value=TRUE)) {
+    key <- sub("_IDs$", "", sn)  # strip _IDs suffix if present (old format)
+    sd_tabs[[key]] <- data[[sn]]
+  }
   gm[, GameKey := Game]; gm[, ShowdownFile := ""]
   for(sdn in names(sd_tabs)) {
     sd_dt <- as.data.table(sd_tabs[[sdn]]); tc <- intersect(c("Team","TeamAbbrev"), names(sd_dt))[1]
@@ -282,10 +286,25 @@ read_soccer_input <- function(file_path) {
   wc_path <- "~/GTS/Soccer/data/wc22_game_flat.parquet"
   if(file.exists(wc_path)) { wc_bootstrap <- as.data.table(arrow::read_parquet(wc_path)); cat(sprintf("  WC bootstrap: %d games\n", nrow(wc_bootstrap))) }
   
-  cat(sprintf("Soccer: %d players | %d games | %d SD tabs\n", nrow(pl), nrow(gm), length(sd_tabs)))
+  # Classic IDs (multi-game DK Classic salary/position pool)
+  classic_ids <- NULL; has_classic <- FALSE
+  if("Classic_IDs" %in% sheets) {
+    classic_ids <- as.data.table(data[["Classic_IDs"]])
+    # Coerce salary to numeric
+    sal_col <- intersect(c("Salary","salary"), names(classic_ids))[1]
+    if(!is.na(sal_col)) classic_ids[[sal_col]] <- as.numeric(classic_ids[[sal_col]])
+    id_col <- intersect(c("ID","id"), names(classic_ids))[1]
+    if(!is.na(id_col)) classic_ids[[id_col]] <- as.character(classic_ids[[id_col]])
+    has_classic <- nrow(classic_ids) > 0
+    cat(sprintf("  Classic IDs: %d rows\n", nrow(classic_ids)))
+  }
+  
+  cat(sprintf("Soccer: %d players | %d games | %d SD tabs | Classic=%s\n",
+              nrow(pl), nrow(gm), length(sd_tabs), has_classic))
   list(Players=pl, Games=gm, IDs=data$IDs, sd_tabs=sd_tabs, games=gm,
        distributions=distributions, correlations=correlations,
        wc_bootstrap=wc_bootstrap, all_sheets=data,
+       classic_ids=classic_ids, has_classic=has_classic,
        has_sd = length(sd_tabs) > 0)
 }
 
@@ -1062,6 +1081,41 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
     if(!is.na(tc)) { st<-unique(sd_dt[[tc]]); metadata[Team %in% st & ShowdownFile=="", ShowdownFile := sdn] }
   }
   
+  # ── CLASSIC IDS MERGE ──
+  # When the combined input has a Classic_IDs sheet, merge Classic-specific
+  
+  # salary, ID, and roster position onto metadata so the DK Classic optimizer
+  # can pull them. The "Player" column in Classic_IDs is the name-matched key
+  # produced by InputMaker_Soccer_Combine.R.
+  has_classic <- isTRUE(input_data$has_classic) && !is.null(input_data$classic_ids)
+  if(has_classic) {
+    ci <- as.data.table(input_data$classic_ids)
+    # Standardise column names (combiner writes make.names'd headers)
+    if("Roster.Position" %in% names(ci)) setnames(ci, "Roster.Position", "RosterPos")
+    sal_col <- intersect(c("Salary","salary"), names(ci))[1]
+    id_col  <- intersect(c("ID","id"), names(ci))[1]
+    rp_col  <- intersect(c("RosterPos","Roster Position"), names(ci))[1]
+    if(!is.na(sal_col) && !is.na(id_col) && !is.na(rp_col)) {
+      ci_merge <- unique(ci[!is.na(Player) & nchar(as.character(Player))>0,
+                            .(Player, ClassicSalary=as.numeric(get(sal_col)),
+                              ClassicID=as.character(get(id_col)),
+                              ClassicPos=as.character(get(rp_col)))], by="Player")
+      metadata <- merge(metadata, ci_merge, by="Player", all.x=TRUE)
+      n_clas <- sum(!is.na(metadata$ClassicSalary))
+      # For players with Classic data, copy Classic ID/Salary into the standard
+      # DK columns so all downstream paths (display, download, portfolio) work
+      # without Classic-specific branches. SD paths use CPTID/SDSalary so they
+      # are unaffected.
+      metadata[!is.na(ClassicID), DKID := ClassicID]
+      metadata[!is.na(ClassicSalary), DKSalary := ClassicSalary]
+      metadata[!is.na(ClassicPos), DKPos := ClassicPos]
+      cat(sprintf("  Classic merged: %d/%d players have Classic salary\n", n_clas, nrow(metadata)))
+    } else {
+      cat("  WARNING: Classic_IDs missing expected columns — skipping merge\n")
+      has_classic <- FALSE
+    }
+  }
+  
   # ── VISUALS ──
   cb("Building visualizations...", 0.95)
   pm <- data.table(Player=all_players_list$Player, Team=all_players_list$Team,
@@ -1276,7 +1330,7 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
          teams=team_list, score_dist=score_dist, stat_dist=stat_dist,
          game_overview=game_overview, team_sim_stats=team_sim_dt,
          goal_freq=goal_freq, xref=xref_dt),
-       has_sd=has_sd)
+       has_sd=has_sd, has_classic=has_classic)
 }
 
 # ── LINEUP FUNCTIONS (unchanged from v2) ─────────────────────────────────────
@@ -1302,48 +1356,80 @@ assign_soccer_slots_dk <- function(cm) {
 }
 
 find_optimal_lineups_soccer <- function(sim_results, metadata, config, verbose=TRUE) {
-  if(verbose) cat("\nPhase 1: Soccer DK lineups...\n")
+  if(verbose) cat("\nPhase 1: Soccer DK Classic lineups...\n")
   setDT(sim_results); setDT(metadata)
   sc <- config$salary_cap; ml <- config$max_lineups %||% 5000L
-  meta <- unique(metadata[, .(Player,DKSalary,DKPos,Team,GameKey)], by="Player")
-  meta[, gk_elig := as.integer(grepl("GK",DKPos))]
-  meta[, d_elig := as.integer(grepl("D",DKPos)&!grepl("GK",DKPos))]
-  meta[, m_elig := as.integer(grepl("M",DKPos))]
-  meta[, f_elig := as.integer(grepl("F",DKPos)&!grepl("FLEX",DKPos))]
+  # Use Classic columns when present (combined input), fall back to SD-era DK columns
+  has_clas <- "ClassicSalary" %in% names(metadata) && "ClassicPos" %in% names(metadata)
+  if(has_clas) {
+    meta <- unique(metadata[!is.na(ClassicSalary), .(Player, Sal=ClassicSalary, Pos=ClassicPos, Team, GameKey)], by="Player")
+    if(verbose) cat(sprintf("  Using Classic salary/pos for %d players\n", nrow(meta)))
+  } else {
+    meta <- unique(metadata[, .(Player, Sal=DKSalary, Pos=DKPos, Team, GameKey)], by="Player")
+  }
+  meta[, gk_elig := as.integer(grepl("GK",Pos))]
+  meta[, d_elig := as.integer(grepl("D",Pos)&!grepl("GK",Pos))]
+  meta[, m_elig := as.integer(grepl("M",Pos))]
+  meta[, f_elig := as.integer(grepl("F",Pos)&!grepl("FLEX",Pos))]
   if("GameRank" %in% names(metadata)) meta<-merge(meta,unique(metadata[,.(Player,GameRank)]),by="Player",all.x=TRUE)
   meta[, game_rank := fifelse(is.na(GameRank),1L,GameRank)][, GameRank := NULL]
-  od <- merge(sim_results[,.(SimID,Player,FP=DKScore)], meta[,.(Player,Sal=DKSalary,gk_elig,d_elig,m_elig,f_elig,game_rank,DKPos,Team,GameKey)], by="Player")
-  od <- od[Sal>0&!is.na(Sal)&!is.na(FP)]; setkey(od, SimID)
-  sids <- unique(od$SimID); ns <- length(sids)
-  if(verbose) cat(sprintf("  %d players | %s sims\n", nrow(meta), format(ns,big.mark=",")))
+  meta[, DKPos := Pos]
+  
+  # Build the score matrix: players × sims
+  pl_vec <- meta$Player; np <- length(pl_vec)
+  od <- merge(sim_results[,.(SimID,Player,FP=DKScore)], data.table(Player=pl_vec), by="Player")
+  od <- od[!is.na(FP)]
+  sids <- sort(unique(od$SimID)); ns <- length(sids)
+  # score matrix [np × ns]
+  sm <- matrix(0, np, ns)
+  sm[cbind(match(od$Player, pl_vec), match(od$SimID, sids))] <- od$FP
+  
+  # ── Precompute constraint matrix ONCE (identical across sims) ──
+  sal <- as.numeric(meta$Sal)
+  gkp <- unique(meta$GameKey)
+  tms <- unique(meta$Team)
+  # constraint rows: count=8, salary<=cap, gk==1, d>=2, m>=2, f>=2, per-game<=7, per-team<=5
+  gc <- if(length(gkp)>=2) do.call(rbind, lapply(gkp, function(g) as.integer(meta$GameKey==g))) else matrix(nrow=0,ncol=np)
+  tc <- if(length(tms)>=3) do.call(rbind, lapply(tms, function(t) as.integer(meta$Team==t))) else matrix(nrow=0,ncol=np)
+  fc <- rbind(rep(1L,np), sal, meta$gk_elig, meta$d_elig, meta$m_elig, meta$f_elig, gc, tc)
+  fd <- c("==","<=","==",">=",">=",">=", rep("<=",nrow(gc)), rep("<=",nrow(tc)))
+  fr <- c(8L, sc, 1L, 2L, 2L, 2L, rep(7L,nrow(gc)), rep(5L,nrow(tc)))
+  
+  if(verbose) cat(sprintf("  %d players | %s sims | constraint matrix %dx%d\n",
+                          np, format(ns,big.mark=","), nrow(fc), ncol(fc)))
+  
   st <- Sys.time(); pf <- max(1L, ns%/%20L); ll <- vector("list", ns)
-  for(i in seq_along(sids)) {
-    sid<-sids[i]; pool<-od[.(sid)]; np<-nrow(pool); if(np<8L) next
-    gkp<-unique(pool$GameKey); gc<-if(length(gkp)>=2) lapply(gkp,function(g) as.integer(pool$GameKey==g)) else list()
-    tms<-unique(pool$Team); tc<-if(length(tms)>=3) lapply(tms,function(t) as.integer(pool$Team==t)) else list()
-    fc<-rbind(rep(1L,np),pool$Sal,pool$gk_elig,pool$d_elig,pool$m_elig,pool$f_elig,
-              if(length(gc)) do.call(rbind,gc) else matrix(nrow=0,ncol=np),
-              if(length(tc)) do.call(rbind,tc) else matrix(nrow=0,ncol=np))
-    fd<-c("==","<=","==",">=",">=",">=",rep("<=",length(gc)),rep("<=",length(tc)))
-    fr<-c(8L,sc,1L,2L,2L,2L,rep(7L,length(gc)),rep(5L,length(tc)))
-    sol<-tryCatch(lpSolve::lp("max",pool$FP,fc,fd,fr,all.bin=TRUE)$solution, error=function(e) NULL)
-    if(is.null(sol)||sum(sol)<8L) next; ch<-pool[sol==1]
-    n_slate_teams <- length(unique(meta$Team))
-    if(n_slate_teams >= 3 && length(unique(ch$Team))<3L) next
-    ll[[i]]<-data.table(Lineup=paste(sort(ch$Player),collapse="|"),TotalSalary=sum(ch$Sal),TotalScore=sum(ch$FP))
-    if(verbose&&i%%pf==0L) { cat(sprintf("\r  Phase 1: %d%%",round(i/ns*100))); flush.console() }
+  n_slate_teams <- length(unique(meta$Team))
+  for(i in seq_len(ns)) {
+    sol <- tryCatch(lpSolve::lp("max", sm[,i], fc, fd, fr, all.bin=TRUE)$solution, error=function(e) NULL)
+    if(is.null(sol) || sum(sol)<8L) next
+    ch <- which(sol==1)
+    if(n_slate_teams >= 3 && length(unique(meta$Team[ch]))<3L) next
+    ll[[i]] <- data.table(Lineup=paste(sort(pl_vec[ch]), collapse="|"),
+                          TotalSalary=sum(sal[ch]), TotalScore=sum(sm[ch,i]))
+    if(verbose && i%%pf==0L) { cat(sprintf("\r  Phase 1: %d%%",round(i/ns*100))); flush.console() }
   }
   if(verbose) cat("\n")
-  valid<-ll[!sapply(ll,is.null)]; if(!length(valid)) stop("No valid lineups.")
-  ad<-rbindlist(valid); ct<-ad[,.(Top1Count=.N,TotalSalary=TotalSalary[1],AvgScore=mean(TotalScore)),by=Lineup]
-  ct[,rand:=runif(.N)]; setorder(ct,-Top1Count,rand); ct[,rand:=NULL]
-  sl2<-vector("list",nrow(ct))
-  for(li in seq_len(nrow(ct))) { ps<-strsplit(ct$Lineup[li],"\\|")[[1]]; cm<-meta[Player%in%ps,.(Player,DKPos,game_rank)]
-  s<-assign_soccer_slots_dk(cm); if(!is.null(s)) sl2[[li]]<-as.data.table(c(list(Lineup=ct$Lineup[li]),s)) }
-  sd2<-rbindlist(sl2[!sapply(sl2,is.null)]); ct<-merge(ct,sd2,by="Lineup",all.x=TRUE)
-  ul<-ct[!is.na(F1),.(TotalSalary,Top1Count,AvgScore,Player1=F1,Player2=F2,Player3=M1,Player4=M2,Player5=D1,Player6=D2,Player7=GK,Player8=UTIL)]
-  if(nrow(ul)>ml) ul<-ul[1:ml]
-  el<-as.numeric(difftime(Sys.time(),st,units="secs"))
+  valid <- ll[!sapply(ll,is.null)]; if(!length(valid)) stop("No valid lineups.")
+  ad <- rbindlist(valid)
+  ct <- ad[, .(Top1Count=.N, TotalSalary=TotalSalary[1], AvgScore=mean(TotalScore)), by=Lineup]
+  ct[, rand:=runif(.N)]; setorder(ct, -Top1Count, rand); ct[, rand:=NULL]
+  
+  # ── Assign slots: game_rank ascending = early-game fills natural slots first,
+  #    late-game overflow goes to UTIL (preserves late-swap flexibility) ──
+  sl2 <- vector("list", nrow(ct))
+  for(li in seq_len(nrow(ct))) {
+    ps <- strsplit(ct$Lineup[li], "\\|")[[1]]
+    cm <- meta[Player %in% ps, .(Player, DKPos, game_rank)]
+    s <- assign_soccer_slots_dk(cm)
+    if(!is.null(s)) sl2[[li]] <- as.data.table(c(list(Lineup=ct$Lineup[li]), s))
+  }
+  sd2 <- rbindlist(sl2[!sapply(sl2,is.null)]); ct <- merge(ct, sd2, by="Lineup", all.x=TRUE)
+  ul <- ct[!is.na(F1), .(TotalSalary, Top1Count, AvgScore,
+                         Player1=F1, Player2=F2, Player3=M1, Player4=M2,
+                         Player5=D1, Player6=D2, Player7=GK, Player8=UTIL)]
+  if(nrow(ul)>ml) ul <- ul[1:ml]
+  el <- as.numeric(difftime(Sys.time(), st, units="secs"))
   if(verbose) cat(sprintf("  Done: %s lineups | %.1fs\n", format(nrow(ul),big.mark=","), el))
   list(unique_lineups=ul, n_sims=ns, config=config, mode="soccer_dk")
 }
