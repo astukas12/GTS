@@ -2091,7 +2091,7 @@ server <- function(input, output, session) {
         p <- exp_tbl$Player[i]
         if (p %in% names(all_counts)) exp_tbl$Exposure[i] <- as.numeric(all_counts[p]) / n_lineups * 100
       }
-      if (is_f1 || (is_cbb && has_captain) || (is_nba && is_sd && has_captain)) {
+      if (has_captain || length(util_cols) > 0) {
         cpt_counts  <- if (length(cpt_cols))  table(unlist(filtered[, ..cpt_cols]))  else table(character(0))
         util_counts <- if (length(util_cols)) table(unlist(filtered[, ..util_cols])) else table(character(0))
         exp_tbl[, CptExp  := 0]
@@ -2415,19 +2415,19 @@ server <- function(input, output, session) {
         # ── IN / OUT split mode ──────────────────────────────────────────────
         port_in  <- port[Build %in% sel_builds]
         port_out <- port[!(Build %in% sel_builds)]
+        n_in  <- nrow(port_in);  n_out <- nrow(port_out)
+        # NOTE: keep the total column named "Exposure" (not the pretty display
+        # name) through all the downstream sport-specific processing below,
+        # since that code references `Exposure` directly (OwnProj/Leverage/
+        # TotExp calcs). We rename to the display labels at the very end,
+        # right before building the datatable.
         exp_tbl  <- data.table(
-          Player = meta_players,
-          ExpIN  = round(compute_exp(port_in),  1),
-          ExpOUT = round(compute_exp(port_out), 1),
-          ExpTOT = round(compute_exp(port),     1)
+          Player   = meta_players,
+          ExpIN    = round(compute_exp(port_in),  1),
+          ExpOUT   = round(compute_exp(port_out), 1),
+          Exposure = round(compute_exp(port),     1)
         )
         exp_tbl[, Diff := round(ExpIN - ExpOUT, 1)]
-        n_in  <- nrow(port_in);  n_out <- nrow(port_out)
-        setnames(exp_tbl, c("ExpIN","ExpOUT","ExpTOT","Diff"),
-                 c(paste0("IN (",  n_in,  "L)"),
-                   paste0("OUT (", n_out, "L)"),
-                   paste0("Total (", nrow(port), "L)"),
-                   "IN-OUT"))
         
         exp_tbl <- merge(exp_tbl, rv$sim_metadata[Player %in% meta_players, ..mc], by="Player", all.x=TRUE)
         if (salary_col %in% names(exp_tbl)) setnames(exp_tbl, salary_col, "Salary")
@@ -2495,12 +2495,23 @@ server <- function(input, output, session) {
         exp_sort_col <- if ("Exposure" %in% names(exp_tbl)) "Exposure" else "TotExp"
         exp_tbl <- exp_tbl[get(exp_sort_col) > 0]
         setorderv(exp_tbl, exp_sort_col, order = -1L)
+        
+        # ── Rename to display labels now that all Exposure-dependent calcs are done ──
+        in_lab  <- paste0("IN (",  n_in,  "L)")
+        out_lab <- paste0("OUT (", n_out, "L)")
+        tot_lab <- paste0("Total (", nrow(port), "L)")
+        setnames(exp_tbl, c("ExpIN","ExpOUT","Diff"), c(in_lab, out_lab, "IN-OUT"))
+        if ("Exposure" %in% names(exp_tbl)) setnames(exp_tbl, "Exposure", tot_lab)
+        front_cols <- intersect(c("Player", in_lab, out_lab, tot_lab, "IN-OUT"), names(exp_tbl))
+        setcolorder(exp_tbl, front_cols)
+        
         dt <- datatable(exp_tbl, options=list(pageLength=50,scrollX=TRUE,searching=FALSE,lengthChange=FALSE,dom='tp'), rownames=FALSE)
         rc <- intersect(c("CptExp","CptOwn","CptLev",
                           "UtlExp","UtlOwn","UtlLev",
                           "TotExp","TotOwn","TotLev",
-                          "Exposure","FlexExp","OwnProj","Leverage",
-                          "CutProb","RGProj","RGMin","Proj","Sim"), names(exp_tbl))
+                          "FlexExp","OwnProj","Leverage",
+                          "CutProb","RGProj","RGMin","Proj","Sim",
+                          in_lab, out_lab, tot_lab, "IN-OUT"), names(exp_tbl))
         if (length(rc) > 0) dt <- dt %>% formatRound(rc, 1)
         cap <- rv$config$salary_caps[[platform]] %||% 50000
         sal_col_disp <- if ("Sal" %in% names(exp_tbl)) "Sal" else if ("Salary" %in% names(exp_tbl)) "Salary" else NULL
