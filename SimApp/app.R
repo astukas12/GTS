@@ -2389,6 +2389,14 @@ server <- function(input, output, session) {
         cnt <- table(unlist(sub_port[, ..all_pc]))
         sapply(meta_players, function(p) if (p %in% names(cnt)) as.numeric(cnt[p]) / n * 100 else 0)
       }
+      # Helper: same, but restricted to a specific set of columns (e.g. just
+      # the Captain slot columns, or just the Util slot columns)
+      compute_exp_cols <- function(sub_port, cols) {
+        n <- nrow(sub_port)
+        if (n == 0 || length(cols) == 0) return(setNames(rep(0, length(meta_players)), meta_players))
+        cnt <- table(unlist(sub_port[, ..cols]))
+        sapply(meta_players, function(p) if (p %in% names(cnt)) as.numeric(cnt[p]) / n * 100 else 0)
+      }
       
       # ── Build metadata column list ─────────────────────────────────────────
       if (is_nba && is_sd) {
@@ -2428,6 +2436,18 @@ server <- function(input, output, session) {
           Exposure = round(compute_exp(port),     1)
         )
         exp_tbl[, Diff := round(ExpIN - ExpOUT, 1)]
+        
+        if (has_captain || length(util_cols) > 0) {
+          # Total Cpt/Util exposure (kept under these exact names since the
+          # sport-specific blocks below reference CptExp/UtilExp directly for
+          # Leverage/TotExp calcs), plus separate IN/OUT columns for display.
+          exp_tbl[, CptExp     := round(compute_exp_cols(port,     cpt_cols),  1)]
+          exp_tbl[, CptExpIN   := round(compute_exp_cols(port_in,  cpt_cols),  1)]
+          exp_tbl[, CptExpOUT  := round(compute_exp_cols(port_out, cpt_cols),  1)]
+          exp_tbl[, UtilExp    := round(compute_exp_cols(port,     util_cols), 1)]
+          exp_tbl[, UtilExpIN  := round(compute_exp_cols(port_in,  util_cols), 1)]
+          exp_tbl[, UtilExpOUT := round(compute_exp_cols(port_out, util_cols), 1)]
+        }
         
         exp_tbl <- merge(exp_tbl, rv$sim_metadata[Player %in% meta_players, ..mc], by="Player", all.x=TRUE)
         if (salary_col %in% names(exp_tbl)) setnames(exp_tbl, salary_col, "Salary")
@@ -2502,8 +2522,20 @@ server <- function(input, output, session) {
         tot_lab <- paste0("Total (", nrow(port), "L)")
         setnames(exp_tbl, c("ExpIN","ExpOUT","Diff"), c(in_lab, out_lab, "IN-OUT"))
         if ("Exposure" %in% names(exp_tbl)) setnames(exp_tbl, "Exposure", tot_lab)
+        
+        cpt_in_lab  <- paste0("Cpt IN (",  n_in,  "L)")
+        cpt_out_lab <- paste0("Cpt OUT (", n_out, "L)")
+        utl_in_lab  <- paste0("Utl IN (",  n_in,  "L)")
+        utl_out_lab <- paste0("Utl OUT (", n_out, "L)")
+        if ("CptExpIN"   %in% names(exp_tbl)) setnames(exp_tbl, "CptExpIN",   cpt_in_lab)
+        if ("CptExpOUT"  %in% names(exp_tbl)) setnames(exp_tbl, "CptExpOUT",  cpt_out_lab)
+        if ("UtilExpIN"  %in% names(exp_tbl)) setnames(exp_tbl, "UtilExpIN",  utl_in_lab)
+        if ("UtilExpOUT" %in% names(exp_tbl)) setnames(exp_tbl, "UtilExpOUT", utl_out_lab)
+        
         front_cols <- intersect(c("Player", in_lab, out_lab, tot_lab, "IN-OUT"), names(exp_tbl))
-        setcolorder(exp_tbl, front_cols)
+        cpt_util_group <- intersect(c("CptExp", cpt_in_lab, cpt_out_lab, "CptOwn","CptLev",
+                                      "UtlExp","UtilExp", utl_in_lab, utl_out_lab, "UtlOwn","UtlLev"), names(exp_tbl))
+        setcolorder(exp_tbl, c(front_cols, cpt_util_group))
         
         dt <- datatable(exp_tbl, options=list(pageLength=50,scrollX=TRUE,searching=FALSE,lengthChange=FALSE,dom='tp'), rownames=FALSE)
         rc <- intersect(c("CptExp","CptOwn","CptLev",
@@ -2511,7 +2543,8 @@ server <- function(input, output, session) {
                           "TotExp","TotOwn","TotLev",
                           "FlexExp","OwnProj","Leverage",
                           "CutProb","RGProj","RGMin","Proj","Sim",
-                          in_lab, out_lab, tot_lab, "IN-OUT"), names(exp_tbl))
+                          in_lab, out_lab, tot_lab, "IN-OUT",
+                          cpt_in_lab, cpt_out_lab, utl_in_lab, utl_out_lab), names(exp_tbl))
         if (length(rc) > 0) dt <- dt %>% formatRound(rc, 1)
         cap <- rv$config$salary_caps[[platform]] %||% 50000
         sal_col_disp <- if ("Sal" %in% names(exp_tbl)) "Sal" else if ("Salary" %in% names(exp_tbl)) "Salary" else NULL
