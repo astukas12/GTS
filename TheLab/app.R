@@ -229,21 +229,21 @@ ui <- fluidPage(
     tags$script(src = "custom-handlers.js"),
     
     # Page title
-    tags$title("Golden Ticket Research Center")
+    tags$title("Golden Ticket Research Lab")
   ),
   
   # ---- HEADER ----
   div(class = "app-header",
       div(class = "app-header-left",
           img(src = "logo.jpg", class = "app-logo"),
-          h1("Golden Ticket Research Center", class = "app-title")
+          h1("Golden Ticket Research Labr", class = "app-title")
       )
   ),
   
   navbarPage(
     title       = NULL,
     id          = "main_tabs",
-    windowTitle = "Golden Ticket Research Center",
+    windowTitle = "Golden Ticket Research Lab",
     
     # =========================================================================
     # SETUP TAB  (merged Race Selection + Entry List; pool builders as sub-tabs)
