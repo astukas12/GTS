@@ -236,7 +236,7 @@ ui <- fluidPage(
   div(class = "app-header",
       div(class = "app-header-left",
           img(src = "logo.jpg", class = "app-logo"),
-          h1("Golden Ticket Research Labr", class = "app-title")
+          h1("Golden Ticket Research Lab", class = "app-title")
       )
   ),
   
