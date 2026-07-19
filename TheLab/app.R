@@ -229,21 +229,21 @@ ui <- fluidPage(
     tags$script(src = "custom-handlers.js"),
     
     # Page title
-    tags$title("Golden Ticket Research Lab")
+    tags$title("Golden Ticket Research Center")
   ),
   
   # ---- HEADER ----
   div(class = "app-header",
       div(class = "app-header-left",
           img(src = "logo.jpg", class = "app-logo"),
-          h1("Golden Ticket Research Lab", class = "app-title")
+          h1("Golden Ticket Research Center", class = "app-title")
       )
   ),
   
   navbarPage(
     title       = NULL,
     id          = "main_tabs",
-    windowTitle = "Golden Ticket Research Lab",
+    windowTitle = "Golden Ticket Research Center",
     
     # =========================================================================
     # SETUP TAB  (merged Race Selection + Entry List; pool builders as sub-tabs)
@@ -656,6 +656,10 @@ server <- function(input, output, session) {
     dom_target_lo            = NULL,        # DK dom-total acceptance band (hard gate)
     dom_target_hi            = NULL,
     dom_target_laps          = NULL,        # upcoming race scheduled lap count
+    dom_target_laps_auto     = NULL,        # value read from the Races sheet
+    dom_target_laps_override = NULL,        # manual user edit, if any
+    dom_ref_basis            = NULL,        # what the band was anchored to
+    dom_ref_ncomps           = 0L,          # how many comps in that anchor
     dom_include              = NULL,        # named logical vector keyed by race_id
     dom_band_initialized     = FALSE
   )
@@ -913,29 +917,34 @@ server <- function(input, output, session) {
       
       incProgress(0.6)
       
-      # Auto dom pool: ±25% of median DK dom total at this track+series
-      # If no same-track history, use full series median
-      same_track_dom <- races_available %>%
-        filter(is_same_track, DK_Dom_Total > 0) %>%
-        pull(DK_Dom_Total)
-      # Default range: ±25% of median, but always wide enough to include
-      # all same-track races so the selected track's history is in Dom pool
-      ref_median <- if (length(same_track_dom) >= 2) {
-        median(same_track_dom, na.rm = TRUE)
+      # Auto dom pool: races with a similar ACTUAL lap count. That is the rule.
+      sel_race_row <- values$races_sheet %>%
+        filter(race_id == suppressWarnings(as.numeric(input$analysis_race_id))) %>%
+        slice(1)
+      .gc <- function(d, nm) if (nm %in% names(d) && nrow(d) > 0)
+        suppressWarnings(as.numeric(d[[nm]][1])) else NA_real_
+      .sl <- .gc(sel_race_row, "scheduled_laps")
+      .al <- .gc(sel_race_row, "actual_laps")
+      target_laps_seed <- if (!is.na(.sl) && .sl > 1) .sl else
+        if (!is.na(.al) && .al > 1) .al else NA_real_
+      
+      lap_comp_dom <- if (!is.na(target_laps_seed)) {
+        races_available %>%
+          filter(DK_Dom_Total > 0, !is.na(total_laps),
+                 abs(total_laps - target_laps_seed) <= 0.20 * target_laps_seed) %>%
+          pull(DK_Dom_Total)
+      } else {
+        races_available$DK_Dom_Total[races_available$DK_Dom_Total > 0]
+      }
+      
+      ref_median <- if (length(lap_comp_dom) > 0) {
+        median(lap_comp_dom, na.rm = TRUE)
       } else {
         median(races_available$DK_Dom_Total[races_available$DK_Dom_Total > 0],
                na.rm = TRUE)
       }
-      dom_lo <- if (length(same_track_dom) > 0) {
-        min(floor(ref_median * 0.75), floor(min(same_track_dom) * 0.95))
-      } else {
-        floor(ref_median * 0.75)
-      }
-      dom_hi <- if (length(same_track_dom) > 0) {
-        max(ceiling(ref_median * 1.25), ceiling(max(same_track_dom) * 1.05))
-      } else {
-        ceiling(ref_median * 1.25)
-      }
+      dom_lo <- floor(ref_median * 0.75)
+      dom_hi <- ceiling(ref_median * 1.25)
       
       # Default perf pill state: tracks of same type as selected track
       default_perf_tracks <- if (!is.na(selected_track_type)) {
@@ -946,7 +955,10 @@ server <- function(input, output, session) {
         unique(races_available$track_name[!is.na(races_available$track_name)])
       }
       
-      # Build initial pool_state: auto-assign dom and perf flags
+      # Build initial pool_state: auto-assign dom and perf flags.
+      # dom is a coarse band pre-filter only — the lap-similarity gate lives in
+      # dom_profiles(), which is the single source of truth for the candidate
+      # set. Gating both places created a circular filter that emptied the pool.
       pool_state <- races_available %>%
         transmute(
           race_id,
@@ -954,7 +966,8 @@ server <- function(input, output, session) {
           perf       = track_name %in% default_perf_tracks,
           dom_manual = FALSE,
           perf_manual= FALSE
-        )
+        ) %>%
+        mutate(dom = if_else(is.na(dom), FALSE, dom))
       
       # Store perf control state
       values$perf_same_track_only   <- FALSE
@@ -962,6 +975,11 @@ server <- function(input, output, session) {
       values$perf_season_from       <- min(races_available$race_season, na.rm = TRUE)
       values$perf_same_track_toggle <- 0L
       values$dom_track_exclude      <- character(0)
+      values$dom_target_laps_override <- NULL
+      # Set the target lap count here (not only in the seeding observer) so the
+      # dom_profiles() lap filter has a value on first evaluation.
+      values$dom_target_laps        <- target_laps_seed
+      values$dom_target_laps_auto   <- target_laps_seed
       
       incProgress(0.8)
       
@@ -1596,17 +1614,12 @@ server <- function(input, output, session) {
   # ===========================================================================
   
   # All candidate races for the loaded series, each reduced to a profile.
-  # Scoped to the Race Selection dom pre-filter (pool_state$dom) so the
-  # candidate set matches what was filtered in on the selection page.
+  # The candidate set is EVERY available race — the lap-similarity filter is
+  # applied here, once. It must not read pool_state$dom, because pool_state$dom
+  # is itself derived from this filter (that circularity produced 0 comps).
   dom_profiles <- reactive({
-    req(values$analysis_filtered_data, values$analysis_races_available,
-        values$pool_state)
-    prefilter_ids <- values$pool_state %>%
-      filter(dom == TRUE) %>% pull(race_id)
-    # Fallback: if the pre-filter is empty, use the full available set so the
-    # tab is never blank.
-    if (length(prefilter_ids) == 0)
-      prefilter_ids <- values$analysis_races_available$race_id
+    req(values$analysis_filtered_data, values$analysis_races_available)
+    prefilter_ids <- values$analysis_races_available$race_id
     
     # Track-exclude pills: drop all races at excluded tracks from the candidate
     # set entirely (their cards disappear).
@@ -1615,6 +1628,20 @@ server <- function(input, output, session) {
       keep_ids <- values$analysis_races_available %>%
         filter(!(track_name %in% excl)) %>% pull(race_id)
       prefilter_ids <- intersect(prefilter_ids, keep_ids)
+    }
+    
+    # Lap-similarity gate: races within +/-20% of the target's lap count.
+    # total_laps falls back to scheduled_laps upstream, so it is populated for
+    # every historical race that has either figure.
+    tl <- values$dom_target_laps
+    if (!is.null(tl) && !is.na(tl) && tl > 1) {
+      lap_ids <- values$analysis_races_available %>%
+        filter(!is.na(total_laps),
+               abs(total_laps - tl) <= 0.20 * tl) %>%
+        pull(race_id)
+      # Only apply if it leaves something; otherwise show all rather than blank.
+      if (length(lap_ids) > 0)
+        prefilter_ids <- intersect(prefilter_ids, lap_ids)
     }
     
     df <- values$analysis_filtered_data %>%
@@ -1658,79 +1685,75 @@ server <- function(input, output, session) {
          doms = doms)
   })
   
-  # Seed target band + include set when a new race/track loads.
-  observeEvent(list(values$analysis_races_available, input$analysis_race_id), {
-    req(values$analysis_races_available, dom_profiles())
-    meta <- dom_profiles()$meta
-    if (nrow(meta) == 0) return()
-    sel_track <- input$analysis_primary_track
-    
-    # Upcoming race lap count + track type come from the Races sheet, so they
-    # resolve even for a brand-new venue with no results history.
-    up <- values$races_sheet %>%
-      filter(race_id == suppressWarnings(as.numeric(input$analysis_race_id))) %>%
-      slice(1)
-    get_col <- function(d, nm) if (nm %in% names(d) && nrow(d) > 0) d[[nm]][1] else NA
-    al <- get_col(up, "actual_laps")
-    sl <- get_col(up, "scheduled_laps")
-    upcoming_laps <- if (!is.na(al) && al > 0) al else sl
-    sel_type <- get_col(up, "track_type")
-    values$dom_target_laps <- upcoming_laps
-    
-    pos <- meta %>% filter(!is.na(dk_total) & dk_total > 0)
-    same_track <- pos$dk_total[pos$track_name == sel_track]
-    
-    if (length(same_track) >= 2) {
-      # Returning track: anchor to this track's own history
-      ref_set <- same_track
-    } else {
-      # New (or near-new) venue: anchor to races with SIMILAR LAP COUNTS,
-      # preferring the same track type. Dom points scale with laps, so a
-      # 50-lap road course is a far better comp than a 110-lap one.
-      cand <- pos
-      if (!is.na(sel_type)) {
-        st <- cand %>% filter(!is.na(track_type) & track_type == sel_type)
-        if (nrow(st) >= 3) cand <- st   # keep type filter only if it leaves enough
-      }
-      if (!is.na(upcoming_laps) && any(!is.na(cand$act_laps))) {
-        cand <- cand %>%
-          mutate(lap_gap = abs(act_laps - upcoming_laps)) %>%
-          arrange(lap_gap)
-        # take races within 20% of target laps; if too few, take nearest 8
-        near <- cand %>% filter(!is.na(lap_gap) &
-                                  lap_gap <= 0.20 * upcoming_laps)
-        if (nrow(near) < 4) near <- head(cand, 8)
-        ref_set <- near$dk_total
-      } else {
-        ref_set <- cand$dk_total
-      }
-    }
-    ref_set <- ref_set[!is.na(ref_set) & ref_set > 0]
-    if (length(ref_set) == 0) ref_set <- pos$dk_total  # last-resort fallback
-    ref <- median(ref_set, na.rm = TRUE)
-    
-    if (!is.finite(ref)) {
-      # Absolute fallback so the slider never sees NA
-      allv <- pos$dk_total
-      ref <- if (length(allv) > 0) median(allv, na.rm = TRUE) else 100
-    }
-    
-    lo <- floor(ref * 0.80); hi <- ceiling(ref * 1.20)
-    # Widen to cover the comp set we anchored on
-    if (length(ref_set) > 0) {
-      lo <- min(lo, floor(min(ref_set) * 0.95))
-      hi <- max(hi, ceiling(max(ref_set) * 1.05))
-    }
-    if (!is.finite(lo)) lo <- 0
-    if (!is.finite(hi)) hi <- ceiling(ref * 1.5)
-    values$dom_target_lo <- lo
-    values$dom_target_hi <- hi
-    inc <- setNames(meta$dk_total >= lo & meta$dk_total <= hi,
-                    as.character(meta$race_id))
-    inc[is.na(inc)] <- FALSE
-    values$dom_include <- inc
-    values$dom_band_initialized <- TRUE
-  }, ignoreInit = FALSE)
+  # Seed target band + include set when a new race/track loads, and re-seed
+  # when the user edits Target Laps (the whole reference set is lap-anchored,
+  # so a corrected lap count must re-pick the comps).
+  observeEvent(list(values$analysis_races_available, input$analysis_race_id,
+                    values$dom_target_laps_override), {
+                      req(values$analysis_races_available, dom_profiles())
+                      meta <- dom_profiles()$meta
+                      if (nrow(meta) == 0) return()
+                      
+                      # Upcoming race lap count + track type come from the Races sheet, so they
+                      # resolve even for a brand-new venue with no results history.
+                      up <- values$races_sheet %>%
+                        filter(race_id == suppressWarnings(as.numeric(input$analysis_race_id))) %>%
+                        slice(1)
+                      get_col <- function(d, nm) if (nm %in% names(d) && nrow(d) > 0) d[[nm]][1] else NA
+                      al <- suppressWarnings(as.numeric(get_col(up, "actual_laps")))
+                      sl <- suppressWarnings(as.numeric(get_col(up, "scheduled_laps")))
+                      # The target race normally has not run yet, so scheduled_laps is the
+                      # correct source. actual_laps is only a fallback (and is ignored when it
+                      # holds a placeholder like 0/1 for an unrun race).
+                      sched_laps <- if (!is.na(sl) && sl > 1) {
+                        sl
+                      } else if (!is.na(al) && al > 1) {
+                        al
+                      } else {
+                        NA_real_
+                      }
+                      # A manual edit wins over the schedule until the race selection changes.
+                      ovr <- values$dom_target_laps_override
+                      upcoming_laps <- if (!is.null(ovr) && !is.na(ovr) && ovr > 0) ovr else sched_laps
+                      values$dom_target_laps      <- upcoming_laps
+                      values$dom_target_laps_auto <- sched_laps   # remember DB value for display
+                      
+                      pos <- meta %>% filter(!is.na(dk_total) & dk_total > 0)
+                      
+                      # meta is already restricted to lap-similar races by dom_profiles(), so the
+                      # reference set is simply those races' dom totals.
+                      ref_set <- pos$dk_total
+                      ref_set <- ref_set[!is.na(ref_set) & ref_set > 0]
+                      ref_basis <- if (!is.na(upcoming_laps))
+                        sprintf("races within \u00b120%% of %g laps", round(upcoming_laps))
+                      else "all available races"
+                      values$dom_ref_basis  <- ref_basis
+                      values$dom_ref_ncomps <- length(ref_set)
+                      ref <- median(ref_set, na.rm = TRUE)
+                      
+                      if (!is.finite(ref)) {
+                        # Absolute fallback so the slider never sees NA
+                        allv <- pos$dk_total
+                        ref <- if (length(allv) > 0) median(allv, na.rm = TRUE) else 100
+                      }
+                      
+                      lo <- floor(ref * 0.80); hi <- ceiling(ref * 1.20)
+                      # Widen to cover the comp set we anchored on
+                      if (length(ref_set) > 0) {
+                        lo <- min(lo, floor(min(ref_set) * 0.95))
+                        hi <- max(hi, ceiling(max(ref_set) * 1.05))
+                      }
+                      if (!is.finite(lo)) lo <- 0
+                      if (!is.finite(hi)) hi <- ceiling(ref * 1.5)
+                      values$dom_target_lo <- lo
+                      values$dom_target_hi <- hi
+                      # meta is already lap-filtered by dom_profiles(), so the band alone gates.
+                      inc <- setNames(meta$dk_total >= lo & meta$dk_total <= hi,
+                                      as.character(meta$race_id))
+                      inc[is.na(inc)] <- FALSE
+                      values$dom_include <- inc
+                      values$dom_band_initialized <- TRUE
+                    }, ignoreInit = FALSE)
   
   # Band slider re-gates the include set. It must NOT rewrite dom_target_lo/hi
   # (the slider UI is seeded from those; rewriting them re-renders the slider,
@@ -1740,6 +1763,7 @@ server <- function(input, output, session) {
     req(input$dom_band, dom_profiles())
     lo <- input$dom_band[1]; hi <- input$dom_band[2]
     meta <- dom_profiles()$meta
+    # meta is already lap-filtered by dom_profiles(), so the band alone gates.
     inc <- setNames(meta$dk_total >= lo & meta$dk_total <= hi,
                     as.character(meta$race_id))
     inc[is.na(inc)] <- FALSE
@@ -1776,45 +1800,67 @@ server <- function(input, output, session) {
   output$dom_target_panel <- renderUI({
     req(dom_profiles())
     meta <- dom_profiles()$meta
-    sel_track <- input$analysis_primary_track
-    laps <- values$dom_target_laps
-    st <- meta$dk_total[meta$track_name == sel_track]
-    same_track <- st[!is.na(st) & st > 0]
-    is_new <- length(same_track) < 2
+    # isolate(): the numeric input below writes back to dom_target_laps, so a
+    # reactive read here would re-render the panel on every keystroke and steal
+    # focus. Race changes still re-render via dom_profiles()/input$ above.
+    laps <- isolate(values$dom_target_laps)
     
-    # For new venues, count how many comp races sit near the target lap count
-    n_lapcomp <- NA_integer_
-    if (is_new && !is.null(laps) && !is.na(laps)) {
-      lc <- meta %>% filter(!is.na(dk_total) & dk_total > 0 & !is.na(act_laps))
-      n_lapcomp <- sum(abs(lc$act_laps - laps) <= 0.20 * laps)
-    }
-    ref_txt <- if (is_new)
-      sprintf("races with similar lap counts (~%s laps), preferring same type — no prior race at this track",
-              if (!is.null(laps) && !is.na(laps)) round(laps) else "?")
-    else "this track's own history"
+    # Reference reporting is driven by what the seeding logic ACTUALLY
+    # anchored to (dom_ref_basis), not by an assumption about same-track
+    # history — a 450-lap race and a ~100-lap All-Star race share a track but
+    # are not comps.
+    ref_basis  <- values$dom_ref_basis  %||% "\u2014"
+    n_comps    <- values$dom_ref_ncomps %||% 0L
+    # Amber when the anchor is thin or had to fall back past the lap window.
+    thin_anchor <- n_comps < 4 || grepl("closest|no lap data|unknown", ref_basis)
     
     stat_box <- function(label, val, accent = "#FFE500") {
       div(style = "flex:1;min-width:120px;background:#1e1e1e;border:1px solid #3a3a3a;border-radius:8px;padding:10px 14px;",
           div(style = "color:#888;font-size:11px;text-transform:uppercase;letter-spacing:.5px;", label),
           div(style = sprintf("color:%s;font-size:22px;font-weight:700;line-height:1.1;margin-top:2px;", accent), val))
     }
-    ref_val <- if (is_new) {
-      if (!is.na(n_lapcomp) && n_lapcomp > 0)
-        sprintf("%d lap-comps", n_lapcomp) else "New venue"
-    } else sprintf("%g", round(median(same_track)))
+    ref_val <- sprintf("%d comp%s", n_comps, if (n_comps == 1) "" else "s")
+    ref_txt <- sprintf("%s (n=%d)", ref_basis, n_comps)
+    
+    # Target Laps is editable: seeded from the Races sheet (scheduled_laps),
+    # but overridable for new venues or when the schedule data is missing.
+    laps_box <- div(
+      style = "flex:1;min-width:150px;background:#1e1e1e;border:1px solid #3a3a3a;border-radius:8px;padding:10px 14px;",
+      div(style = "color:#888;font-size:11px;text-transform:uppercase;letter-spacing:.5px;", "Target Laps"),
+      div(class = "dom-laps-input",
+          numericInput("dom_target_laps_in", label = NULL,
+                       value = if (is.null(laps) || is.na(laps)) NA else round(laps),
+                       min = 1, max = 1000, step = 1, width = "100%")),
+      if (!is.null(values$dom_target_laps_auto) && !is.na(values$dom_target_laps_auto))
+        div(style = "color:#666;font-size:10px;margin-top:2px;",
+            sprintf("schedule: %g", round(values$dom_target_laps_auto)))
+      else
+        div(style = "color:#ff9800;font-size:10px;margin-top:2px;", "not in schedule — set manually")
+    )
     
     div(style = "display:flex;gap:12px;flex-wrap:wrap;align-items:stretch;",
-        stat_box("Target Laps",
-                 if (is.null(laps) || is.na(laps)) "—" else as.character(round(laps))),
+        laps_box,
         stat_box("DK Dom-Total Target",
                  if (is.null(values$dom_target_lo) || is.na(values$dom_target_lo)) "—"
                  else sprintf("%g – %g", values$dom_target_lo, values$dom_target_hi)),
         stat_box("Reference", ref_val,
-                 accent = if (is_new) "#ff9800" else "#4caf50"),
+                 accent = if (thin_anchor) "#ff9800" else "#4caf50"),
         div(style = "flex:2;min-width:200px;display:flex;align-items:center;color:#777;font-size:12px;",
             sprintf("Target seeded from %s. Total dom points is the hard gate — drag the band to tighten.", ref_txt))
     )
   })
+  
+  # Manual Target Laps edit -> sets the override, which re-fires the seeding
+  # observer above (sole writer of dom_target_laps). The whole reference set is
+  # lap-anchored, so this re-picks the comps, the band, and the include set.
+  observeEvent(input$dom_target_laps_in, {
+    v <- suppressWarnings(as.numeric(input$dom_target_laps_in))
+    if (is.na(v) || v <= 0) return()
+    cur <- values$dom_target_laps
+    if (!is.null(cur) && !is.na(cur) &&
+        isTRUE(all.equal(as.numeric(cur), v))) return()   # no-op guard
+    values$dom_target_laps_override <- v
+  }, ignoreInit = TRUE, ignoreNULL = TRUE)
   
   # --- band slider --------------------------------------------------------
   output$dom_band_slider_ui <- renderUI({
