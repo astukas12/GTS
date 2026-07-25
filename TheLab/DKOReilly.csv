@@ -1,39 +1,39 @@
-Position,Name + ID,Name,ID,Roster Position,Salary,Game Info,TeamAbbrev,AvgPointsPerGame
-D,Austin Hill (43510733),Austin Hill,43510733,D,11500,Focused Health 250,Nasca,33.84
-D,Jesse Love (43510734),Jesse Love,43510734,D,11000,Focused Health 250,Nasca,41.41
-D,Justin Allgaier (43510735),Justin Allgaier,43510735,D,10500,Focused Health 250,Nasca,45.66
-D,Sam Mayer (43510736),Sam Mayer,43510736,D,10200,Focused Health 250,Nasca,22.28
-D,Brent Crews (43510737),Brent Crews,43510737,D,10000,Focused Health 250,Nasca,37.03
-D,Corey Day (43510738),Corey Day,43510738,D,9700,Focused Health 250,Nasca,35.52
-D,Sheldon Creed (43510739),Sheldon Creed,43510739,D,9500,Focused Health 250,Nasca,35.62
-D,Carson Kvapil (43510740),Carson Kvapil,43510740,D,9200,Focused Health 250,Nasca,30.1
-D,Taylor Gray (43510741),Taylor Gray,43510741,D,9000,Focused Health 250,Nasca,25.7
-D,Sammy Smith (43510742),Sammy Smith,43510742,D,8800,Focused Health 250,Nasca,34.64
-D,Brandon Jones (43510743),Brandon Jones,43510743,D,8500,Focused Health 250,Nasca,33.56
-D,William Sawalich (43510744),William Sawalich,43510744,D,8300,Focused Health 250,Nasca,21.2
-D,Jeb Burton (43510745),Jeb Burton,43510745,D,8000,Focused Health 250,Nasca,20.58
-D,Ryan Sieg (43510746),Ryan Sieg,43510746,D,7800,Focused Health 250,Nasca,25.54
-D,Rajah Caruth (43510747),Rajah Caruth,43510747,D,7700,Focused Health 250,Nasca,25.18
-D,Parker Retzlaff (43510748),Parker Retzlaff,43510748,D,7500,Focused Health 250,Nasca,30.94
-D,Anthony Alfredo (43510749),Anthony Alfredo,43510749,D,7300,Focused Health 250,Nasca,19.5
-D,Harrison Burton (43510750),Harrison Burton,43510750,D,7200,Focused Health 250,Nasca,19.49
-D,Jake Finch (43510751),Jake Finch,43510751,D,7000,Focused Health 250,Nasca,0
-D,Nicholas Sanchez (43510752),Nicholas Sanchez,43510752,D,6900,Focused Health 250,Nasca,15.47
-D,Jordan Anderson (43510753),Jordan Anderson,43510753,D,6800,Focused Health 250,Nasca,54.45
-D,Leland Honeyman (43510754),Leland Honeyman,43510754,D,6600,Focused Health 250,Nasca,18.33
-D,Dean Thompson (43510755),Dean Thompson,43510755,D,6500,Focused Health 250,Nasca,23.6
-D,Jeremy Clements (43510756),Jeremy Clements,43510756,D,6400,Focused Health 250,Nasca,20.35
-D,Kyle Sieg (43510757),Kyle Sieg,43510757,D,6200,Focused Health 250,Nasca,12.99
-D,Brennan Poole (43510758),Brennan Poole,43510758,D,6000,Focused Health 250,Nasca,27.83
-D,Blaine Perkins (43510759),Blaine Perkins,43510759,D,5900,Focused Health 250,Nasca,22.18
-D,Patrick Staropoli (43510760),Patrick Staropoli,43510760,D,5800,Focused Health 250,Nasca,19.56
-D,Ryan Ellis (43510761),Ryan Ellis,43510761,D,5700,Focused Health 250,Nasca,17.87
-D,Josh Bilicki (43510762),Josh Bilicki,43510762,D,5600,Focused Health 250,Nasca,21.04
-D,Joey Gase (43510763),Joey Gase,43510763,D,5500,Focused Health 250,Nasca,18.16
-D,Lavar Scott (43510764),Lavar Scott,43510764,D,5400,Focused Health 250,Nasca,18.66
-D,JJ Yeley (43510765),JJ Yeley,43510765,D,5300,Focused Health 250,Nasca,19.78
-D,Mason Maggio (43510766),Mason Maggio,43510766,D,5200,Focused Health 250,Nasca,6.94
-D,Carson Ware (43510767),Carson Ware,43510767,D,5100,Focused Health 250,Nasca,30.5
-D,Garrett Smithley (43510768),Garrett Smithley,43510768,D,5000,Focused Health 250,Nasca,15.64
-D,Glen Reen (43510769),Glen Reen,43510769,D,4900,Focused Health 250,Nasca,14
-D,Nick Leitz (43510770),Nick Leitz,43510770,D,4800,Focused Health 250,Nasca,45
+Position,Name + ID,Name,ID,Roster Position,Salary,Game Info,TeamAbbrev,AvgPointsPerGame,Status,Starting
+D,Justin Allgaier (43666939),Justin Allgaier,43666939,D,11500,Pennzoil 250 presented by Take 5 Oil Change,Nasca,46.7,,
+D,Chase Elliott (43666940),Chase Elliott,43666940,D,11000,Pennzoil 250 presented by Take 5 Oil Change,Nasca,90.8,,
+D,Sam Mayer (43666941),Sam Mayer,43666941,D,10500,Pennzoil 250 presented by Take 5 Oil Change,Nasca,20.7,,
+D,Ross Chastain (43666942),Ross Chastain,43666942,D,10000,Pennzoil 250 presented by Take 5 Oil Change,Nasca,45.7,,
+D,Brent Crews (43666943),Brent Crews,43666943,D,9800,Pennzoil 250 presented by Take 5 Oil Change,Nasca,35,,
+D,Carson Kvapil (43666944),Carson Kvapil,43666944,D,9500,Pennzoil 250 presented by Take 5 Oil Change,Nasca,31.1,,
+D,Jesse Love (43666945),Jesse Love,43666945,D,9300,Pennzoil 250 presented by Take 5 Oil Change,Nasca,39.2,,
+D,Sheldon Creed (43666946),Sheldon Creed,43666946,D,9100,Pennzoil 250 presented by Take 5 Oil Change,Nasca,34.2,,
+D,Austin Hill (43666947),Austin Hill,43666947,D,9000,Pennzoil 250 presented by Take 5 Oil Change,Nasca,32.9,,
+D,Corey Day (43666948),Corey Day,43666948,D,8700,Pennzoil 250 presented by Take 5 Oil Change,Nasca,33.5,,
+D,Taylor Gray (43666949),Taylor Gray,43666949,D,8500,Pennzoil 250 presented by Take 5 Oil Change,Nasca,23.7,,
+D,Brandon Jones (43666950),Brandon Jones,43666950,D,8300,Pennzoil 250 presented by Take 5 Oil Change,Nasca,34.1,,
+D,Sammy Smith (43666951),Sammy Smith,43666951,D,8100,Pennzoil 250 presented by Take 5 Oil Change,Nasca,34.1,,
+D,William Sawalich (43666952),William Sawalich,43666952,D,8000,Pennzoil 250 presented by Take 5 Oil Change,Nasca,22.1,,
+D,Parker Retzlaff (43666953),Parker Retzlaff,43666953,D,7800,Pennzoil 250 presented by Take 5 Oil Change,Nasca,32.3,,
+D,Ryan Sieg (43666954),Ryan Sieg,43666954,D,7700,Pennzoil 250 presented by Take 5 Oil Change,Nasca,25.8,,
+D,Anthony Alfredo (43666955),Anthony Alfredo,43666955,D,7500,Pennzoil 250 presented by Take 5 Oil Change,Nasca,21,,
+D,Rajah Caruth (43666956),Rajah Caruth,43666956,D,7300,Pennzoil 250 presented by Take 5 Oil Change,Nasca,25.9,,
+D,Nicholas Sanchez (43666957),Nicholas Sanchez,43666957,D,7200,Pennzoil 250 presented by Take 5 Oil Change,Nasca,16.3,,
+D,Harrison Burton (43666958),Harrison Burton,43666958,D,7000,Pennzoil 250 presented by Take 5 Oil Change,Nasca,18.5,,
+D,Jeremy Clements (43666959),Jeremy Clements,43666959,D,6900,Pennzoil 250 presented by Take 5 Oil Change,Nasca,21.3,,
+D,Jeb Burton (43666960),Jeb Burton,43666960,D,6700,Pennzoil 250 presented by Take 5 Oil Change,Nasca,18.9,,
+D,Dean Thompson (43666961),Dean Thompson,43666961,D,6600,Pennzoil 250 presented by Take 5 Oil Change,Nasca,24.3,,
+D,Kyle Sieg (43666962),Kyle Sieg,43666962,D,6500,Pennzoil 250 presented by Take 5 Oil Change,Nasca,14.7,,
+D,Patrick Staropoli (43666963),Patrick Staropoli,43666963,D,6300,Pennzoil 250 presented by Take 5 Oil Change,Nasca,19.9,,
+D,Brennan Poole (43666964),Brennan Poole,43666964,D,6200,Pennzoil 250 presented by Take 5 Oil Change,Nasca,28.4,,
+D,Preston Pardus (43666965),Preston Pardus,43666965,D,6100,Pennzoil 250 presented by Take 5 Oil Change,Nasca,21,,
+D,Blaine Perkins (43666966),Blaine Perkins,43666966,D,6000,Pennzoil 250 presented by Take 5 Oil Change,Nasca,23,,
+D,Ryan Ellis (43666967),Ryan Ellis,43666967,D,5800,Pennzoil 250 presented by Take 5 Oil Change,Nasca,18.1,,
+D,Josh Bilicki (43666968),Josh Bilicki,43666968,D,5700,Pennzoil 250 presented by Take 5 Oil Change,Nasca,22.6,,
+D,Lavar Scott (43666969),Lavar Scott,43666969,D,5500,Pennzoil 250 presented by Take 5 Oil Change,Nasca,19.3,,
+D,Joey Gase (43666970),Joey Gase,43666970,D,5300,Pennzoil 250 presented by Take 5 Oil Change,Nasca,17,,
+D,JJ Yeley (43666971),JJ Yeley,43666971,D,5200,Pennzoil 250 presented by Take 5 Oil Change,Nasca,19.8,,
+D,Garrett Smithley (43666972),Garrett Smithley,43666972,D,5000,Pennzoil 250 presented by Take 5 Oil Change,Nasca,19.2,,
+D,Mason Maggio (43666973),Mason Maggio,43666973,D,4900,Pennzoil 250 presented by Take 5 Oil Change,Nasca,11.1,,
+D,Nathan Byrd (43666974),Nathan Byrd,43666974,D,4700,Pennzoil 250 presented by Take 5 Oil Change,Nasca,17.9,,
+D,Dawson Cram (43666975),Dawson Cram,43666975,D,4600,Pennzoil 250 presented by Take 5 Oil Change,Nasca,10.4,,
+D,Blake Lothian (43666976),Blake Lothian,43666976,D,4500,Pennzoil 250 presented by Take 5 Oil Change,Nasca,17,,
