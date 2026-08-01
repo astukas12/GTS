@@ -1,0 +1,312 @@
+---
+title: "Brickyard 400 — Green-Flag Passing Analysis"
+subtitle: "2026 NASCAR Cup Series · Indianapolis Motor Speedway"
+output:
+  html_document:
+    theme: null
+    css: gts_theme.css
+    self_contained: true
+    df_print: kable
+params:
+  data_file: "IndyPasses.xlsx"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE, warning = FALSE, message = FALSE,
+  fig.width = 10, fig.height = 5.2, dpi = 130,
+  fig.align = "center", dev = "png"
+)
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(scales)
+library(forcats)
+
+# ---- GTS palette -----------------------------------------------------------
+gts_gold   <- "#FFE500"
+gts_dark   <- "#1a1a1a"
+gts_panel  <- "#242424"
+gts_grid   <- "#3a3a3a"
+gts_text   <- "#f2f2f2"
+gts_green  <- "#4CAF50"
+gts_amber  <- "#FF9800"
+gts_red    <- "#E53935"
+
+theme_gts <- function(base = 13) {
+  theme_minimal(base_size = base, base_family = "Helvetica") +
+    theme(
+      plot.background   = element_rect(fill = gts_dark,  color = NA),
+      panel.background  = element_rect(fill = gts_panel, color = NA),
+      panel.grid.major  = element_line(color = gts_grid, linewidth = 0.3),
+      panel.grid.minor  = element_blank(),
+      text              = element_text(color = gts_text),
+      axis.text         = element_text(color = gts_text),
+      axis.title        = element_text(color = gts_text, face = "bold"),
+      plot.title        = element_text(color = gts_gold, face = "bold", size = base + 3),
+      plot.subtitle     = element_text(color = "#bdbdbd", size = base - 1),
+      legend.position   = "top",
+      legend.title      = element_blank(),
+      legend.key        = element_rect(fill = gts_panel, color = NA),
+      plot.margin       = margin(12, 16, 12, 12)
+    )
+}
+
+# ---- load ------------------------------------------------------------------
+passes    <- read_xlsx(params$data_file, sheet = "Passes")
+lapstatus <- read_xlsx(params$data_file, sheet = "LapStatus")
+pitlaps   <- read_xlsx(params$data_file, sheet = "PitLaps")
+
+# The NASCAR feed appends "(i)"/"#" to ineligible / rookie drivers. Cosmetic —
+# strip so names read clean.
+clean_driver <- function(x) str_trim(str_remove(x, "\\s*[\\(#].*$"))
+passes  <- passes  %>% mutate(passer = clean_driver(passer),
+                              passed = clean_driver(passed))
+pitlaps <- pitlaps %>% mutate(driver = clean_driver(driver))
+
+# true green-flag passes only
+tg <- passes %>% filter(PassCategory == "True Green (8+)")
+
+n_tg           <- nrow(tg)
+n_green_laps   <- sum(lapstatus$FlagCondition != "Caution")
+# true-green laps = settled green (8+ since restart); the honest denominator
+# for the passing rate, since restart laps are a different regime.
+n_truegreen_laps <- sum(lapstatus$FlagCondition == "Green (8+)")
+pass_per_green <- round(n_tg / n_truegreen_laps, 2)
+
+# ---- green-run segmentation ------------------------------------------------
+# A green run = a maximal span of consecutive laps that are not stoppages.
+green_laps <- lapstatus %>%
+  filter(FlagCondition != "Caution") %>%
+  arrange(Lap) %>%
+  mutate(new_run = as.integer(c(1, diff(Lap)) != 1),
+         run_id  = cumsum(new_run))
+
+run_meta <- green_laps %>%
+  group_by(run_id) %>%
+  summarise(start = min(Lap), end = max(Lap), run_laps = n(), .groups = "drop") %>%
+  mutate(run_label = sprintf("L%d–%d", start, end))
+
+tg <- tg %>% left_join(green_laps %>% select(Lap, run_id), by = c("lap" = "Lap"))
+
+# ---- incident reconstruction (multi-spot single-lap losses) ----------------
+# Rebuild per-driver lap position from the pass-pairs (both roles carry
+# prev/pos), compute lap-to-lap delta, flag big single-lap drops that are
+# genuine on-track losses (not pit in/out laps, not stoppages).
+pos_recs <- bind_rows(
+  passes %>% transmute(lap, driver = passer, prev = passer_prev, pos = passer_pos),
+  passes %>% transmute(lap, driver = passed, prev = passed_prev, pos = passed_pos)
+) %>% distinct() %>% filter(!is.na(prev), !is.na(pos))
+
+pit_set  <- pitlaps %>% distinct(driver, lap)
+caut_set <- lapstatus %>% filter(FlagCondition == "Caution") %>% pull(Lap)
+
+incidents <- pos_recs %>%
+  mutate(delta = pos - prev) %>%                       # +ve = spots lost
+  anti_join(pit_set, by = c("driver", "lap")) %>%
+  anti_join(pit_set %>% mutate(lap = lap + 1), by = c("driver", "lap")) %>%
+  filter(!lap %in% caut_set) %>%
+  filter(delta >= 3)
+
+n_incidents <- nrow(incidents)
+```
+
+<div class="hero">
+<div class="hero-badge">GOLDEN TICKET SIMS</div>
+<h1>Green-Flag Passing at the Brickyard</h1>
+<p>Isolating true on-track green-flag passes — where the racing actually happened, when in the race, and who was moving forward on merit.</p>
+</div>
+
+## The headline numbers
+
+<div class="kpi-row">
+<div class="kpi"><div class="kpi-num">`r n_tg`</div><div class="kpi-lab">Green-flag passes</div></div>
+<div class="kpi"><div class="kpi-num">`r pass_per_green`</div><div class="kpi-lab">Per green lap</div></div>
+<div class="kpi"><div class="kpi-num">`r nrow(run_meta)`</div><div class="kpi-lab">Green runs</div></div>
+<div class="kpi"><div class="kpi-num">`r n_green_laps`</div><div class="kpi-lab">Green laps</div></div>
+<div class="kpi"><div class="kpi-num">`r n_incidents`</div><div class="kpi-lab">Multi-spot losses</div></div>
+</div>
+
+At roughly **`r pass_per_green` clean pass per green lap**, this was a track-position race — the leaders ran in clean-air trains while nearly all the on-track passing happened deep in the field.
+
+## When did the passing happen?
+
+```{r passing-by-lap, fig.height=5}
+tg_by_lap <- tg %>% count(lap, name = "passes")
+max_lap   <- max(lapstatus$Lap)
+
+ggplot(tg_by_lap, aes(x = lap, y = passes)) +
+  geom_col(fill = gts_green, width = 0.9) +
+  scale_x_continuous(limits = c(0, max_lap + 1), expand = c(0.01, 0)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(title = "Green-flag passes by lap",
+       subtitle = "Passing clusters early in each green run, then thins as the field strings out",
+       x = "Lap", y = "Passes") +
+  theme_gts()
+```
+
+## Passing per green run
+
+```{r run-totals, fig.height=4.6}
+run_totals <- tg %>%
+  count(run_id, name = "passes") %>%
+  right_join(run_meta, by = "run_id") %>%
+  mutate(passes = coalesce(passes, 0L),
+         per_lap = round(passes / run_laps, 2)) %>%
+  arrange(start) %>%
+  mutate(run_label = factor(run_label, levels = run_label))
+
+ggplot(run_totals, aes(x = run_label, y = passes)) +
+  geom_col(fill = gts_gold, width = 0.68) +
+  geom_text(aes(label = sprintf("%d\n(%.2f/lap)", passes, per_lap)),
+            vjust = -0.3, color = gts_text, fontface = "bold", size = 3.6, lineheight = 0.9) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.18))) +
+  labs(title = "Green-flag passes by run",
+       subtitle = "Total passes in each green run, with per-lap rate",
+       x = "Green run (laps)", y = "Passes") +
+  theme_gts()
+```
+
+## Where on the leaderboard?
+
+```{r by-position}
+pos_band <- tg %>%
+  mutate(band = cut(passer_pos,
+                    breaks = c(0, 5, 10, 15, 20, 25, 40),
+                    labels = c("1–5", "6–10", "11–15", "16–20", "21–25", "26+"))) %>%
+  count(band)
+
+ggplot(pos_band, aes(x = band, y = n, fill = n)) +
+  geom_col(width = 0.72) +
+  geom_text(aes(label = n), vjust = -0.5, color = gts_text, fontface = "bold", size = 4) +
+  scale_fill_gradient(low = "#2e5d34", high = gts_green, guide = "none") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(title = "Where passes happened on track",
+       subtitle = "By the position the passer moved INTO",
+       x = "Running position gained", y = "Passes") +
+  theme_gts()
+```
+
+```{r position-distribution, fig.height=4.2}
+ggplot(tg, aes(x = "", y = passer_pos)) +
+  geom_violin(fill = gts_green, alpha = 0.35, color = gts_green, width = 0.8) +
+  geom_boxplot(width = 0.16, fill = gts_panel, color = gts_gold, outlier.color = gts_amber) +
+  scale_y_reverse(breaks = seq(0, 40, 5)) +
+  coord_flip() +
+  labs(title = "Spread of where passing happened",
+       subtitle = "Distribution of running position after each pass — the mass sits deep in the field",
+       x = NULL, y = "Position moved into") +
+  theme_gts() +
+  theme(axis.text.y = element_blank())
+```
+
+## Who was doing the passing?
+
+```{r top-passers}
+top_passers <- tg %>%
+  count(passer, name = "passes_made") %>%
+  arrange(desc(passes_made)) %>%
+  slice_head(n = 15)
+
+ggplot(top_passers, aes(x = reorder(passer, passes_made), y = passes_made)) +
+  geom_col(fill = gts_gold, width = 0.72) +
+  geom_text(aes(label = passes_made), hjust = -0.2, color = gts_text, fontface = "bold", size = 3.8) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  coord_flip() +
+  labs(title = "Most green-flag passes made",
+       subtitle = "Top 15 · clean on-track passes only",
+       x = NULL, y = "Passes made") +
+  theme_gts()
+```
+
+```{r most-passed}
+most_passed <- tg %>%
+  count(passed, name = "times_passed") %>%
+  arrange(desc(times_passed)) %>%
+  slice_head(n = 15)
+
+ggplot(most_passed, aes(x = reorder(passed, times_passed), y = times_passed)) +
+  geom_col(fill = gts_red, width = 0.72) +
+  geom_text(aes(label = times_passed), hjust = -0.2, color = gts_text, fontface = "bold", size = 3.8) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  coord_flip() +
+  labs(title = "Most often passed under green",
+       subtitle = "Top 15 · drivers who lost the most spots on track",
+       x = NULL, y = "Times passed") +
+  theme_gts()
+```
+
+```{r net-passing}
+made   <- tg %>% count(driver = passer, name = "made")
+passed <- tg %>% count(driver = passed, name = "passed")
+net <- full_join(made, passed, by = "driver") %>%
+  mutate(across(c(made, passed), \(x) coalesce(x, 0L)),
+         net = made - passed) %>%
+  filter(made + passed >= 3) %>%
+  arrange(desc(net))
+
+net_plot <- bind_rows(slice_head(net, n = 10), slice_tail(net, n = 10)) %>%
+  distinct() %>%
+  mutate(dir = if_else(net >= 0, "Gained", "Lost"))
+
+ggplot(net_plot, aes(x = reorder(driver, net), y = net, fill = dir)) +
+  geom_col(width = 0.72) +
+  geom_text(aes(label = sprintf("%+d", net),
+                hjust = if_else(net >= 0, -0.3, 1.3)),
+            color = gts_text, fontface = "bold", size = 3.6) +
+  scale_fill_manual(values = c(Gained = gts_green, Lost = gts_red), guide = "none") +
+  geom_hline(yintercept = 0, color = gts_text, linewidth = 0.4) +
+  coord_flip() +
+  labs(title = "Net green-flag passing",
+       subtitle = "Passes made minus times passed · on-track merit (min. 3 involvements)",
+       x = NULL, y = "Net passes") +
+  theme_gts()
+```
+
+## Multi-spot losses
+
+Instances where a driver **lost 3 or more positions in a single green-flag lap** — not necessarily a mistake, but a sign of getting swamped, a moment lost, or a car falling off. `r n_incidents` happened across the race.
+
+```{r incident-count}
+inc_by_driver <- incidents %>%
+  count(driver, name = "incidents") %>%
+  arrange(desc(incidents)) %>%
+  slice_head(n = 12)
+
+ggplot(inc_by_driver, aes(x = reorder(driver, incidents), y = incidents)) +
+  geom_col(fill = gts_amber, width = 0.7) +
+  geom_text(aes(label = incidents), hjust = -0.25, color = gts_text, fontface = "bold", size = 3.8) +
+  scale_y_continuous(breaks = pretty_breaks(), expand = expansion(mult = c(0, 0.14))) +
+  coord_flip() +
+  labs(title = "Who lost multiple spots in a lap most often",
+       subtitle = "Single-lap losses of 3+ positions under green",
+       x = NULL, y = "Occurrences") +
+  theme_gts()
+```
+
+```{r incident-magnitude, fig.height=4.2}
+ggplot(incidents, aes(x = factor(delta))) +
+  geom_bar(fill = gts_red, width = 0.7) +
+  geom_text(stat = "count", aes(label = after_stat(count)),
+            vjust = -0.5, color = gts_text, fontface = "bold", size = 4) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.14))) +
+  labs(title = "How bad were the single-lap losses?",
+       subtitle = "Number of positions lost in one green lap",
+       x = "Positions lost in a single lap", y = "Occurrences") +
+  theme_gts()
+```
+
+```{r incident-table}
+incidents %>%
+  arrange(desc(delta)) %>%
+  transmute(Lap = lap, Driver = driver,
+            From = prev, To = pos, `Spots lost` = delta) %>%
+  slice_head(n = 12)
+```
+
+<div class="footer">
+Golden Ticket Sims · lap-by-lap green-flag pass analysis · Indianapolis Motor Speedway.
+</div>

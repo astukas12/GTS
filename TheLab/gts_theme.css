@@ -1,0 +1,79 @@
+/* Golden Ticket Sims — report theme */
+body {
+  background: #121212;
+  color: #f2f2f2;
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  line-height: 1.55;
+  max-width: 1000px;
+  margin: 0 auto;
+  padding: 0 24px 60px;
+}
+
+h1, h2, h3 { color: #FFE500; font-weight: 700; letter-spacing: 0.3px; }
+h2 {
+  margin-top: 46px;
+  padding-bottom: 8px;
+  border-bottom: 2px solid #FFE500;
+}
+h3 { color: #f2f2f2; margin-top: 30px; }
+
+a { color: #FFE500; }
+
+/* hero banner */
+.hero {
+  background: linear-gradient(135deg, #1a1a1a 0%, #000 100%);
+  border-left: 6px solid #FFE500;
+  padding: 34px 32px;
+  margin: 28px 0 10px;
+  border-radius: 6px;
+}
+.hero-badge {
+  display: inline-block;
+  background: #FFE500;
+  color: #1a1a1a;
+  font-weight: 800;
+  font-size: 11px;
+  letter-spacing: 2px;
+  padding: 4px 12px;
+  border-radius: 3px;
+  margin-bottom: 14px;
+}
+.hero h1 { margin: 0 0 10px; font-size: 34px; }
+.hero p { color: #cfcfcf; font-size: 16px; margin: 0; max-width: 760px; }
+
+/* KPI row */
+.kpi-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin: 22px 0 8px;
+}
+.kpi {
+  flex: 1 1 150px;
+  background: #1e1e1e;
+  border: 1px solid #333;
+  border-top: 3px solid #FFE500;
+  border-radius: 6px;
+  padding: 18px 16px;
+  text-align: center;
+}
+.kpi-num { font-size: 34px; font-weight: 800; color: #FFE500; line-height: 1; }
+.kpi-lab { font-size: 12px; color: #b5b5b5; margin-top: 8px; text-transform: uppercase; letter-spacing: 0.5px; }
+
+/* figures */
+img { border-radius: 6px; margin: 6px 0 4px; }
+
+/* tables */
+table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 14px; }
+th { background: #1a1a1a; color: #FFE500; text-align: left; padding: 9px 12px; border-bottom: 2px solid #FFE500; }
+td { padding: 8px 12px; border-bottom: 1px solid #2c2c2c; }
+tr:nth-child(even) td { background: #191919; }
+
+.footer {
+  margin-top: 50px;
+  padding-top: 18px;
+  border-top: 1px solid #333;
+  font-size: 12px;
+  color: #888;
+  text-align: center;
+}

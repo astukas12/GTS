@@ -119,7 +119,10 @@ SPORT_CONFIGS <- list(
     salary_caps  = list(DK = 50000, FD = 100, SD = 50000),
     # Small player pool: greedy optimal per sim, dedupe → ranked by Top1Count
     optimization_modes = list(DK = "combinatorial", FD = "combinatorial_mvp", SD = "combinatorial_captain"),
-    max_lineups        = 5000,
+    # Pool cutoff validated at ~3,000 (cov80) via contest-portfolio backtest:
+    # random-draw finish degrades monotonically as the pool grows past ~3,000
+    # on both DK Classic and SD. Down from 5,000.
+    max_lineups        = 3000,
     
     standard_metrics = c(
       "WinRate", "Top1Rate", "Top5Rate", "Top10Rate", "Top20Rate",

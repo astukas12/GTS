@@ -1035,13 +1035,13 @@ render_cash_game_tab_ui <- function() {
               tags$button(
                 class   = "gts-pill du-ct-pill active",
                 `data-ct` = k,
-                onclick = sprintf(
+                onclick =
                   "this.classList.toggle('active');
                    var sel=[];
                    document.querySelectorAll('.du-ct-pill.active').forEach(function(b){
                      sel.push(b.getAttribute('data-ct'));
                    });
-                   Shiny.setInputValue('du_contests', sel.join(','), {priority:'event'});", k),
+                   Shiny.setInputValue('du_contests', sel.join(','), {priority:'event'});",
                 CONTEST_TYPES[[k]]$short
               )
             })

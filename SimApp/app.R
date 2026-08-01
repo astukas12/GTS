@@ -1336,7 +1336,8 @@ server <- function(input, output, session) {
         opt_data   <- prepare_optimization_data(rv$simulation_results, rv$sim_metadata, "DK")
         opt_config <- list(roster_size=rv$config$roster_sizes$DK, salary_cap=rv$config$salary_caps$DK,
                            percentiles=c(0.01,0.05,0.10,0.20), platform_col="DKScore",
-                           progress_frequency=500, use_parallel=TRUE, max_lineups=5000)
+                           progress_frequency=500, use_parallel=TRUE,
+                           max_lineups=rv$config$max_lineups %||% 5000L)
         progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
         lineup_data <- find_optimal_lineups(opt_data, opt_config, mode=dk_mode, k=1, verbose=TRUE)
         progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
@@ -1597,7 +1598,8 @@ server <- function(input, output, session) {
         n_sd_players  <- length(unique(opt_data$Player))
         n_flex        <- (rv$config$roster_sizes$SD %||% 6L) - 1L  # roster minus CPT slot
         sd_universe   <- n_sd_players * choose(n_sd_players - 1L, n_flex)
-        sd_max_lineups <- min(5000L, max(500L, sd_universe))
+        sd_cap         <- rv$config$max_lineups %||% 5000L
+        sd_max_lineups <- min(sd_cap, max(500L, sd_universe))
         opt_config <- list(roster_size=rv$config$roster_sizes$SD, salary_cap=rv$config$salary_caps$SD,
                            percentiles=c(0.01,0.05,0.10,0.20), platform_col="DKScore",
                            cpt_multiplier=1.5, progress_frequency=500,
