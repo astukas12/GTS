@@ -1945,7 +1945,7 @@ server <- function(input, output, session) {
       num_cols  <- names(optimal)[sapply(optimal, is.numeric)]
       num_cols  <- setdiff(num_cols, grep("^Player|^Captain|^MVP", names(optimal), value=TRUE))
       range_cols <- setdiff(num_cols, c("WinRate","Top1Pct","Top5Pct","Top10Pct","Top20Pct","ExpectedCuts",
-                                        "TotalEW","Win6Pct","Win5PlusPct"))
+                                        "TotalEW"))
       cfg_map <- list(
         TotalSalary=list(label="Salary",format="k",step=0.1),
         AvgOwn=list(label="Avg Own",format="decimal",step=0.1),
