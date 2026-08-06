@@ -956,15 +956,25 @@ server <- function(input, output, session) {
   }
   
   create_download_showdown <- function(optimal_lineups, metadata) {
-    dl <- copy(optimal_lineups)
-    if ("Captain" %in% names(dl)) {
-      ids <- metadata[match(dl$Captain, metadata$Player), CPTID]
-      dl$Captain <- paste0(dl$Captain," (",ids,")")
+    dl <- copy(optimal_lineups); setDT(metadata)
+    # Engines name the showdown ids differently -- NBA writes CPTID/SDID, the
+    # preseason engine writes DKCID/DKID. Hardcoding one pair made the download
+    # handler throw "object 'CPTID' not found", and a failed downloadHandler
+    # returns Shiny's ERROR PAGE, which arrives as an .xlsx full of HTML.
+    id_for <- function(which) {
+      cands <- if (which == "cpt") c("CPTID","DKCID","CptDFSID") else c("SDID","DKID")
+      hit <- intersect(cands, names(metadata))
+      if (!length(hit)) return(NULL)
+      metadata[[hit[1]]]
     }
-    for (col in grep("^Util", names(dl), value=TRUE)) {
-      ids <- metadata[match(dl[[col]], metadata$Player), SDID]
-      dl[[col]] <- paste0(dl[[col]]," (",ids,")")
+    lookup <- function(players, col) {
+      v <- id_for(col)
+      if (is.null(v)) return(players)
+      paste0(players, " (", v[match(players, metadata$Player)], ")")
     }
+    if ("Captain" %in% names(dl)) dl$Captain <- lookup(dl$Captain, "cpt")
+    for (col in grep("^Util", names(dl), value = TRUE))
+      dl[[col]] <- lookup(dl[[col]], "flex")
     dl
   }
   
