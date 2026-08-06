@@ -1923,15 +1923,47 @@ server <- function(input, output, session) {
               pc <- grep("^Player|^Captain|^MVP|^Util", names(lu), value=TRUE)
               sort(unique(unlist(lu[, ..pc]))[!is.na(unique(unlist(lu[, ..pc]))) & unique(unlist(lu[, ..pc])) != ""])
             } else NULL
+            # On a showdown slate the captain and flex versions of a player are
+            # genuinely different roster spots -- different id, 1.5x points,
+            # 1.5x salary and very different ownership -- so "lock Haynes King"
+            # is ambiguous. The captain/flex pairs below resolve it. The plain
+            # Lock/Exclude keep their old meaning (any slot) so nothing changes
+            # for sports that were already using them.
+            is_showdown <- !is.null(lu) &&
+              any(c("Captain","MVP") %in% names(lu))
+            cap_lbl <- if (!is.null(lu) && "MVP" %in% names(lu)) "MVP" else "CPT"
             tagList(
-              selectizeInput(paste0(lp, "_locked_players_v",  ver), "Lock:",
+              selectizeInput(paste0(lp, "_locked_players_v",  ver), "Lock (any slot):",
                              choices=all_players, multiple=TRUE, selected=character(0),
                              options=list(plugins=list('remove_button'), placeholder='Search to lock players', maxItems=8),
                              width="100%"),
-              selectizeInput(paste0(lp, "_excluded_players_v", ver), "Exclude:",
+              selectizeInput(paste0(lp, "_excluded_players_v", ver), "Exclude (any slot):",
                              choices=all_players, multiple=TRUE, selected=character(0),
                              options=list(plugins=list('remove_button'), placeholder='Search to exclude players'),
-                             width="100%")
+                             width="100%"),
+              if (is_showdown) tagList(
+                tags$hr(style="border-color:#404040;margin:8px 0;"),
+                selectizeInput(paste0(lp, "_locked_cpt_v", ver), paste0(cap_lbl, " Lock:"),
+                               choices=all_players, multiple=TRUE, selected=character(0),
+                               options=list(plugins=list('remove_button'),
+                                            placeholder=paste0('Lock as ', cap_lbl), maxItems=1),
+                               width="100%"),
+                selectizeInput(paste0(lp, "_excluded_cpt_v", ver), paste0(cap_lbl, " Exclude:"),
+                               choices=all_players, multiple=TRUE, selected=character(0),
+                               options=list(plugins=list('remove_button'),
+                                            placeholder=paste0('Never ', cap_lbl)),
+                               width="100%"),
+                selectizeInput(paste0(lp, "_locked_flex_v", ver), "FLEX Lock:",
+                               choices=all_players, multiple=TRUE, selected=character(0),
+                               options=list(plugins=list('remove_button'),
+                                            placeholder='Lock in a flex slot', maxItems=5),
+                               width="100%"),
+                selectizeInput(paste0(lp, "_excluded_flex_v", ver), "FLEX Exclude:",
+                               choices=all_players, multiple=TRUE, selected=character(0),
+                               options=list(plugins=list('remove_button'),
+                                            placeholder='Never in a flex slot'),
+                               width="100%")
+              )
             )
           }
       )
@@ -2065,6 +2097,31 @@ server <- function(input, output, session) {
         if (length(excluded) > 0) {
           pc <- grep("^Player|^Captain|^MVP|^Util",names(lineups),value=TRUE)
           lineups <- lineups[apply(lineups[,..pc],1,function(r) !any(excluded %in% r))]
+        }
+
+        # SHOWDOWN: captain and flex are separate roster spots, so they filter
+        # separately. A player locked at captain is a different constraint from
+        # the same player locked anywhere, and excluding him at captain while
+        # allowing him in flex is a normal thing to want.
+        cap_cols  <- grep("^Captain$|^MVP$", names(lineups), value = TRUE)
+        flex_cols <- grep("^Util|^Player",   names(lineups), value = TRUE)
+        pick <- function(id) {
+          v <- input[[paste0(lp, id, ver)]]
+          v[!is.null(v) & v != ""]
+        }
+        if (length(cap_cols)) {
+          lc <- pick("_locked_cpt_v"); ec <- pick("_excluded_cpt_v")
+          if (length(lc)) lineups <- lineups[get(cap_cols[1]) %in% lc]
+          if (length(ec)) lineups <- lineups[!get(cap_cols[1]) %in% ec]
+        }
+        if (length(flex_cols)) {
+          lf <- pick("_locked_flex_v"); ef <- pick("_excluded_flex_v")
+          if (length(lf))
+            lineups <- lineups[apply(lineups[, ..flex_cols], 1,
+                                     function(r) all(lf %in% r))]
+          if (length(ef))
+            lineups <- lineups[apply(lineups[, ..flex_cols], 1,
+                                     function(r) !any(ef %in% r))]
         }
       }
       lineups
