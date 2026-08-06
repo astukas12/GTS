@@ -17,8 +17,7 @@ source("cash_game_module.R")
 # Never re-source inside reactive observers — re-sourcing re-executes all
 # top-level code on every upload/sim run.
 local({
-  engines <- c("nascar", "mma", "tennis", "golf", "f1", "nfl", "nfl_preseason",
-                 "cbb", "nba", "soccer")
+  engines <- c("nascar", "mma", "tennis", "golf", "f1", "nfl", "cbb", "nba", "soccer")
   for (e in engines) {
     f <- paste0(e, "_engine.R")
     if (file.exists(f)) source(f) else warning("Engine not found at startup: ", f)
@@ -1335,15 +1334,8 @@ server <- function(input, output, session) {
         dk_mode <- rv$config$optimization_modes$DK %||% "standard"
         progress$set(message="Finding optimal DraftKings lineups...", value=0)
         opt_data   <- prepare_optimization_data(rv$simulation_results, rv$sim_metadata, "DK")
-        # cpt_multiplier is REQUIRED whenever dk_mode is a captain mode. Without
-        # it, calculate_distribution_metrics builds
-        # multipliers <- c(config$cpt_multiplier, rep(1, n - 1)) where the first
-        # element is NULL, so the vector is one short and the ownership step
-        # dies with "non-conformable arrays". The FD path below already passes
-        # mvp_multiplier; this one was missing its counterpart.
         opt_config <- list(roster_size=rv$config$roster_sizes$DK, salary_cap=rv$config$salary_caps$DK,
                            percentiles=c(0.01,0.05,0.10,0.20), platform_col="DKScore",
-                           cpt_multiplier=rv$config$showdown_config$DK$captain_multiplier %||% 1.5,
                            progress_frequency=500, use_parallel=TRUE,
                            max_lineups=rv$config$max_lineups %||% 5000L)
         progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
@@ -1976,17 +1968,9 @@ server <- function(input, output, session) {
         else { mn <- floor(mn*10)/10; mx <- ceiling(mx*10)/10; lbl <- cfg$label }
         sliderInput(paste0(lp,"_filter_",col,"_v",ver), lbl, min=mn, max=mx, value=c(mn,mx), step=cfg$step, width="100%")
       }))
-      # No sliders at all is a real case, not an error: on a preseason slate
-      # every numeric column here is a constant (one salary, zero ownership), so
-      # each one is skipped by the mn == mx test above. seq(1, 0, 2) then throws
-      # "wrong sign in 'by' argument", which surfaced as a red error where the
-      # filters should be.
       n <- length(sliders)
-      if (n == 0)
-        return(div(style = "color:#888;font-size:12px;font-style:italic;padding-top:4px;",
-                   "No range filters for this slate."))
-      fluidRow(column(6, sliders[seq(1, n, 2)]),
-               column(6, if (n > 1) sliders[seq(2, n, 2)] else list()))
+      fluidRow(column(6, sliders[seq(1,n,2)]),
+               column(6, if(n>1) sliders[seq(2,n,2)] else list()))
     })
   }
   output$dk_range_sliders <- make_range_sliders("dk")
@@ -3046,99 +3030,12 @@ server <- function(input, output, session) {
     else if (rv$sport == "GOLF")    render_golf_visuals(rv$sport_visuals)
     else if (rv$sport == "MMA")     render_mma_visuals(rv$sport_visuals)
     else if (rv$sport == "F1")      render_f1_visuals(rv$sport_visuals)
-    else if (rv$sport == "NFL_PRESEASON") render_nfl_preseason_visuals(rv$sport_visuals)
     else NULL
   })
   
   
   # ---------- Tennis ----------
   
-  # ---------- NFL Preseason ----------
-  # Four validation views, in the order you would check them: does the GAME look
-  # like a preseason game, does each POSITION GROUP get a sane share, does any
-  # DRIVE have nobody on the field (which silently discards its plays), and
-  # where does the sim disagree with ETR.
-  render_nfl_preseason_visuals <- function(visuals) {
-    req(visuals)
-    gaps <- if (!is.null(visuals$coverage)) sum(visuals$coverage$Gap) else 0
-    fluidRow(column(12,
-      box(width = NULL, title = "Preseason Simulation Analysis",
-          status = "primary", solidHeader = TRUE,
-
-        div(style = "margin-bottom:14px;color:#bbb;font-size:12px;",
-            sprintf("%s games in pool  |  effective sample %s  |  mean margin %+.2f  |  %s sims",
-                    format(visuals$pool_size, big.mark = ","),
-                    format(visuals$ess, big.mark = ","),
-                    visuals$mean_margin, format(visuals$n_sims, big.mark = ","))),
-
-        if (gaps > 0)
-          div(style = "margin-bottom:14px;padding:8px 12px;border-left:3px solid #d9534f;background:#2a1a1a;color:#f0c0c0;font-size:12px;",
-              sprintf("%d drive(s) have no eligible player at a position. Those plays are discarded — widen the drive windows on the team tabs.", gaps)),
-
-        div(style = "margin-bottom:20px;",
-            tags$p(class = "gts-sr-label", "Team Totals"),
-            DTOutput("psn_team_table")),
-        tags$hr(style = "border-color:#2a2a2a;margin:16px 0;"),
-
-        div(style = "margin-bottom:20px;",
-            tags$p(class = "gts-sr-label", "By Position Group"),
-            DTOutput("psn_pos_table")),
-        tags$hr(style = "border-color:#2a2a2a;margin:16px 0;"),
-
-        div(style = "margin-bottom:20px;",
-            tags$p(class = "gts-sr-label", "Sim vs ETR"),
-            plotlyOutput("psn_etr_plot", height = "420px")),
-        tags$hr(style = "border-color:#2a2a2a;margin:16px 0;"),
-
-        div(tags$p(class = "gts-sr-label", "Who Is On The Field, By Drive"),
-            DTOutput("psn_cover_table"))
-      )))
-  }
-
-  output$psn_team_table <- renderDT({
-    req(rv$sport == "NFL_PRESEASON", rv$sport_visuals$team_means)
-    datatable(rv$sport_visuals$team_means, rownames = FALSE,
-              options = list(dom = "t", paging = FALSE, searching = FALSE))
-  })
-
-  output$psn_pos_table <- renderDT({
-    req(rv$sport == "NFL_PRESEASON", rv$sport_visuals$pos_means)
-    datatable(rv$sport_visuals$pos_means, rownames = FALSE,
-              options = list(dom = "t", paging = FALSE, searching = FALSE))
-  })
-
-  output$psn_cover_table <- renderDT({
-    req(rv$sport == "NFL_PRESEASON", rv$sport_visuals$coverage)
-    d <- copy(rv$sport_visuals$coverage)
-    datatable(d, rownames = FALSE,
-              options = list(dom = "t", paging = FALSE, searching = FALSE)) %>%
-      formatStyle("Gap", target = "row",
-                  backgroundColor = styleEqual(c(TRUE), c("#3a1f1f")))
-  })
-
-  # Points on the diagonal are agreement. Distance from it is the disagreement
-  # worth explaining -- usually a drive window, not the model.
-  output$psn_etr_plot <- renderPlotly({
-    req(rv$sport == "NFL_PRESEASON", rv$sport_visuals$player_means)
-    d <- as.data.frame(rv$sport_visuals$player_means)
-    d <- d[!is.na(d$ETR) & !is.na(d$Sim), ]
-    if (!nrow(d)) return(plotly_empty())
-    lim <- c(0, max(c(d$Sim, d$ETR), na.rm = TRUE) * 1.08)
-    plot_ly(d, x = ~ETR, y = ~Sim, type = "scatter", mode = "markers",
-            color = ~Pos, text = ~paste0(Player, " (", Team, ")<br>sim ", Sim,
-                                         " vs ETR ", ETR),
-            hoverinfo = "text", marker = list(size = 9)) %>%
-      add_trace(x = lim, y = lim, type = "scatter", mode = "lines",
-                inherit = FALSE, showlegend = FALSE,
-                line = list(color = "#FFE500", dash = "dash", width = 1)) %>%
-      layout(paper_bgcolor = "#121212", plot_bgcolor = "#141414",
-             font = list(color = "#FFFFFF", size = 11),
-             xaxis = list(title = "ETR projection", range = lim, gridcolor = "#2a2a2a"),
-             yaxis = list(title = "Sim average",    range = lim, gridcolor = "#2a2a2a"),
-             margin = list(l = 60, r = 30, t = 30, b = 50))
-  })
-
-
   render_tennis_visuals <- function(visuals) {
     all_players <- if (!is.null(visuals$score_distributions$all_wins)) {
       avgs <- visuals$score_distributions$all_wins[, .(Avg=mean(Score)), by=Player]
