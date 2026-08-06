@@ -3086,6 +3086,18 @@ server <- function(input, output, session) {
         tags$hr(style = "border-color:#2a2a2a;margin:16px 0;"),
 
         div(style = "margin-bottom:20px;",
+            tags$p(class = "gts-sr-label", "Score Range by Player"),
+            tags$p(style = "color:#888;font-size:11px;margin:-4px 0 8px 0;",
+                   "Bar spans the 10th to 90th percentile; tick is the median, dot the mean."),
+            plotlyOutput("psn_range_plot", height = "760px")),
+        tags$hr(style = "border-color:#2a2a2a;margin:16px 0;"),
+
+        div(style = "margin-bottom:20px;",
+            tags$p(class = "gts-sr-label", "Player Stat Lines (with the inputs that produced them)"),
+            DTOutput("psn_stat_table")),
+        tags$hr(style = "border-color:#2a2a2a;margin:16px 0;"),
+
+        div(style = "margin-bottom:20px;",
             tags$p(class = "gts-sr-label", "Sim vs ETR"),
             plotlyOutput("psn_etr_plot", height = "420px")),
         tags$hr(style = "border-color:#2a2a2a;margin:16px 0;"),
@@ -3114,6 +3126,62 @@ server <- function(input, output, session) {
               options = list(dom = "t", paging = FALSE, searching = FALSE)) %>%
       formatStyle("Gap", target = "row",
                   backgroundColor = styleEqual(c(TRUE), c("#3a1f1f")))
+  })
+
+  # P10-P90 bar with median tick and mean dot, one row per player, teams
+  # separated. Drawn from precomputed quantiles rather than raw sim rows.
+  output$psn_range_plot <- renderPlotly({
+    req(rv$sport == "NFL_PRESEASON", rv$sport_visuals$score_dist)
+    d <- as.data.table(rv$sport_visuals$score_dist)
+    setorder(d, Team, Mean)
+    d[, lab := paste0(Player, "  (", Team, " ", Pos, ")")]
+    d[, y := .I]
+    pal <- c("#FFE500", "#4DA3FF", "#FF7A59", "#6FCF97")
+    tms <- unique(d$Team); names(pal) <- rep_len(pal, length(tms))
+    col_of <- setNames(rep_len(c("#FFE500", "#4DA3FF"), length(tms)), tms)
+
+    p <- plot_ly()
+    for (tm in tms) {
+      s <- d[Team == tm]
+      p <- p %>%
+        add_segments(data = s, x = ~P10, xend = ~P90, y = ~y, yend = ~y,
+                     line = list(color = col_of[[tm]], width = 6),
+                     opacity = 0.35, name = tm, legendgroup = tm,
+                     hoverinfo = "skip") %>%
+        add_segments(data = s, x = ~P25, xend = ~P75, y = ~y, yend = ~y,
+                     line = list(color = col_of[[tm]], width = 6),
+                     opacity = 0.85, showlegend = FALSE, legendgroup = tm,
+                     hoverinfo = "skip") %>%
+        add_trace(data = s, x = ~Median, y = ~y, type = "scatter",
+                  mode = "markers", marker = list(symbol = "line-ns-open",
+                  color = "#FFFFFF", size = 12, line = list(width = 2)),
+                  showlegend = FALSE, legendgroup = tm,
+                  text = ~paste0(Player, "<br>mean ", Mean, "  median ", Median,
+                                 "<br>P10 ", P10, "  P90 ", P90, "  max ", Max),
+                  hoverinfo = "text")
+    }
+    p %>% layout(
+      paper_bgcolor = "#121212", plot_bgcolor = "#141414",
+      font = list(color = "#FFFFFF", size = 11),
+      xaxis = list(title = "DK points", gridcolor = "#2a2a2a", zeroline = FALSE),
+      yaxis = list(title = "", tickmode = "array", tickvals = d$y,
+                   ticktext = d$lab, gridcolor = "#1e1e1e",
+                   range = c(0.5, nrow(d) + 0.5)),
+      margin = list(l = 210, r = 30, t = 20, b = 50),
+      legend = list(orientation = "h", y = 1.03))
+  })
+
+  output$psn_stat_table <- renderDT({
+    req(rv$sport == "NFL_PRESEASON", rv$sport_visuals$stat_line)
+    d <- as.data.table(rv$sport_visuals$stat_line)
+    datatable(d, rownames = FALSE, filter = "top",
+              options = list(pageLength = 25, scrollX = TRUE, dom = "tp",
+                             order = list(list(13, "desc")))) %>%
+      # Red where the sim is well under ETR, green where it is well over --
+      # those rows are the ones whose drive window or catch weight to revisit.
+      formatStyle("Diff",
+                  backgroundColor = styleInterval(c(-2, 2),
+                                                  c("#4a1f1f", "transparent", "#1f4a2a")))
   })
 
   # Points on the diagonal are agreement. Distance from it is the disagreement

@@ -508,9 +508,50 @@ run_nfl_preseason_simulation <- function(input_data, n_sims = 20000,
   }))
   cover[, Gap := RBs == 0 | Receivers == 0 | QB == ""]
 
+  # SCORE RANGE per player. The mean alone hides the thing that matters on a
+  # showdown slate -- two players with the same average can have very different
+  # ceilings, and the ceiling is what wins. Quantiles are precomputed here
+  # rather than shipping 800k rows to the browser.
+  score_dist <- res[, .(
+      Mean   = round(mean(dk), 2),
+      P10    = round(as.numeric(quantile(dk, 0.10)), 1),
+      P25    = round(as.numeric(quantile(dk, 0.25)), 1),
+      Median = round(as.numeric(median(dk)), 1),
+      P75    = round(as.numeric(quantile(dk, 0.75)), 1),
+      P90    = round(as.numeric(quantile(dk, 0.90)), 1),
+      Max    = round(max(dk), 1)),
+    by = .(Player = player, Team, Pos)][order(Team, -Mean)]
+
+  # PLAYER STAT LINE with the INPUTS that produced it sitting alongside. That
+  # pairing is the point: if a receiver's catches look wrong, the drive window
+  # and catch weight that caused it are on the same row, so the fix is visible
+  # without cross-referencing the workbook.
+  stat_line <- res[, .(
+      Carries = round(sum(carries)/n_sims, 2),
+      RushYds = round(sum(rush_yds)/n_sims, 1),
+      Rec     = round(sum(rec)/n_sims, 2),
+      RecYds  = round(sum(rec_yds)/n_sims, 1),
+      PassCmp = round(sum(pass_cmp)/n_sims, 2),
+      PassYds = round(sum(pass_yds)/n_sims, 1),
+      TD      = round(sum(rush_td + rec_td + pass_td)/n_sims, 3),
+      DK      = round(mean(dk), 2)),
+    by = .(Player = player, Team, Pos)]
+  inputs <- players[, .(Player, Drives = paste0(DriveStart, "-", DriveEnd),
+                        CatchWeight = round(ps_num(CatchWeight), 2),
+                        Mobility = if ("Mobility" %in% names(players)) Mobility else NA_character_)]
+  stat_line <- merge(stat_line, inputs, by = "Player", all.x = TRUE)
+  stat_line <- merge(stat_line, metadata[, .(Player, ETR = ps_num(DKProj))],
+                     by = "Player", all.x = TRUE)
+  stat_line[, Diff := round(DK - ETR, 2)]
+  setcolorder(stat_line, c("Player","Team","Pos","Drives","CatchWeight","Mobility",
+                           "Carries","RushYds","Rec","RecYds","PassCmp","PassYds",
+                           "TD","DK","ETR","Diff"))
+  setorder(stat_line, Team, -DK)
+
   sport_visuals <- list(
     team_means = team_means, pos_means = pos_means,
     player_means = player_means, coverage = cover,
+    score_dist = score_dist, stat_line = stat_line,
     pool_size = nrow(pool), n_sims = n_sims,
     ess = round(1/sum(w^2)),
     mean_margin = round(sum(w * ps_num(pool$Margin_A)), 2))
