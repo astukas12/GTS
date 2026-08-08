@@ -1018,13 +1018,23 @@ server <- function(input, output, session) {
   }
   
   create_download_table <- function(optimal_lineups, metadata, platform, sport = NULL) {
-    if ("Captain" %in% names(optimal_lineups)) {
-      if (identical(sport, "F1"))
-        return(create_download_f1(optimal_lineups, metadata))
-      return(create_download_showdown(optimal_lineups, metadata))
+    dl <- if ("Captain" %in% names(optimal_lineups)) {
+      if (identical(sport, "F1")) create_download_f1(optimal_lineups, metadata)
+      else create_download_showdown(optimal_lineups, metadata)
+    } else if ("MVP" %in% names(optimal_lineups)) {
+      create_download_mvp(optimal_lineups, metadata)
+    } else {
+      create_download_standard(optimal_lineups, metadata, platform)
     }
-    if ("MVP" %in% names(optimal_lineups)) return(create_download_mvp(optimal_lineups, metadata))
-    create_download_standard(optimal_lineups, metadata, platform)
+    # Round here rather than in each builder: the CBB and NBA download helpers
+    # already rounded AvgOwn, but the shared showdown/standard/mvp paths did
+    # not, so a DK export carried values like 21.555775970326.
+    setDT(dl)
+    for (cl in intersect(c("AvgOwn","WinRate","Top1Pct","Top5Pct","Top10Pct",
+                           "Top20Pct","Win","Top1","Top5","Top10","Top20",
+                           "AvgScore"), names(dl)))
+      if (is.numeric(dl[[cl]])) dl[, (cl) := round(get(cl), 2)]
+    dl[]
   }
   
   create_display_table_cbb <- function(optimal_lineups, platform = "DK") {
