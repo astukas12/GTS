@@ -286,29 +286,62 @@ run_nfl_preseason_simulation <- function(input_data, n_sims = 20000,
   if (is.null(n_sims) || is.na(n_sims)) n_sims <- 20000
 
   # ---- the pool -----------------------------------------------------------
-  # The Sim tab names the matchup and IS the pool: there is no settings sheet,
-  # because the spread and roster slot were inputs to BUILDING it and are never
-  # consulted again. Deleting rows really does drop those games.
-  simnm <- grep("^Sim_", names(input_data), value = TRUE, ignore.case = TRUE)[1]
-  if (is.na(simnm)) stop("Preseason workbook has no Sim_<A>_vs_<B> sheet")
-  pool <- ps_sheet(input_data, simnm)
-  pool <- pool[!is.na(ps_num(Weight)) & ps_num(Weight) > 0]
-  if (!nrow(pool)) stop("Sim sheet has no games with a positive Weight")
+  # Two workbook shapes are accepted, and the tabs say which is which:
+  #
+  #   SHOWDOWN  a single Sim_<A>_vs_<B> tab that IS the pool for one game.
+  #   CLASSIC   a Pool tab holding every game's pool stacked, keyed by GameKey,
+  #             plus a Games tab listing the matchups.
+  #
+  # Neither carries a settings sheet: the spread and roster slot were inputs to
+  # BUILDING a pool and are never consulted again, so deleting rows from the
+  # pool really does drop those games from the projection.
+  pooltab <- ps_sheet(input_data, "Pool")
+  is_classic <- !is.null(pooltab) && "GameKey" %in% names(pooltab)
 
-  tt <- strsplit(sub("^[Ss]im_", "", simnm), "_vs_", fixed = TRUE)[[1]]
-  team_a <- tt[1]; team_b <- if (length(tt) > 1) tt[2] else NA_character_
+  if (is_classic) {
+    pool <- pooltab[!is.na(ps_num(Weight)) & ps_num(Weight) > 0]
+    if (!nrow(pool)) stop("Pool sheet has no rows with a positive Weight")
+    gm <- unique(pool[, .(GameKey, HomeTeam, AwayTeam)])
+    say(sprintf("classic slate: %d games, %s pool rows",
+                nrow(gm), format(nrow(pool), big.mark = ",")), 0.05)
+  } else {
+    simnm <- grep("^Sim_", names(input_data), value = TRUE, ignore.case = TRUE)[1]
+    if (is.na(simnm)) stop("Preseason workbook has no Pool or Sim_<A>_vs_<B> sheet")
+    pool <- ps_sheet(input_data, simnm)
+    pool <- pool[!is.na(ps_num(Weight)) & ps_num(Weight) > 0]
+    if (!nrow(pool)) stop("Sim sheet has no games with a positive Weight")
+    tt <- strsplit(sub("^[Ss]im_", "", simnm), "_vs_", fixed = TRUE)[[1]]
+    pool[, `:=`(GameKey = simnm, HomeTeam = tt[1],
+                AwayTeam = if (length(tt) > 1) tt[2] else NA_character_)]
+    gm <- unique(pool[, .(GameKey, HomeTeam, AwayTeam)])
+    w <- ps_num(pool$Weight); w <- w/sum(w)
+    say(sprintf("%s vs %s | %d games in pool | ESS %.0f | mean margin %+.2f",
+                gm$HomeTeam[1], gm$AwayTeam[1], nrow(pool), 1/sum(w^2),
+                sum(w * ps_num(pool$Margin_A))), 0.05)
+  }
+  teams_all <- unique(c(gm$HomeTeam, gm$AwayTeam))
+  teams_all <- teams_all[!is.na(teams_all)]
 
-  w <- ps_num(pool$Weight); w <- w/sum(w)
-  say(sprintf("%s vs %s | %d games in pool | ESS %.0f | mean margin %+.2f",
-              team_a, team_b, nrow(pool), 1/sum(w^2),
-              sum(w * ps_num(pool$Margin_A))), 0.05)
+  # Diagnostic per game: how much of the history each pool really draws on, and
+  # whether the weighting landed on the line it was given.
+  pool_diag <- pool[, {
+    ww <- ps_num(Weight); ww <- ww/sum(ww)
+    .(Games = .N, ESS = round(1/sum(ww^2)),
+      Spread = round(ps_num(Spread_A)[1], 1),
+      MeanMargin = round(sum(ww * ps_num(Margin_A)), 2),
+      MeanTotal  = round(sum(ww * ps_num(Total)), 1))
+  }, by = GameKey]
+  pool_diag[, Miss := round(MeanMargin - Spread, 2)]
 
   # ---- players ------------------------------------------------------------
-  players <- rbindlist(lapply(c(team_a, team_b), function(tm) {
+  players <- rbindlist(lapply(teams_all, function(tm) {
     d <- ps_sheet(input_data, tm)
     if (is.null(d)) stop("Workbook has no sheet for team ", tm)
     d[, Team := tm]
   }), fill = TRUE)
+  # The classic sheet keeps non-playing rows for reference, flagged in Status.
+  if ("Status" %in% names(players))
+    players <- players[!Status %in% c("OUT","SIT","NOT ON DEPTH CHART")]
   # A row's PRESENCE is the flag — there is no Plays column.
   if ("Plays" %in% names(players))
     players <- players[toupper(as.character(Plays)) %in% c("TRUE","1","YES")]
@@ -329,67 +362,77 @@ run_nfl_preseason_simulation <- function(input_data, n_sims = 20000,
     if (cl %in% names(recs))    recs[,    (cl) := ps_num(get(cl))]
   }
 
-  # ---- draw ---------------------------------------------------------------
+  # ---- draw and allocate, one game at a time -------------------------------
+  # Every game is drawn independently under a SHARED SimID. That is what lets a
+  # classic lineup combine players from different games while each game keeps
+  # its own betting line, roster slot and quarterback mobility. It also makes
+  # cross-game correlation exactly zero, which is what the history shows --
+  # opposing team totals inside a game correlate -0.253, but separate games
+  # have no mechanism linking them at all.
   set.seed(20260806)
-  idx  <- sample.int(nrow(pool), n_sims, replace = TRUE, prob = w)
-  draw <- data.table(sim_id = seq_len(n_sims),
-                     game_id = pool$GameID[idx],
-                     team_A  = pool$TeamA[idx],  team_B = pool$TeamB[idx],
-                     kA = ps_num(pool$KickA)[idx], kB = ps_num(pool$KickB)[idx],
-                     dA = ps_num(pool$DstA)[idx],  dB = ps_num(pool$DstB)[idx])
-  for (c_ in c("kA","kB","dA","dB")) draw[[c_]][is.na(draw[[c_]])] <- 0
-
-  # ---- allocate -----------------------------------------------------------
   out <- list()
-  for (side in c("A","B")) {
-    tm  <- if (side == "A") team_a else team_b
-    col <- paste0("team_", side)
-    sh  <- players[Team == tm]
-    if (!nrow(sh)) next
-    say(sprintf("allocating %s", tm), if (side == "A") 0.3 else 0.6)
+  for (gi in seq_len(nrow(gm))) {
+    gk <- gm$GameKey[gi]; ha <- gm$HomeTeam[gi]; aw <- gm$AwayTeam[gi]
+    gp <- pool[GameKey == gk]
+    if (!nrow(gp)) next
+    w <- ps_num(gp$Weight); w <- w/sum(w)
+    idx <- sample.int(nrow(gp), n_sims, replace = TRUE, prob = w)
+    draw <- data.table(sim_id = seq_len(n_sims),
+                       game_id = gp$GameID[idx],
+                       team_A = gp$TeamA[idx], team_B = gp$TeamB[idx],
+                       kA = ps_num(gp$KickA)[idx], kB = ps_num(gp$KickB)[idx],
+                       dA = ps_num(gp$DstA)[idx], dB = ps_num(gp$DstB)[idx])
+    for (c_ in c("kA","kB","dA","dB")) draw[[c_]][is.na(draw[[c_]])] <- 0
+    say(sprintf("allocating %s", gk), 0.1 + 0.75 * gi/nrow(gm))
 
-    rb <- sh[Pos %in% c("QB","RB"),
-             .(player = Player, pos = Pos, drive_start = DriveStart,
-               drive_end = DriveEnd, weight = 1)]
-    wr <- sh[Pos %in% c("WR","TE","RB"),
-             .(player = Player, pos = Pos, drive_start = DriveStart,
-               drive_end = DriveEnd, catch_w = CatchWeight,
-               depth_z = if ("CatchDepth" %in% names(sh))
-                           ps_depth_z(CatchDepth, Pos) else 0)]
-    qb <- sh[Pos == "QB", .(player = Player, drive_start = DriveStart,
-                            drive_end = DriveEnd)]
+    for (side in c("A","B")) {
+      tm  <- if (side == "A") ha else aw
+      col <- paste0("team_", side)
+      sh  <- players[Team == tm]
+      if (!nrow(sh)) next
 
-    ru <- if (nrow(rb)) ps_allocate_rushing(draw, carries, rb, col) else NULL
-    rc <- if (nrow(wr) && nrow(qb)) ps_allocate_receiving(draw, recs, wr, qb, col) else NULL
+      rb <- sh[Pos %in% c("QB","RB"),
+               .(player = Player, pos = Pos, drive_start = DriveStart,
+                 drive_end = DriveEnd, weight = 1)]
+      wr <- sh[Pos %in% c("WR","TE","RB"),
+               .(player = Player, pos = Pos, drive_start = DriveStart,
+                 drive_end = DriveEnd, catch_w = CatchWeight,
+                 depth_z = if ("CatchDepth" %in% names(sh))
+                             ps_depth_z(CatchDepth, Pos) else 0)]
+      qb <- sh[Pos == "QB", .(player = Player, drive_start = DriveStart,
+                              drive_end = DriveEnd)]
 
-    all_p <- data.table(player = sh$Player, Pos = sh$Pos, Team = tm)
-    grid  <- all_p[rep(seq_len(.N), each = n_sims)]
-    grid[, sim_id := rep(seq_len(n_sims), times = nrow(all_p))]
-    if (!is.null(ru)) grid <- merge(grid, ru, by = c("sim_id","player"), all.x = TRUE)
-    if (!is.null(rc)) {
-      grid <- merge(grid, rc$rec, by = c("sim_id","player"), all.x = TRUE)
-      grid <- merge(grid, rc$qb,  by = c("sim_id","player"), all.x = TRUE)
+      ru <- if (nrow(rb)) ps_allocate_rushing(draw, carries, rb, col) else NULL
+      rc <- if (nrow(wr) && nrow(qb)) ps_allocate_receiving(draw, recs, wr, qb, col) else NULL
+
+      all_p <- data.table(player = sh$Player, Pos = sh$Pos, Team = tm)
+      grid  <- all_p[rep(seq_len(.N), each = n_sims)]
+      grid[, sim_id := rep(seq_len(n_sims), times = nrow(all_p))]
+      if (!is.null(ru)) grid <- merge(grid, ru, by = c("sim_id","player"), all.x = TRUE)
+      if (!is.null(rc)) {
+        grid <- merge(grid, rc$rec, by = c("sim_id","player"), all.x = TRUE)
+        grid <- merge(grid, rc$qb,  by = c("sim_id","player"), all.x = TRUE)
+      }
+      for (c_ in c("carries","rush_yds","rush_td","rec","rec_yds","rec_td",
+                   "pass_cmp","pass_yds","pass_td"))
+        if (!c_ %in% names(grid)) grid[, (c_) := 0] else grid[is.na(get(c_)), (c_) := 0]
+
+      kcol <- if (side == "A") "kA" else "kB"
+      dcol <- if (side == "A") "dA" else "dB"
+      kv <- draw[[kcol]]
+      grid[Pos == "K", `:=`(rush_yds = 0, rec_yds = 0, pass_yds = 0)]
+      grid[, dk := ps_dk_score(.SD)]
+      grid[, fd := ps_fd_score(.SD)]
+      grid[Pos == "K", `:=`(dk = kv[sim_id], fd = kv[sim_id])]
+      grid[, GameKey := gk]
+
+      dst <- data.table(sim_id = seq_len(n_sims), player = paste(tm, "D/ST"),
+                        Pos = "DST", Team = tm, GameKey = gk,
+                        dk = draw[[dcol]], fd = draw[[dcol]])
+      for (c_ in c("carries","rush_yds","rush_td","rec","rec_yds","rec_td",
+                   "pass_cmp","pass_yds","pass_td")) dst[, (c_) := 0]
+      out[[paste(gk, side)]] <- rbind(grid, dst, fill = TRUE)
     }
-    for (c_ in c("carries","rush_yds","rush_td","rec","rec_yds","rec_td",
-                 "pass_cmp","pass_yds","pass_td"))
-      if (!c_ %in% names(grid)) grid[, (c_) := 0] else grid[is.na(get(c_)), (c_) := 0]
-
-    # Kicker and team defence are team-level totals that ride along with the
-    # sampled game — no allocation, and no input required from the user.
-    kcol <- if (side == "A") "kA" else "kB"
-    dcol <- if (side == "A") "dA" else "dB"
-    kv <- draw[[kcol]]
-    grid[Pos == "K", `:=`(rush_yds = 0, rec_yds = 0, pass_yds = 0)]
-    grid[, dk := ps_dk_score(.SD)]
-    grid[, fd := ps_fd_score(.SD)]
-    grid[Pos == "K", `:=`(dk = kv[sim_id], fd = kv[sim_id])]
-
-    dst <- data.table(sim_id = seq_len(n_sims), player = paste(tm, "D/ST"),
-                      Pos = "DST", Team = tm,
-                      dk = draw[[dcol]], fd = draw[[dcol]])
-    for (c_ in c("carries","rush_yds","rush_td","rec","rec_yds","rec_td",
-                 "pass_cmp","pass_yds","pass_td")) dst[, (c_) := 0]
-    out[[side]] <- rbind(grid, dst, fill = TRUE)
   }
   res <- rbindlist(out, fill = TRUE)
   say("shaping output", 0.9)
@@ -410,9 +453,12 @@ run_nfl_preseason_simulation <- function(input_data, n_sims = 20000,
     }
     rep(dflt, if (is.null(d)) 0L else nrow(d))
   }
+  # A classic workbook names these Player/DK_ID/FD_ID; a showdown one names them
+  # Name/DKID/DKCID. Reading only one spelling drops every id silently -- the
+  # sim still runs and the downloads come out blank -- so accept both.
   metadata <- if (!is.null(ids)) unique(data.table(
-      Player = ids$Name, Team = ids$Team, Pos = pick(ids, "Pos"),
-      DKID  = pick(ids, "DKID", "DK_FLEX"),
+      Player = pick(ids, "Player", "Name"), Team = ids$Team, Pos = pick(ids, "Pos"),
+      DKID  = pick(ids, "DKID", "DK_FLEX", "DK_ID"),
       DKCID = pick(ids, "DKCID", "DK_CPT"),
       FDID  = pick(ids, "FDID", "FD_ID"),
       # Constants, not information -- but the optimiser reads them by name.
@@ -452,6 +498,36 @@ run_nfl_preseason_simulation <- function(input_data, n_sims = 20000,
                      else PS_FD_SALARY * 1.5]
   for (cl in c("DKOwn","FDOwn","DKCOwn","FDMOwn"))
     metadata[is.na(get(cl)), (cl) := 0]
+  # The shared SD optimiser indexes salary as SDSalary/CPTSalary regardless of
+  # sport. Preseason prices everyone the same, so these are constants -- but
+  # they have to exist or the merge drops every row.
+  metadata[, `:=`(SDSalary = DKSalary, CPTSalary = DKCSalary)]
+
+  # SHOWDOWN IDENTITY. On a classic slate a showdown contest is one of the
+  # games, so a player belongs to at most one -- his team decides it. The app's
+  # SD picker filters metadata by ShowdownFile, and the download needs that
+  # game's own captain/flex ids, which are NOT the classic ones.
+  gsd <- ps_sheet(input_data, "Games")
+  if (!is.null(gsd) && "ShowdownFile" %in% names(gsd)) {
+    gsd <- gsd[!is.na(ShowdownFile) & nzchar(as.character(ShowdownFile))]
+    if (nrow(gsd)) {
+      tm2sd <- rbind(gsd[, .(Team = HomeTeam, ShowdownFile, GameKey)],
+                     gsd[, .(Team = AwayTeam, ShowdownFile, GameKey)])
+      metadata[, ShowdownFile := tm2sd$ShowdownFile[match(Team, tm2sd$Team)]]
+      metadata[, GameKey      := tm2sd$GameKey[match(Team, tm2sd$Team)]]
+      # SD1_CPT / SD1_FLEX ... one column pair per showdown contest.
+      if (!is.null(ids)) for (sf in unique(tm2sd$ShowdownFile)) {
+        cc <- paste0(sf, "_CPT"); fc <- paste0(sf, "_FLEX")
+        if (!all(c(cc, fc) %in% names(ids))) next
+        nm <- pick(ids, "Player", "Name")
+        j  <- match(metadata$Player, nm)
+        ok <- which(!is.na(j) & !is.na(metadata$ShowdownFile) &
+                    metadata$ShowdownFile == sf)
+        metadata[ok, `:=`(SDCID = as.character(ids[[cc]])[j[ok]],
+                          SDID  = as.character(ids[[fc]])[j[ok]])]
+      }
+    }
+  }
 
   projections <- res[, .(Sim_DK_Mean   = mean(dk),
                          Sim_DK_Median = as.numeric(median(dk)),
@@ -494,7 +570,7 @@ run_nfl_preseason_simulation <- function(input_data, n_sims = 20000,
 
   # A drive nobody's window covers silently discards its plays -- it surfaces as
   # a quietly low projection rather than an error, so it is reported here.
-  cover <- rbindlist(lapply(c(team_a, team_b), function(tm) {
+  cover <- rbindlist(lapply(teams_all, function(tm) {
     sh <- players[Team == tm]
     if (!nrow(sh)) return(NULL)
     rbindlist(lapply(seq_len(PS_DRIVES), function(dv) {
@@ -553,8 +629,12 @@ run_nfl_preseason_simulation <- function(input_data, n_sims = 20000,
     player_means = player_means, coverage = cover,
     score_dist = score_dist, stat_line = stat_line,
     pool_size = nrow(pool), n_sims = n_sims,
-    ess = round(1/sum(w^2)),
-    mean_margin = round(sum(w * ps_num(pool$Margin_A)), 2))
+    # Per game, because on a classic slate each game carries its own line and
+    # its own pool -- one slate-wide ESS would average away the game that is
+    # actually short of diversity.
+    pool_diag = pool_diag,
+    ess = round(mean(pool_diag$ESS)),
+    mean_margin = round(mean(pool_diag$MeanMargin), 2))
 
   say("done", 1)
   list(sim_results = sim_results, metadata = metadata, projections = projections,

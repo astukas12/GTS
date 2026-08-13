@@ -785,6 +785,118 @@ SPORT_CONFIGS <- list(
   ),
 
   # ==========================================================================
+  # NFL PRESEASON CLASSIC (multi-game slate)
+  # --------------------------------------------------------------------------
+  # Same engine as NFL_PRESEASON, different workbook shape and roster. The
+  # showdown file carries one Sim_<A>_vs_<B> pool; this one carries a Pool tab
+  # holding every game's pool keyed by GameKey, plus a Games tab. Detection
+  # keys on that difference.
+  #
+  # NO SALARY TRADEOFF. DraftKings prices a preseason classic slate flat --
+  # every player 5,500 -- so nine of them cost 49,500 against a 50,000 cap and
+  # it fits with 500 to spare. The cap can never bind, which means the position
+  # constrained optimum needs no linear program at all: best QB, best two RB,
+  # best three WR, best TE, best DST, then the best remaining flex is exactly
+  # optimal. Hence the dedicated mode below rather than "standard".
+  # ==========================================================================
+  NFL_PRESEASON_CLASSIC = list(
+    sport_name          = "NFL_PRESEASON_CLASSIC",
+    sport_display_name  = "NFL Preseason (Classic)",
+    player_label        = "Player",
+    player_label_plural = "Players",
+
+    detection = list(
+      custom_detect = function(sheets, file_path = NULL) {
+        "Pool" %in% sheets && "Games" %in% sheets && "IDs" %in% sheets &&
+          !any(grepl("^Sim_", sheets)) &&
+          !("Similar_Games" %in% sheets) &&
+          !any(grepl("_Rushing$", sheets))
+      },
+      required_sheets    = NULL,
+      required_columns   = NULL,
+      min_sheet_matches  = 0,
+      min_column_matches = 0
+    ),
+
+    platforms    = c("DK", "FD", "SD"),
+    roster_sizes = list(DK = 9, FD = 9, SD = 6),
+    salary_caps  = list(DK = 50000, FD = 60000, SD = 50000),
+
+    optimization_modes = list(DK = "preseason_classic", FD = "preseason_classic",
+                              SD = "combinatorial_captain"),
+    max_lineups        = 5000,
+
+    showdown_config = list(
+      SD = list(enabled = TRUE, captain_multiplier = 1.5,
+                captain_salary_multiplier = 1.5, mode = "captain")
+    ),
+
+    # DK classic: QB, RB, RB, WR, WR, WR, TE, FLEX, DST
+    position_slots = list(QB = 1, RB = 2, WR = 3, TE = 1, FLEX = 1, DST = 1),
+    flex_eligible  = c("RB", "WR", "TE"),
+
+    standard_metrics = c("WinRate", "Top1Rate", "Top5Rate", "Top10Rate", "Top20Rate"),
+
+    custom_metrics = list(
+      list(name = "TeamStack", source = "Team", calculation = "team_stack",
+           label = "Team Stack")
+    ),
+
+    metadata_columns = list(
+      list(name = "Pos",    label = "Position", type = "text",    display = TRUE, filter = TRUE),
+      list(name = "Team",   label = "Team",     type = "text",    display = TRUE, filter = TRUE),
+      list(name = "DKProj", label = "ETR",      type = "numeric", display = TRUE, filter = FALSE)
+    ),
+
+    portfolio_filters = list(
+      rate_minimums = list(
+        list(name = "Win",   label = "Win",    step = 0.1),
+        list(name = "Top1",  label = "Top 1",  step = 0.1),
+        list(name = "Top5",  label = "Top 5",  step = 0.1),
+        list(name = "Top10", label = "Top 10", step = 0.1),
+        list(name = "Top20", label = "Top 20", step = 0.1)
+      ),
+      range_filters = list()
+    ),
+
+    platform_columns = list(
+      DK = list(salary = "DKSalary", id = "DKID", ownership = "DKOwn", score = "DKScore"),
+      FD = list(salary = "FDSalary", id = "FDID", ownership = "FDOwn", score = "FDScore"),
+      SD = list(salary = "DKSalary", id = "DKID", ownership = "DKOwn", score = "DKScore")
+    ),
+
+    download_formats = list(DK = "{Name} ({DKID})", FD = "{FDID}:{Name}",
+                            SD = "{Name} ({DKID})"),
+
+    dk_export_slots = list(
+      DK = c("QB","RB","RB","WR","WR","WR","TE","FLEX","DST"),
+      FD = c("QB","RB","RB","WR","WR","WR","TE","FLEX","DST"),
+      SD = c("CPT","FLEX","FLEX","FLEX","FLEX","FLEX")
+    ),
+
+    input_file = list(
+      type            = "excel",
+      load_all_sheets = TRUE,
+      required_sheets = c("Games", "Pool", "IDs"),
+      player_sheet    = "IDs",
+      required_columns = list(
+        base     = c("Player", "Team"),
+        DK       = c("DK_ID", "Pos"),
+        FD       = c("FD_ID"),
+        metadata = c("Team")
+      )
+    ),
+
+    simulation = list(
+      function_name = "run_nfl_preseason_simulation",
+      output_format = list(
+        sim_results = c("SimID", "Player", "Team", "DKScore", "FDScore"),
+        metadata    = c("Player", "Team", "Pos", "DKID", "FDID")
+      )
+    )
+  ),
+
+  # ==========================================================================
   # NBA (National Basketball Association)
   # ==========================================================================
   NBA = list(

@@ -47,7 +47,15 @@ load_sport_input <- function(file_path, sport, config) {
   input_cfg <- config$input_file
   if (isTRUE(input_cfg$load_all_sheets)) {
     sheets <- readxl::excel_sheets(file_path)
-    return(setNames(lapply(sheets, function(s) readxl::read_excel(file_path, sheet = s)), sheets))
+    out <- setNames(lapply(sheets, function(s) readxl::read_excel(file_path, sheet = s)), sheets)
+    # The showdown game picker reads input_data$games and indexes it like a
+    # data.table. A workbook that spells the sheet "Games" and hands back a
+    # tibble would make the picker vanish rather than error, so alias it.
+    if (is.null(out$games)) {
+      g <- names(out)[tolower(names(out)) == "games"]
+      if (length(g)) out$games <- data.table::as.data.table(out[[g[1]]])
+    } else out$games <- data.table::as.data.table(out$games)
+    return(out)
   }
   sheets <- if (!is.null(input_cfg$required_sheets)) input_cfg$required_sheets else readxl::excel_sheets(file_path)[1]
   setNames(lapply(sheets, function(s) readxl::read_excel(file_path, sheet = s)), sheets)
@@ -955,6 +963,38 @@ server <- function(input, output, session) {
     download_table
   }
   
+  # DK/FD import a classic NFL lineup by SLOT HEADER. The optimiser emits the
+  # nine players already in QB/RB/RB/WR/WR/WR/TE/FLEX/DST order, so this only
+  # has to put the site's own names on them. FanDuel calls the last slot DEF.
+  ps_classic_headers <- function(dl, platform) {
+    pc <- grep("^Player", names(dl), value = TRUE)
+    if (length(pc) != 9) return(dl)
+    hdr <- c("QB","RB","RB","WR","WR","WR","TE","FLEX",
+             if (platform == "FD") "DEF" else "DST")
+    # Reorder by INDEX first: the slot headers repeat (RB, RB / WR, WR, WR) and
+    # setcolorder refuses duplicated names.
+    idx <- match(pc, names(dl))
+    setcolorder(dl, c(idx, setdiff(seq_along(dl), idx)))
+    setnames(dl, seq_along(hdr), hdr)
+    dl
+  }
+
+  # DK Showdown requires at least one player from EACH team. The optimiser picks
+  # the highest-scoring six per sim and in a lopsided preseason game that is
+  # sometimes six from the same side -- a lineup DK refuses on upload. Drop
+  # those rather than ship an entry file that fails at the door.
+  drop_single_team_sd <- function(lineup_data, metadata) {
+    ul <- lineup_data$unique_lineups
+    pc <- intersect(c("Captain", grep("^Util", names(ul), value = TRUE)), names(ul))
+    if (!length(pc) || !"Team" %in% names(metadata)) return(lineup_data)
+    tm <- vapply(pc, function(c_) metadata$Team[match(ul[[c_]], metadata$Player)],
+                 character(nrow(ul)))
+    keep <- apply(tm, 1, function(r) length(unique(r[!is.na(r)])) >= 2)
+    if (all(keep)) return(lineup_data)
+    lineup_data$unique_lineups <- ul[keep]
+    lineup_data
+  }
+
   create_download_showdown <- function(optimal_lineups, metadata) {
     dl <- copy(optimal_lineups); setDT(metadata)
     # Engines name the showdown ids differently -- NBA writes CPTID/SDID, the
@@ -962,7 +1002,10 @@ server <- function(input, output, session) {
     # handler throw "object 'CPTID' not found", and a failed downloadHandler
     # returns Shiny's ERROR PAGE, which arrives as an .xlsx full of HTML.
     id_for <- function(which) {
-      cands <- if (which == "cpt") c("CPTID","DKCID","CptDFSID") else c("SDID","DKID")
+      # SDCID comes first because on a classic slate the showdown ids belong to
+      # ONE game and are not the classic ids -- DKCID would be the wrong
+      # contest's number, which uploads without complaint and scores nothing.
+      cands <- if (which == "cpt") c("SDCID","CPTID","DKCID","CptDFSID") else c("SDID","DKID")
       hit <- intersect(cands, names(metadata))
       if (!length(hit)) return(NULL)
       metadata[[hit[1]]]
@@ -1024,7 +1067,9 @@ server <- function(input, output, session) {
     } else if ("MVP" %in% names(optimal_lineups)) {
       create_download_mvp(optimal_lineups, metadata)
     } else {
-      create_download_standard(optimal_lineups, metadata, platform)
+      d0 <- create_download_standard(optimal_lineups, metadata, platform)
+      if (identical(sport, "NFL_PRESEASON_CLASSIC")) d0 <- ps_classic_headers(setDT(d0), platform)
+      d0
     }
     # Round here rather than in each builder: the CBB and NBA download helpers
     # already rounded AvgOwn, but the shared showdown/standard/mvp paths did
@@ -1351,6 +1396,37 @@ server <- function(input, output, session) {
         if ("AvgOwn" %in% names(final_results)) final_results[, AvgOwn := round(AvgOwn, 1)]
         rv$dk_optimal_lineups <- final_results
         
+      } else if (rv$sport == "NFL_PRESEASON_CLASSIC") {
+        # Roster SHAPE is the whole constraint here -- preseason salaries are
+        # flat, so the cap never binds and the slate is solved by position, not
+        # by price. prepare_optimization_data keeps only Player/Salary, so Pos
+        # has to be merged back on or the optimiser has nothing to fill slots
+        # with.
+        progress$set(message="Finding optimal DraftKings lineups...", value=0)
+        opt_data <- prepare_optimization_data(rv$simulation_results, rv$sim_metadata, "DK")
+        opt_data <- merge(opt_data, rv$sim_metadata[, .(Player, Pos)], by="Player", all.x=TRUE)
+        # A player the site does not list cannot be rostered, so leaving him in
+        # produces an "optimal" lineup that will not upload. The workbook keeps
+        # these players on purpose (to be investigated); the optimiser must not.
+        dk_ok <- rv$sim_metadata[!is.na(DKID) & DKID != "" & DKID != "NA", Player]
+        opt_data <- opt_data[Player %in% dk_ok]
+        opt_config <- list(roster_size=rv$config$roster_sizes$DK, salary_cap=rv$config$salary_caps$DK,
+                           percentiles=c(0.01,0.05,0.10,0.20), platform_col="DKScore",
+                           position_slots=rv$config$position_slots,
+                           flex_eligible=rv$config$flex_eligible,
+                           max_lineups=rv$config$max_lineups %||% 5000L)
+        progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
+        lineup_data <- find_optimal_lineups(opt_data, opt_config,
+                                            mode=rv$config$optimization_modes$DK, k=1, verbose=TRUE)
+        progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
+                                    format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
+        score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
+        progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
+        final_results <- calculate_distribution_metrics(score_matrix, lineup_data, opt_config,
+                                                        ownership_data=NULL, verbose=TRUE)
+        if ("AvgOwn" %in% names(final_results)) final_results[, AvgOwn := NULL]
+        rv$dk_optimal_lineups <- final_results
+
       } else {
         dk_mode <- rv$config$optimization_modes$DK %||% "standard"
         progress$set(message="Finding optimal DraftKings lineups...", value=0)
@@ -1481,6 +1557,33 @@ server <- function(input, output, session) {
         if ("AvgOwn" %in% names(final_results)) final_results[, AvgOwn := round(AvgOwn, 1)]
         rv$fd_optimal_lineups <- final_results
         
+      } else if (rv$sport == "NFL_PRESEASON_CLASSIC") {
+        # Same nine slots as DK, scored on FDScore. FD is never gated on
+        # has_fd here -- preseason salary is flat and supplied by the engine,
+        # so the usual "no FD salary data" check would block a slate that is
+        # perfectly playable.
+        progress$set(message="Finding optimal FanDuel lineups...", value=0)
+        opt_data <- prepare_optimization_data(rv$simulation_results, rv$sim_metadata, "FD")
+        opt_data <- merge(opt_data, rv$sim_metadata[, .(Player, Pos)], by="Player", all.x=TRUE)
+        fd_ok <- rv$sim_metadata[!is.na(FDID) & FDID != "" & FDID != "NA", Player]
+        opt_data <- opt_data[Player %in% fd_ok]
+        opt_config <- list(roster_size=rv$config$roster_sizes$FD, salary_cap=rv$config$salary_caps$FD,
+                           percentiles=c(0.01,0.05,0.10,0.20), platform_col="FDScore",
+                           position_slots=rv$config$position_slots,
+                           flex_eligible=rv$config$flex_eligible,
+                           max_lineups=rv$config$max_lineups %||% 5000L)
+        progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
+        lineup_data <- find_optimal_lineups(opt_data, opt_config,
+                                            mode=rv$config$optimization_modes$FD, k=1, verbose=TRUE)
+        progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
+                                    format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
+        score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
+        progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
+        final_results <- calculate_distribution_metrics(score_matrix, lineup_data, opt_config,
+                                                        ownership_data=NULL, verbose=TRUE)
+        if ("AvgOwn" %in% names(final_results)) final_results[, AvgOwn := NULL]
+        rv$fd_optimal_lineups <- final_results
+
       } else {
         if (!isTRUE(rv$has_fd)) {
           showNotification("No FD salary data in this file.", type="warning"); return()
@@ -1588,6 +1691,46 @@ server <- function(input, output, session) {
         if ("AvgOwn" %in% names(final_results)) final_results[, AvgOwn := NULL]
         rv$sd_optimal_lineups <- final_results
         
+      } else if (rv$sport == "NFL_PRESEASON_CLASSIC") {
+        # A preseason showdown is one GAME out of the classic slate, so the
+        # pool must be cut to that game's two teams first -- the generic branch
+        # below would build lineups across all twelve. Salary is flat here, so
+        # the cap never binds and only the roster shape matters.
+        sd_meta <- copy(rv$sim_metadata); setDT(sd_meta)
+        if (!"ShowdownFile" %in% names(sd_meta))
+          stop("No ShowdownFile in metadata -- the workbook's Games tab needs a ShowdownFile column.")
+        selected_sd <- if (!is.null(input$sd_game_select)) input$sd_game_select else {
+          sdf <- unique(sd_meta[!is.na(ShowdownFile) & ShowdownFile != "", ShowdownFile])
+          if (length(sdf)) sdf[1] else stop("No showdown game found on this slate.")
+        }
+        sd_meta <- sd_meta[!is.na(ShowdownFile) & ShowdownFile == selected_sd]
+        if (nrow(sd_meta) == 0) stop(sprintf("No players found for showdown: %s", selected_sd))
+        # Same rule as the classic path: a player without this contest's id
+        # cannot be entered, so he must not reach the optimiser.
+        if ("SDID" %in% names(sd_meta))
+          sd_meta <- sd_meta[!is.na(SDID) & SDID != "" & SDID != "NA"]
+        sd_sim <- rv$simulation_results[Player %in% sd_meta$Player]
+        ps_sd_config <- list(roster_size = 6L,
+                             salary_cap  = rv$config$salary_caps$SD %||% 50000,
+                             percentiles = c(0.01, 0.05, 0.10, 0.20),
+                             platform_col = "DKScore", cpt_multiplier = 1.5,
+                             use_parallel = FALSE, max_lineups = 5000L)
+        progress$set(message = sprintf("Finding optimal Showdown lineups (%s)...", selected_sd),
+                     detail = "Phase 1: Building lineup pool...", value = 0.05)
+        opt_data_sd <- prepare_optimization_data(sd_sim, sd_meta, "SD")
+        lineup_data <- find_optimal_lineups(opt_data_sd, ps_sd_config,
+                                            mode = rv$config$optimization_modes$SD %||% "combinatorial_captain",
+                                            k = 1, verbose = TRUE)
+        lineup_data <- drop_single_team_sd(lineup_data, sd_meta)
+        progress$set(detail = sprintf("Phase 2: Scoring %s lineups...",
+                                      format(nrow(lineup_data$unique_lineups), big.mark = ",")), value = 0.35)
+        score_matrix <- score_all_lineups(lineup_data, opt_data_sd, verbose = TRUE)
+        progress$set(detail = "Phase 3: Calculating metrics...", value = 0.70)
+        final_results <- calculate_distribution_metrics(score_matrix, lineup_data, ps_sd_config,
+                                                        ownership_data = NULL, verbose = TRUE)
+        if ("AvgOwn" %in% names(final_results)) final_results[, AvgOwn := NULL]
+        rv$sd_optimal_lineups <- final_results
+
       } else if (rv$sport == "SOCCER") {
         sd_meta <- copy(rv$sim_metadata); setDT(sd_meta)
         if (!all(c("CPTSalary","SDSalary") %in% names(sd_meta)))
@@ -1635,6 +1778,9 @@ server <- function(input, output, session) {
         progress$set(message="Finding optimal Showdown lineups...",
                      detail="Phase 1: Building lineup pool...", value=0.05)
         lineup_data  <- find_optimal_lineups(opt_data, opt_config, mode=sd_mode, k=1, verbose=TRUE)
+        # Single-game preseason showdown has the same both-teams requirement.
+        if (isTRUE(rv$sport == "NFL_PRESEASON"))
+          lineup_data <- drop_single_team_sd(lineup_data, rv$sim_metadata)
         progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
                                     format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
         score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
@@ -1713,7 +1859,7 @@ server <- function(input, output, session) {
   
   output$scoring_tabs_ui <- renderUI({
     req(rv$config)
-    sd_game_selector <- if (isTRUE(rv$sport %in% c("CBB","NBA","SOCCER")) && "SD" %in% rv$config$platforms &&
+    sd_game_selector <- if (isTRUE(rv$sport %in% c("CBB","NBA","SOCCER","NFL_PRESEASON_CLASSIC")) && "SD" %in% rv$config$platforms &&
                             !is.null(rv$input_data$games)) {
       games_with_sd <- rv$input_data$games[!is.na(ShowdownFile) & ShowdownFile != ""]
       if (nrow(games_with_sd) > 1) {
@@ -2808,6 +2954,7 @@ server <- function(input, output, session) {
             ids <- rv$sim_metadata[match(dl[[col]],rv$sim_metadata$Player), get(id_col)]
             dl[[col]] <- if(platform=="DK") paste0(dl[[col]]," (",ids,")") else paste0(ids,":",dl[[col]])
           }
+          if (isTRUE(rv$sport == "NFL_PRESEASON_CLASSIC")) dl <- ps_classic_headers(dl, platform)
         }
         fwrite(dl, file)
       }
@@ -3123,7 +3270,8 @@ server <- function(input, output, session) {
     else if (rv$sport == "GOLF")    render_golf_visuals(rv$sport_visuals)
     else if (rv$sport == "MMA")     render_mma_visuals(rv$sport_visuals)
     else if (rv$sport == "F1")      render_f1_visuals(rv$sport_visuals)
-    else if (rv$sport == "NFL_PRESEASON") render_nfl_preseason_visuals(rv$sport_visuals)
+    else if (rv$sport %in% c("NFL_PRESEASON","NFL_PRESEASON_CLASSIC"))
+      render_nfl_preseason_visuals(rv$sport_visuals)
     else NULL
   })
   
@@ -3185,19 +3333,19 @@ server <- function(input, output, session) {
   }
 
   output$psn_team_table <- renderDT({
-    req(rv$sport == "NFL_PRESEASON", rv$sport_visuals$team_means)
+    req(rv$sport %in% c("NFL_PRESEASON","NFL_PRESEASON_CLASSIC"), rv$sport_visuals$team_means)
     datatable(rv$sport_visuals$team_means, rownames = FALSE,
               options = list(dom = "t", paging = FALSE, searching = FALSE))
   })
 
   output$psn_pos_table <- renderDT({
-    req(rv$sport == "NFL_PRESEASON", rv$sport_visuals$pos_means)
+    req(rv$sport %in% c("NFL_PRESEASON","NFL_PRESEASON_CLASSIC"), rv$sport_visuals$pos_means)
     datatable(rv$sport_visuals$pos_means, rownames = FALSE,
               options = list(dom = "t", paging = FALSE, searching = FALSE))
   })
 
   output$psn_cover_table <- renderDT({
-    req(rv$sport == "NFL_PRESEASON", rv$sport_visuals$coverage)
+    req(rv$sport %in% c("NFL_PRESEASON","NFL_PRESEASON_CLASSIC"), rv$sport_visuals$coverage)
     d <- copy(rv$sport_visuals$coverage)
     datatable(d, rownames = FALSE,
               options = list(dom = "t", paging = FALSE, searching = FALSE)) %>%
@@ -3208,7 +3356,7 @@ server <- function(input, output, session) {
   # P10-P90 bar with median tick and mean dot, one row per player, teams
   # separated. Drawn from precomputed quantiles rather than raw sim rows.
   output$psn_range_plot <- renderPlotly({
-    req(rv$sport == "NFL_PRESEASON", rv$sport_visuals$score_dist)
+    req(rv$sport %in% c("NFL_PRESEASON","NFL_PRESEASON_CLASSIC"), rv$sport_visuals$score_dist)
     d <- as.data.table(rv$sport_visuals$score_dist)
     setorder(d, Team, Mean)
     d[, lab := paste0(Player, "  (", Team, " ", Pos, ")")]
@@ -3249,7 +3397,7 @@ server <- function(input, output, session) {
   })
 
   output$psn_stat_table <- renderDT({
-    req(rv$sport == "NFL_PRESEASON", rv$sport_visuals$stat_line)
+    req(rv$sport %in% c("NFL_PRESEASON","NFL_PRESEASON_CLASSIC"), rv$sport_visuals$stat_line)
     d <- as.data.table(rv$sport_visuals$stat_line)
     datatable(d, rownames = FALSE, filter = "top",
               options = list(pageLength = 25, scrollX = TRUE, dom = "tp",
@@ -3264,7 +3412,7 @@ server <- function(input, output, session) {
   # Points on the diagonal are agreement. Distance from it is the disagreement
   # worth explaining -- usually a drive window, not the model.
   output$psn_etr_plot <- renderPlotly({
-    req(rv$sport == "NFL_PRESEASON", rv$sport_visuals$player_means)
+    req(rv$sport %in% c("NFL_PRESEASON","NFL_PRESEASON_CLASSIC"), rv$sport_visuals$player_means)
     d <- as.data.frame(rv$sport_visuals$player_means)
     d <- d[!is.na(d$ETR) & !is.na(d$Sim), ]
     if (!nrow(d)) return(plotly_empty())

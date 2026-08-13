@@ -27,6 +27,8 @@ find_optimal_lineups <- function(sim_results, config, mode = "standard", k = 3, 
     return(find_optimal_lineups_combinatorial_captain(sim_results, config, verbose))
   } else if (mode == "combinatorial_mvp") {
     return(find_optimal_lineups_combinatorial_mvp(sim_results, config, verbose))
+  } else if (mode == "preseason_classic") {
+    return(find_optimal_lineups_preseason_classic(sim_results, config, k, verbose))
   } else {
     stop(paste("Unknown mode:", mode,
                "- must be 'standard', 'mvp', 'captain', 'win_based',",
@@ -1660,4 +1662,94 @@ find_optimal_lineups_winbased <- function(sim_results, config, verbose = TRUE) {
     n_sims = n_sims,
     mode = "win_based"
   ))
+}
+
+# =============================================================================
+# find_optimal_lineups_preseason_classic
+# -----------------------------------------------------------------------------
+# A position-constrained classic optimum with NO linear program, because on a
+# preseason slate there is nothing to trade off: DraftKings prices every player
+# identically (5,500), so nine of them cost 49,500 against a 50,000 cap and the
+# constraint can never bind. With salary out of the picture the best lineup is
+# simply the best available at each slot -- take the top QB, the top two RB, the
+# top three WR, the top TE and the top DST, then the best remaining RB/WR/TE for
+# the flex. That is exactly optimal, not a heuristic, and it runs in a sort
+# rather than an LP solve per simulation.
+#
+# sim_results needs SimID, Player, FantasyPoints and Pos.
+# =============================================================================
+find_optimal_lineups_preseason_classic <- function(sim_results, config,
+                                                   k = 1, verbose = TRUE) {
+  setDT(sim_results)
+  slots <- config$position_slots %||% list(QB = 1, RB = 2, WR = 3, TE = 1,
+                                           FLEX = 1, DST = 1)
+  flex_ok <- config$flex_eligible %||% c("RB","WR","TE")
+  max_lineups <- config$max_lineups %||% 5000L
+
+  if (!"Pos" %in% names(sim_results))
+    stop("preseason_classic optimiser needs a Pos column on sim_results")
+
+  sims <- unique(sim_results$SimID)
+  if (verbose) cat(sprintf("
+Phase 1: optimal classic lineup for %s sims
+",
+                           format(length(sims), big.mark = ",")))
+
+  setorder(sim_results, SimID, -FantasyPoints)
+  # Rank inside each sim and position once; every pick below is then a lookup.
+  sim_results[, prk := seq_len(.N), by = .(SimID, Pos)]
+
+  base <- rbindlist(lapply(names(slots)[names(slots) != "FLEX"], function(p) {
+    sim_results[Pos == p & prk <= slots[[p]]]
+  }))
+  # The flex is the best eligible player NOT already used at his own position.
+  flex <- sim_results[Pos %in% flex_ok]
+  flex <- flex[!paste(SimID, Player) %in% paste(base$SimID, base$Player)]
+  setorder(flex, SimID, -FantasyPoints)
+  flex <- flex[, head(.SD, 1), by = SimID]
+
+  base[, slot := Pos]
+  flex[, slot := "FLEX"]
+  full <- rbind(base, flex, fill = TRUE)
+  # Keep only sims where every slot could be filled.
+  need <- sum(unlist(slots))
+  ok <- full[, .N, by = SimID][N == need]$SimID
+  full <- full[SimID %in% ok]
+  if (!length(ok)) stop("no simulation had enough players to fill every slot")
+
+  # SLOT ORDER IS THE UPLOAD FORMAT. DraftKings and FanDuel both import a
+  # classic NFL lineup positionally as QB/RB/RB/WR/WR/WR/TE/FLEX/DST, so the
+  # columns have to come out in that order. Sorting by Pos instead gives
+  # DST/QB/RB/RB/RB/TE/WR/WR/WR, which uploads into the wrong slots.
+  slot_order <- c("QB","RB","WR","TE","FLEX","DST")
+  full[, slot_rank := match(slot, slot_order)]
+  setorder(full, SimID, slot_rank, -FantasyPoints)
+  full[, slot_i := seq_len(.N), by = SimID]
+  wide <- dcast(full, SimID ~ slot_i, value.var = "Player")
+  setnames(wide, c("SimID", paste0("Player", seq_len(need))))
+  pc <- paste0("Player", seq_len(need))
+  # Sorting each lineup's names makes the same nine players one row regardless
+  # of which slot they happened to fill.
+  key <- apply(as.matrix(wide[, ..pc]), 1, function(r) paste(sort(r), collapse = "|"))
+  wide[, lkey := key]
+
+  cnt <- wide[, .(Top1Count = .N), by = lkey][order(-Top1Count)]
+  uni <- wide[!duplicated(lkey)]
+  uni <- merge(uni, cnt, by = "lkey")
+  setorder(uni, -Top1Count)
+  if (nrow(uni) > max_lineups) uni <- head(uni, max_lineups)
+  sc <- full[, .(TotalScore = sum(FantasyPoints)), by = SimID]
+  uni <- merge(uni, sc, by = "SimID", all.x = TRUE)
+  uni[, `:=`(AvgScore = TotalScore, TotalSalary = NA_real_)]
+  uni[, c("lkey","SimID","TotalScore") := NULL]
+
+  if (verbose) cat(sprintf("  %s distinct lineups from %s sims
+",
+                           format(nrow(uni), big.mark = ","),
+                           format(length(ok), big.mark = ",")))
+  # n_sims and config are not decoration -- score_all_lineups sizes its scoring
+  # matrix from n_sims, and reads the platform column out of config. Omitting
+  # them fails later, inside the scorer, rather than here.
+  list(unique_lineups = uni, n_sims = length(sims), config = config,
+       mode = "preseason_classic")
 }
