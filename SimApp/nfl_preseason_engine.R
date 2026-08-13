@@ -423,7 +423,22 @@ run_nfl_preseason_simulation <- function(input_data, n_sims = 20000,
       grid[Pos == "K", `:=`(rush_yds = 0, rec_yds = 0, pass_yds = 0)]
       grid[, dk := ps_dk_score(.SD)]
       grid[, fd := ps_fd_score(.SD)]
-      grid[Pos == "K", `:=`(dk = kv[sim_id], fd = kv[sim_id])]
+      # KICKERS SPLIT THE TEAM'S KICKING OUTPUT, they do not each receive it.
+      # kv is the whole team's kicker score from the sampled game; assigning it
+      # flat to every K meant a two-kicker team scored its field goals twice --
+      # live on this slate for Indianapolis, Pittsburgh and Las Vegas, and
+      # Indianapolis is in a showdown where kickers are rosterable. Split it by
+      # the share of drives each man is on the field for.
+      kk <- sh[Pos == "K"]
+      if (nrow(kk) <= 1) {
+        grid[Pos == "K", `:=`(dk = kv[sim_id], fd = kv[sim_id])]
+      } else {
+        span <- pmax(1, ps_num(kk$DriveEnd) - ps_num(kk$DriveStart) + 1)
+        frac <- span / sum(span)
+        for (i in seq_len(nrow(kk)))
+          grid[Pos == "K" & player == kk$Player[i],
+               `:=`(dk = kv[sim_id] * frac[i], fd = kv[sim_id] * frac[i])]
+      }
       grid[, GameKey := gk]
 
       dst <- data.table(sim_id = seq_len(n_sims), player = paste(tm, "D/ST"),
