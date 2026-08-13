@@ -657,8 +657,22 @@ server <- function(input, output, session) {
             error = function(e) NULL
           )
           if (!is.null(pcols)) {
-            if (rv$has_fd) rv$has_fd <- any(c("FDSalary","FDSal","FDID") %in% pcols)
-            if (rv$has_sd) rv$has_sd <- any(c("SDSal","SDSalary","SDID","CPTID") %in% pcols)
+            # Column names are per-sport. MMA's Fights sheet spells them
+            # FDSalary / SDSal; the preseason IDs tab uses FD_ID and one
+            # SD<n>_CPT / SD<n>_FLEX pair per showdown contest. Hardcoding one
+            # sport's spelling silently dropped BOTH optional platforms for
+            # preseason -- which left the SD game picker on screen (it reads
+            # config$platforms) with no button to score it (that reads
+            # available_platforms()). Check the sport's own DECLARED columns
+            # first and only fall back to the generic names.
+            reqc <- rv$config$input_file$required_columns %||% list()
+            if (rv$has_fd)
+              rv$has_fd <- if (!is.null(reqc$FD)) all(reqc$FD %in% pcols)
+                           else any(c("FDSalary","FDSal","FDID","FD_ID") %in% pcols)
+            if (rv$has_sd)
+              rv$has_sd <- if (!is.null(reqc$SD)) all(reqc$SD %in% pcols)
+                           else (any(c("SDSal","SDSalary","SDID","CPTID") %in% pcols) ||
+                                 any(grepl("^SD[0-9]+_(CPT|FLEX)$", pcols)))
           }
         }
       }
@@ -1859,7 +1873,10 @@ server <- function(input, output, session) {
   
   output$scoring_tabs_ui <- renderUI({
     req(rv$config)
-    sd_game_selector <- if (isTRUE(rv$sport %in% c("CBB","NBA","SOCCER","NFL_PRESEASON_CLASSIC")) && "SD" %in% rv$config$platforms &&
+    # Gate the picker on available_platforms(), NOT config$platforms: the two
+    # disagreeing is exactly what put a game picker on screen with no Score
+    # Showdown button beside it.
+    sd_game_selector <- if (isTRUE(rv$sport %in% c("CBB","NBA","SOCCER","NFL_PRESEASON_CLASSIC")) && "SD" %in% available_platforms() &&
                             !is.null(rv$input_data$games)) {
       games_with_sd <- rv$input_data$games[!is.na(ShowdownFile) & ShowdownFile != ""]
       if (nrow(games_with_sd) > 1) {
