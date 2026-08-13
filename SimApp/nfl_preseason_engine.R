@@ -146,7 +146,75 @@ ps_wpick <- function(Wm, u) {
 # take their yards out of the team total entirely.
 # =============================================================================
 
-ps_allocate_rushing <- function(draw, carries, sheet, team_col) {
+# Redistribute a team's QB carries across its quarterbacks by mobility tier,
+# holding the TEAM TOTAL fixed. The pool already sets how many carries the team's
+# quarterbacks get (that is what qb_rate_A/B matches on), so this adds nothing —
+# it only decides WHICH of them gets the run. Without it the Mobility label is
+# inert inside a team: windows do not overlap, so the QB on the field takes every
+# QB carry on the drive, and since late drives carry more QB runs the backup
+# out-rushed the starter regardless of tier (Richardson 1.62 to Leonard's 2.31).
+#
+# The model is a PLAY BUDGET, not an addition. Each quarterback's dropbacks plus
+# carries are held fixed at what the sampled game gave him, and his tier decides
+# how that budget splits: carries = r_i * plays_i, attempts = (1 - r_i) * plays_i.
+# So a mobile QB's runs come OUT of his own pass attempts — the documented
+# tradeoff (+30 QB rush yards costs -47 team pass yards, total offence flat) —
+# and a team with a runner at QB now shows a run-leaning team stat line rather
+# than the same line with the carries shuffled between its own quarterbacks.
+#
+# This finishes a job the pool can only start. Pool matching is attenuated by
+# calibration (an IND request of 0.134 achieves 0.112), and it matches a
+# TEAM-GAME average, which carries no information about which of three
+# quarterbacks did the running. Setting the per-QB rate is not double-counting:
+# the play-weighted blend of r_i reproduces the same team rate the pool asked
+# for, it just lands the split on the right man.
+#
+# PS_COMP_RATE converts completions to attempts; only the ratio matters, so a
+# preseason-typical 0.60 is enough.
+PS_COMP_RATE <- 0.60
+PS_MOB_KC <- c(lo = 0.50, hi = 2.50)   # carry multiplier clamp
+PS_MOB_KA <- c(lo = 0.75, hi = 1.15)   # attempt multiplier clamp -- passing is
+                                       # the big number, so it moves gently
+
+# Solve both multipliers from the untilted baseline means.
+ps_qb_play_budget <- function(carries, cmp, mob) {
+  r <- mob; r[is.na(r)] <- PS_MOB_TIER[["mid"]]
+  att   <- pmax(1e-6, cmp / PS_COMP_RATE)
+  plays <- pmax(1e-6, carries + att)
+  kc <- pmin(PS_MOB_KC[["hi"]], pmax(PS_MOB_KC[["lo"]], (r * plays)/pmax(1e-6, carries)))
+  ka <- pmin(PS_MOB_KA[["hi"]], pmax(PS_MOB_KA[["lo"]], ((1 - r) * plays)/att))
+  list(kc = kc, ka = ka)
+}
+
+# Thin or thicken rows to hit a per-player multiplier. Rows are the unit of
+# scoring, so a duplicated carry is a fresh bootstrap draw from that same player's
+# carries in the SAME sampled game, never a copy of one yardage repeated.
+ps_rescale_rows <- function(dt, key_col, k) {
+  if (!nrow(dt) || !length(k)) return(dt)
+  kk <- k[dt[[key_col]]]; kk[is.na(kk)] <- 1
+  if (all(abs(kk - 1) < 1e-9)) return(dt)
+  cp <- floor(kk) + (runif(length(kk)) < (kk - floor(kk)))
+  out <- dt[cp >= 1]
+  ex  <- which(cp > 1)
+  if (length(ex)) {
+    reps <- rep(ex, cp[ex] - 1L)
+    gk  <- paste(dt$game_id, dt[[key_col]])
+    tmp <- data.table(gk = gk, i = seq_along(gk))
+    setorder(tmp, gk)
+    ix  <- tmp[, .(st = .I[1], cnt = .N), by = gk]
+    # index ix by COLUMN, not by ix[j] -- a keyed/ordered data.table treats a
+    # bare vector as a key lookup, which silently returned all-NA rows and
+    # dropped every added carry (the tilt then only ever thinned).
+    j   <- match(gk[reps], ix$gk)
+    src <- tmp$i[ix$st[j] + floor(runif(length(j)) * ix$cnt[j])]
+    dup <- dt[src]
+    set(dup, j = key_col, value = dt[[key_col]][reps])
+    out <- rbind(out, dup)
+  }
+  out
+}
+
+ps_allocate_rushing <- function(draw, carries, sheet, team_col, qb_kc = NULL) {
   d  <- as.data.table(draw)[, .(sim_id, game_id, team = get(team_col))]
   cr <- merge(carries, d, by = c("game_id","team"), allow.cartesian = TRUE)
   if (!nrow(cr)) return(NULL)
@@ -162,6 +230,7 @@ ps_allocate_rushing <- function(draw, carries, sheet, team_col) {
     for (i in seq_len(nrow(qb)))
       qcr[is.na(player) & frac >= qb$f0[i] & frac < qb$f1[i], player := qb$player[i]]
     qcr <- qcr[!is.na(player)]
+    if (!is.null(qb_kc)) qcr <- ps_rescale_rows(qcr, "player", qb_kc)
   } else { qcr <- qcr[0]; qcr[, player := character(0)] }
 
   rcr <- cr[grp %in% c("RB","OTH")]
@@ -227,11 +296,26 @@ ps_allocate_rushing <- function(draw, carries, sheet, team_col) {
 # outright — two QBs on one drive is vanishingly rare.
 # =============================================================================
 
-ps_allocate_receiving <- function(draw, recs, sheet, qb_sheet, team_col) {
+ps_allocate_receiving <- function(draw, recs, sheet, qb_sheet, team_col,
+                                  qb_ka = NULL) {
   d  <- as.data.table(draw)[, .(sim_id, game_id, team = get(team_col))]
   cr <- merge(recs, d, by = c("game_id","team"), allow.cartesian = TRUE)
   if (!nrow(cr)) return(NULL)
   cr[, frac := (team_drive - 0.5) / n_team_drives]
+
+  # The pass/rush split is decided per quarterback BEFORE receivers are drawn:
+  # a play a mobile QB ran instead of threw never happened, so it has to leave
+  # the receiver's line as well as the passer's.
+  if (!is.null(qb_ka)) {
+    qs <- as.data.table(qb_sheet)
+    qs[, `:=`(f0 = (drive_start - 1)/PS_DRIVES, f1 = drive_end/PS_DRIVES)]
+    cr[, .qbo := NA_character_]
+    for (i in seq_len(nrow(qs)))
+      cr[is.na(.qbo) & frac >= qs$f0[i] & frac < qs$f1[i], .qbo := qs$player[i]]
+    cr <- ps_rescale_rows(cr[!is.na(.qbo)], ".qbo", qb_ka)
+    cr[, .qbo := NULL]
+    if (!nrow(cr)) return(NULL)
+  }
 
   sh <- as.data.table(sheet)
   sh[, `:=`(f0 = (drive_start - 1)/PS_DRIVES, f1 = drive_end/PS_DRIVES)]
@@ -393,7 +477,9 @@ run_nfl_preseason_simulation <- function(input_data, n_sims = 20000,
 
       rb <- sh[Pos %in% c("QB","RB"),
                .(player = Player, pos = Pos, drive_start = DriveStart,
-                 drive_end = DriveEnd, weight = 1)]
+                 drive_end = DriveEnd, weight = 1,
+                 mob = if ("Mobility" %in% names(sh))
+                         PS_MOB_TIER[tolower(trimws(Mobility))] else NA_real_)]
       wr <- sh[Pos %in% c("WR","TE","RB"),
                .(player = Player, pos = Pos, drive_start = DriveStart,
                  drive_end = DriveEnd, catch_w = CatchWeight,
@@ -402,8 +488,34 @@ run_nfl_preseason_simulation <- function(input_data, n_sims = 20000,
       qb <- sh[Pos == "QB", .(player = Player, drive_start = DriveStart,
                               drive_end = DriveEnd)]
 
-      ru <- if (nrow(rb)) ps_allocate_rushing(draw, carries, rb, col) else NULL
-      rc <- if (nrow(wr) && nrow(qb)) ps_allocate_receiving(draw, recs, wr, qb, col) else NULL
+      # Calibrate the mobility play-budget on a subsample: the multipliers only
+      # need the BASELINE means, and 3,000 draws pin those down well inside the
+      # noise of the tiers themselves.
+      kc <- ka <- NULL
+      qmob <- rb[pos == "QB"]
+      if (nrow(qmob) && "mob" %in% names(qmob) && !all(is.na(qmob$mob)) &&
+          nrow(wr) && nrow(qb)) {
+        cal <- draw[seq_len(min(nrow(draw), 3000L))]
+        b_ru <- ps_allocate_rushing(cal, carries, rb, col)
+        b_rc <- ps_allocate_receiving(cal, recs, wr, qb, col)
+        if (!is.null(b_ru) && !is.null(b_rc)) {
+          nc  <- uniqueN(cal$sim_id)
+          bc  <- b_ru[player %in% qmob$player, .(v = sum(carries)/nc),  by = player]
+          bp  <- b_rc$qb[,                      .(v = sum(pass_cmp)/nc), by = player]
+          cv  <- setNames(bc$v, bc$player)[qmob$player]; cv[is.na(cv)] <- 0
+          pv  <- setNames(bp$v, bp$player)[qmob$player]; pv[is.na(pv)] <- 0
+          ok  <- cv > 0.02 & pv > 0.1
+          if (any(ok)) {
+            kb <- ps_qb_play_budget(cv[ok], pv[ok], qmob$mob[ok])
+            kc <- setNames(kb$kc, qmob$player[ok])
+            ka <- setNames(kb$ka, qmob$player[ok])
+          }
+        }
+      }
+
+      ru <- if (nrow(rb)) ps_allocate_rushing(draw, carries, rb, col, kc) else NULL
+      rc <- if (nrow(wr) && nrow(qb))
+              ps_allocate_receiving(draw, recs, wr, qb, col, ka) else NULL
 
       # D/ST is SYNTHESIZED below from the sampled game's real defensive score.
       # The team sheet also carries a D/ST row, and leaving it here produced a

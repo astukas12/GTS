@@ -1751,11 +1751,28 @@ Phase 1: optimal classic lineup for %s sims
   # lets the candidate pool come from 100k sims without the memory blowing
   # up. Measured against keeping an arbitrary slice, it lifts pool quality
   # from 1.03 to 1.61 mean Top1% and raises the mean lineup score 56.9 -> 61.8.
+  #
+  # A HARD top-N by mean is the highest-EV pool but a narrow one: at 100k sims
+  # it is a top-5% cut, and everything below the chalk gets shaved off (Altmyer
+  # 77.6%, QBs down to 16 distinct names). config$pool_spread softens the cut
+  # into a weighted sample of the same ranking -- Gumbel-top-k, which is exactly
+  # sampling without replacement from softmax(lineup_mu / T) but O(n) instead of
+  # O(n*k), so it still runs over millions of candidates. T is in lineup POINTS
+  # (pool_spread * sd of the lineup means), so 0 reproduces the hard cut and
+  # larger values trade EV for coverage. Ranking, not filtering: a bad lineup is
+  # still overwhelmingly unlikely to survive.
   if (nrow(uni) > max_lineups) {
     pmu <- sim_results[, .(mu = mean(FantasyPoints)), by = Player]
     mu  <- setNames(pmu$mu, pmu$Player)
     lm  <- rowSums(matrix(mu[unlist(uni[, ..pc])], nrow = nrow(uni)))
-    uni[, lineup_mu := lm]
+    sprd <- if (!is.null(config$pool_spread)) config$pool_spread else 0
+    if (sprd > 0) {
+      tT <- sprd * stats::sd(lm)
+      g  <- -log(-log(stats::runif(length(lm))))       # Gumbel(0,1)
+      uni[, lineup_mu := lm/tT + g]
+    } else {
+      uni[, lineup_mu := lm]
+    }
     setorder(uni, -Top1Count, -lineup_mu)
     uni <- head(uni, max_lineups)
     uni[, lineup_mu := NULL]
