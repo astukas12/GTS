@@ -405,7 +405,12 @@ run_nfl_preseason_simulation <- function(input_data, n_sims = 20000,
       ru <- if (nrow(rb)) ps_allocate_rushing(draw, carries, rb, col) else NULL
       rc <- if (nrow(wr) && nrow(qb)) ps_allocate_receiving(draw, recs, wr, qb, col) else NULL
 
-      all_p <- data.table(player = sh$Player, Pos = sh$Pos, Team = tm)
+      # D/ST is SYNTHESIZED below from the sampled game's real defensive score.
+      # The team sheet also carries a D/ST row, and leaving it here produced a
+      # second row per sim carrying 0 (a defence has no rushing or receiving
+      # stats to score). The two rows then averaged, halving every D/ST: a real
+      # 6.7-point position came out at 3.4 with a median of zero.
+      all_p <- data.table(player = sh$Player, Pos = sh$Pos, Team = tm)[Pos != "DST"]
       grid  <- all_p[rep(seq_len(.N), each = n_sims)]
       grid[, sim_id := rep(seq_len(n_sims), times = nrow(all_p))]
       if (!is.null(ru)) grid <- merge(grid, ru, by = c("sim_id","player"), all.x = TRUE)
