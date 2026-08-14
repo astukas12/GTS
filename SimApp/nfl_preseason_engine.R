@@ -122,9 +122,20 @@ ps_depth_z <- function(ypr, pos) {
 }
 
 # Weighted pick, one row at a time, from a matrix of weights.
+# Cumulative sum ACROSS each row, done as a handful of whole-column additions
+# rather than t(apply(M, 1, cumsum)). The apply form makes one R-level call per
+# ROW -- millions of them at 100k sims -- to do a few additions each; this makes
+# one call per COLUMN, and there are only ever a dozen or so columns (players in
+# a window). Bit-identical: cumsum accumulates left to right and so does this,
+# and two-operand addition is commutative in floating point.
+ps_row_cumsum <- function(M) {
+  if (ncol(M) > 1L) for (j in 2:ncol(M)) M[, j] <- M[, j] + M[, j - 1L]
+  M
+}
+
 ps_wpick <- function(Wm, u) {
   cw <- Wm / rowSums(Wm)
-  cw <- t(apply(cw, 1, cumsum))
+  cw <- ps_row_cumsum(cw)
   max.col(cw >= u, ties.method = "first")
 }
 
@@ -336,7 +347,7 @@ ps_allocate_receiving <- function(draw, recs, sheet, qb_sheet, team_col,
   tot <- rowSums(W); ok <- tot > 0
   cr[, player := NA_character_]
   if (any(ok)) {
-    cw   <- t(apply(W[ok, , drop = FALSE] / tot[ok], 1, cumsum))
+    cw   <- ps_row_cumsum(W[ok, , drop = FALSE] / tot[ok])
     pick <- max.col(cw >= runif(sum(ok)), ties.method = "first")
     cr[ok, player := sh$player[pick]]
   }

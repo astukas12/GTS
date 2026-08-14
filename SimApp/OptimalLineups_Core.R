@@ -1072,35 +1072,51 @@ score_all_lineups <- function(lineup_data, sim_results, verbose = TRUE, sims_per
   # Create player-to-index mapping
   all_players <- unique(unlist(unique_lineups[, ..player_cols]))
   player_to_id <- setNames(1:length(all_players), all_players)
-  
-  # Build lineup matrix
-  lineup_matrix <- matrix(0, nrow = n_lineups, ncol = length(all_players))
-  
-  for (i in 1:n_lineups) {
-    players <- as.character(unique_lineups[i, ..player_cols])
-    
-    for (j in seq_along(players)) {
-      player_id <- player_to_id[players[j]]
-      lineup_matrix[i, player_id] <- multipliers[j]
-    }
-  }
-  
+
+  # SLOT INDEX, not a wide indicator matrix. `slot_idx` is n_lineups x n_slots
+  # holding each lineup's player ids. Built by one vectorised lookup instead of
+  # a row-by-row loop -- `unique_lineups[i, ..player_cols]` is a full data.table
+  # subset call per lineup, which at 20k lineups dominated the setup.
+  slot_idx <- matrix(player_to_id[unlist(unique_lineups[, ..player_cols])],
+                     nrow = n_lineups)
+
   if (verbose) {
     elapsed <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
     cat(sprintf("  Phase 2: 20%% | %.1fs | Organizing sim data...\n", elapsed))
     flush.console()
   }
   
-  # Organize sim scores by player
-  sim_score_list <- vector("list", length(all_players))
-  names(sim_score_list) <- all_players
-  
-  for (player_name in all_players) {
-    player_data <- sim_results[Player == player_name, .(SimID, Score = get(platform_col))]
-    setkey(player_data, SimID)
-    sim_score_list[[player_name]] <- player_data
+  # PLAYER SCORES AS ONE DENSE MATRIX, players x sims, built in a single pass.
+  # The old code ran `sim_results[Player == player_name]` once per player, and
+  # each of those is a full linear scan of a table holding n_players * n_sims
+  # rows -- 30M rows at 100k sims, scanned ~300 times. It then REBUILT a slice
+  # of the same thing inside every batch. One indexed assignment replaces both.
+  # This matrix is the small one (players x sims); the batching below exists for
+  # the lineup x sims matrix, which is orders of magnitude larger.
+  sub <- sim_results[Player %chin% all_players,
+                     .(pi = player_to_id[Player], si = SimID, S = get(platform_col))]
+  sub <- sub[!is.na(pi) & si >= 1L & si <= n_sims]
+  player_scores <- matrix(0, nrow = length(all_players), ncol = n_sims)
+  player_scores[cbind(sub$pi, sub$si)] <- sub$S
+  rm(sub)
+
+  # Score a block of sims: gather each slot's row and add. Every lineup has only
+  # n_slots players, so summing n_slots gathers does far less work than the old
+  # dense (lineups x players) %*% (players x sims) product, which multiplied
+  # through a matrix that is ~97% zeros.
+  # Rounded to 6dp because RANKING IS TIE-SENSITIVE. Fantasy scores land on
+  # exact ties constantly (2% of sims here have a tied winner), and summing the
+  # same six numbers in a different order moves the total by ~3e-14 -- enough to
+  # break a tie that should hold. Rounding well below the 0.01 scoring
+  # granularity makes ties exact again, so results no longer depend on summation
+  # order, BLAS build, or batch size.
+  score_block <- function(sim_ids) {
+    out <- multipliers[1] * player_scores[slot_idx[, 1], sim_ids, drop = FALSE]
+    for (j in seq_along(multipliers)[-1])
+      out <- out + multipliers[j] * player_scores[slot_idx[, j], sim_ids, drop = FALSE]
+    round(out, 6)
   }
-  
+
   n_batches <- ceiling(n_sims / sims_per_batch)
   
   if (verbose) {
@@ -1127,23 +1143,9 @@ score_all_lineups <- function(lineup_data, sim_results, verbose = TRUE, sims_per
       sim_end <- min(batch_idx * sims_per_batch, n_sims)
       batch_sim_ids <- sim_start:sim_end
       n_batch_sims <- length(batch_sim_ids)
-      
-      batch_score_matrix <- matrix(0, nrow = n_batch_sims, ncol = length(all_players))
-      
-      for (player_idx in seq_along(all_players)) {
-        player_name <- all_players[player_idx]
-        player_data <- sim_score_list[[player_name]]
-        
-        matching_sims <- player_data[list(batch_sim_ids), nomatch = 0]
-        if (nrow(matching_sims) > 0) {
-          row_indices <- matching_sims$SimID - sim_start + 1
-          batch_score_matrix[row_indices, player_idx] <- matching_sims$Score
-        }
-      }
-      
-      # Calculate lineup scores for this batch: lineups × sims
-      batch_lineup_scores <- lineup_matrix %*% t(batch_score_matrix)
-      
+
+      batch_lineup_scores <- score_block(batch_sim_ids)
+
       # ======================================================================
       # OPTIMIZATION: Vectorized batch ranking with partial sorting
       # Instead of ranking each sim individually, process in mini-batches
@@ -1168,23 +1170,21 @@ score_all_lineups <- function(lineup_data, sim_results, verbose = TRUE, sims_per
         win_matrix <- sweep(mini_batch_scores, 2, max_scores, "==")
         win_counts <- win_counts + rowSums(win_matrix)
         
-        # PARTIAL SORTING: For each percentile, find threshold and count
-        # This is faster than full ranking
-        for (p_idx in seq_along(percentiles_config)) {
-          threshold_rank <- ceiling(n_lineups * percentiles_config[p_idx])
-          
-          # For each sim in mini-batch, use partial sort to find top threshold_rank
-          for (sim_offset in 1:rb_size) {
-            sim_scores <- mini_batch_scores[, sim_offset]
-            
-            if (threshold_rank < n_lineups) {
-              # Sort and get threshold value
-              sorted_scores <- sort(sim_scores, decreasing = TRUE)
-              threshold_score <- sorted_scores[threshold_rank]
-              # Count lineups >= threshold (handles ties correctly)
-              top_counts[, p_idx] <- top_counts[, p_idx] + (sim_scores >= threshold_score)
+        # ONE sort per sim, not one per sim PER PERCENTILE. The old loop nesting
+        # was percentile-outside-sim, so every sim was fully sorted four times
+        # over -- 400k sorts of a 20k vector at 100k sims. The thresholds are
+        # four positions in the SAME ordering, so a single sort answers all of
+        # them and the counts are bit-for-bit identical.
+        thr_ranks <- ceiling(n_lineups * percentiles_config)
+        for (sim_offset in 1:rb_size) {
+          sim_scores <- mini_batch_scores[, sim_offset]
+          need_sort <- any(thr_ranks < n_lineups)
+          sorted_scores <- if (need_sort) sort(sim_scores, decreasing = TRUE) else NULL
+          for (p_idx in seq_along(percentiles_config)) {
+            if (thr_ranks[p_idx] < n_lineups) {
+              top_counts[, p_idx] <- top_counts[, p_idx] +
+                (sim_scores >= sorted_scores[thr_ranks[p_idx]])
             } else {
-              # If threshold_rank >= n_lineups, all lineups qualify
               top_counts[, p_idx] <- top_counts[, p_idx] + 1
             }
           }
@@ -1207,7 +1207,7 @@ score_all_lineups <- function(lineup_data, sim_results, verbose = TRUE, sims_per
         flush.console()
       }
       
-      rm(batch_score_matrix, batch_lineup_scores)
+      rm(batch_lineup_scores)
       gc(verbose = FALSE)
     }
     
@@ -1239,21 +1239,8 @@ score_all_lineups <- function(lineup_data, sim_results, verbose = TRUE, sims_per
     sim_end <- min(batch_idx * sims_per_batch, n_sims)
     batch_sim_ids <- sim_start:sim_end
     n_batch_sims <- length(batch_sim_ids)
-    
-    batch_score_matrix <- matrix(0, nrow = n_batch_sims, ncol = length(all_players))
-    
-    for (player_idx in seq_along(all_players)) {
-      player_name <- all_players[player_idx]
-      player_data <- sim_score_list[[player_name]]
-      
-      matching_sims <- player_data[list(batch_sim_ids), nomatch = 0]
-      if (nrow(matching_sims) > 0) {
-        row_indices <- matching_sims$SimID - sim_start + 1
-        batch_score_matrix[row_indices, player_idx] <- matching_sims$Score
-      }
-    }
-    
-    batch_lineup_scores <- lineup_matrix %*% t(batch_score_matrix)
+
+    batch_lineup_scores <- score_block(batch_sim_ids)
     score_matrix[, batch_sim_ids] <- batch_lineup_scores
     
     if (verbose) {
@@ -1271,7 +1258,7 @@ score_all_lineups <- function(lineup_data, sim_results, verbose = TRUE, sims_per
       flush.console()
     }
     
-    rm(batch_score_matrix, batch_lineup_scores)
+    rm(batch_lineup_scores)
     gc(verbose = FALSE)
   }
   

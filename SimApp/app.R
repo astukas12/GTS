@@ -2380,8 +2380,11 @@ server <- function(input, output, session) {
                               names(rv$sim_metadata))
         meta_cols <- nba_meta
       } else {
+        # "Pos" as well as "Position": the preseason engine writes the column as
+        # Pos, so listing only Position silently dropped the position from the
+        # exposure tables and left them showing bare player names.
         meta_cols <- intersect(c("Player","PlayerType",salary_col,own_col,
-                                 "PosGroup","RGProj","RGMin","GameTime","Starting","Team","Car",
+                                 "Pos","PosGroup","RGProj","RGMin","GameTime","Starting","Team","Car",
                                  "Position","Match","Opponent","Surface","Tour","TeeTimeGroup","CutProb"),
                                names(rv$sim_metadata))
         meta_cols <- meta_cols[!is.na(meta_cols)]
@@ -2667,7 +2670,7 @@ server <- function(input, output, session) {
                         names(rv$sim_metadata))
       } else {
         mc <- intersect(c("Player","PlayerType",salary_col,own_col,
-                          "PosGroup","RGProj","RGMin","GameTime","Starting","Team","Car",
+                          "Pos","PosGroup","RGProj","RGMin","GameTime","Starting","Team","Car",
                           "Position","Match","Opponent","TeeTimeGroup","CutProb"),
                         names(rv$sim_metadata))
         mc <- mc[!is.na(mc)]
