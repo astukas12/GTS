@@ -1262,9 +1262,46 @@ create_dominator_violin_by_position <- function(sim_results, platform = "DK",
 #' 
 #' Performance: ~10x faster than original by pre-computing profile data once instead of per simulation
 #' Maintains greedy algorithm: each profile assigned to exactly one driver (no duplicates)
-assign_dominator_points_from_profiles_optimized <- function(race_result, race_weights, 
+#' Dominator bond controls
+#'
+#' How tightly a historical dominator profile binds to the driver who lands in
+#' its (start, finish) slot. Both defaults reproduce the original behaviour
+#' exactly, so leaving these alone changes nothing.
+#'
+#' @param tau Softness of the match. 0 (default) is hard nearest-neighbour: the
+#'   profile always goes to the closest eligible driver, so dominator points are
+#'   fully determined by the simulated finishing order and all variance comes
+#'   from which race was sampled. Raising tau lets a profile land on a driver
+#'   further away in (start, finish) space — roughly, tau is the distance in
+#'   positions over which alternatives become competitive. 2-4 loosens the bond
+#'   noticeably; large values approach a random eligible assignment.
+#' @param start_weight Weight on qualifying position relative to finishing
+#'   position in the match distance. 1 (default) weights them equally; 0 ignores
+#'   the grid and matches on finishing position alone.
+#' @return The current settings, invisibly when setting.
+#' @examples
+#'   gts_dom_bond()                          # read current settings
+#'   gts_dom_bond(tau = 3, start_weight = 0.5)
+gts_dom_bond <- function(tau = NULL, start_weight = NULL) {
+  if (!is.null(tau)) {
+    if (!is.numeric(tau) || length(tau) != 1 || is.na(tau) || tau < 0)
+      stop("tau must be a single non-negative number")
+    options(gts.dom.tau = tau)
+  }
+  if (!is.null(start_weight)) {
+    if (!is.numeric(start_weight) || length(start_weight) != 1 ||
+        is.na(start_weight) || start_weight < 0)
+      stop("start_weight must be a single non-negative number")
+    options(gts.dom.start_weight = start_weight)
+  }
+  out <- list(tau = getOption("gts.dom.tau", 0),
+              start_weight = getOption("gts.dom.start_weight", 1))
+  if (is.null(tau) && is.null(start_weight)) out else invisible(out)
+}
+
+assign_dominator_points_from_profiles_optimized <- function(race_result, race_weights,
                                                             race_distance_data, platform) {
-  
+
   # Ensure data.table has proper allocation
   setalloccol(race_result)
   
@@ -1332,10 +1369,14 @@ assign_dominator_points_from_profiles_optimized <- function(race_result, race_we
   profile_starts <- race_data$profile_starts
   
   # Calculate distance matrix (vectorized, unavoidable cost)
+  # start_weight scales how much qualifying position constrains the match
+  # relative to finishing position; see gts_dom_bond(). 1 = original behaviour.
+  bond_tau    <- getOption("gts.dom.tau", 0)
+  bond_startw <- getOption("gts.dom.start_weight", 1)
   finish_diff_matrix <- outer(driver_finishes, profile_finishes, function(x, y) abs(x - y))
   start_diff_matrix <- outer(driver_starts, profile_starts, function(x, y) abs(x - y))
-  distance_matrix <- sqrt(finish_diff_matrix^2 + start_diff_matrix^2)
-  
+  distance_matrix <- sqrt(finish_diff_matrix^2 + bond_startw * start_diff_matrix^2)
+
   # =========================================================================
   # GREEDY ASSIGNMENT: Prioritize high-value profiles + DKMax eligibility
   # =========================================================================
@@ -1381,9 +1422,18 @@ assign_dominator_points_from_profiles_optimized <- function(race_result, race_we
     # Find the best eligible driver for this profile (minimum distance)
     # Get distances only for eligible drivers
     distances_to_profile <- distance_matrix[eligible_driver_indices, profile_idx]
-    
-    # Find which eligible driver has minimum distance
-    best_idx_in_eligible <- which.min(distances_to_profile)
+
+    # tau = 0 keeps the original hard nearest-neighbour pick. Above 0, draw from
+    # a softmax over -distance/tau so the profile can land on a driver further
+    # from its historical slot — this is the only source of dominator variance
+    # that is not just "which race got sampled". Distances are shifted by their
+    # minimum first so exp() cannot underflow to an all-zero weight vector.
+    if (bond_tau <= 0 || length(distances_to_profile) == 1L) {
+      best_idx_in_eligible <- which.min(distances_to_profile)
+    } else {
+      w <- exp(-(distances_to_profile - min(distances_to_profile)) / bond_tau)
+      best_idx_in_eligible <- sample.int(length(w), size = 1L, prob = w)
+    }
     driver_idx <- eligible_driver_indices[best_idx_in_eligible]
     
     # Assign dominator points from this profile to this driver
