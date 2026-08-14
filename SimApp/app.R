@@ -997,6 +997,30 @@ server <- function(input, output, session) {
   # the highest-scoring six per sim and in a lopsided preseason game that is
   # sometimes six from the same side -- a lineup DK refuses on upload. Drop
   # those rather than ship an entry file that fails at the door.
+  # DraftKings classic rule: "Each team you create must have players from at
+  # least two different NFL teams and these players must be playing in at least
+  # two different football games." Both halves are required, and nothing in the
+  # classic optimiser enforced either -- it just takes the top scorer per slot.
+  # On a six-game slate it never bit (0 of 5,000 lineups violated, though 6 sat
+  # at exactly two games). On a THREE-game slate the margin is far thinner, so
+  # this has to be a guarantee rather than a happy accident.
+  drop_invalid_classic <- function(lineup_data, metadata, games) {
+    ul <- lineup_data$unique_lineups
+    pc <- grep("^Player", names(ul), value = TRUE)
+    if (!length(pc) || is.null(games) || !nrow(games)) return(lineup_data)
+    if (!all(c("HomeTeam","AwayTeam") %in% names(games))) return(lineup_data)
+    gkey <- paste0(games$AwayTeam, "@", games$HomeTeam)
+    t2g  <- setNames(rep(gkey, 2), c(games$HomeTeam, games$AwayTeam))
+    p2t  <- setNames(metadata$Team, metadata$Player)
+    tm   <- matrix(p2t[unlist(ul[, ..pc])], nrow = nrow(ul))
+    gm   <- matrix(t2g[tm], nrow = nrow(ul))
+    ndis <- function(M) apply(M, 1, function(r) length(unique(r[!is.na(r)])))
+    keep <- ndis(tm) >= 2 & ndis(gm) >= 2
+    if (all(keep)) return(lineup_data)
+    lineup_data$unique_lineups <- ul[keep]
+    lineup_data
+  }
+
   drop_single_team_sd <- function(lineup_data, metadata) {
     ul <- lineup_data$unique_lineups
     pc <- intersect(c("Captain", grep("^Util", names(ul), value = TRUE)), names(ul))
@@ -1437,6 +1461,7 @@ server <- function(input, output, session) {
         progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
         lineup_data <- find_optimal_lineups(opt_data, opt_config,
                                             mode=rv$config$optimization_modes$DK, k=1, verbose=TRUE)
+        lineup_data <- drop_invalid_classic(lineup_data, rv$sim_metadata, rv$input_data$games)
         progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
                                     format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
         score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
@@ -1604,6 +1629,7 @@ server <- function(input, output, session) {
         progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
         lineup_data <- find_optimal_lineups(opt_data, opt_config,
                                             mode=rv$config$optimization_modes$FD, k=1, verbose=TRUE)
+        lineup_data <- drop_invalid_classic(lineup_data, rv$sim_metadata, rv$input_data$games)
         progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
                                     format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
         score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
