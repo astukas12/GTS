@@ -1428,7 +1428,12 @@ server <- function(input, output, session) {
                            percentiles=c(0.01,0.05,0.10,0.20), platform_col="DKScore",
                            position_slots=rv$config$position_slots,
                            flex_eligible=rv$config$flex_eligible,
-                           max_lineups=rv$config$max_lineups %||% 5000L)
+                           max_lineups=rv$config$max_lineups %||% 5000L,
+                           # opt_config is a FRESH list, not rv$config, so
+                           # anything the optimiser reads has to be copied in
+                           # explicitly -- pool_spread was set in the sport
+                           # config and silently never arrived.
+                           pool_spread=rv$config$pool_spread %||% 0)
         progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
         lineup_data <- find_optimal_lineups(opt_data, opt_config,
                                             mode=rv$config$optimization_modes$DK, k=1, verbose=TRUE)
@@ -1455,7 +1460,12 @@ server <- function(input, output, session) {
                            percentiles=c(0.01,0.05,0.10,0.20), platform_col="DKScore",
                            cpt_multiplier=rv$config$showdown_config$DK$captain_multiplier %||% 1.5,
                            progress_frequency=500, use_parallel=TRUE,
-                           max_lineups=rv$config$max_lineups %||% 5000L)
+                           max_lineups=rv$config$max_lineups %||% 5000L,
+                           # opt_config is a FRESH list, not rv$config, so
+                           # anything the optimiser reads has to be copied in
+                           # explicitly -- pool_spread was set in the sport
+                           # config and silently never arrived.
+                           pool_spread=rv$config$pool_spread %||% 0)
         progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
         lineup_data <- find_optimal_lineups(opt_data, opt_config, mode=dk_mode, k=1, verbose=TRUE)
         progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
@@ -1585,7 +1595,12 @@ server <- function(input, output, session) {
                            percentiles=c(0.01,0.05,0.10,0.20), platform_col="FDScore",
                            position_slots=rv$config$position_slots,
                            flex_eligible=rv$config$flex_eligible,
-                           max_lineups=rv$config$max_lineups %||% 5000L)
+                           max_lineups=rv$config$max_lineups %||% 5000L,
+                           # opt_config is a FRESH list, not rv$config, so
+                           # anything the optimiser reads has to be copied in
+                           # explicitly -- pool_spread was set in the sport
+                           # config and silently never arrived.
+                           pool_spread=rv$config$pool_spread %||% 0)
         progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
         lineup_data <- find_optimal_lineups(opt_data, opt_config,
                                             mode=rv$config$optimization_modes$FD, k=1, verbose=TRUE)
@@ -2185,7 +2200,15 @@ server <- function(input, output, session) {
       sliders <- Filter(Negate(is.null), lapply(range_cols, function(col) {
         cfg <- cfg_map[[col]] %||% list(label=col,format="decimal",step=0.1)
         mn  <- min(optimal[[col]],na.rm=TRUE); mx <- max(optimal[[col]],na.rm=TRUE)
-        if (mn == mx) return(NULL)
+        # An ALL-NA column is not the same as a constant one and the mn == mx
+        # test does not catch it: min(NA, na.rm=TRUE) is +Inf and max is -Inf, so
+        # the slider was built with min=Inf, max=-Inf and rendered "NaN - NaN".
+        # Preseason classic hits this every time because the optimiser sets
+        # TotalSalary to NA (salary is flat, so the cap never binds). The broken
+        # slider also threw in the browser, which aborted the rest of that
+        # panel's JS -- that is why Lock/Exclude fell back to raw multi-selects
+        # instead of searchable selectize boxes.
+        if (!is.finite(mn) || !is.finite(mx) || mn == mx) return(NULL)
         if (cfg$format=="k")     { mn <- floor(mn/1000);  mx <- ceiling(mx/1000); lbl <- paste0(cfg$label," (K)") }
         else if (cfg$format=="whole") { mn <- floor(mn); mx <- ceiling(mx); lbl <- cfg$label }
         else { mn <- floor(mn*10)/10; mx <- ceiling(mx*10)/10; lbl <- cfg$label }
@@ -2440,9 +2463,26 @@ server <- function(input, output, session) {
           exp_tbl[, OwnProj  := round(OwnProj, 1)]
           exp_tbl[, Leverage := round(Exposure - OwnProj, 1)]
         }
-        base_meta     <- c("Player", if (is_f1) "PlayerType" else NULL,
+        # Pos sits immediately after Player. It was absent from this list
+        # entirely, so setcolorder left it trailing at the far right of the
+        # table, past Exposure and Leverage.
+        base_meta     <- c("Player", "Pos", if (is_f1) "PlayerType" else NULL,
                            "PosGroup","Salary","RGProj","RGMin","SimProj","GameTime","Starting","Team","Car",
                            "Position","Match","Opponent","Surface","Tour","TeeTimeGroup","CutProb")
+        # Preseason carries no salary or ownership data -- the sheet has no
+        # salary columns at all, so the engine fills a flat default and the
+        # column is the same number on every row. Leverage is then just a copy
+        # of Exposure. Drop them rather than show three dead columns.
+        if (isTRUE(rv$sport %in% c("NFL_PRESEASON","NFL_PRESEASON_CLASSIC"))) {
+          dead <- intersect(c("Salary","Sal"), names(exp_tbl))
+          dead <- dead[vapply(dead, function(c_) uniqueN(exp_tbl[[c_]]) <= 1L, logical(1))]
+          # Leverage goes with OwnProj: it is Exposure - OwnProj, so a zero
+          # OwnProj makes it a verbatim copy of the Exposure column beside it.
+          if ("OwnProj" %in% names(exp_tbl) &&
+              all(is.na(exp_tbl$OwnProj) | exp_tbl$OwnProj == 0))
+            dead <- c(dead, intersect(c("OwnProj","Leverage"), names(exp_tbl)))
+          if (length(dead)) exp_tbl[, (dead) := NULL]
+        }
         meta_order    <- intersect(base_meta, names(exp_tbl))
         split_cols    <- intersect(c("CptExp","UtilExp","FlexExp"), names(exp_tbl))
         metrics_order <- intersect(c("Exposure","OwnProj","Leverage"), names(exp_tbl))
@@ -2457,8 +2497,15 @@ server <- function(input, output, session) {
       exp_sort_col <- if ("Exposure" %in% names(exp_tbl)) "Exposure" else "TotExp"
       exp_tbl <- exp_tbl[get(exp_sort_col) > 0]
       setorderv(exp_tbl, exp_sort_col, order = -1L)
+      # Pos and Team as FACTORS so DT's column filter renders a dropdown of the
+      # actual values instead of a free-text box -- that is what makes "show me
+      # only the TEs" one click. searching must be TRUE for column filters to
+      # work at all, but dom='tp' still keeps the global search box hidden.
+      for (fc in intersect(c("Pos","Position","PosGroup","Team"), names(exp_tbl)))
+        if (!is.factor(exp_tbl[[fc]])) set(exp_tbl, j = fc, value = factor(exp_tbl[[fc]]))
       dt <- datatable(exp_tbl,
-                      options=list(pageLength=50,scrollX=TRUE,searching=FALSE,lengthChange=FALSE,dom='tp'),
+                      filter = list(position = "top", clear = TRUE),
+                      options=list(pageLength=50,scrollX=TRUE,searching=TRUE,lengthChange=FALSE,dom='tp'),
                       rownames=FALSE)
       rc <- intersect(c("CptExp","CptOwn","CptLev",
                         "UtlExp","UtlOwn","UtlLev",
@@ -2760,9 +2807,17 @@ server <- function(input, output, session) {
             exp_tbl[, OwnProj  := round(OwnProj, 1)]
             exp_tbl[, Leverage := round(Exposure - OwnProj, 1)]
           }
-          base_meta  <- c("Player", if (is_f1) "PlayerType" else NULL,
+          base_meta  <- c("Player", "Pos", if (is_f1) "PlayerType" else NULL,
                           "PosGroup","Salary","RGProj","RGMin","SimProj","GameTime","Starting","Team","Car",
                           "Position","Match","Opponent","Surface","Tour","TeeTimeGroup","CutProb")
+          if (isTRUE(rv$sport %in% c("NFL_PRESEASON","NFL_PRESEASON_CLASSIC"))) {
+            dead <- intersect(c("Salary","Sal"), names(exp_tbl))
+            dead <- dead[vapply(dead, function(c_) uniqueN(exp_tbl[[c_]]) <= 1L, logical(1))]
+            if ("OwnProj" %in% names(exp_tbl) &&
+                all(is.na(exp_tbl$OwnProj) | exp_tbl$OwnProj == 0))
+              dead <- c(dead, intersect(c("OwnProj","Leverage"), names(exp_tbl)))
+            if (length(dead)) exp_tbl[, (dead) := NULL]
+          }
           meta_order    <- intersect(base_meta, names(exp_tbl))
           split_cols    <- intersect(c("CptExp","UtilExp","FlexExp"), names(exp_tbl))
           metrics_order <- intersect(c("Exposure","OwnProj","Leverage"), names(exp_tbl))
@@ -2798,7 +2853,10 @@ server <- function(input, output, session) {
                                       "UtlExp","UtilExp", utl_in_lab, utl_out_lab, "UtlOwn","UtlLev"), names(exp_tbl))
         setcolorder(exp_tbl, c(front_cols, cpt_util_group))
         
-        dt <- datatable(exp_tbl, options=list(pageLength=50,scrollX=TRUE,searching=FALSE,lengthChange=FALSE,dom='tp'), rownames=FALSE)
+        for (fc in intersect(c("Pos","Position","PosGroup","Team"), names(exp_tbl)))
+          if (!is.factor(exp_tbl[[fc]])) set(exp_tbl, j = fc, value = factor(exp_tbl[[fc]]))
+        dt <- datatable(exp_tbl, filter = list(position = "top", clear = TRUE),
+                        options=list(pageLength=50,scrollX=TRUE,searching=TRUE,lengthChange=FALSE,dom='tp'), rownames=FALSE)
         rc <- intersect(c("CptExp","CptOwn","CptLev",
                           "UtlExp","UtlOwn","UtlLev",
                           "TotExp","TotOwn","TotLev",
@@ -2881,9 +2939,17 @@ server <- function(input, output, session) {
             exp_tbl[, OwnProj  := round(OwnProj, 1)]
             exp_tbl[, Leverage := round(Exposure - OwnProj, 1)]
           }
-          base_meta  <- c("Player", if (is_f1) "PlayerType" else NULL,
+          base_meta  <- c("Player", "Pos", if (is_f1) "PlayerType" else NULL,
                           "PosGroup","Salary","RGProj","RGMin","SimProj","GameTime","Starting","Team","Car",
                           "Position","Match","Opponent","Surface","Tour","TeeTimeGroup","CutProb")
+          if (isTRUE(rv$sport %in% c("NFL_PRESEASON","NFL_PRESEASON_CLASSIC"))) {
+            dead <- intersect(c("Salary","Sal"), names(exp_tbl))
+            dead <- dead[vapply(dead, function(c_) uniqueN(exp_tbl[[c_]]) <= 1L, logical(1))]
+            if ("OwnProj" %in% names(exp_tbl) &&
+                all(is.na(exp_tbl$OwnProj) | exp_tbl$OwnProj == 0))
+              dead <- c(dead, intersect(c("OwnProj","Leverage"), names(exp_tbl)))
+            if (length(dead)) exp_tbl[, (dead) := NULL]
+          }
           meta_order    <- intersect(base_meta, names(exp_tbl))
           split_cols    <- intersect(c("CptExp","UtilExp","FlexExp"), names(exp_tbl))
           metrics_order <- intersect(c("Exposure","OwnProj","Leverage"), names(exp_tbl))
@@ -2897,7 +2963,10 @@ server <- function(input, output, session) {
         exp_sort_col <- if ("Exposure" %in% names(exp_tbl)) "Exposure" else "TotExp"
         exp_tbl <- exp_tbl[get(exp_sort_col) > 0]
         setorderv(exp_tbl, exp_sort_col, order = -1L)
-        dt <- datatable(exp_tbl, options=list(pageLength=50,scrollX=TRUE,searching=FALSE,lengthChange=FALSE,dom='tp'), rownames=FALSE)
+        for (fc in intersect(c("Pos","Position","PosGroup","Team"), names(exp_tbl)))
+          if (!is.factor(exp_tbl[[fc]])) set(exp_tbl, j = fc, value = factor(exp_tbl[[fc]]))
+        dt <- datatable(exp_tbl, filter = list(position = "top", clear = TRUE),
+                        options=list(pageLength=50,scrollX=TRUE,searching=TRUE,lengthChange=FALSE,dom='tp'), rownames=FALSE)
         rc <- intersect(c("CptExp","CptOwn","CptLev",
                           "UtlExp","UtlOwn","UtlLev",
                           "TotExp","TotOwn","TotLev",

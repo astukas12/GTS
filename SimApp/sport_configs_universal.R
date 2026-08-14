@@ -826,6 +826,16 @@ SPORT_CONFIGS <- list(
                               SD = "combinatorial_captain"),
     max_lineups        = 5000,
 
+    # Preseason is the degenerate case for lineup counting: the space is ~4.5e12
+    # and EVERY sim's optimum is unique, so Top1Count is 1 for every candidate
+    # and carries no signal. Measured at 50k sims, a three-game slate still gave
+    # 49,992 distinct optima -- shrinking the slate does not help. The candidate
+    # cut is therefore made on lineup quality (sum of player means), and
+    # pool_spread softens that cut into a weighted sample so the pool does not
+    # collapse onto chalk: a hard top-5,000 of 100k is a top-5% cut and put one
+    # quarterback in 78% of it. Units are lineup POINTS; 0 restores the hard cut.
+    pool_spread        = 0.6,
+
     showdown_config = list(
       SD = list(enabled = TRUE, captain_multiplier = 1.5,
                 captain_salary_multiplier = 1.5, mode = "captain")
