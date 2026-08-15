@@ -2058,7 +2058,7 @@ server <- function(input, output, session) {
                                     fluidRow(box(title="Lineup Filters", status="warning", solidHeader=TRUE,
                                                  width=12, collapsible=TRUE,
                                                  fluidRow(
-                                                   column(2,
+                                                   column(3,
                                                           div(style="background-color:#2d2d2d;padding:6px;border-radius:4px;border:1px solid #404040;",
                                                               h6("Min Rates", style="color:#FFE500;font-weight:bold;margin:0 0 8px 0;font-size:13px;"),
                                                               div(style="display:flex;align-items:center;margin-bottom:4px;",
@@ -2078,13 +2078,12 @@ server <- function(input, output, session) {
                                                                   numericInput(paste0(lp,"_min_top20"),NULL,value=0,min=0,max=100,step=5,  width="68px"))
                                                           )
                                                    ),
-                                                   column(4,
+                                                   column(6,
                                                           div(style="padding-left:4px;",
                                                               h6("Ranges", style="color:#FFE500;font-weight:bold;margin:0 0 8px 0;font-size:13px;"),
                                                               uiOutput(paste0(lp,"_range_sliders"))
                                                           )
                                                    ),
-                                                   column(3, uiOutput(paste0(lp, "_lock_exclude_ui"))),
                                                    column(3,
                                                           div(style="background-color:#2d2d2d;padding:8px;border-radius:4px;border:1px solid #FFE500;",
                                                               h6("Add to Portfolio", style="color:#FFE500;font-weight:bold;margin:0 0 8px 0;font-size:13px;"),
@@ -2099,6 +2098,8 @@ server <- function(input, output, session) {
                                                  )
                                     )),
                                     fluidRow(box(title="Player Exposure in Filtered Pool",status="info",solidHeader=TRUE,width=12,
+                                                 div(style="margin-bottom:6px;",
+                                                     uiOutput(paste0(lp,"_lock_summary"), inline=TRUE)),
                                                  DTOutput(paste0(lp,"_filtered_exposure"))))
                            ),
                            
@@ -2132,78 +2133,54 @@ server <- function(input, output, session) {
   # LOCK / EXCLUDE UI
   # ==========================================================================
   
-  # Lock / exclude is driven from the LOCK column of the exposure table below:
-  # click a row's LOCK cell to cycle it lock -> exclude -> clear. This panel is
-  # just the read-out, so the current constraints are visible without scanning
-  # a 200-row table, plus a one-click clear. It replaces the eight stacked
-  # selectize boxes that used to live here.
-  make_lock_exclude_ui <- function(lp) {
+  # Lock / exclude is driven entirely from the exposure table: each row has its
+  # own LOCK and EXCL button. This is just a one-line count plus a clear-all,
+  # sitting directly above the table rather than in a panel at the top.
+  make_lock_summary_ui <- function(lp) {
     renderUI({
-      chip <- function(txt, col) span(txt,
-        style=sprintf("display:inline-block;background:%s;color:#111;border-radius:3px;padding:1px 6px;margin:2px 3px 0 0;font-size:11px;font-weight:bold;", col))
-      la <- rv[[paste0(lp,"_lock_any")]]; xa <- rv[[paste0(lp,"_excl_any")]]
-      lc <- rv[[paste0(lp,"_lock_cpt")]]; xc <- rv[[paste0(lp,"_excl_cpt")]]
-      n_total <- length(la) + length(xa) + length(lc) + length(xc)
-      cap_lbl <- if (isTRUE(rv$sport == "F1")) "CPT" else "CPT"
-
-      div(style="background-color:#2d2d2d;padding:8px;border-radius:4px;border:1px solid #404040;",
-          div(style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;",
-              h6("Locks / Excludes", style="color:#FFE500;font-weight:bold;margin:0;font-size:13px;"),
-              if (n_total > 0)
-                actionLink(paste0(lp,"_clear_locks"), "clear all",
-                           style="color:#ff6b6b;font-size:11px;font-weight:bold;")
-          ),
-          if (n_total == 0) {
-            div(style="color:#888;font-size:11px;line-height:1.5;",
-                "None set.", br(),
-                "Click the ", span("LOCK", style="color:#FFE500;font-weight:bold;"),
-                " cell on any row of the exposure table to cycle it ",
-                span("LOCK", style="color:#4caf50;font-weight:bold;"), " → ",
-                span("EXCL", style="color:#ff6b6b;font-weight:bold;"), " → off.")
-          } else {
-            div(style="max-height:150px;overflow-y:auto;",
-                if (length(la)) div(tags$span("Lock:",  style="color:#888;font-size:10px;"),
-                                    lapply(la, chip, col="#4caf50")),
-                if (length(xa)) div(tags$span("Excl:",  style="color:#888;font-size:10px;"),
-                                    lapply(xa, chip, col="#ff6b6b")),
-                if (length(lc)) div(tags$span(paste0(cap_lbl," lock:"), style="color:#888;font-size:10px;"),
-                                    lapply(lc, chip, col="#8bc34a")),
-                if (length(xc)) div(tags$span(paste0(cap_lbl," excl:"), style="color:#888;font-size:10px;"),
-                                    lapply(xc, chip, col="#e57373"))
-            )
-          }
+      n <- length(rv[[paste0(lp,"_lock_any")]]) + length(rv[[paste0(lp,"_excl_any")]]) +
+           length(rv[[paste0(lp,"_lock_cpt")]]) + length(rv[[paste0(lp,"_excl_cpt")]])
+      if (n == 0) return(
+        span("Click LOCK or EXCL on any row to constrain the pool.",
+             style="color:#777;font-size:11px;"))
+      tagList(
+        span(sprintf("%d constraint%s active", n, if (n == 1) "" else "s"),
+             style="color:#FFE500;font-size:11px;font-weight:bold;margin-right:10px;"),
+        actionLink(paste0(lp,"_clear_locks"), "clear all",
+                   style="color:#ff6b6b;font-size:11px;font-weight:bold;")
       )
     })
   }
+  output$dk_lock_summary <- make_lock_summary_ui("dk")
+  output$fd_lock_summary <- make_lock_summary_ui("fd")
+  output$sd_lock_summary <- make_lock_summary_ui("sd")
 
   # Clear-all links
   lapply(c("dk","fd","sd"), function(lp)
     observeEvent(input[[paste0(lp,"_clear_locks")]], clear_lock_state(lp), ignoreInit = TRUE))
 
   # ---- Toggle handler -------------------------------------------------------
-  # The exposure table sends {player, slot, nonce} when a LOCK/CPT cell is
-  # clicked. nonce is there so clicking the same cell twice still fires.
+  # The table sends {player, slot, action, nonce}. Each button toggles its OWN
+  # state on/off, and setting one clears the other -- a player cannot be both
+  # locked and excluded. nonce makes a repeat click on the same cell fire again.
   make_lock_toggle_observer <- function(lp) {
     observeEvent(input[[paste0(lp,"_lock_toggle")]], {
       ev <- input[[paste0(lp,"_lock_toggle")]]
       if (is.null(ev$player) || !nzchar(ev$player)) return()
       slot <- if (identical(ev$slot, "cpt")) "cpt" else "any"
       lk <- paste0(lp,"_lock_", slot); xk <- paste0(lp,"_excl_", slot)
-      locked <- rv[[lk]]; excl <- rv[[xk]]; pl <- ev$player
-      if (pl %in% locked) {           # lock -> exclude
-        rv[[lk]] <- setdiff(locked, pl); rv[[xk]] <- union(excl, pl)
-      } else if (pl %in% excl) {      # exclude -> off
-        rv[[xk]] <- setdiff(excl, pl)
-      } else {                        # off -> lock
-        rv[[lk]] <- union(locked, pl)
+      pl <- ev$player
+      if (identical(ev$action, "excl")) {
+        if (pl %in% rv[[xk]]) rv[[xk]] <- setdiff(rv[[xk]], pl)
+        else { rv[[xk]] <- union(rv[[xk]], pl); rv[[lk]] <- setdiff(rv[[lk]], pl) }
+      } else {
+        if (pl %in% rv[[lk]]) rv[[lk]] <- setdiff(rv[[lk]], pl)
+        else { rv[[lk]] <- union(rv[[lk]], pl); rv[[xk]] <- setdiff(rv[[xk]], pl) }
       }
     }, ignoreInit = TRUE)
   }
   lapply(c("dk","fd","sd"), make_lock_toggle_observer)
 
-  output$dk_lock_exclude_ui <- make_lock_exclude_ui("dk")
-  output$fd_lock_exclude_ui <- make_lock_exclude_ui("fd")
-  output$sd_lock_exclude_ui <- make_lock_exclude_ui("sd")
   
   
   # ==========================================================================
@@ -2384,29 +2361,30 @@ server <- function(input, output, session) {
   # FILTERED EXPOSURE
   # ==========================================================================
   
-  # ---- LOCK column in the exposure tables -----------------------------------
-  # A clickable badge per row: click cycles LOCK -> EXCL -> off. On showdown /
-  # F1 a second CPT badge does the same for the captain slot only. This is what
-  # replaced the stack of selectize boxes; the constraint now lives next to the
-  # exposure number you are reacting to.
-  lock_badge <- function(players, on_lock, on_excl) {
-    ifelse(players %in% on_lock,
-           '<span class="gts-badge gts-lock">LOCK</span>',
-    ifelse(players %in% on_excl,
-           '<span class="gts-badge gts-excl">EXCL</span>',
-           '<span class="gts-badge gts-none">+</span>'))
+  # ---- LOCK / EXCL buttons in the exposure tables ---------------------------
+  # One button per action per row. Clicking toggles that state for the player;
+  # setting one clears the other. This replaced the stack of selectize boxes,
+  # so the constraint is set right next to the exposure number you react to.
+  lock_btn <- function(players, active, kind) {
+    cls <- if (kind == "lock") "gts-lock" else "gts-excl"
+    lab <- if (kind == "lock") "LOCK" else "EXCL"
+    ifelse(players %in% active,
+           paste0('<span class="gts-btn ', cls, ' on">',  lab, '</span>'),
+           paste0('<span class="gts-btn ', cls, ' off">', lab, '</span>'))
   }
 
-  # JS: bind clicks on the badge cells and report {player, slot} back to Shiny.
-  # nonce makes a repeat click on the same cell still register as a new event.
+  # JS: report {player, slot, action} when a button cell is clicked. The cell
+  # classes carry which button it is; nonce makes repeat clicks fire again.
   # player_idx is the 0-based column position of Player in the rendered table.
   lock_click_js <- function(lp, player_idx) {
     DT::JS(paste0(
-      "table.on('click','td.gts-lockcell',function(){",
+      "table.on('click','td.gts-btncell',function(){",
         "var d=table.row(this).data(); if(!d) return;",
-        "var slot=$(this).hasClass('gts-cptcell')?'cpt':'any';",
+        "var $c=$(this);",
+        "var slot=$c.hasClass('gts-cptcell')?'cpt':'any';",
+        "var action=$c.hasClass('gts-exclcell')?'excl':'lock';",
         "Shiny.setInputValue('", lp, "_lock_toggle',",
-          "{player:d[", player_idx, "],slot:slot,nonce:Math.random()},",
+          "{player:d[", player_idx, "],slot:slot,action:action,nonce:Math.random()},",
           "{priority:'event'});",
       "});"))
   }
@@ -2585,34 +2563,40 @@ server <- function(input, output, session) {
       # work at all, but dom='tp' still keeps the global search box hidden.
       for (fc in intersect(c("Pos","Position","PosGroup","Team"), names(exp_tbl)))
         if (!is.factor(exp_tbl[[fc]])) set(exp_tbl, j = fc, value = factor(exp_tbl[[fc]]))
-      # ---- LOCK / CPT badge columns ----------------------------------------
-      # Prepended so they sit at the left edge, next to the player name.
+      # ---- LOCK / EXCL button columns --------------------------------------
+      # Placed at the left edge, next to the player name. On showdown / F1 a
+      # second pair drives the captain slot, which is a separate constraint.
       lp_ <- tolower(platform)
       show_cpt <- has_captain || length(grep("^MVP$", names(filtered), value=TRUE)) > 0 || is_f1
-      exp_tbl[, LOCK := lock_badge(Player, rv[[paste0(lp_,"_lock_any")]],
-                                           rv[[paste0(lp_,"_excl_any")]])]
-      if (show_cpt)
-        exp_tbl[, CPT := lock_badge(Player, rv[[paste0(lp_,"_lock_cpt")]],
-                                            rv[[paste0(lp_,"_excl_cpt")]])]
-      setcolorder(exp_tbl, c(intersect(c("LOCK","CPT"), names(exp_tbl)),
-                             setdiff(names(exp_tbl), c("LOCK","CPT"))))
+      la <- rv[[paste0(lp_,"_lock_any")]]; xa <- rv[[paste0(lp_,"_excl_any")]]
+      exp_tbl[, LOCK := lock_btn(Player, la, "lock")]
+      exp_tbl[, EXCL := lock_btn(Player, xa, "excl")]
+      if (show_cpt) {
+        lcv <- rv[[paste0(lp_,"_lock_cpt")]]; xcv <- rv[[paste0(lp_,"_excl_cpt")]]
+        exp_tbl[, `CPT LOCK` := lock_btn(Player, lcv, "lock")]
+        exp_tbl[, `CPT EXCL` := lock_btn(Player, xcv, "excl")]
+      }
+      btn_cols <- intersect(c("LOCK","EXCL","CPT LOCK","CPT EXCL"), names(exp_tbl))
+      setcolorder(exp_tbl, c(btn_cols, setdiff(names(exp_tbl), btn_cols)))
 
       fcfg <- exposure_filter_cfg(exp_tbl)
       nm        <- names(exp_tbl)
-      lock_idx  <- which(nm == "LOCK") - 1L
-      cpt_idx   <- if ("CPT" %in% nm) which(nm == "CPT") - 1L else integer(0)
+      ix <- function(cn) if (cn %in% nm) which(nm == cn) - 1L else integer(0)
       player_ix <- which(nm == "Player") - 1L
-      badge_defs <- c(
-        list(list(targets = as.list(lock_idx), className = "gts-lockcell",
-                  orderable = TRUE, searchable = FALSE, title = "LOCK")),
-        if (length(cpt_idx))
-          list(list(targets = as.list(cpt_idx),
-                    className = "gts-lockcell gts-cptcell",
-                    orderable = TRUE, searchable = FALSE, title = "CPT"))
+      btn_defs <- list(
+        list(targets = as.list(c(ix("LOCK"))),     className = "gts-btncell",
+             searchable = FALSE, orderable = TRUE),
+        list(targets = as.list(c(ix("EXCL"))),     className = "gts-btncell gts-exclcell",
+             searchable = FALSE, orderable = TRUE)
       )
-      # Only the badge columns carry HTML; everything else stays escaped so a
+      if (length(ix("CPT LOCK"))) btn_defs <- c(btn_defs, list(
+        list(targets = as.list(ix("CPT LOCK")), className = "gts-btncell gts-cptcell",
+             searchable = FALSE, orderable = TRUE),
+        list(targets = as.list(ix("CPT EXCL")), className = "gts-btncell gts-cptcell gts-exclcell",
+             searchable = FALSE, orderable = TRUE)))
+      # Only the button columns carry HTML; everything else stays escaped so a
       # player name with an ampersand or quote cannot break the cell.
-      esc <- setdiff(seq_along(nm), c(which(nm == "LOCK"), which(nm == "CPT")))
+      esc <- setdiff(seq_along(nm), match(btn_cols, nm))
 
       dt <- datatable(exp_tbl,
                       filter = fcfg$filter,
@@ -2620,7 +2604,7 @@ server <- function(input, output, session) {
                       callback = lock_click_js(lp_, player_ix),
                       options=list(pageLength=50,scrollX=TRUE,searching=TRUE,lengthChange=FALSE,dom='tp',
                                    stateSave=TRUE,
-                                   columnDefs=c(badge_defs, fcfg$coldefs)),
+                                   columnDefs=c(btn_defs, fcfg$coldefs)),
                       rownames=FALSE)
       rc <- intersect(c("CptExp","CptOwn","CptLev",
                         "UtlExp","UtlOwn","UtlLev",

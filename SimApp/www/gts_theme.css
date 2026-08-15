@@ -1458,30 +1458,41 @@ a.text-info {
   background-color: var(--gts-gold) !important;
   color: var(--gts-black) !important;
 }
-/* ── Lock / exclude badges in the exposure tables ───────────────────────────
-   Clicking one of these cells cycles the player LOCK -> EXCL -> off. The whole
-   cell is the hit target, not just the badge, so the click is forgiving. */
-td.gts-lockcell {
+/* ── Lock / exclude buttons in the exposure tables ──────────────────────────
+   One LOCK and one EXCL button per row. Inactive buttons stay deliberately
+   quiet so a 200-row table reads as "nothing set" -- only the active
+   constraints pull the eye. The whole cell is the hit target, not just the
+   pill, so the click is forgiving. */
+td.gts-btncell {
   cursor: pointer;
   text-align: center;
-  padding: 2px 4px !important;
+  padding: 2px 3px !important;
   user-select: none;
+  width: 1%;
+  white-space: nowrap;
 }
-td.gts-lockcell:hover { background-color: #3a3a3a; }
 
-.gts-badge {
+.gts-btn {
   display: inline-block;
-  min-width: 42px;
-  padding: 1px 6px;
+  min-width: 46px;
+  padding: 2px 7px;
   border-radius: 3px;
   font-size: 10px;
   font-weight: bold;
-  letter-spacing: 0.3px;
-  line-height: 16px;
+  letter-spacing: 0.4px;
+  line-height: 15px;
+  border: 1px solid transparent;
+  transition: background-color .12s, color .12s, border-color .12s;
 }
-/* Neutral state is deliberately dim: a 200-row table should read as "nothing
-   set", with only the active constraints pulling the eye. */
-.gts-badge.gts-none { background: transparent; color: #555; border: 1px dashed #444; }
-td.gts-lockcell:hover .gts-badge.gts-none { color: #FFE500; border-color: #FFE500; }
-.gts-badge.gts-lock { background: #4caf50; color: #111; }
-.gts-badge.gts-excl { background: #ff6b6b; color: #111; }
+
+/* Inactive: outline only */
+.gts-btn.off        { background: transparent; color: #5a5a5a; border-color: #3d3d3d; }
+td.gts-btncell:hover .gts-btn.gts-lock.off { color: #4caf50; border-color: #4caf50; }
+td.gts-btncell:hover .gts-btn.gts-excl.off { color: #ff6b6b; border-color: #ff6b6b; }
+
+/* Active: filled, so it is obvious at a glance which rows are constrained */
+.gts-btn.gts-lock.on { background: #4caf50; color: #10210f; border-color: #4caf50; }
+.gts-btn.gts-excl.on { background: #ff6b6b; color: #2a0f0f; border-color: #ff6b6b; }
+
+/* Captain-slot pair reads as a lighter variant of the same idea */
+td.gts-cptcell .gts-btn.on { opacity: .82; }
