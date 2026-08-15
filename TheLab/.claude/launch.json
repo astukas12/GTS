@@ -1,0 +1,14 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "simapp",
+      "runtimeExecutable": "C:\\Program Files\\R\\R-4.4.2\\bin\\Rscript.exe",
+      "runtimeArgs": [
+        "-e",
+        "shiny::runApp('C:/Users/astuk/OneDrive/Documents/GitHub/GTS/SimApp', port=7788, host='127.0.0.1', launch.browser=FALSE)"
+      ],
+      "port": 7788
+    }
+  ]
+}

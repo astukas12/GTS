@@ -388,7 +388,7 @@ ui <- dashboardPage(
       });
     });
 
-    ))")),
+    )")),
     
     tabItems(
       
