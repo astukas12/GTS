@@ -90,6 +90,11 @@ run_nascar_simulation <- function(input_data, n_sims, config, progress_callback 
   start_time <- Sys.time()
   
   driver_distributions <- precompute_driver_distributions(driver_data)
+  # The sampler does not reproduce these marginals on its own; calibrate first
+  # so the sheet's finish rates are what actually come out. Set
+  # options(gts.calibrate_finish = FALSE) to skip.
+  if (isTRUE(getOption("gts.calibrate_finish", TRUE)))
+    driver_distributions <- calibrate_position_matrix(driver_distributions)
   all_finish_positions <- simulate_finish_positions_vectorized(driver_distributions, n_sims)
   
   elapsed <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
@@ -507,6 +512,78 @@ precompute_driver_distributions <- function(driver_data) {
 }
 
 
+#' Make the sampler reproduce the finish rates in the input sheet
+#'
+#' The position-first draw below always produces a legal finishing order, but it
+#' does not reproduce the marginals it was handed. Only position 1 comes out
+#' right. From position 2 on, a driver is eligible only if they were not already
+#' assigned, and renormalising across whoever is left hands probability from the
+#' strong drivers to the pack. The leak compounds with depth: measured on a Cup
+#' Richmond sheet the regression of (simulated - input) on input ran -0.06 at
+#' T3, -0.19 at T10 and -0.86 at T30, so a hand-set T10 of 0.79 came back as
+#' 0.63 while a 0.06 came back as 0.079.
+#'
+#' That also distorts scoring downstream, since probability pushed into the
+#' midfield inflates place-differential for deep starters.
+#'
+#' Rather than change how the order is drawn, this pre-distorts the matrix the
+#' sampler is given: simulate, measure what marginals actually came out, scale
+#' the working matrix by target/realised, repeat. A few passes converge, and the
+#' result is a matrix which is not the input but which *samples* to the input.
+#'
+#' Hard zeros are preserved throughout — a driver given no chance at a position
+#' never gains one — and rows are renormalised each pass so every driver still
+#' finishes somewhere.
+#'
+#' @param target Matrix the caller wants reproduced (drivers x positions).
+#' @param n_cal Sims per calibration pass. Cheap relative to a real run.
+#' @param iters Maximum passes.
+#' @param damp Exponent on the correction; <1 stops sampling noise oscillating.
+#' @param tol Stop once the worst cumulative threshold is within this.
+#' @return A matrix to hand to simulate_finish_positions_vectorized().
+calibrate_position_matrix <- function(target, iters = 20, damp = 0.5, cap = 1.5,
+                                      tol = 0.005, verbose = TRUE) {
+  n <- ncol(target)
+  zero <- target <= 0
+  # Only the thresholds the input sheet actually specifies are targeted. The
+  # positions between them are unconstrained by the sheet, so chasing them adds
+  # nothing and drags the fit on the columns that matter.
+  K <- c(1, 3, 5, 10, 15, 20, 25, 30); K <- K[K <= n]
+  cumT <- t(apply(target, 1, cumsum))[, K, drop = FALSE]
+  err_of <- function(rea) max(abs(t(apply(rea, 1, cumsum))[, K, drop = FALSE] - cumT))
+
+  work <- target; acc <- NULL; nacc <- 0L; final_err <- NA_real_
+  for (it in seq_len(iters)) {
+    # Cheap passes to get close, precise ones to settle. A tight fit needs more
+    # draws than a rough one, and early passes do not deserve them.
+    nc <- if (it <= 8) 3000L else if (it <= 14) 6000L else 12000L
+    pos <- simulate_finish_positions_vectorized(work, nc)
+    realised <- t(apply(pos, 1, function(r) tabulate(r, n))) / nc
+    final_err <- err_of(realised)
+    if (final_err < tol) break
+    # A cell seen zero times in nc draws is not impossible, only rarer than the
+    # resolution of this pass. Flooring at half a count, and capping how far any
+    # cell can move, is what keeps target/realised from exploding and taking the
+    # row normalisation with it.
+    flo <- 0.5 / nc
+    ratio <- (pmax(target, flo) / pmax(realised, flo))^damp
+    work <- work * pmin(pmax(ratio, 1 / cap), cap)
+    work[zero] <- 0
+    work <- work / rowSums(work)
+    # Average the last few iterates: the update jitters around the solution
+    # rather than settling on it, and the mean of the jitter is a better answer
+    # than any single pass.
+    if (it > iters - 5L) { acc <- if (is.null(acc)) work else acc + work; nacc <- nacc + 1L }
+  }
+  if (nacc > 0L) {
+    work <- acc / nacc; work[zero] <- 0; work <- work / rowSums(work)
+  }
+  if (verbose)
+    cat(sprintf("  calibrated finish distribution (last pass error %.4f)\n", final_err))
+  attr(work, "cal_error") <- final_err
+  work
+}
+
 #' Simulate finish positions — position-first assignment
 #'
 #' Iterates positions 1 through n_positions. For each position, only drivers
@@ -514,6 +591,9 @@ precompute_driver_distributions <- function(driver_data) {
 #' from that eligible pool and assigned. Drivers already assigned are excluded.
 #' Because each position is filled exactly once in order, collisions are
 #' impossible by construction — no driver can land outside their valid range.
+#'
+#' Note this reproduces the matrix it is given only at position 1; see
+#' calibrate_position_matrix() for why callers should pass a calibrated matrix.
 simulate_finish_positions_vectorized <- function(prob_matrix, n_sims) {
   n_drivers   <- nrow(prob_matrix)
   n_positions <- ncol(prob_matrix)
@@ -1652,6 +1732,8 @@ get_full_nascar_simulation_data <- function(input_data, n_sims, config) {
   
   # Pre-compute distributions
   prob_matrix <- precompute_driver_distributions(driver_data)
+  if (isTRUE(getOption("gts.calibrate_finish", TRUE)))
+    prob_matrix <- calibrate_position_matrix(prob_matrix)
   all_finish_positions <- simulate_finish_positions_vectorized(prob_matrix, n_sims)
   
   # Scoring system
