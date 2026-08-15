@@ -557,6 +557,15 @@ server <- function(input, output, session) {
     rv$dk_slider_v         <- 0L
     rv$fd_slider_v         <- 0L
     rv$sd_slider_v         <- 0L
+    for (lp_ in c("dk","fd","sd")) clear_lock_state(lp_)
+  }
+
+  # Wipe every lock/exclude for a platform. Called on reset and whenever a new
+  # set of optimal lineups arrives, since a lock on a player who is no longer
+  # in the pool would silently filter everything to zero.
+  clear_lock_state <- function(lp) {
+    for (sfx in c("_lock_any","_excl_any","_lock_cpt","_excl_cpt"))
+      rv[[paste0(lp, sfx)]] <- character(0)
   }
   
   
@@ -573,6 +582,16 @@ server <- function(input, output, session) {
     dk_lock_v          = 0L,
     fd_lock_v          = 0L,
     sd_lock_v          = 0L,
+    # Lock / exclude now lives in the exposure table: click the LOCK cell on a
+    # row to cycle it through lock -> exclude -> clear. These hold the player
+    # names for each state. "_cpt" is the captain/MVP slot specifically, which
+    # on a showdown slate is a genuinely different constraint from "any slot".
+    dk_lock_any = character(0), dk_excl_any = character(0),
+    dk_lock_cpt = character(0), dk_excl_cpt = character(0),
+    fd_lock_any = character(0), fd_excl_any = character(0),
+    fd_lock_cpt = character(0), fd_excl_cpt = character(0),
+    sd_lock_any = character(0), sd_excl_any = character(0),
+    sd_lock_cpt = character(0), sd_excl_cpt = character(0),
     dk_slider_v        = 0L,
     fd_slider_v        = 0L,
     sd_slider_v        = 0L,
@@ -2113,86 +2132,75 @@ server <- function(input, output, session) {
   # LOCK / EXCLUDE UI
   # ==========================================================================
   
+  # Lock / exclude is driven from the LOCK column of the exposure table below:
+  # click a row's LOCK cell to cycle it lock -> exclude -> clear. This panel is
+  # just the read-out, so the current constraints are visible without scanning
+  # a 200-row table, plus a one-click clear. It replaces the eight stacked
+  # selectize boxes that used to live here.
   make_lock_exclude_ui <- function(lp) {
     renderUI({
-      lu  <- rv[[paste0(lp, "_optimal_lineups")]]
+      chip <- function(txt, col) span(txt,
+        style=sprintf("display:inline-block;background:%s;color:#111;border-radius:3px;padding:1px 6px;margin:2px 3px 0 0;font-size:11px;font-weight:bold;", col))
+      la <- rv[[paste0(lp,"_lock_any")]]; xa <- rv[[paste0(lp,"_excl_any")]]
+      lc <- rv[[paste0(lp,"_lock_cpt")]]; xc <- rv[[paste0(lp,"_excl_cpt")]]
+      n_total <- length(la) + length(xa) + length(lc) + length(xc)
+      cap_lbl <- if (isTRUE(rv$sport == "F1")) "CPT" else "CPT"
+
       div(style="background-color:#2d2d2d;padding:8px;border-radius:4px;border:1px solid #404040;",
-          h6("Lock / Exclude", style="color:#FFE500;font-weight:bold;margin:0 0 8px 0;font-size:13px;"),
-          if (isTRUE(rv$sport == "F1")) {
-            drv_choices <- if (!is.null(lu)) sort(unique(unlist(lu[, grep("^Captain|^Util[1-4]$", names(lu), value=TRUE), with=FALSE]))) else NULL
-            con_choices <- if (!is.null(lu)) sort(unique(unlist(lu[, grep("^Util5$",             names(lu), value=TRUE), with=FALSE]))) else NULL
-            tagList(
-              tags$label("Captain Lock:",      style="color:#aaa;font-size:11px;"),
-              selectizeInput(paste0(lp,"_locked_captain"),      NULL, choices=drv_choices, multiple=TRUE, selected=character(0),
-                             options=list(plugins=list('remove_button'), placeholder='Lock captain', maxItems=1), width="100%"),
-              tags$label("Captain Exclude:",   style="color:#aaa;font-size:11px;"),
-              selectizeInput(paste0(lp,"_excluded_captain"),    NULL, choices=drv_choices, multiple=TRUE, selected=character(0),
-                             options=list(plugins=list('remove_button'), placeholder='Exclude captain'), width="100%"),
-              tags$label("Driver Lock:",       style="color:#aaa;font-size:11px;"),
-              selectizeInput(paste0(lp,"_locked_players"),      NULL, choices=drv_choices, multiple=TRUE, selected=character(0),
-                             options=list(plugins=list('remove_button'), placeholder='Lock flex driver', maxItems=4), width="100%"),
-              tags$label("Driver Exclude:",    style="color:#aaa;font-size:11px;"),
-              selectizeInput(paste0(lp,"_excluded_players"),    NULL, choices=drv_choices, multiple=TRUE, selected=character(0),
-                             options=list(plugins=list('remove_button'), placeholder='Exclude flex driver'), width="100%"),
-              tags$label("Constructor Lock:",  style="color:#aaa;font-size:11px;"),
-              selectizeInput(paste0(lp,"_locked_constructor"),  NULL, choices=con_choices, multiple=TRUE, selected=character(0),
-                             options=list(plugins=list('remove_button'), placeholder='Lock constructor', maxItems=1), width="100%"),
-              tags$label("Constructor Exclude:", style="color:#aaa;font-size:11px;"),
-              selectizeInput(paste0(lp,"_excluded_constructor"), NULL, choices=con_choices, multiple=TRUE, selected=character(0),
-                             options=list(plugins=list('remove_button'), placeholder='Exclude constructor'), width="100%")
-            )
+          div(style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;",
+              h6("Locks / Excludes", style="color:#FFE500;font-weight:bold;margin:0;font-size:13px;"),
+              if (n_total > 0)
+                actionLink(paste0(lp,"_clear_locks"), "clear all",
+                           style="color:#ff6b6b;font-size:11px;font-weight:bold;")
+          ),
+          if (n_total == 0) {
+            div(style="color:#888;font-size:11px;line-height:1.5;",
+                "None set.", br(),
+                "Click the ", span("LOCK", style="color:#FFE500;font-weight:bold;"),
+                " cell on any row of the exposure table to cycle it ",
+                span("LOCK", style="color:#4caf50;font-weight:bold;"), " → ",
+                span("EXCL", style="color:#ff6b6b;font-weight:bold;"), " → off.")
           } else {
-            ver <- rv[[paste0(lp, "_lock_v")]]
-            all_players <- if (!is.null(lu)) {
-              pc <- grep("^Player|^Captain|^MVP|^Util", names(lu), value=TRUE)
-              sort(unique(unlist(lu[, ..pc]))[!is.na(unique(unlist(lu[, ..pc]))) & unique(unlist(lu[, ..pc])) != ""])
-            } else NULL
-            # On a showdown slate the captain and flex versions of a player are
-            # genuinely different roster spots -- different id, 1.5x points,
-            # 1.5x salary and very different ownership -- so "lock Haynes King"
-            # is ambiguous. The captain/flex pairs below resolve it. The plain
-            # Lock/Exclude keep their old meaning (any slot) so nothing changes
-            # for sports that were already using them.
-            is_showdown <- !is.null(lu) &&
-              any(c("Captain","MVP") %in% names(lu))
-            cap_lbl <- if (!is.null(lu) && "MVP" %in% names(lu)) "MVP" else "CPT"
-            tagList(
-              selectizeInput(paste0(lp, "_locked_players_v",  ver), "Lock (any slot):",
-                             choices=all_players, multiple=TRUE, selected=character(0),
-                             options=list(plugins=list('remove_button'), placeholder='Search to lock players', maxItems=8),
-                             width="100%"),
-              selectizeInput(paste0(lp, "_excluded_players_v", ver), "Exclude (any slot):",
-                             choices=all_players, multiple=TRUE, selected=character(0),
-                             options=list(plugins=list('remove_button'), placeholder='Search to exclude players'),
-                             width="100%"),
-              if (is_showdown) tagList(
-                tags$hr(style="border-color:#404040;margin:8px 0;"),
-                selectizeInput(paste0(lp, "_locked_cpt_v", ver), paste0(cap_lbl, " Lock:"),
-                               choices=all_players, multiple=TRUE, selected=character(0),
-                               options=list(plugins=list('remove_button'),
-                                            placeholder=paste0('Lock as ', cap_lbl), maxItems=1),
-                               width="100%"),
-                selectizeInput(paste0(lp, "_excluded_cpt_v", ver), paste0(cap_lbl, " Exclude:"),
-                               choices=all_players, multiple=TRUE, selected=character(0),
-                               options=list(plugins=list('remove_button'),
-                                            placeholder=paste0('Never ', cap_lbl)),
-                               width="100%"),
-                selectizeInput(paste0(lp, "_locked_flex_v", ver), "FLEX Lock:",
-                               choices=all_players, multiple=TRUE, selected=character(0),
-                               options=list(plugins=list('remove_button'),
-                                            placeholder='Lock in a flex slot', maxItems=5),
-                               width="100%"),
-                selectizeInput(paste0(lp, "_excluded_flex_v", ver), "FLEX Exclude:",
-                               choices=all_players, multiple=TRUE, selected=character(0),
-                               options=list(plugins=list('remove_button'),
-                                            placeholder='Never in a flex slot'),
-                               width="100%")
-              )
+            div(style="max-height:150px;overflow-y:auto;",
+                if (length(la)) div(tags$span("Lock:",  style="color:#888;font-size:10px;"),
+                                    lapply(la, chip, col="#4caf50")),
+                if (length(xa)) div(tags$span("Excl:",  style="color:#888;font-size:10px;"),
+                                    lapply(xa, chip, col="#ff6b6b")),
+                if (length(lc)) div(tags$span(paste0(cap_lbl," lock:"), style="color:#888;font-size:10px;"),
+                                    lapply(lc, chip, col="#8bc34a")),
+                if (length(xc)) div(tags$span(paste0(cap_lbl," excl:"), style="color:#888;font-size:10px;"),
+                                    lapply(xc, chip, col="#e57373"))
             )
           }
       )
     })
   }
+
+  # Clear-all links
+  lapply(c("dk","fd","sd"), function(lp)
+    observeEvent(input[[paste0(lp,"_clear_locks")]], clear_lock_state(lp), ignoreInit = TRUE))
+
+  # ---- Toggle handler -------------------------------------------------------
+  # The exposure table sends {player, slot, nonce} when a LOCK/CPT cell is
+  # clicked. nonce is there so clicking the same cell twice still fires.
+  make_lock_toggle_observer <- function(lp) {
+    observeEvent(input[[paste0(lp,"_lock_toggle")]], {
+      ev <- input[[paste0(lp,"_lock_toggle")]]
+      if (is.null(ev$player) || !nzchar(ev$player)) return()
+      slot <- if (identical(ev$slot, "cpt")) "cpt" else "any"
+      lk <- paste0(lp,"_lock_", slot); xk <- paste0(lp,"_excl_", slot)
+      locked <- rv[[lk]]; excl <- rv[[xk]]; pl <- ev$player
+      if (pl %in% locked) {           # lock -> exclude
+        rv[[lk]] <- setdiff(locked, pl); rv[[xk]] <- union(excl, pl)
+      } else if (pl %in% excl) {      # exclude -> off
+        rv[[xk]] <- setdiff(excl, pl)
+      } else {                        # off -> lock
+        rv[[lk]] <- union(locked, pl)
+      }
+    }, ignoreInit = TRUE)
+  }
+  lapply(c("dk","fd","sd"), make_lock_toggle_observer)
+
   output$dk_lock_exclude_ui <- make_lock_exclude_ui("dk")
   output$fd_lock_exclude_ui <- make_lock_exclude_ui("fd")
   output$sd_lock_exclude_ui <- make_lock_exclude_ui("sd")
@@ -2262,19 +2270,41 @@ server <- function(input, output, session) {
   # VERSION-BASED LOCK/EXCLUDE RESET
   # ==========================================================================
   
-  observeEvent(rv$dk_optimal_lineups, { rv$dk_lock_v <- rv$dk_lock_v + 1L; rv$dk_slider_v <- rv$dk_slider_v + 1L })
-  observeEvent(rv$fd_optimal_lineups, { rv$fd_lock_v <- rv$fd_lock_v + 1L; rv$fd_slider_v <- rv$fd_slider_v + 1L })
-  observeEvent(rv$sd_optimal_lineups, { rv$sd_lock_v <- rv$sd_lock_v + 1L; rv$sd_slider_v <- rv$sd_slider_v + 1L })
+  observeEvent(rv$dk_optimal_lineups, { rv$dk_lock_v <- rv$dk_lock_v + 1L; rv$dk_slider_v <- rv$dk_slider_v + 1L; clear_lock_state("dk") })
+  observeEvent(rv$fd_optimal_lineups, { rv$fd_lock_v <- rv$fd_lock_v + 1L; rv$fd_slider_v <- rv$fd_slider_v + 1L; clear_lock_state("fd") })
+  observeEvent(rv$sd_optimal_lineups, { rv$sd_lock_v <- rv$sd_lock_v + 1L; rv$sd_slider_v <- rv$sd_slider_v + 1L; clear_lock_state("sd") })
   
   
   # ==========================================================================
   # FILTERED LINEUPS
   # ==========================================================================
   
+  # Row masks for lock / exclude.
+  # The old implementation was apply(dt[, ..cols], 1, function(r) ...), which
+  # coerces the whole player block to a character MATRIX (a full copy of the
+  # pool) and then loops row-by-row in R. On a 100k-lineup pool that was the
+  # slowest step in the filter chain, and it reran on every slider tick and
+  # every lock change. These build the same mask with vectorised column
+  # comparisons: one pass per (player x column), no matrix, no R-level loop.
+  has_all_players <- function(dt, cols, players) {
+    if (!length(players) || !length(cols)) return(rep(TRUE, nrow(dt)))
+    Reduce(`&`, lapply(players, function(p)
+      Reduce(`|`, lapply(cols, function(cc) !is.na(dt[[cc]]) & dt[[cc]] == p))))
+  }
+  has_no_players <- function(dt, cols, players) {
+    if (!length(players) || !length(cols)) return(rep(TRUE, nrow(dt)))
+    !Reduce(`|`, lapply(players, function(p)
+      Reduce(`|`, lapply(cols, function(cc) !is.na(dt[[cc]]) & dt[[cc]] == p))))
+  }
+
   make_filtered_lineups <- function(lp) {
     reactive({
       optimal <- rv[[paste0(lp,"_optimal_lineups")]]; req(optimal)
-      lineups <- copy(optimal)
+      # No copy(): every operation below is `lineups <- lineups[...]`, which
+      # returns a NEW data.table rather than modifying in place, and the only
+      # `:=` downstream (add_build) runs on a fresh sampled subset. Copying the
+      # whole pool here cost a full deep copy on every single invalidation.
+      lineups <- optimal
       rate_pairs <- list(c("WinRate","win"),c("Top1Pct","top1"),c("Top5Pct","top5"),
                          c("Top10Pct","top10"),c("Top20Pct","top20"))
       for (rp in rate_pairs) {
@@ -2298,62 +2328,44 @@ server <- function(input, output, session) {
         cpt_cols  <- grep("^Captain",    names(lineups), value=TRUE)
         flex_cols <- grep("^Util[1-4]$", names(lineups), value=TRUE)
         con_cols  <- grep("^Util5$",     names(lineups), value=TRUE)
-        locked_cpt <- input[[paste0(lp,"_locked_captain")]];     locked_cpt  <- locked_cpt[!is.null(locked_cpt)  & locked_cpt  != ""]
-        excl_cpt   <- input[[paste0(lp,"_excluded_captain")]];   excl_cpt    <- excl_cpt[!is.null(excl_cpt)    & excl_cpt    != ""]
-        locked_drv <- input[[paste0(lp,"_locked_players")]];     locked_drv  <- locked_drv[!is.null(locked_drv)  & locked_drv  != ""]
-        excl_drv   <- input[[paste0(lp,"_excluded_players")]];   excl_drv    <- excl_drv[!is.null(excl_drv)    & excl_drv    != ""]
-        locked_con <- input[[paste0(lp,"_locked_constructor")]]; locked_con  <- locked_con[!is.null(locked_con)  & locked_con  != ""]
-        excl_con   <- input[[paste0(lp,"_excluded_constructor")]]; excl_con  <- excl_con[!is.null(excl_con)    & excl_con    != ""]
-        if (length(locked_cpt) > 0 && length(cpt_cols) > 0)
-          lineups <- lineups[apply(lineups[,..cpt_cols],1,function(r) all(locked_cpt %in% r))]
-        if (length(excl_cpt)   > 0 && length(cpt_cols) > 0)
-          lineups <- lineups[apply(lineups[,..cpt_cols],1,function(r) !any(excl_cpt %in% r))]
+        # F1 rows carry their own type, so one LOCK column covers both: locking
+        # a driver constrains the flex driver slots, locking a constructor
+        # constrains the constructor slot. The CPT column is captain-only.
+        con_names <- if (!is.null(rv$sim_metadata) && "PlayerType" %in% names(rv$sim_metadata))
+          rv$sim_metadata[PlayerType == "Constructor", Player] else character(0)
+        la <- rv[[paste0(lp,"_lock_any")]]; xa <- rv[[paste0(lp,"_excl_any")]]
+        lc <- rv[[paste0(lp,"_lock_cpt")]]; xc <- rv[[paste0(lp,"_excl_cpt")]]
+        locked_con <- intersect(la, con_names); locked_drv <- setdiff(la, con_names)
+        excl_con   <- intersect(xa, con_names); excl_drv   <- setdiff(xa, con_names)
+        if (length(lc) > 0 && length(cpt_cols) > 0)
+          lineups <- lineups[has_all_players(lineups, cpt_cols,  lc)]
+        if (length(xc) > 0 && length(cpt_cols) > 0)
+          lineups <- lineups[has_no_players( lineups, cpt_cols,  xc)]
         if (length(locked_drv) > 0 && length(flex_cols) > 0)
-          lineups <- lineups[apply(lineups[,..flex_cols],1,function(r) all(locked_drv %in% r))]
+          lineups <- lineups[has_all_players(lineups, flex_cols, locked_drv)]
         if (length(excl_drv)   > 0 && length(flex_cols) > 0)
-          lineups <- lineups[apply(lineups[,..flex_cols],1,function(r) !any(excl_drv %in% r))]
+          lineups <- lineups[has_no_players( lineups, flex_cols, excl_drv)]
         if (length(locked_con) > 0 && length(con_cols) > 0)
-          lineups <- lineups[apply(lineups[,..con_cols],1,function(r) all(locked_con %in% r))]
+          lineups <- lineups[has_all_players(lineups, con_cols,  locked_con)]
         if (length(excl_con)   > 0 && length(con_cols) > 0)
-          lineups <- lineups[apply(lineups[,..con_cols],1,function(r) !any(excl_con %in% r))]
+          lineups <- lineups[has_no_players( lineups, con_cols,  excl_con)]
       } else {
-        ver    <- rv[[paste0(lp,"_lock_v")]]
-        locked <- input[[paste0(lp,"_locked_players_v",ver)]]
-        locked <- locked[!is.null(locked) & locked != ""]
-        if (length(locked) > 0) {
-          pc <- grep("^Player|^Captain|^MVP|^Util",names(lineups),value=TRUE)
-          lineups <- lineups[apply(lineups[,..pc],1,function(r) all(locked %in% r))]
-        }
-        excluded <- input[[paste0(lp,"_excluded_players_v",ver)]]
-        excluded <- excluded[!is.null(excluded) & excluded != ""]
-        if (length(excluded) > 0) {
-          pc <- grep("^Player|^Captain|^MVP|^Util",names(lineups),value=TRUE)
-          lineups <- lineups[apply(lineups[,..pc],1,function(r) !any(excluded %in% r))]
-        }
+        locked   <- rv[[paste0(lp,"_lock_any")]]
+        excluded <- rv[[paste0(lp,"_excl_any")]]
+        pc <- grep("^Player|^Captain|^MVP|^Util",names(lineups),value=TRUE)
+        if (length(locked)   > 0) lineups <- lineups[has_all_players(lineups, pc, locked)]
+        if (length(excluded) > 0) lineups <- lineups[has_no_players( lineups, pc, excluded)]
 
         # SHOWDOWN: captain and flex are separate roster spots, so they filter
         # separately. A player locked at captain is a different constraint from
         # the same player locked anywhere, and excluding him at captain while
-        # allowing him in flex is a normal thing to want.
-        cap_cols  <- grep("^Captain$|^MVP$", names(lineups), value = TRUE)
-        flex_cols <- grep("^Util|^Player",   names(lineups), value = TRUE)
-        pick <- function(id) {
-          v <- input[[paste0(lp, id, ver)]]
-          v[!is.null(v) & v != ""]
-        }
+        # allowing him in flex is a normal thing to want. The CPT column in the
+        # exposure table drives these.
+        cap_cols <- grep("^Captain$|^MVP$", names(lineups), value = TRUE)
         if (length(cap_cols)) {
-          lc <- pick("_locked_cpt_v"); ec <- pick("_excluded_cpt_v")
+          lc <- rv[[paste0(lp,"_lock_cpt")]]; ec <- rv[[paste0(lp,"_excl_cpt")]]
           if (length(lc)) lineups <- lineups[get(cap_cols[1]) %in% lc]
           if (length(ec)) lineups <- lineups[!get(cap_cols[1]) %in% ec]
-        }
-        if (length(flex_cols)) {
-          lf <- pick("_locked_flex_v"); ef <- pick("_excluded_flex_v")
-          if (length(lf))
-            lineups <- lineups[apply(lineups[, ..flex_cols], 1,
-                                     function(r) all(lf %in% r))]
-          if (length(ef))
-            lineups <- lineups[apply(lineups[, ..flex_cols], 1,
-                                     function(r) !any(ef %in% r))]
         }
       }
       lineups
@@ -2372,6 +2384,47 @@ server <- function(input, output, session) {
   # FILTERED EXPOSURE
   # ==========================================================================
   
+  # ---- LOCK column in the exposure tables -----------------------------------
+  # A clickable badge per row: click cycles LOCK -> EXCL -> off. On showdown /
+  # F1 a second CPT badge does the same for the captain slot only. This is what
+  # replaced the stack of selectize boxes; the constraint now lives next to the
+  # exposure number you are reacting to.
+  lock_badge <- function(players, on_lock, on_excl) {
+    ifelse(players %in% on_lock,
+           '<span class="gts-badge gts-lock">LOCK</span>',
+    ifelse(players %in% on_excl,
+           '<span class="gts-badge gts-excl">EXCL</span>',
+           '<span class="gts-badge gts-none">+</span>'))
+  }
+
+  # JS: bind clicks on the badge cells and report {player, slot} back to Shiny.
+  # nonce makes a repeat click on the same cell still register as a new event.
+  # player_idx is the 0-based column position of Player in the rendered table.
+  lock_click_js <- function(lp, player_idx) {
+    DT::JS(paste0(
+      "table.on('click','td.gts-lockcell',function(){",
+        "var d=table.row(this).data(); if(!d) return;",
+        "var slot=$(this).hasClass('gts-cptcell')?'cpt':'any';",
+        "Shiny.setInputValue('", lp, "_lock_toggle',",
+          "{player:d[", player_idx, "],slot:slot,nonce:Math.random()},",
+          "{priority:'event'});",
+      "});"))
+  }
+
+  # Exposure tables: render a DT filter control ONLY for columns where filtering
+  # is a real action -- the categorical ones (Pos / Team / PosGroup). Numeric and
+  # free-text columns got a search box nobody used, and on sports with no such
+  # column at all (MMA, Golf, Tennis) that meant a whole row of dead inputs under
+  # the header. When there is nothing categorical, the filter row is dropped.
+  exposure_filter_cfg <- function(tbl) {
+    cats <- intersect(c("Pos","Position","PosGroup","Team"), names(tbl))
+    cats <- cats[vapply(cats, function(c_) is.factor(tbl[[c_]]), logical(1))]
+    if (!length(cats)) return(list(filter = "none", coldefs = NULL))
+    others <- setdiff(seq_along(names(tbl)), match(cats, names(tbl))) - 1L
+    list(filter  = list(position = "top", clear = TRUE),
+         coldefs = list(list(targets = as.list(others), searchable = FALSE)))
+  }
+
   make_filtered_exposure <- function(filtered_reactive, platform) {
     renderDT({
       req(filtered_reactive(), rv$sim_metadata)
@@ -2393,21 +2446,21 @@ server <- function(input, output, session) {
       } else {
         rv$sim_metadata$Player
       }
-      exp_tbl <- data.table(Player = meta_players, Exposure = 0)
-      for (i in seq_len(nrow(exp_tbl))) {
-        p <- exp_tbl$Player[i]
-        if (p %in% names(all_counts)) exp_tbl$Exposure[i] <- as.numeric(all_counts[p]) / n_lineups * 100
+      # Vectorised count lookup. This was a for-loop doing `exp_tbl$col[i] <- ..`
+      # per player, which reallocates the column on every iteration -- O(n^2)
+      # copying on a 200+ player slate, three times over (total/cpt/util).
+      pct_of <- function(counts) {
+        if (!length(counts) || n_lineups == 0) return(rep(0, length(meta_players)))
+        v <- as.numeric(counts[meta_players])
+        v[is.na(v)] <- 0
+        v / n_lineups * 100
       }
+      exp_tbl <- data.table(Player = meta_players, Exposure = pct_of(all_counts))
       if (has_captain || length(util_cols) > 0) {
         cpt_counts  <- if (length(cpt_cols))  table(unlist(filtered[, ..cpt_cols]))  else table(character(0))
         util_counts <- if (length(util_cols)) table(unlist(filtered[, ..util_cols])) else table(character(0))
-        exp_tbl[, CptExp  := 0]
-        exp_tbl[, UtilExp := 0]
-        for (i in seq_len(nrow(exp_tbl))) {
-          p <- exp_tbl$Player[i]
-          if (p %in% names(cpt_counts))  exp_tbl$CptExp[i]  <- as.numeric(cpt_counts[p])  / n_lineups * 100
-          if (p %in% names(util_counts)) exp_tbl$UtilExp[i] <- as.numeric(util_counts[p]) / n_lineups * 100
-        }
+        exp_tbl[, CptExp  := pct_of(cpt_counts)]
+        exp_tbl[, UtilExp := pct_of(util_counts)]
         if (is_f1) {
           exp_tbl[Player %in% rv$sim_metadata$Player[rv$sim_metadata$PlayerType == "Constructor"],
                   c("CptExp","UtilExp") := NA_real_]
@@ -2521,7 +2574,10 @@ server <- function(input, output, session) {
       
       # For NBA-SD, Exposure was replaced by TotExp
       exp_sort_col <- if ("Exposure" %in% names(exp_tbl)) "Exposure" else "TotExp"
-      exp_tbl <- exp_tbl[get(exp_sort_col) > 0]
+      # Every player in the sim stays in the table, including 0% ones: an
+      # unrostered player is information (the optimiser never wanted him),
+      # and silently dropping him made the table disagree with the pool.
+      # They sort to the bottom, so the useful rows are still on top.
       setorderv(exp_tbl, exp_sort_col, order = -1L)
       # Pos and Team as FACTORS so DT's column filter renders a dropdown of the
       # actual values instead of a free-text box -- that is what makes "show me
@@ -2529,9 +2585,42 @@ server <- function(input, output, session) {
       # work at all, but dom='tp' still keeps the global search box hidden.
       for (fc in intersect(c("Pos","Position","PosGroup","Team"), names(exp_tbl)))
         if (!is.factor(exp_tbl[[fc]])) set(exp_tbl, j = fc, value = factor(exp_tbl[[fc]]))
+      # ---- LOCK / CPT badge columns ----------------------------------------
+      # Prepended so they sit at the left edge, next to the player name.
+      lp_ <- tolower(platform)
+      show_cpt <- has_captain || length(grep("^MVP$", names(filtered), value=TRUE)) > 0 || is_f1
+      exp_tbl[, LOCK := lock_badge(Player, rv[[paste0(lp_,"_lock_any")]],
+                                           rv[[paste0(lp_,"_excl_any")]])]
+      if (show_cpt)
+        exp_tbl[, CPT := lock_badge(Player, rv[[paste0(lp_,"_lock_cpt")]],
+                                            rv[[paste0(lp_,"_excl_cpt")]])]
+      setcolorder(exp_tbl, c(intersect(c("LOCK","CPT"), names(exp_tbl)),
+                             setdiff(names(exp_tbl), c("LOCK","CPT"))))
+
+      fcfg <- exposure_filter_cfg(exp_tbl)
+      nm        <- names(exp_tbl)
+      lock_idx  <- which(nm == "LOCK") - 1L
+      cpt_idx   <- if ("CPT" %in% nm) which(nm == "CPT") - 1L else integer(0)
+      player_ix <- which(nm == "Player") - 1L
+      badge_defs <- c(
+        list(list(targets = as.list(lock_idx), className = "gts-lockcell",
+                  orderable = TRUE, searchable = FALSE, title = "LOCK")),
+        if (length(cpt_idx))
+          list(list(targets = as.list(cpt_idx),
+                    className = "gts-lockcell gts-cptcell",
+                    orderable = TRUE, searchable = FALSE, title = "CPT"))
+      )
+      # Only the badge columns carry HTML; everything else stays escaped so a
+      # player name with an ampersand or quote cannot break the cell.
+      esc <- setdiff(seq_along(nm), c(which(nm == "LOCK"), which(nm == "CPT")))
+
       dt <- datatable(exp_tbl,
-                      filter = list(position = "top", clear = TRUE),
-                      options=list(pageLength=50,scrollX=TRUE,searching=TRUE,lengthChange=FALSE,dom='tp'),
+                      filter = fcfg$filter,
+                      escape = esc,
+                      callback = lock_click_js(lp_, player_ix),
+                      options=list(pageLength=50,scrollX=TRUE,searching=TRUE,lengthChange=FALSE,dom='tp',
+                                   stateSave=TRUE,
+                                   columnDefs=c(badge_defs, fcfg$coldefs)),
                       rownames=FALSE)
       rc <- intersect(c("CptExp","CptOwn","CptLev",
                         "UtlExp","UtlOwn","UtlLev",
@@ -2855,7 +2944,8 @@ server <- function(input, output, session) {
         }
         
         exp_sort_col <- if ("Exposure" %in% names(exp_tbl)) "Exposure" else "TotExp"
-        exp_tbl <- exp_tbl[get(exp_sort_col) > 0]
+        # Every player in the sim stays in the table, including 0% ones --
+        # see the note in make_filtered_exposure.
         setorderv(exp_tbl, exp_sort_col, order = -1L)
         
         # ── Rename to display labels now that all Exposure-dependent calcs are done ──
@@ -2881,8 +2971,10 @@ server <- function(input, output, session) {
         
         for (fc in intersect(c("Pos","Position","PosGroup","Team"), names(exp_tbl)))
           if (!is.factor(exp_tbl[[fc]])) set(exp_tbl, j = fc, value = factor(exp_tbl[[fc]]))
-        dt <- datatable(exp_tbl, filter = list(position = "top", clear = TRUE),
-                        options=list(pageLength=50,scrollX=TRUE,searching=TRUE,lengthChange=FALSE,dom='tp'), rownames=FALSE)
+        fcfg <- exposure_filter_cfg(exp_tbl)
+        dt <- datatable(exp_tbl, filter = fcfg$filter,
+                        options=list(pageLength=50,scrollX=TRUE,searching=TRUE,lengthChange=FALSE,dom='tp',
+                                     columnDefs=fcfg$coldefs), rownames=FALSE)
         rc <- intersect(c("CptExp","CptOwn","CptLev",
                           "UtlExp","UtlOwn","UtlLev",
                           "TotExp","TotOwn","TotLev",
@@ -2987,12 +3079,15 @@ server <- function(input, output, session) {
         }
         
         exp_sort_col <- if ("Exposure" %in% names(exp_tbl)) "Exposure" else "TotExp"
-        exp_tbl <- exp_tbl[get(exp_sort_col) > 0]
+        # Every player in the sim stays in the table, including 0% ones --
+        # see the note in make_filtered_exposure.
         setorderv(exp_tbl, exp_sort_col, order = -1L)
         for (fc in intersect(c("Pos","Position","PosGroup","Team"), names(exp_tbl)))
           if (!is.factor(exp_tbl[[fc]])) set(exp_tbl, j = fc, value = factor(exp_tbl[[fc]]))
-        dt <- datatable(exp_tbl, filter = list(position = "top", clear = TRUE),
-                        options=list(pageLength=50,scrollX=TRUE,searching=TRUE,lengthChange=FALSE,dom='tp'), rownames=FALSE)
+        fcfg <- exposure_filter_cfg(exp_tbl)
+        dt <- datatable(exp_tbl, filter = fcfg$filter,
+                        options=list(pageLength=50,scrollX=TRUE,searching=TRUE,lengthChange=FALSE,dom='tp',
+                                     columnDefs=fcfg$coldefs), rownames=FALSE)
         rc <- intersect(c("CptExp","CptOwn","CptLev",
                           "UtlExp","UtlOwn","UtlLev",
                           "TotExp","TotOwn","TotLev",

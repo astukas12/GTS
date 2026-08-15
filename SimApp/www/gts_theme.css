@@ -1458,3 +1458,30 @@ a.text-info {
   background-color: var(--gts-gold) !important;
   color: var(--gts-black) !important;
 }
+/* ── Lock / exclude badges in the exposure tables ───────────────────────────
+   Clicking one of these cells cycles the player LOCK -> EXCL -> off. The whole
+   cell is the hit target, not just the badge, so the click is forgiving. */
+td.gts-lockcell {
+  cursor: pointer;
+  text-align: center;
+  padding: 2px 4px !important;
+  user-select: none;
+}
+td.gts-lockcell:hover { background-color: #3a3a3a; }
+
+.gts-badge {
+  display: inline-block;
+  min-width: 42px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: bold;
+  letter-spacing: 0.3px;
+  line-height: 16px;
+}
+/* Neutral state is deliberately dim: a 200-row table should read as "nothing
+   set", with only the active constraints pulling the eye. */
+.gts-badge.gts-none { background: transparent; color: #555; border: 1px dashed #444; }
+td.gts-lockcell:hover .gts-badge.gts-none { color: #FFE500; border-color: #FFE500; }
+.gts-badge.gts-lock { background: #4caf50; color: #111; }
+.gts-badge.gts-excl { background: #ff6b6b; color: #111; }
