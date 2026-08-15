@@ -2589,6 +2589,16 @@ server <- function(input, output, session) {
       btn_cols <- intersect(c("LOCK","EXCL","CPT LOCK","CPT EXCL"), names(exp_tbl))
       setcolorder(exp_tbl, c(btn_cols, setdiff(names(exp_tbl), btn_cols)))
 
+      # Row state drives the whole-row tint, so a constrained player is obvious
+      # while scanning the exposure numbers rather than only at the button.
+      # Held in a hidden column because DT styles rows off a column value.
+      # A lock in ANY slot wins over an exclude: being locked somewhere means
+      # the player is in every lineup, which is the stronger thing to notice.
+      lock_all <- union(rv[[paste0(lp_,"_lock_any")]], rv[[paste0(lp_,"_lock_cpt")]])
+      excl_all <- union(rv[[paste0(lp_,"_excl_any")]], rv[[paste0(lp_,"_excl_cpt")]])
+      exp_tbl[, .rowstate := fifelse(Player %in% lock_all, "lock",
+                             fifelse(Player %in% excl_all, "excl", ""))]
+
       fcfg <- exposure_filter_cfg(exp_tbl)
       nm        <- names(exp_tbl)
       ix <- function(cn) if (cn %in% nm) which(nm == cn) - 1L else integer(0)
@@ -2604,6 +2614,9 @@ server <- function(input, output, session) {
              searchable = FALSE, orderable = TRUE),
         list(targets = as.list(ix("CPT EXCL")), className = "gts-btncell gts-cptcell gts-exclcell",
              searchable = FALSE, orderable = TRUE)))
+      # The state column only exists to drive the row tint -- never shown.
+      btn_defs <- c(btn_defs, list(
+        list(targets = as.list(ix(".rowstate")), visible = FALSE, searchable = FALSE)))
       # Only the button columns carry HTML; everything else stays escaped so a
       # player name with an ampersand or quote cannot break the cell.
       esc <- setdiff(seq_along(nm), match(btn_cols, nm))
@@ -2616,6 +2629,16 @@ server <- function(input, output, session) {
                                    stateSave=TRUE,
                                    columnDefs=c(btn_defs, fcfg$coldefs)),
                       rownames=FALSE)
+      # Whole-row tint for constrained players. Kept low-saturation so it reads
+      # as a highlight rather than an alert -- the numbers still have to be
+      # legible on top of it -- with a solid left edge doing the real signalling.
+      dt <- dt %>% formatStyle(
+        ".rowstate", target = "row",
+        backgroundColor = styleEqual(c("lock","excl"),
+                                     c("rgba(76,175,80,0.16)", "rgba(255,107,107,0.14)")),
+        borderLeft      = styleEqual(c("lock","excl"),
+                                     c("3px solid #4caf50", "3px solid #ff6b6b")),
+        color           = styleEqual(c("lock","excl"), c("#dff5df", "#ffdcdc")))
       rc <- intersect(c("CptExp","CptOwn","CptLev",
                         "UtlExp","UtlOwn","UtlLev",
                         "TotExp","TotOwn","TotLev",
