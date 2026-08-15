@@ -183,11 +183,17 @@ ui <- dashboardPage(
       .sidebar-menu>li>.treeview-menu{background:#0a0a0a}
 
       /* Sidebar collapse tab — fixed to right edge of sidebar */
+      /* Was #444 on #111 at 16px wide, which read as invisible against the
+         sidebar. Wider, lighter, and raised off the page with a shadow. */
       #gts_sb_tab{position:fixed;top:50%;left:200px;transform:translateY(-50%);z-index:9999;
-        background:#111;border:1px solid #2a2a2a;border-left:none;border-radius:0 6px 6px 0;
-        color:#444;font-size:13px;width:16px;height:48px;padding:0;cursor:pointer;line-height:48px;
-        text-align:center;transition:left .2s ease,color .15s,background .15s,border-color .15s}
-      #gts_sb_tab:hover{color:#FFE500;background:#1a1a1a;border-color:#444}
+        background:#1e1e1e;border:1px solid #3a3a3a;border-left:none;border-radius:0 8px 8px 0;
+        color:#9a9a9a;font-size:15px;width:22px;height:66px;padding:0;cursor:pointer;line-height:66px;
+        text-align:center;box-shadow:3px 0 8px rgba(0,0,0,.5);
+        transition:left .2s ease,width .15s,color .15s,background .15s,border-color .15s}
+      /* Hover fills gold: unmistakably a control, and matches the theme. */
+      #gts_sb_tab:hover{color:#111;background:#FFE500;border-color:#FFE500;width:26px}
+      #gts_sb_tab:active{background:#e6ce00}
+      #gts_sb_tab:focus{outline:none;box-shadow:3px 0 8px rgba(0,0,0,.5),0 0 0 2px rgba(255,229,0,.35)}
       .sidebar-collapse #gts_sb_tab{left:50px}
 
       /* Platform pill selector — used in sim results and lineup scoring */
@@ -339,16 +345,16 @@ ui <- dashboardPage(
         var btn  = document.getElementById('gts_sb_tab');
         if (collapsed) {
           body.classList.add('sidebar-collapse');
-          if (btn) btn.textContent = '\u25BA';
+          if (btn) btn.innerHTML = '<i class="fa-solid fa-angle-right"></i>';
         } else {
           body.classList.remove('sidebar-collapse');
-          if (btn) btn.textContent = '\u25C4';
+          if (btn) btn.innerHTML = '<i class="fa-solid fa-angle-left"></i>';
         }
       }
 
       var btn = document.createElement('button');
       btn.id  = 'gts_sb_tab';
-      btn.title = 'Toggle sidebar (or press [)';
+      btn.title = 'Collapse / expand sidebar  ( [ )';
       btn.onclick = function() {
         var collapsed = !document.querySelector('body').classList.contains('sidebar-collapse');
         applyState(collapsed);
@@ -2368,9 +2374,13 @@ server <- function(input, output, session) {
   lock_btn <- function(players, active, kind) {
     cls <- if (kind == "lock") "gts-lock" else "gts-excl"
     lab <- if (kind == "lock") "LOCK" else "EXCL"
+    # Icon-only: the column header already says LOCK / EXCL, so repeating the
+    # word on all 200 rows was noise. Font Awesome ships with the app already.
+    icon <- if (kind == "lock") '<i class="fa-solid fa-lock"></i>'
+            else                '<i class="fa-solid fa-xmark"></i>'
     ifelse(players %in% active,
-           paste0('<span class="gts-btn ', cls, ' on">',  lab, '</span>'),
-           paste0('<span class="gts-btn ', cls, ' off">', lab, '</span>'))
+           paste0('<span class="gts-btn ', cls, ' on">',  icon, '</span>'),
+           paste0('<span class="gts-btn ', cls, ' off">', icon, '</span>'))
   }
 
   # JS: report {player, slot, action} when a button cell is clicked. The cell
