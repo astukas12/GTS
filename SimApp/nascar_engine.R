@@ -1276,8 +1276,15 @@ create_dominator_violin_by_position <- function(sim_results, platform = "DK",
 #'   positions over which alternatives become competitive. 2-4 loosens the bond
 #'   noticeably; large values approach a random eligible assignment.
 #' @param start_weight Weight on qualifying position relative to finishing
-#'   position in the match distance. 1 (default) weights them equally; 0 ignores
-#'   the grid and matches on finishing position alone.
+#'   position in the match distance. 0 (default) matches on finishing position
+#'   alone; 1 weights the grid equally with it.
+#'
+#'   The default is 0 deliberately. A profile's starting spot is a fact about
+#'   the historical driver, not about yours -- what transfers is "this car
+#'   finished 4th and led 228 laps". Weighting the historical start also
+#'   double-counts the grid, which is already inside DKMax via the projected
+#'   finish curve, and with a sparse profile pool it locks drivers out of
+#'   profiles purely because no past dominator happened to start near them.
 #' @return The current settings, invisibly when setting.
 #' @examples
 #'   gts_dom_bond()                          # read current settings
@@ -1295,8 +1302,73 @@ gts_dom_bond <- function(tau = NULL, start_weight = NULL) {
     options(gts.dom.start_weight = start_weight)
   }
   out <- list(tau = getOption("gts.dom.tau", 0),
-              start_weight = getOption("gts.dom.start_weight", 1))
+              start_weight = getOption("gts.dom.start_weight", 0))
   if (is.null(tau) && is.null(start_weight)) out else invisible(out)
+}
+
+#' Pick tau from the data instead of by hand
+#'
+#' There is a right answer for tau, and the profile pool already contains it.
+#' Race_Profiles is a set of real races, so the relationship between where a
+#' driver finished and how many dominator points they scored is a fact we can
+#' measure. The simulation should reproduce it.
+#'
+#' At tau = 0 the engine hands the biggest profile to the closest finisher every
+#' single time, which makes that relationship TIGHTER in the sim than it was in
+#' reality. Raising tau loosens the match until the two agree. So this is a
+#' calibration, not a preference: run the sim at several tau values and keep the
+#' one whose output matches the pool it was built from.
+#'
+#' Correlation is measured only over drivers who actually scored dominator
+#' points, because Race_Profiles only contains scoring drivers -- including the
+#' zeros on the sim side would compare two different populations.
+#'
+#' @param input_data Same list passed to run_nascar_simulation().
+#' @param taus Candidate values to try.
+#' @param n_sims Sims per candidate. A few thousand is plenty; this is a
+#'   correlation over tens of thousands of driver-rows.
+#' @param platform "DK" or "FD".
+#' @param seed Fixed so every candidate sees the same race draws, which makes
+#'   the comparison between them apples-to-apples.
+#' @param verbose Print the fit for each candidate.
+#' @return The chosen tau, with the full table attached as attr(x, "fit").
+gts_calibrate_tau <- function(input_data, taus = c(0, 1, 2, 3, 4, 6, 8, 12),
+                              n_sims = 3000, platform = "DK", seed = 1L,
+                              verbose = TRUE) {
+  prof <- as.data.frame(input_data$Race_Profiles)
+  dom_col <- paste0(platform, "DomPoints")
+  if (!all(c("FinPos", dom_col) %in% names(prof)))
+    stop("Race_Profiles needs FinPos and ", dom_col)
+  target <- suppressWarnings(stats::cor(prof$FinPos, prof[[dom_col]]))
+  if (!is.finite(target)) stop("could not compute a target correlation from Race_Profiles")
+
+  old <- getOption("gts.dom.tau", 0)
+  on.exit(options(gts.dom.tau = old), add = TRUE)
+  sim_col <- paste0(platform, "DominatorPoints")
+
+  fit <- do.call(rbind, lapply(taus, function(tt) {
+    options(gts.dom.tau = tt)
+    set.seed(seed)
+    r <- suppressMessages(utils::capture.output(
+      out <- run_nascar_simulation(input_data, n_sims = n_sims, config = list())))
+    d <- as.data.frame(out$full_results)
+    keep <- d[[sim_col]] > 0
+    data.frame(tau = tt,
+               sim_cor = suppressWarnings(stats::cor(d$FinishPosition[keep], d[[sim_col]][keep])),
+               scoring_rate = mean(keep))
+  }))
+  fit$gap <- abs(fit$sim_cor - target)
+  best <- fit$tau[which.min(fit$gap)]
+
+  if (verbose) {
+    cat(sprintf("target cor(finish, dominator pts) from Race_Profiles: %.3f\n", target))
+    print(within(fit, {
+      sim_cor <- round(sim_cor, 3); gap <- round(gap, 3)
+      scoring_rate <- round(scoring_rate, 3)
+    }), row.names = FALSE)
+    cat(sprintf("-> tau = %g\n", best))
+  }
+  structure(best, fit = fit, target = target)
 }
 
 assign_dominator_points_from_profiles_optimized <- function(race_result, race_weights,
@@ -1372,7 +1444,7 @@ assign_dominator_points_from_profiles_optimized <- function(race_result, race_we
   # start_weight scales how much qualifying position constrains the match
   # relative to finishing position; see gts_dom_bond(). 1 = original behaviour.
   bond_tau    <- getOption("gts.dom.tau", 0)
-  bond_startw <- getOption("gts.dom.start_weight", 1)
+  bond_startw <- getOption("gts.dom.start_weight", 0)
   finish_diff_matrix <- outer(driver_finishes, profile_finishes, function(x, y) abs(x - y))
   start_diff_matrix <- outer(driver_starts, profile_starts, function(x, y) abs(x - y))
   distance_matrix <- sqrt(finish_diff_matrix^2 + bond_startw * start_diff_matrix^2)

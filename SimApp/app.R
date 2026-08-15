@@ -2399,18 +2399,13 @@ server <- function(input, output, session) {
       "});"))
   }
 
-  # Exposure tables: render a DT filter control ONLY for columns where filtering
-  # is a real action -- the categorical ones (Pos / Team / PosGroup). Numeric and
-  # free-text columns got a search box nobody used, and on sports with no such
-  # column at all (MMA, Golf, Tennis) that meant a whole row of dead inputs under
-  # the header. When there is nothing categorical, the filter row is dropped.
+  # Exposure tables carry no DT filter row on any sport. Even restricted to the
+  # categorical columns it was a band of half-height inputs under the header
+  # that nobody typed into, and the column sort arrows already cover the cases
+  # it was there for. Sorting and the Lock/Excl cells stay; only the filter
+  # inputs go.
   exposure_filter_cfg <- function(tbl) {
-    cats <- intersect(c("Pos","Position","PosGroup","Team"), names(tbl))
-    cats <- cats[vapply(cats, function(c_) is.factor(tbl[[c_]]), logical(1))]
-    if (!length(cats)) return(list(filter = "none", coldefs = NULL))
-    others <- setdiff(seq_along(names(tbl)), match(cats, names(tbl))) - 1L
-    list(filter  = list(position = "top", clear = TRUE),
-         coldefs = list(list(targets = as.list(others), searchable = FALSE)))
+    list(filter = "none", coldefs = NULL)
   }
 
   make_filtered_exposure <- function(filtered_reactive, platform) {
