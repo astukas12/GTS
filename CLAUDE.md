@@ -19,15 +19,39 @@ shiny::runGitHub(repo = "GTS", username = "astukas12",
                  subdir = "SimApp", ref = "main")
 ```
 
+The launcher is not tracked in this repo — it lives on Andrew's machine, and
+each customer holds their own copy with `ref = "main"` baked in. It cannot be
+repointed after the fact, so **`main` is the release branch and that is fixed.**
+
 Three consequences, and they govern everything else in this file:
 
-1. **There is no release step.** Whatever is on `main` is what the next customer
-   runs, the moment it is pushed. Never push a broken `main`.
-2. **This repo must stay public.** `runGitHub` fetches the public archive.
+1. **This repo must stay public.** `runGitHub` fetches the public archive.
    Making it private breaks every customer.
-3. **`runGitHub` downloads the whole repo**, then runs the `SimApp` subdir. Every
-   tracked file anywhere in the repo is on the customer's download path — 16MB
+2. **`runGitHub` downloads the whole repo**, then runs the `SimApp` subdir. Every
+   tracked file anywhere in the repo is on the customer's download path — 15.7MB
    today for roughly 1MB of app. Adding large files here has a direct cost.
+3. **Never commit to `main`.** See below.
+
+## Branching: `dev` is where work happens
+
+`main` ships to customers, so it is not a working branch.
+
+```
+git checkout dev          # everything happens here
+git commit ...            # freely
+
+git checkout main         # only to ship
+git merge --no-ff dev     # this is the release
+git push                  # customers get it now
+```
+
+Feature branches come off `dev` and merge back to `dev`. `main` only ever
+receives merges from `dev`, and only when the change has been verified.
+
+A `pre-commit` hook in `.git/hooks/` refuses direct commits on `main` and
+explains why. It allows merge commits, since that is the ship action. It is
+local and untracked, so it does not reach customers. `--no-verify` overrides it
+if you genuinely mean to.
 
 ## The wider operation
 
