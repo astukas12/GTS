@@ -1,0 +1,25 @@
+# Customers run this repo directly via shiny::runGitHub(subdir = "SimApp"),
+# which downloads the WHOLE repo on every launch. Anything tracked here is on
+# their download path, so keep working files, backups and data dumps out.
+
+# Backup copies. Use a git branch instead — see CLAUDE.md.
+*.bak
+*.bak-*
+*.orig
+*~
+
+# R session cruft
+.Rhistory
+.RData
+.Rproj.user/
+.Ruserdata
+*.Rproj
+
+# Local fixtures. 72 real NASCAR input sheets, ~5.7MB. Kept out of git so
+# customers do not download them; they are test fixtures, not app data.
+TheLab/InputFiles/
+
+# OS noise
+Thumbs.db
+Desktop.ini
+.DS_Store

@@ -3,12 +3,31 @@
 Four R/Shiny apps for Golden Ticket Sims, a daily-fantasy sports simulation
 operation. Solo-maintained.
 
-| App | What it is | Deployed |
+| App | What it is | How it reaches users |
 | --- | --- | --- |
-| `SimApp/` | The simulator. 10 sport engines behind one dashboard. | local only |
+| `SimApp/` | The simulator. 10 sport engines behind one dashboard. | `runGitHub` off `main` — see below |
 | `TheLab/` | NASCAR research + input-sheet builder. | shinyapps.io |
 | `AuctionDraft/` | Status unknown — do not assume it is live. | — |
 | `OhHell/` | Status unknown — do not assume it is live. | — |
+
+## `main` is production
+
+`GTS2026Launch.R` (in `Documents\`, outside this repo) is what customers run:
+
+```r
+shiny::runGitHub(repo = "GTS", username = "astukas12",
+                 subdir = "SimApp", ref = "main")
+```
+
+Three consequences, and they govern everything else in this file:
+
+1. **There is no release step.** Whatever is on `main` is what the next customer
+   runs, the moment it is pushed. Never push a broken `main`.
+2. **This repo must stay public.** `runGitHub` fetches the public archive.
+   Making it private breaks every customer.
+3. **`runGitHub` downloads the whole repo**, then runs the `SimApp` subdir. Every
+   tracked file anywhere in the repo is on the customer's download path — 16MB
+   today for roughly 1MB of app. Adding large files here has a direct cost.
 
 ## The wider operation
 
@@ -25,17 +44,19 @@ scope — no need to request access:
 
 - R 4.4.2 at `C:\Program Files\R\R-4.4.2\bin\Rscript.exe`.
 - Windows. Paths in R code use forward slashes or escaped backslashes.
-- Deployment is `rsconnect` → shinyapps.io, account `goldenticketsims`. It
-  publishes from local files and **never reads GitHub**, so repo state and
-  deployed state are independent.
-- Both repos are currently public on GitHub. Keep credentials, tokens, and
-  customer data out of every file here.
+- `TheLab` deploys separately via `rsconnect` → shinyapps.io, account
+  `goldenticketsims`. That path publishes from local files and does not read
+  GitHub, so TheLab's deployed state and repo state are independent. **SimApp is
+  the opposite** — see "`main` is production" above.
+- This repo is public and must stay so. Keep credentials, tokens, and customer
+  data out of every file here.
 
 ## Standing rules
 
 **Branch before structural work.** Any change touching multiple files or
 restructuring a file gets a git branch first. Andrew runs live slates off this
-working copy — `main` must stay runnable at all times.
+working copy and customers run `main` directly — `main` must stay runnable at
+all times.
 
 **Verification bar: launch and load.** An app change is not done until the app
 has been started and a real input sheet for an affected sport has been loaded
