@@ -61,8 +61,10 @@ scope — no need to request access:
 - `C:\Users\astuk\OneDrive\Documents\GTS` — the working-data tree. Per-sport
   folders holding InputMaker scripts, database-update scripts, and real input
   sheets. Has its own CLAUDE.md.
-- `C:\Users\astuk\OneDrive\Documents\GitHub\NicheSportSimsPublic\Sweat` — the
-  MMA sweat tool. Separate repo, its own CLAUDE.md.
+- `C:\Users\astuk\OneDrive\Documents\GitHub\NicheSportSimsPublic` — the previous
+  generation: 15 Shiny apps behind their own customer launcher. Sims run through
+  `SimApp` now, so treat it as legacy. Two things in it still matter — a working
+  CFB app, and `Sweat/`. Its own CLAUDE.md has the detail.
 
 ## Environment
 
@@ -97,10 +99,15 @@ build. Plan mode is the right tool for this.
 
 ## Known state (August 2026)
 
-- **No tests anywhere.** Nothing can be verified safe by automation yet.
-- No `.gitignore`. Three `.bak` files sit in `SimApp/` — `app.R.bak` and
-  `sport_configs_universal.R.bak` are **committed to git**, `app.R.bak-20260815-000739`
-  is untracked. `TheLab/InputFiles/` (72 sheets) is untracked.
-- `tennis_clean_database.xlsx` (8.4MB) is committed in-repo.
-- `SimApp/app.R` is ~4,940 lines in one file. Read the part you need — grep for
+- **No tests anywhere.** Nothing can be verified safe by automation yet. The
+  bar is the manual launch-and-load check above.
+- `SimApp/app.R` is 4,939 lines in one file. Read the part you need — grep for
   the function, then read that range. Do not read it whole.
+- Three `.bak` files sit in `SimApp/`, untracked and gitignored. They are
+  Andrew's older safety net; leave them alone. Use a branch instead.
+- `SimApp/tennis_clean_database.xlsx` (8.6MB) is a real runtime dependency of
+  `tennis_engine.R`, so it has to stay tracked — but it is on every customer's
+  download path. Converting it to `.rds` would shrink it sharply; that is a code
+  change and wants a test around it.
+- `TheLab/NascarData.xlsx` (4.7MB) is used only by TheLab, yet SimApp customers
+  download it too. Splitting TheLab out is the fix, and it is not scoped yet.
