@@ -84,6 +84,20 @@ restructuring a file gets a git branch first. Andrew runs live slates off this
 working copy and customers run `main` directly — `main` must stay runnable at
 all times.
 
+**The operation is live.** Andrew builds input sheets for real slates from this
+working copy while the overhaul is happening. Tennis runs daily; MMA and NASCAR
+on weekends; NFL preseason for three weeks in August; NFL and CFB from early
+autumn. Three rules follow:
+
+1. **Never end a session with the working copy unable to produce a sheet.** This
+   outranks finishing whatever refactor is in progress.
+2. **Ask what is on the slate before touching a sport's engine or InputMaker.**
+   Tennis is daily, so tennis code is effectively always in production.
+3. **Structural work belongs in a git worktree**, so the copy Andrew builds
+   sheets from is never mid-surgery. A branch alone is not enough when one
+   directory is doing both jobs. Prefer additive change during live weeks — new
+   file alongside old, switch when verified — over in-place restructuring.
+
 **Verification bar: launch and load.** An app change is not done until the app
 has been started and a real input sheet for an affected sport has been loaded
 successfully. Say exactly what was checked. There is no test suite yet, so a
