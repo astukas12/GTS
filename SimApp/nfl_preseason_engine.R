@@ -488,7 +488,16 @@ run_nfl_preseason_simulation <- function(input_data, n_sims = 20000,
 
       rb <- sh[Pos %in% c("QB","RB"),
                .(player = Player, pos = Pos, drive_start = DriveStart,
-                 drive_end = DriveEnd, weight = 1,
+                 drive_end = DriveEnd,
+                 # RUSHING weight, per player. Every back in a window used to be
+                 # weighted 1, so carries split by stickiness alone and a pure
+                 # receiving back (Ogunbowale: 10 snaps, 6 routes, ZERO carries in
+                 # 2026 wk1) drew the same carry share as an early-down banger.
+                 # Re-labelling him WR would fix the carries but break his DK
+                 # roster slot and swap his catch-length profile, so the weight
+                 # belongs here instead.
+                 weight = if ("RushWeight" %in% names(sh))
+                            pmax(0, as.numeric(RushWeight)) else 1,
                  mob = if ("Mobility" %in% names(sh))
                          PS_MOB_TIER[tolower(trimws(Mobility))] else NA_real_)]
       wr <- sh[Pos %in% c("WR","TE","RB"),
