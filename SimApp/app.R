@@ -1482,7 +1482,9 @@ server <- function(input, output, session) {
                            # anything the optimiser reads has to be copied in
                            # explicitly -- pool_spread was set in the sport
                            # config and silently never arrived.
-                           pool_spread=rv$config$pool_spread %||% 0)
+                           pool_spread=rv$config$pool_spread %||% 0,
+                           phase1_metric=rv$config$phase1_metric %||% "mean",
+                           phase1_sims=rv$config$phase1_sims %||% 5000L)
         progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
         lineup_data <- find_optimal_lineups(opt_data, opt_config,
                                             mode=rv$config$optimization_modes$DK, k=1, verbose=TRUE)
@@ -1515,7 +1517,9 @@ server <- function(input, output, session) {
                            # anything the optimiser reads has to be copied in
                            # explicitly -- pool_spread was set in the sport
                            # config and silently never arrived.
-                           pool_spread=rv$config$pool_spread %||% 0)
+                           pool_spread=rv$config$pool_spread %||% 0,
+                           phase1_metric=rv$config$phase1_metric %||% "mean",
+                           phase1_sims=rv$config$phase1_sims %||% 5000L)
         progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
         lineup_data <- find_optimal_lineups(opt_data, opt_config, mode=dk_mode, k=1, verbose=TRUE)
         progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
@@ -1650,7 +1654,9 @@ server <- function(input, output, session) {
                            # anything the optimiser reads has to be copied in
                            # explicitly -- pool_spread was set in the sport
                            # config and silently never arrived.
-                           pool_spread=rv$config$pool_spread %||% 0)
+                           pool_spread=rv$config$pool_spread %||% 0,
+                           phase1_metric=rv$config$phase1_metric %||% "mean",
+                           phase1_sims=rv$config$phase1_sims %||% 5000L)
         progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
         lineup_data <- find_optimal_lineups(opt_data, opt_config,
                                             mode=rv$config$optimization_modes$FD, k=1, verbose=TRUE)
