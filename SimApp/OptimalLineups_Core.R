@@ -1315,6 +1315,13 @@ calculate_distribution_metrics <- function(score_matrix, lineup_data, config,
     if (verbose) { cat("  Phase 3: Ranking lineups...\n"); flush.console() }
     
     # Pre-compute threshold ranks for each percentile
+    # matrixStats does the per-column max and order statistic in C. Nothing else
+    # here depends on it, so fall back to base when absent -- slower, identical.
+    .has_ms  <- requireNamespace("matrixStats", quietly = TRUE)
+    .colMaxs <- if (.has_ms) matrixStats::colMaxs else function(x) apply(x, 2L, max)
+    .colOrd  <- if (.has_ms) matrixStats::colOrderStats else
+                function(x, which) apply(x, 2L, function(v) sort(v, partial = which)[which])
+
     threshold_ranks  <- ceiling(n_lineups * percentiles)
     top_pcts         <- matrix(0L, nrow = n_lineups, ncol = length(percentiles))
     win_counts_accum <- integer(n_lineups)
@@ -1329,25 +1336,25 @@ calculate_distribution_metrics <- function(score_matrix, lineup_data, config,
       chunk_end    <- min(chunk_idx * chunk_size, n_sims)
       chunk_scores <- score_matrix[, chunk_start:chunk_end, drop = FALSE]
       
-      # Win counts: vectorized max per sim, then flag lineups that hit it
-      col_max          <- apply(chunk_scores, 2L, max)
+      # NO FULL RANKING. "rank(-x, ties='min') <= k" is exactly "x >= the k-th
+      # largest value in that sim", so a per-column ORDER STATISTIC answers every
+      # percentile without sorting. That drops an O(n log n) sort per sim to O(n)
+      # and stops materialising an n_lineups x chunk rank matrix. Measured on a
+      # 5,000-lineup pool over 50,000 sims this took the ranking step from ~84s
+      # to a few seconds, and the counts are identical (ties at the boundary land
+      # the same way under both forms).
+      col_max          <- .colMaxs(chunk_scores)
       win_counts_accum <- win_counts_accum +
-        rowSums(sweep(chunk_scores, 2L, col_max, "=="))
-      
-      # Rank matrix: compute ONCE per chunk, reuse for all percentiles
-      # rank(-x) per sim gives ascending rank (1 = best). One sort per sim total.
-      # Using a matrix apply is faster than a nested loop over percentiles.
-      rank_mat <- apply(chunk_scores, 2L,
-                        function(x) rank(-x, ties.method = "min"))
-      # rank_mat is n_lineups x n_chunk_sims
-      
-      # Count how many sims each lineup is within each percentile threshold
+        rowSums(chunk_scores == rep(col_max, each = n_lineups))
+
       for (p_idx in seq_along(percentiles)) {
         k <- threshold_ranks[p_idx]
         if (k >= n_lineups) {
           top_pcts[, p_idx] <- top_pcts[, p_idx] + ncol(chunk_scores)
         } else {
-          top_pcts[, p_idx] <- top_pcts[, p_idx] + rowSums(rank_mat <= k)
+          kth <- .colOrd(chunk_scores, which = n_lineups - k + 1L)
+          top_pcts[, p_idx] <- top_pcts[, p_idx] +
+            rowSums(chunk_scores >= rep(kth, each = n_lineups))
         }
       }
       
@@ -1665,6 +1672,56 @@ find_optimal_lineups_winbased <- function(sim_results, config, verbose = TRUE) {
 #
 # sim_results needs SimID, Player, FantasyPoints and Pos.
 # =============================================================================
+# -----------------------------------------------------------------------------
+# ps_top_frac -- how often each candidate lineup lands in the top FRAC of all
+# candidates, measured across simulations.
+#
+# WHY NOT THE MEAN. The mean-of-means cut asks "what is the highest expected
+# score". Measured against three real contests it ranks almost the same lineups
+# but concentrates harder: on 2026-08-20 the mean cut put one back in 79.5% of
+# the pool (he scored 3.3) where this metric held him to 71.4%, and it beat the
+# mean cut on every hit rate that night. It ties on good slates and loses less
+# on bad ones.
+#
+# SPEED. The naive form is 50k candidates x 50k sims. Each lineup is 9 of ~90
+# players, so the gather is expressed as a SPARSE indicator matrix and the
+# per-sim scores come from one sparse matmul per block -- 13s at 5,000 sims
+# against 24s for a hand-rolled gather and 28s for dense BLAS. Sims are blocked
+# so the score matrix never exceeds n x block in memory.
+#
+# SIM COUNT. Ranking is stable well below the full run: Spearman against the
+# full 50,000 is 0.948 at 500 sims, 0.995 at 5,000 and 0.998 at 10,000, and
+# pool performance is flat past ~2,500. The SIMULATION still uses every sim --
+# this subsample only estimates the ranking statistic.
+ps_top_frac <- function(uni, pc, sim_results, score_col,
+                        n_sims_use = 5000L, frac = 0.05, block = 2500L) {
+  if (!requireNamespace("Matrix", quietly = TRUE) ||
+      !requireNamespace("matrixStats", quietly = TRUE)) return(NULL)
+  # Subset the sims BEFORE reshaping. dcast over the full 4.5M-row result was
+  # the whole cost here -- it added ~180s against 13s for the matmul itself.
+  # Filtering first and filling a matrix by index is ~20x cheaper.
+  sid <- utils::head(unique(sim_results$SimID), n_sims_use)
+  sub <- sim_results[SimID %in% sid, c("Player", "SimID", score_col), with = FALSE]
+  pn  <- unique(sub$Player)
+  Wm  <- matrix(0, nrow = length(pn), ncol = length(sid))
+  Wm[cbind(match(sub$Player, pn), match(sub$SimID, sid))] <- sub[[score_col]]
+  M <- as.matrix(uni[, ..pc])
+  n <- nrow(M); k <- ncol(M)
+  ridx <- match(as.vector(M), pn)
+  if (anyNA(ridx)) return(NULL)
+  A <- Matrix::sparseMatrix(i = rep(seq_len(n), k), j = ridx, x = 1,
+                            dims = c(n, length(pn)))
+  cnt <- numeric(n)
+  for (s in seq(1L, ncol(Wm), by = block)) {
+    ix <- s:min(s + block - 1L, ncol(Wm))
+    L  <- as.matrix(A %*% Wm[, ix, drop = FALSE])
+    thr <- matrixStats::colQuantiles(L, probs = 1 - frac)
+    cnt <- cnt + rowSums(L >= rep(thr, each = n))
+    rm(L)
+  }
+  cnt / ncol(Wm)
+}
+
 find_optimal_lineups_preseason_classic <- function(sim_results, config,
                                                    k = 1, verbose = TRUE) {
   setDT(sim_results)
@@ -1749,9 +1806,22 @@ Phase 1: optimal classic lineup for %s sims
   # larger values trade EV for coverage. Ranking, not filtering: a bad lineup is
   # still overwhelmingly unlikely to survive.
   if (nrow(uni) > max_lineups) {
-    pmu <- sim_results[, .(mu = mean(FantasyPoints)), by = Player]
-    mu  <- setNames(pmu$mu, pmu$Player)
-    lm  <- rowSums(matrix(mu[unlist(uni[, ..pc])], nrow = nrow(uni)))
+    metric <- if (!is.null(config$phase1_metric)) config$phase1_metric else "mean"
+    lm <- NULL
+    if (identical(metric, "top5")) {
+      lm <- ps_top_frac(uni, pc, sim_results, "FantasyPoints",
+                        n_sims_use = if (!is.null(config$phase1_sims))
+                                       config$phase1_sims else 5000L,
+                        frac = if (!is.null(config$phase1_frac))
+                                 config$phase1_frac else 0.05)
+      if (is.null(lm) && verbose) cat("  phase1 top5 unavailable, using mean
+")
+    }
+    if (is.null(lm)) {
+      pmu <- sim_results[, .(mu = mean(FantasyPoints)), by = Player]
+      mu  <- setNames(pmu$mu, pmu$Player)
+      lm  <- rowSums(matrix(mu[unlist(uni[, ..pc])], nrow = nrow(uni)))
+    }
     sprd <- if (!is.null(config$pool_spread)) config$pool_spread else 0
     if (sprd > 0) {
       tT <- sprd * stats::sd(lm)

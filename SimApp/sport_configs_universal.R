@@ -834,7 +834,19 @@ SPORT_CONFIGS <- list(
     # pool_spread softens that cut into a weighted sample so the pool does not
     # collapse onto chalk: a hard top-5,000 of 100k is a top-5% cut and put one
     # quarterback in 78% of it. Units are lineup POINTS; 0 restores the hard cut.
-    pool_spread        = 0.6,
+    # Phase 1 candidate cut. "top5" ranks on how often a lineup lands in the top
+    # 5% across sims rather than on its mean; measured over three real contests
+    # it ties the mean cut on good slates, beats it on bad ones, and always
+    # concentrates less. pool_spread is the Gumbel softener on top of that
+    # ranking and is OFF -- the diversity should come from the metric, not from
+    # injected noise. phase1_sims only sizes the ranking estimate (Spearman vs
+    # the full 50k run is 0.989 at 2,500); the simulation itself uses every sim.
+    # 2,500 is measured, not guessed: against the mean cut it costs +13s and gives
+    # max exposure 70.7% vs 79.4%. Raising it to 5,000 (+12s) or 10,000 (+49s)
+    # changes neither the exposures nor the lineups, so it buys nothing.
+    phase1_metric      = "top5",
+    phase1_sims        = 2500L,
+    pool_spread        = 0,
 
     showdown_config = list(
       SD = list(enabled = TRUE, captain_multiplier = 1.5,
