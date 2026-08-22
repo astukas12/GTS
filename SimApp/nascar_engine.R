@@ -731,7 +731,7 @@ assign_dominator_points_from_profiles <- function(race_result, race_weights,
   # Apply driver-specific ceiling (DKMax or FDMax)
   max_allowed <- race_result[[max_col]]
   dom_points <- pmin(dom_points, max_allowed)
-  
+
   # Use set() instead of [[ to avoid allocation issues
   col_name <- paste0(platform, "DominatorPoints")
   set(race_result, j = col_name, value = dom_points)
@@ -1566,6 +1566,10 @@ assign_dominator_points_from_profiles_optimized <- function(race_result, race_we
   # relative to finishing position; see gts_dom_bond(). 1 = original behaviour.
   bond_tau    <- getOption("gts.dom.tau", 0)
   bond_startw <- getOption("gts.dom.start_weight", 0.25)
+  # how hard a still-unassigned front starter is pulled up the queue, and how
+  # far back that reaches. 0 restores the plain nearest-neighbour assignment.
+  start_boost <- getOption("gts.dom.start_boost", 0.55)
+  start_reach <- getOption("gts.dom.start_reach", 6)
   finish_diff_matrix <- outer(driver_finishes, profile_finishes, function(x, y) abs(x - y))
   start_diff_matrix <- outer(driver_starts, profile_starts, function(x, y) abs(x - y))
   distance_matrix <- sqrt(finish_diff_matrix^2 + bond_startw * start_diff_matrix^2)
@@ -1591,10 +1595,17 @@ assign_dominator_points_from_profiles_optimized <- function(race_result, race_we
   driver_max_values <- race_result[[max_col]]
   
   # Assign profiles one at a time, starting with highest value
-  for (profile_idx in profile_order) {
-    
+  n_profiles <- length(profile_order)
+  for (pass in seq_len(n_profiles)) {
+    profile_idx <- profile_order[pass]
+
     if (length(available_drivers) == 0) break
-    
+
+    # how far down the descending value list we are; the front-starter boost
+    # below grows with this, so the biggest profiles are still settled purely on
+    # distance and only the mid and lower ones get pulled toward the grid.
+    prog <- (pass - 1) / max(1L, n_profiles - 1L)
+
     profile_dom_points <- profile_dom_values[profile_idx]
     
     # =========================================================================
@@ -1615,6 +1626,24 @@ assign_dominator_points_from_profiles_optimized <- function(race_result, race_we
     # Find the best eligible driver for this profile (minimum distance)
     # Get distances only for eligible drivers
     distances_to_profile <- distance_matrix[eligible_driver_indices, profile_idx]
+
+    # A front-row starter leads the opening stint whether or not the race goes
+    # his way, but profiles are matched on FINISHING position — so a pole sitter
+    # who comes home 20th looks like any other 20th-place truck and inherits a
+    # profile that never saw the front. Across 18 similar-track races a pole
+    # sitter scored zero dominator points exactly never; the sim was handing him
+    # zero 29% of the time.
+    #
+    # Rather than floor his points afterwards, which would invent points the
+    # race never had, pull him forward in the queue. Profiles are consumed in
+    # descending order, so a still-unassigned high starter gets a growing
+    # discount on his distance as the meaningful profiles run out — he competes
+    # for the "led early, faded" profiles instead of being left the dregs. Every
+    # profile is still assigned exactly once, so the pot is untouched.
+    if (start_boost > 0 && length(distances_to_profile) > 1L) {
+      prio <- pmax(0, 1 - (driver_starts[eligible_driver_indices] - 1) / start_reach)
+      distances_to_profile <- distances_to_profile * (1 - start_boost * prio * prog)
+    }
 
     # tau = 0 keeps the original hard nearest-neighbour pick. Above 0, draw from
     # a softmax over -distance/tau so the profile can land on a driver further
@@ -1651,11 +1680,11 @@ assign_dominator_points_from_profiles_optimized <- function(race_result, race_we
       assigned_profiles[driver_idx] <- NA
     }
   }
-  
+
   # Use set() instead of [[ to avoid allocation issues
   col_name <- paste0(platform, "DominatorPoints")
   set(race_result, j = col_name, value = dom_points)
-  
+
   return(race_result)
 }
 
@@ -1725,7 +1754,7 @@ assign_dominator_points_from_profiles_cached <- function(race_result, race_weigh
   # Apply driver-specific ceiling (DKMax or FDMax)
   max_allowed <- race_result[[max_col]]
   dom_points <- pmin(dom_points, max_allowed)
-  
+
   # Use set() instead of [[ to avoid allocation issues
   col_name <- paste0(platform, "DominatorPoints")
   set(race_result, j = col_name, value = dom_points)
