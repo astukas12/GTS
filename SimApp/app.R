@@ -3780,7 +3780,16 @@ server <- function(input, output, session) {
                                                shinycssloaders::withSpinner(color = "#FFE500", type = 6)),
                                     tabPanel("Dominator by Driver", div(style = "margin-top:15px;"),
                                              plotlyOutput("dominator_violin_driver", height = "auto") %>%
-                                               shinycssloaders::withSpinner(color = "#FFE500", type = 6))
+                                               shinycssloaders::withSpinner(color = "#FFE500", type = 6)),
+                                    tabPanel("Dominator Upside",
+                                             div(style = "margin-top:15px;color:#888;font-size:12px;",
+                                                 "Chance of clearing a given dominator score. The box plot",
+                                                 " collapses this to five numbers, so a driver whose median is",
+                                                 " zero looks capped even when the sim gives him a big race."),
+                                             plotlyOutput("dominator_exceedance", height = "auto") %>%
+                                               shinycssloaders::withSpinner(color = "#FFE500", type = 6),
+                                             div(style = "margin-top:20px;"),
+                                             DTOutput("dominator_reliability"))
                         )
                     )
     ))
@@ -3844,6 +3853,67 @@ server <- function(input, output, session) {
       dt <- if (platform == "FD" && !is.null(rv$sport_visuals$dom_fd)) copy(rv$sport_visuals$dom_fd) else copy(rv$sport_visuals$dom_dk)
       nascar_box_plot(dt, color = "#4A90D9", title_x = paste(platform, "Dominator Points"), sort_desc = TRUE)
     }, error = function(e) { plotly_empty() })
+  })
+
+
+  # One line per driver: the share of sims clearing each dominator score. Only the
+  # drivers with real upside are drawn — past a dozen the lines stop being readable
+  # and the rest are flat against the axis anyway.
+  output$dominator_exceedance <- renderPlotly({
+    req(rv$sport == "NASCAR", rv$sport_visuals$dom_exc_dk)
+    tryCatch({
+      platform <- if (!is.null(input$sim_results_platform) && nchar(input$sim_results_platform) > 0) input$sim_results_platform else "DK"
+      exc <- if (platform == "FD" && !is.null(rv$sport_visuals$dom_exc_fd)) copy(rv$sport_visuals$dom_exc_fd) else copy(rv$sport_visuals$dom_exc_dk)
+      rel <- if (platform == "FD" && !is.null(rv$sport_visuals$dom_rel_fd)) copy(rv$sport_visuals$dom_rel_fd) else copy(rv$sport_visuals$dom_rel_dk)
+      setorder(rel, -P95, -Max)
+      keep <- head(rel[Max > 0]$Name, 12)
+      exc  <- exc[Name %in% keep]
+      if (!nrow(exc)) return(plotly_empty())
+      pal <- c("#FFE500","#4A90D9","#E86A33","#3FB984","#D96BA5","#8E7BE0",
+               "#E05C5C","#37B3C4","#B9A24A","#7FA8D9","#C97BD9","#5FBF7A")
+      p <- plot_ly()
+      for (i in seq_along(keep)) {
+        one <- exc[Name == keep[i]][order(threshold)]
+        p <- add_trace(p, x = one$threshold, y = one$pct, type = "scatter", mode = "lines",
+                       name = keep[i], line = list(color = pal[(i - 1) %% length(pal) + 1], width = 2),
+                       hovertemplate = paste0("<b>", keep[i], "</b><br>over %{x:.1f} pts: %{y:.1f}% of sims<extra></extra>"))
+      }
+      p %>% layout(
+        xaxis = list(title = paste(platform, "Dominator Points"), gridcolor = "#2a2a2a",
+                     color = "#888", zeroline = FALSE),
+        yaxis = list(title = "Chance of clearing (%)", gridcolor = "#2a2a2a",
+                     color = "#888", zeroline = FALSE, rangemode = "tozero"),
+        paper_bgcolor = "#121212", plot_bgcolor = "#141414",
+        font = list(color = "#FFFFFF", size = 11), height = 460,
+        legend = list(font = list(size = 10), bgcolor = "rgba(0,0,0,0)"),
+        margin = list(l = 70, r = 20, t = 20, b = 50), hovermode = "closest"
+      ) %>% config(displayModeBar = FALSE)
+    }, error = function(e) { plotly_empty() })
+  })
+
+
+  # The numbers the box plot cannot show: how often a driver scores nothing, and
+  # how big his best race actually gets.
+  output$dominator_reliability <- renderDT({
+    req(rv$sport == "NASCAR", rv$sport_visuals$dom_rel_dk)
+    platform <- if (!is.null(input$sim_results_platform) && nchar(input$sim_results_platform) > 0) input$sim_results_platform else "DK"
+    dt <- if (platform == "FD" && !is.null(rv$sport_visuals$dom_rel_fd)) copy(rv$sport_visuals$dom_rel_fd) else copy(rv$sport_visuals$dom_rel_dk)
+    setorder(dt, -P95, -Max)
+    out <- dt[, .(Driver = Name, Start = Starting,
+                  `No dominator %` = round(PctZero, 1),
+                  Median = round(P50, 1), P95 = round(P95, 1), Ceiling = round(Max, 1))]
+    if ("DKMax" %in% names(dt)) out[, `DKMax cap` := dt$DKMax]
+    datatable(out, rownames = FALSE, selection = "none",
+              options = list(pageLength = 15, dom = "tp", scrollX = TRUE,
+                             columnDefs = list(list(className = "dt-right", targets = "_all")))) %>%
+      formatStyle("No dominator %",
+                  background = styleColorBar(c(0, 100), "#5A2D2D"),
+                  backgroundSize = "98% 60%", backgroundRepeat = "no-repeat",
+                  backgroundPosition = "center") %>%
+      formatStyle("Ceiling",
+                  background = styleColorBar(c(0, max(out$Ceiling, na.rm = TRUE)), "#2D4A5A"),
+                  backgroundSize = "98% 60%", backgroundRepeat = "no-repeat",
+                  backgroundPosition = "center")
   })
   
   

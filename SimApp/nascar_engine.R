@@ -334,6 +334,32 @@ run_nascar_simulation <- function(input_data, n_sims, config, progress_callback 
     ), by = group_col]
   }
   
+  # Dominator points are zero-inflated: a driver either draws a big profile or
+  # gets nothing. A box plot cannot show that — its whiskers are Tukey fences, so
+  # once the median sits at zero the fence lands far below the real ceiling and
+  # the chart reads "no upside" for a driver who has plenty. At NH, Eckes had a
+  # median of 0 and a fence near 15 against an actual maximum of 46.2.
+  # These two tables carry what the box drops: the whole exceedance curve, and
+  # the zero-mass beside the true maximum.
+  make_exceedance <- function(dt, val_col, n_steps = 40L) {
+    top <- suppressWarnings(max(dt[[val_col]], na.rm = TRUE))
+    if (!is.finite(top) || top <= 0) return(NULL)
+    steps <- unique(round(seq(0, top, length.out = n_steps), 2))
+    dt[, {
+      v <- get(val_col)
+      .(threshold = steps, pct = vapply(steps, function(s) mean(v > s) * 100, numeric(1)))
+    }, by = Name]
+  }
+
+  make_reliability <- function(dt, val_col) {
+    dt[, .(
+      PctZero = mean(get(val_col) < 0.5) * 100,
+      P50     = median(get(val_col)),
+      P95     = quantile(get(val_col), 0.95),
+      Max     = max(get(val_col))
+    ), by = Name]
+  }
+
   # Driver metadata (one row per driver — salary, starting pos)
   driver_meta <- unique(combined_results[, .(Name, DKSalary, Starting)])
   if (has_fd) driver_meta <- merge(
@@ -352,21 +378,36 @@ run_nascar_simulation <- function(input_data, n_sims, config, progress_callback 
   finish  <- make_box_stats(combined_results, "FinishPosition")
   finish  <- merge(finish, driver_meta[, .(Name, Starting)], by = "Name")
   
+  dom_exc_dk <- make_exceedance(combined_results, "DKDominatorPoints")
+  dom_rel_dk <- merge(make_reliability(combined_results, "DKDominatorPoints"),
+                      driver_meta[, .(Name, DKSalary, Starting)], by = "Name")
+  if (!is.null(driver_data$DKMax))
+    dom_rel_dk <- merge(dom_rel_dk, driver_data[, .(Name, DKMax)], by = "Name", all.x = TRUE)
+
   if (has_fd) {
     fp_fd  <- make_box_stats(combined_results, "FDScore")
     fp_fd  <- merge(fp_fd, driver_meta[, .(Name, FDSalary, Starting)], by = "Name")
     dom_fd <- make_box_stats(combined_results, "FDDominatorPoints")
     dom_fd <- merge(dom_fd, driver_meta[, .(Name, DKSalary, Starting)], by = "Name")
+    dom_exc_fd <- make_exceedance(combined_results, "FDDominatorPoints")
+    dom_rel_fd <- merge(make_reliability(combined_results, "FDDominatorPoints"),
+                        driver_meta[, .(Name, DKSalary, Starting)], by = "Name")
   } else {
     fp_fd  <- NULL
     dom_fd <- NULL
+    dom_exc_fd <- NULL
+    dom_rel_fd <- NULL
   }
-  
+
   sport_visuals <- list(
     fp_dk       = fp_dk,
     fp_fd       = fp_fd,
     dom_dk      = dom_dk,
     dom_fd      = dom_fd,
+    dom_exc_dk  = dom_exc_dk,
+    dom_exc_fd  = dom_exc_fd,
+    dom_rel_dk  = dom_rel_dk,
+    dom_rel_fd  = dom_rel_fd,
     finish      = finish,
     driver_meta = driver_meta,
     accuracy_data = accuracy_data,
@@ -1382,7 +1423,7 @@ gts_dom_bond <- function(tau = NULL, start_weight = NULL) {
     options(gts.dom.start_weight = start_weight)
   }
   out <- list(tau = getOption("gts.dom.tau", 0),
-              start_weight = getOption("gts.dom.start_weight", 0))
+              start_weight = getOption("gts.dom.start_weight", 0.25))
   if (is.null(tau) && is.null(start_weight)) out else invisible(out)
 }
 
@@ -1524,7 +1565,7 @@ assign_dominator_points_from_profiles_optimized <- function(race_result, race_we
   # start_weight scales how much qualifying position constrains the match
   # relative to finishing position; see gts_dom_bond(). 1 = original behaviour.
   bond_tau    <- getOption("gts.dom.tau", 0)
-  bond_startw <- getOption("gts.dom.start_weight", 0)
+  bond_startw <- getOption("gts.dom.start_weight", 0.25)
   finish_diff_matrix <- outer(driver_finishes, profile_finishes, function(x, y) abs(x - y))
   start_diff_matrix <- outer(driver_starts, profile_starts, function(x, y) abs(x - y))
   distance_matrix <- sqrt(finish_diff_matrix^2 + bond_startw * start_diff_matrix^2)
