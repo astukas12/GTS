@@ -1,39 +1,42 @@
-Position,Name + ID,Name,ID,Roster Position,Salary,Game Info,TeamAbbrev,AvgPointsPerGame,Status,Starting
-D,Layne Riggs (43666825),Layne Riggs,43666825,D,12500,TSport 200 presented by Warn Industries,Nasca,45.2,,
-D,Chandler Smith (43666826),Chandler Smith,43666826,D,12000,TSport 200 presented by Warn Industries,Nasca,41.7,,
-D,Kaden Honeycutt (43666827),Kaden Honeycutt,43666827,D,10500,TSport 200 presented by Warn Industries,Nasca,36.3,,
-D,Ty Majeski (43666828),Ty Majeski,43666828,D,10000,TSport 200 presented by Warn Industries,Nasca,20.7,,
-D,Nicholas Sanchez (43666829),Nicholas Sanchez,43666829,D,9500,TSport 200 presented by Warn Industries,Nasca,0,,
-D,Christian Eckes (43666830),Christian Eckes,43666830,D,9300,TSport 200 presented by Warn Industries,Nasca,41.9,,
-D,Giovanni Ruggiero (43666831),Giovanni Ruggiero,43666831,D,9000,TSport 200 presented by Warn Industries,Nasca,29.7,,
-D,Harrison Burton (43666832),Harrison Burton,43666832,D,8700,TSport 200 presented by Warn Industries,Nasca,0,,
-D,Connor Mosack (43666833),Connor Mosack,43666833,D,8500,TSport 200 presented by Warn Industries,Nasca,23.7,,
-D,Grant Enfinger (43666834),Grant Enfinger,43666834,D,8300,TSport 200 presented by Warn Industries,Nasca,19.1,,
-D,Tyler Ankrum (43666835),Tyler Ankrum,43666835,D,8200,TSport 200 presented by Warn Industries,Nasca,23.2,,
-D,Landen Lewis (43666836),Landen Lewis,43666836,D,8000,TSport 200 presented by Warn Industries,Nasca,41.6,,
-D,Daniel Hemric (43666837),Daniel Hemric,43666837,D,7800,TSport 200 presented by Warn Industries,Nasca,32.9,,
-D,Stewart Friesen (43666838),Stewart Friesen,43666838,D,7700,TSport 200 presented by Warn Industries,Nasca,25.4,,
-D,Ben Rhodes (43666839),Ben Rhodes,43666839,D,7500,TSport 200 presented by Warn Industries,Nasca,28.1,,
-D,Jake Garcia (43666840),Jake Garcia,43666840,D,7300,TSport 200 presented by Warn Industries,Nasca,18.4,,
-D,Tanner Gray (43666841),Tanner Gray,43666841,D,7200,TSport 200 presented by Warn Industries,Nasca,21.2,,
-D,Gavan Boschele (43666842),Gavan Boschele,43666842,D,7100,TSport 200 presented by Warn Industries,Nasca,0,,
-D,Justin Haley (43666843),Justin Haley,43666843,D,7000,TSport 200 presented by Warn Industries,Nasca,26.5,,
-D,Corey LaJoie (43666844),Corey LaJoie,43666844,D,6900,TSport 200 presented by Warn Industries,Nasca,18.1,,
-D,Michael Christopher Jr (43666845),Michael Christopher Jr,43666845,D,6700,TSport 200 presented by Warn Industries,Nasca,26.7,,
-D,Parker Eatmon (43666846),Parker Eatmon,43666846,D,6600,TSport 200 presented by Warn Industries,Nasca,8,,
-D,Conor Daly (43666847),Conor Daly,43666847,D,6500,TSport 200 presented by Warn Industries,Nasca,0,,
-D,Cole Butcher (43666848),Cole Butcher,43666848,D,6400,TSport 200 presented by Warn Industries,Nasca,13,,
-D,Brenden Queen (43666849),Brenden Queen,43666849,D,6300,TSport 200 presented by Warn Industries,Nasca,33.5,,
-D,Andres Perez De Lara (43666850),Andres Perez De Lara,43666850,D,6200,TSport 200 presented by Warn Industries,Nasca,21.6,,
-D,Dawson Sutton (43666851),Dawson Sutton,43666851,D,6100,TSport 200 presented by Warn Industries,Nasca,22.4,,
-D,Mini Tyrrell (43666852),Mini Tyrrell,43666852,D,6000,TSport 200 presented by Warn Industries,Nasca,25.2,,
-D,Timmy Hill (43666853),Timmy Hill,43666853,D,5900,TSport 200 presented by Warn Industries,Nasca,22.4,,
-D,Kris Wright (43666854),Kris Wright,43666854,D,5800,TSport 200 presented by Warn Industries,Nasca,18.7,,
-D,Jonathan Shafer (43666855),Jonathan Shafer,43666855,D,5700,TSport 200 presented by Warn Industries,Nasca,0,,
-D,Cassten Everidge (43666856),Cassten Everidge,43666856,D,5600,TSport 200 presented by Warn Industries,Nasca,0,,
-D,Jackson MacEnko (43666857),Jackson MacEnko,43666857,D,5500,TSport 200 presented by Warn Industries,Nasca,0,,
-D,Spencer Boyd (43666858),Spencer Boyd,43666858,D,5400,TSport 200 presented by Warn Industries,Nasca,21.1,,
-D,Derek Lemke (43666859),Derek Lemke,43666859,D,5300,TSport 200 presented by Warn Industries,Nasca,31,,
-D,Toni Breidinger (43666860),Toni Breidinger,43666860,D,5200,TSport 200 presented by Warn Industries,Nasca,28,,
-D,Justin S Carroll (43666861),Justin S Carroll,43666861,D,5100,TSport 200 presented by Warn Industries,Nasca,15,,
-D,Frankie Muniz (43666862),Frankie Muniz,43666862,D,5000,TSport 200 presented by Warn Industries,Nasca,22.2,,
+﻿Position,Name + ID,Name,ID,Roster Position,Salary,Game Info,TeamAbbrev,AvgPointsPerGame,Status,Starting
+D,Layne Riggs (43876735),Layne Riggs,43876735,D,13000,Team EJP 175,Nasca,49.4,,1
+D,Kaden Honeycutt (43876736),Kaden Honeycutt,43876736,D,12500,Team EJP 175,Nasca,42,,2
+D,Christopher Bell (43876737),Christopher Bell,43876737,D,11500,Team EJP 175,Nasca,48.8,,17
+D,Connor Zilisch (43876738),Connor Zilisch,43876738,D,11000,Team EJP 175,Nasca,63.9,,4
+D,Chandler Smith (43876739),Chandler Smith,43876739,D,10500,Team EJP 175,Nasca,41.6,,12
+D,Ty Majeski (43876740),Ty Majeski,43876740,D,10000,Team EJP 175,Nasca,23,,16
+D,John H. Nemechek (43876741),John H. Nemechek,43876741,D,9500,Team EJP 175,Nasca,48.7,,23
+D,Christian Eckes (43876742),Christian Eckes,43876742,D,9000,Team EJP 175,Nasca,39.6,,19
+D,Giovanni Ruggiero (43876743),Giovanni Ruggiero,43876743,D,8800,Team EJP 175,Nasca,30.6,,3
+D,Connor Mosack (43876744),Connor Mosack,43876744,D,8500,Team EJP 175,Nasca,28.9,,11
+D,Grant Enfinger (43876745),Grant Enfinger,43876745,D,8300,Team EJP 175,Nasca,21.4,,8
+D,Tyler Ankrum (43876746),Tyler Ankrum,43876746,D,8100,Team EJP 175,Nasca,24.8,,15
+D,Landen Lewis (43876747),Landen Lewis,43876747,D,7900,Team EJP 175,Nasca,34,,22
+D,Tristan McKee (43876748),Tristan McKee,43876748,D,7700,Team EJP 175,Nasca,41.9,,5
+D,Daniel Hemric (43876749),Daniel Hemric,43876749,D,7600,Team EJP 175,Nasca,31.2,,6
+D,Ben Rhodes (43876750),Ben Rhodes,43876750,D,7500,Team EJP 175,Nasca,28.2,,10
+D,Gavan Boschele (43876751),Gavan Boschele,43876751,D,7400,Team EJP 175,Nasca,47,,7
+D,Jake Garcia (43876752),Jake Garcia,43876752,D,7300,Team EJP 175,Nasca,20.3,,9
+D,Stewart Friesen (43876753),Stewart Friesen,43876753,D,7200,Team EJP 175,Nasca,23.3,,13
+D,Parker Eatmon (43876754),Parker Eatmon,43876754,D,7000,Team EJP 175,Nasca,16.6,,18
+D,Tanner Gray (43876755),Tanner Gray,43876755,D,6900,Team EJP 175,Nasca,21.9,,20
+D,Corey LaJoie (43876756),Corey LaJoie,43876756,D,6700,Team EJP 175,Nasca,18.4,,24
+D,Justin Haley (43876757),Justin Haley,43876757,D,6600,Team EJP 175,Nasca,25.6,,25
+D,Michael Christopher Jr (43876758),Michael Christopher Jr,43876758,D,6500,Team EJP 175,Nasca,31.3,,21
+D,Cole Butcher (43876759),Cole Butcher,43876759,D,6300,Team EJP 175,Nasca,14.1,,14
+D,Brenden Queen (43876760),Brenden Queen,43876760,D,6100,Team EJP 175,Nasca,32.2,,26
+D,Andres Perez De Lara (43876761),Andres Perez De Lara,43876761,D,6000,Team EJP 175,Nasca,21.1,,29
+D,Colin Braun (43876762),Colin Braun,43876762,D,5800,Team EJP 175,Nasca,49.5,,30
+D,Connor Hall (43876763),Connor Hall,43876763,D,5700,Team EJP 175,Nasca,22.5,,27
+D,Mason Massey (43876764),Mason Massey,43876764,D,5600,Team EJP 175,Nasca,25,OUT,
+D,Timmy Hill (43876765),Timmy Hill,43876765,D,5500,Team EJP 175,Nasca,20.4,,31
+D,Dawson Sutton (43876766),Dawson Sutton,43876766,D,5400,Team EJP 175,Nasca,22.9,,
+D,Kris Wright (43876767),Kris Wright,43876767,D,5300,Team EJP 175,Nasca,17.4,,28
+D,Luke Baldwin (43876768),Luke Baldwin,43876768,D,5200,Team EJP 175,Nasca,6.6,,
+D,Mini Tyrrell (43876769),Mini Tyrrell,43876769,D,5100,Team EJP 175,Nasca,23.9,,33
+D,Patrick Emerling (43876770),Patrick Emerling,43876770,D,5000,Team EJP 175,Nasca,0,,32
+D,Toni Breidinger (43876771),Toni Breidinger,43876771,D,4900,Team EJP 175,Nasca,26.7,OUT,34
+D,Spencer Boyd (43876772),Spencer Boyd,43876772,D,4800,Team EJP 175,Nasca,20,,35
+D,Frankie Muniz (43876773),Frankie Muniz,43876773,D,4700,Team EJP 175,Nasca,21.7,OUT,36
+D,D. L. Wilson (43876774),D. L. Wilson,43876774,D,4600,Team EJP 175,Nasca,0,OUT,
+D,Derek White (43876775),Derek White,43876775,D,4500,Team EJP 175,Nasca,3,OUT,
