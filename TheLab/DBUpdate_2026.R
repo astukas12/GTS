@@ -15,7 +15,11 @@ library(openxlsx)
 library(stringr)
 
 
-setwd("~/GitHub/GTS/TheLab")
+# "~" is the Documents folder under RStudio but the user profile under
+# Rscript, so the hard-coded path only resolves in one of them. Move if it is
+# there, otherwise assume we were already launched from the right directory.
+.gts_wd <- path.expand("~/GitHub/GTS/TheLab")
+if (dir.exists(.gts_wd)) setwd(.gts_wd)
 
 # -----------------------------------------------------------------------------
 # CONFIGURATION
