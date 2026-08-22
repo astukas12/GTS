@@ -344,12 +344,15 @@ generate_field_lineups <- function(metadata,
     return(finalize_field(combos, pool, roster_size))
   }
   
-  setorder(pool, -PPD)
+  # Take the top-PPD slice WITHOUT reordering `pool`. setorder() sorts by
+  # reference, and core_mat already holds row indices into the pool as it stands
+  # here — re-sorting silently repointed every one of them at a different
+  # player, so a core lineup that passed the salary check came back out as a
+  # different combination entirely. That is how lineups landed over the cap.
   n_cut <- min(top_n_ppd, nrow(pool))
-  sub   <- head(pool, n_cut)
-  map   <- match(sub$Player, pool$Player)     # sub index -> pool index
-  
-  cmat <- build_combo_matrix(nrow(sub), roster_size, seed = seed)
+  map   <- order(-pool$PPD)[seq_len(n_cut)]   # sub index -> pool index
+
+  cmat <- build_combo_matrix(n_cut, roster_size, seed = seed)
   cmat <- matrix(map[cmat], nrow = nrow(cmat))
   
   # Salary filter, relaxing the floor if nothing passes
@@ -419,11 +422,26 @@ generate_field_lineups <- function(metadata,
   )
   
   combos <- rbind(core_mat, cmat[sel, , drop = FALSE])
-  
+
   cat(sprintf("  [Field] %d core + %d fill = %d lineups\n",
               nrow(core_mat), length(sel), nrow(combos)))
-  
-  finalize_field(combos, pool, roster_size)
+
+  out <- finalize_field(combos, pool, roster_size)
+
+  # Every lineup passed a cap test before it got here, so anything over the cap
+  # now means the indices and the pool disagree — the failure that produced
+  # $60,500 NASCAR lineups against a $50,000 cap. Drop them and say so rather
+  # than handing the user a field that cannot be entered.
+  bad <- which(out$TotalSalary > salary_cap)
+  if (length(bad)) {
+    warning(sprintf("Dropped %d generated lineup(s) over the $%s cap (max $%s).",
+                    length(bad), format(salary_cap, big.mark = ","),
+                    format(max(out$TotalSalary[bad]), big.mark = ",")))
+    out <- out[-bad]
+    if (nrow(out) == 0L) stop("Every generated lineup exceeded the salary cap.")
+    out[, LineupID := paste0("F", seq_len(.N))]
+  }
+  out
 }
 
 
