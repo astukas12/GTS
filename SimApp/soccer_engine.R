@@ -65,11 +65,17 @@ SOCCER_P <- list(
   
   # YC frustration by opp goals (indexed opp_goals+1)
   # Conceded 0:1.38, 1:1.58, 2:2.13, 3:2.62 → relative to mean 1.77
-  # ── EXTRA TIME (knockout) ──────────────────────────────────────────────
-  # Applied ONLY to sims tied after 90' (hg==ag), identified from the scoreline
-  # draw. The fraction of sims that trigger ET is therefore the correct-score
-  # market's draw mass — self-scaling per game (lopsided games rarely trigger).
-  et_enable = TRUE,        # master switch for ET modeling
+  # ── EXTRA TIME (knockout only) ─────────────────────────────────────────
+  # OFF unless a game asks for it. League fixtures (EPL and every other domestic
+  # league) are settled at 90', so nothing here runs for them: a game opts in via
+  # an ET column on the Games tab, and no column means no extra time. Only cup
+  # knockouts (FA Cup, Carabao, UCL KO rounds, World Cup) should set it.
+  #
+  # When a game does opt in, ET is applied ONLY to sims tied after 90' (hg==ag),
+  # identified from the scoreline draw. The fraction of sims that trigger ET is
+  # therefore the correct-score market's draw mass — self-scaling per game
+  # (lopsided games rarely trigger).
+  et_enable = TRUE,        # master kill switch; per-game ET flag still required
   et_minutes = 30,         # length of extra time
   # ── ET per-minute intensity vs regulation, by stat ──
   # Grounded in ET sports-science findings (Field/Harper systematic review):
@@ -238,6 +244,20 @@ dk_score_soccer_v <- function(dk_pos, goals, assists, shots, sot, cc,
   s <- s + ifelse(is_gk & mins>=60 & cs==1, 5, 0)
   s <- s + ifelse(is_gk & mins>=90 & gk_win==1, 5, 0)
   s
+}
+
+
+# ── EXTRA-TIME GATE ──────────────────────────────────────────────────────────
+# TRUE only when a Games row explicitly opts into extra time. Everything else —
+# no ET column, blank cell, NA, or an unrecognised value — is league play and
+# returns FALSE. Excel round-trips this as a logical, a number, or a string
+# depending on how the sheet was written, so all three are accepted.
+game_allows_et <- function(game_row) {
+  if(is.null(game_row) || !("ET" %in% names(game_row))) return(FALSE)
+  v <- game_row$ET[1]
+  if(is.null(v) || length(v) == 0 || is.na(v)) return(FALSE)
+  if(is.character(v)) return(toupper(trimws(v)) %in% c("TRUE","T","YES","Y","1"))
+  isTRUE(as.logical(v))
 }
 
 
@@ -867,7 +887,11 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
     }
     
     # ── EXTRA TIME (game-level; tied sims only) ──────────────────────────
-    if(isTRUE(SOCCER_P$et_enable)) {
+    # Knockout only. League fixtures are settled at 90', so ET is gated on a
+    # per-game ET flag from the Games tab (written by the InputMaker). A missing
+    # column means league play — the safe default, since a stray ET inflates
+    # every ceiling in ~the draw mass of the correct-score market.
+    if(isTRUE(SOCCER_P$et_enable) && isTRUE(game_allows_et(gd$game))) {
       tied <- which(gd$hg == gd$ag)
       if(!exists("et_went")) et_went <- logical(n_sims)  # per-sim ET flag (any game)
       if(length(tied)) {
@@ -1232,8 +1256,12 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
     a_g_full <- gd$ag + (if(!is.null(gd$et_ag)) gd$et_ag else 0L)
     h_gk_idx <- which(all_players_list$Team==ht & grepl("GK",all_players_list$DK_RosterPos))
     a_gk_idx <- which(all_players_list$Team==at & grepl("GK",all_players_list$DK_RosterPos))
-    h_sv <- if(length(h_gk_idx)) rowMeans(mats$GK_Saves[h_gk_idx,,drop=FALSE]) else 0
-    a_sv <- if(length(a_gk_idx)) rowMeans(mats$GK_Saves[a_gk_idx,,drop=FALSE]) else 0
+    # Team save total per sim, then averaged — one number per team. rowMeans here
+    # returned one value PER KEEPER, so any pool carrying a backup GK (an untrimmed
+    # player list does) silently lengthened the c() below and recycled the whole
+    # xref table. Identical to the old result when a team has a single keeper.
+    h_sv <- if(length(h_gk_idx)) mean(colSums(mats$GK_Saves[h_gk_idx,,drop=FALSE])) else 0
+    a_sv <- if(length(a_gk_idx)) mean(colSums(mats$GK_Saves[a_gk_idx,,drop=FALSE])) else 0
     xref[[gi]] <- data.table(
       Game=gd$game$Game,
       Check=c("FC↔FD", "FC↔FD", "SOT-G=Sv", "SOT-G=Sv", "CC/Shots", "CC/Shots"),
