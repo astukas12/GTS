@@ -3721,33 +3721,31 @@ server <- function(input, output, session) {
 
         tabsetPanel(id = "cfb_tabs", type = "tabs",
           tabPanel("Team Outcomes", div(style = "margin-top:14px;"),
-            tags$p(style = "color:#888;font-size:11px;margin:0 0 8px 0;",
-                   "Every player number sits inside these, so if the team range is wrong nothing below it can be right."),
             radioButtons("cfb_team_metric", NULL, inline = TRUE,
-                         choices = c("Passing yards" = "PassYds",
-                                     "Rushing yards" = "RushYds",
-                                     "Receiving yards" = "RecYds",
-                                     "Total TDs" = "TotalTD",
-                                     "Points" = "Points"),
-                         selected = "PassYds"),
-            plotlyOutput("cfb_team_violin", height = "300px"),
-            div(style = "margin-top:16px;", DTOutput("cfb_team_spread"))),
+                         choices = c("Points" = "Points",
+                                     "Scrimmage yards" = "ScrimYds",
+                                     "Passing" = "PassYds",
+                                     "Rushing" = "RushYds",
+                                     "Touchdowns" = "TotalTD"),
+                         selected = "Points"),
+            uiOutput("cfb_team_cards"),
+            plotlyOutput("cfb_team_violin", height = "260px")),
 
           tabPanel("Where the points come from", div(style = "margin-top:14px;"),
-            tags$p(style = "color:#888;font-size:11px;margin:0 0 8px 0;",
-                   "A projection built out of yardage behaves differently from the same projection built out of touchdowns. Yardage is close to stable week to week; touchdowns are lumpy and mostly decided by who is dealt one carry from the two."),
+            tags$p(style = "color:#888;font-size:11px;margin:0 0 10px 0;",
+                   "Yardage is close to stable week to week. Touchdowns are lumpy."),
             plotlyOutput("cfb_components", height = "700px"),
             div(style = "margin-top:16px;", DTOutput("cfb_comp_table"))),
 
           tabPanel("Scoring rates", div(style = "margin-top:14px;"),
-            tags$p(style = "color:#888;font-size:11px;margin:0 0 8px 0;",
-                   "Rates, not averages. \"0.37 touchdowns a game\" is not a thing that can happen; \"scores in 31% of games, twice in 5%\" is. Blank is the share of games he records nothing at all."),
+            tags$p(style = "color:#888;font-size:11px;margin:0 0 10px 0;",
+                   "How often, not how many. Blank is the share of games he records nothing at all."),
             plotlyOutput("cfb_rates_plot", height = "620px"),
             div(style = "margin-top:16px;", DTOutput("cfb_rates_table"))),
 
           tabPanel("Score Range", div(style = "margin-top:14px;"),
-            tags$p(style = "color:#888;font-size:11px;margin:0 0 8px 0;",
-                   "The one fantasy-points view, kept because the spread is the point: bar is the middle half, thin line the 10th to 90th, white dot the mean, yellow diamond the one-in-a-hundred game."),
+            tags$p(style = "color:#888;font-size:11px;margin:0 0 10px 0;",
+                   "Bar is the middle half, line the 10th to 90th, white dot the mean, diamond the one-in-a-hundred game."),
             plotlyOutput("cfb_violin", height = "820px")),
 
           tabPanel("Players", div(style = "margin-top:14px;"),
@@ -3780,19 +3778,44 @@ server <- function(input, output, session) {
     CFB_DARK(plot_ly(d, x = ~Value, y = ~team, color = ~team, colors = pal,
             type = "violin", orientation = "h", points = FALSE, width = 0.85,
             meanline = list(visible = TRUE, color = "#ffffff", width = 1.5),
-            box = list(visible = TRUE, width = 0.2),
-            hoveron = "violins", showlegend = FALSE)) %>%
-      layout(violinmode = "overlay",
-             xaxis = list(title = m, gridcolor = "#2a2a2a", zeroline = FALSE),
+            box = list(visible = FALSE), hoverinfo = "none",
+            showlegend = FALSE)) %>%
+      layout(violinmode = "overlay", hovermode = FALSE,
+             xaxis = list(title = NULL, gridcolor = "#2a2a2a", zeroline = FALSE),
              yaxis = list(title = "", automargin = TRUE),
              margin = list(l = 10, r = 30, t = 10, b = 44))
   })
 
-  output$cfb_team_spread <- renderDT({
+  # CARDS, NOT A SORTABLE TABLE. Ten rows of six numbers sorted by an arbitrary
+  # column answers no question anyone has. What is wanted is the range for a
+  # team at a glance, so each team gets one card per metric with the middle of
+  # the distribution large and the tails small underneath.
+  output$cfb_team_cards <- renderUI({
     req(rv$sport == "CFB", rv$sport_visuals$team_spread)
-    datatable(rv$sport_visuals$team_spread, rownames = FALSE,
-              options = list(dom = "tp", pageLength = 16, searching = FALSE,
-                             scrollX = TRUE))
+    m  <- input$cfb_team_metric %||% "Points"
+    d  <- rv$sport_visuals$team_spread[Metric == m]
+    if (!is.null(input$cfb_team_filter)) d <- d[Team %in% input$cfb_team_filter]
+    req(nrow(d) > 0)
+    pal <- cfb_team_pal(sort(unique(rv$sport_visuals$team_spread$Team)))
+    fmt <- function(x) if (m == "TotalTD") sprintf("%.1f", x) else
+                       formatC(round(x), big.mark = ",", format = "d")
+    div(style = "display:flex;gap:14px;flex-wrap:wrap;margin-bottom:16px;",
+      lapply(seq_len(nrow(d)), function(i) {
+        r <- d[i]; col <- pal[[r$Team]]
+        div(style = sprintf("flex:1 1 220px;background:#1a1a1a;border:1px solid #2f2f2f;border-left:4px solid %s;border-radius:4px;padding:14px 16px;", col),
+          div(style = sprintf("font-family:inherit;font-size:12px;font-weight:700;letter-spacing:.12em;color:%s;", col),
+              toupper(r$Team)),
+          div(style = "display:flex;align-items:baseline;gap:8px;margin-top:6px;",
+              span(style = "font-size:30px;font-weight:700;color:#FFE500;line-height:1;",
+                   fmt(r$Median)),
+              span(style = "font-size:12px;color:#8a8a84;", "median")),
+          div(style = "margin-top:10px;font-size:12px;color:#c8c8c2;",
+              sprintf("middle half  %s to %s", fmt(r$P25), fmt(r$P75))),
+          div(style = "margin-top:2px;font-size:12px;color:#8a8a84;",
+              sprintf("1 in 10 below %s   \u00b7   1 in 10 above %s",
+                      fmt(r$P10), fmt(r$P90)))
+        )
+      }))
   })
 
   # ---- where the points come from ------------------------------------------
@@ -3904,8 +3927,8 @@ server <- function(input, output, session) {
       add_markers(data = d, x = ~P99, y = ~lab, showlegend = FALSE,
                   marker = list(color = "#FFE500", size = 5, symbol = "diamond"),
                   hoverinfo = "text", text = ~paste0("1-in-100 game: ", P99))) %>%
-      layout(xaxis = list(title = "DraftKings points  —  bar is the middle half, line p10 to p90, white dot the mean, yellow diamond the 1-in-100 game",
-                          gridcolor = "#2a2a2a", zeroline = FALSE),
+      layout(xaxis = list(title = "DraftKings points", gridcolor = "#2a2a2a",
+                          zeroline = FALSE),
              yaxis = list(title = "", automargin = TRUE),
              margin = list(l = 10, r = 30, t = 10, b = 60))
   })

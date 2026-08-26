@@ -551,20 +551,32 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
   setorder(rates, -DK)
 
   # 3. TEAM OUTCOME SPREAD. The player numbers all sit inside these, so if the
-  # team passing range is wrong nothing downstream can be right. Downsampled
-  # for the browser the same way the player distributions are.
-  tg <- A[, .(PassYds = sum(pyds), RushYds = sum(cyds), RecYds = sum(ryds),
+  # team passing range is wrong nothing downstream can be right.
+  #
+  # POINTS COME FROM THE DRAWN GAME, not from adding up the touchdowns we dealt.
+  # A real final score includes defensive and special-teams scores this engine
+  # never allocates, so reconstructing it from dealt TDs both understates it and
+  # breaks the one number the pool was calibrated against.
+  #
+  # RECEIVING YARDS ARE NOT A SEPARATE METRIC. They reconcile to passing yards
+  # by construction -- that is the whole point of dealing rather than sharing --
+  # so listing both invites reading one as a check on the other.
+  ptsv <- data.table(SimID = seq_len(n_sims), f = draw$ptsF, d = draw$ptsD)
+  tg <- A[, .(PassYds = sum(pyds), RushYds = sum(cyds),
               PassTD = sum(ptd), RushTD = sum(ctd), RecTD = sum(rtd),
-              TotalTD = sum(rtd) + sum(ctd),
-              Points = sum(rtd) * 6 + sum(ctd) * 6 + sum(fgp) + sum(xp)),
+              TotalTD = sum(rtd) + sum(ctd)),
           by = .(SimID, team)]
+  tg[ptsv, Points := fifelse(team == fav, i.f, i.d), on = "SimID"]
+  tg[, ScrimYds := PassYds + RushYds]
+
+  TEAM_METRICS <- c("Points", "ScrimYds", "PassYds", "RushYds", "TotalTD")
   tkeep <- min(2000L, n_sims)
   team_dist <- melt(tg[SimID %in% sample(unique(tg$SimID), tkeep)],
-                    id.vars = c("SimID","team"),
+                    id.vars = c("SimID", "team"), measure.vars = TEAM_METRICS,
                     variable.name = "Metric", value.name = "Value")
-  team_spread <- tg[, .(Mean = round(mean(PassYds), 1)), by = team]
-  team_spread <- melt(tg, id.vars = c("SimID","team"), variable.name = "Metric",
-                      value.name = "V")[
+  team_spread <- melt(tg, id.vars = c("SimID", "team"),
+                      measure.vars = TEAM_METRICS,
+                      variable.name = "Metric", value.name = "V")[
     , .(Mean = round(mean(V), 1), P10 = round(quantile(V, .1), 1),
         P25 = round(quantile(V, .25), 1), Median = round(median(V), 1),
         P75 = round(quantile(V, .75), 1), P90 = round(quantile(V, .9), 1)),
