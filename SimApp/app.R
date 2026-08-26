@@ -3726,6 +3726,7 @@ server <- function(input, output, session) {
                                      "Scrimmage yards" = "ScrimYds",
                                      "Passing" = "PassYds",
                                      "Rushing" = "RushYds",
+                                     "Receptions" = "Rec",
                                      "Touchdowns" = "TotalTD"),
                          selected = "Points"),
             uiOutput("cfb_team_cards"),
@@ -3797,7 +3798,7 @@ server <- function(input, output, session) {
     if (!is.null(input$cfb_team_filter)) d <- d[Team %in% input$cfb_team_filter]
     req(nrow(d) > 0)
     pal <- cfb_team_pal(sort(unique(rv$sport_visuals$team_spread$Team)))
-    fmt <- function(x) if (m == "TotalTD") sprintf("%.1f", x) else
+    fmt <- function(x) if (m %in% c("TotalTD","Rec")) sprintf("%.1f", x) else
                        formatC(round(x), big.mark = ",", format = "d")
     div(style = "display:flex;gap:14px;flex-wrap:wrap;margin-bottom:16px;",
       lapply(seq_len(nrow(d)), function(i) {

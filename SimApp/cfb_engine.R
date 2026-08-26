@@ -560,16 +560,18 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
   #
   # RECEIVING YARDS ARE NOT A SEPARATE METRIC. They reconcile to passing yards
   # by construction -- that is the whole point of dealing rather than sharing --
-  # so listing both invites reading one as a check on the other.
+  # so listing both invites reading one as a check on the other. RECEPTIONS are
+  # a different quantity and do belong: full PPR means the catch count is a
+  # scoring line in its own right, and it is what the usage vector is dealing.
   ptsv <- data.table(SimID = seq_len(n_sims), f = draw$ptsF, d = draw$ptsD)
-  tg <- A[, .(PassYds = sum(pyds), RushYds = sum(cyds),
+  tg <- A[, .(PassYds = sum(pyds), RushYds = sum(cyds), Rec = sum(rec),
               PassTD = sum(ptd), RushTD = sum(ctd), RecTD = sum(rtd),
               TotalTD = sum(rtd) + sum(ctd)),
           by = .(SimID, team)]
   tg[ptsv, Points := fifelse(team == fav, i.f, i.d), on = "SimID"]
   tg[, ScrimYds := PassYds + RushYds]
 
-  TEAM_METRICS <- c("Points", "ScrimYds", "PassYds", "RushYds", "TotalTD")
+  TEAM_METRICS <- c("Points", "ScrimYds", "PassYds", "RushYds", "Rec", "TotalTD")
   tkeep <- min(2000L, n_sims)
   team_dist <- melt(tg[SimID %in% sample(unique(tg$SimID), tkeep)],
                     id.vars = c("SimID", "team"), measure.vars = TEAM_METRICS,
