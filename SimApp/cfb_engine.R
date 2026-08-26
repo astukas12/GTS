@@ -185,7 +185,19 @@ read_cfb_input <- function(file_path) {
                pys_target = as.numeric(o$pys_target %||% NA))
   }), fill = TRUE)
 
-  list(game = g, team = tt, players = pl)
+  # OPTIONAL `projections` tab: Player + ETR + Own. When ETR ships a file for a
+  # slate, drop it in as a tab and the sim's average lands beside their number
+  # on the main table, the same way the preseason engine does it. Absent, the
+  # columns simply stay empty -- nothing else changes.
+  prj <- NULL
+  ptab <- sh[tolower(sh) %in% c("projections", "etr")]
+  if (length(ptab)) {
+    prj <- as.data.table(readxl::read_excel(file_path, sheet = ptab[1]))
+    setnames(prj, tolower(names(prj)))
+    if (!"player" %in% names(prj) && "name" %in% names(prj))
+      setnames(prj, "name", "player")
+  }
+  list(game = g, team = tt, players = pl, projections = prj)
 }
 `%||%` <- function(a, b) if (is.null(a) || length(a) == 0 || is.na(a[1])) b else a
 
@@ -410,6 +422,15 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
                         DKSalary = as.integer(salary_util),
                         DKCSalary = as.integer(salary_cpt))])
   meta <- meta[Player %in% unique(A$player)]
+  meta[, `:=`(DKProj = NA_real_, DKOwn = 0)]
+  prj <- input_data$projections
+  if (!is.null(prj) && nrow(prj)) {
+    setDT(prj)
+    if ("etr" %in% names(prj))
+      meta[prj, DKProj := as.numeric(i.etr), on = .(Player = player)]
+    if ("own" %in% names(prj))
+      meta[prj, DKOwn := as.numeric(i.own), on = .(Player = player)]
+  }
 
   sim_results <- A[, .(SimID, Player = player, Team = team,
                        DKScore = round(dk, 3))]
@@ -432,46 +453,80 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
       Boom = round(100 * mean(dk >= 20), 1)),
     by = .(Player = player, Team = team)][order(Team, -Mean)]
 
-  # THE STAT LINE WITH THE INPUTS THAT PRODUCED IT ALONGSIDE. If a receiver's
-  # catches look wrong, the usage and ypc that caused them are on the same row.
+  # PLAYER TABLE -- SIM OUTPUTS ONLY. The sheet inputs that produced these live
+  # in the workbook; repeating them here just makes the table wider than the
+  # screen and invites reading a projection as if it were an assumption.
   stat_line <- A[, .(
       Rec = round(mean(rec), 2), RecYds = round(mean(ryds), 1),
+      RecTD = round(mean(rtd), 3),
       Car = round(mean(car), 2), RushYds = round(mean(cyds), 1),
-      PassYds = round(mean(pyds), 1),
-      TD = round(mean(rtd + ctd + rettd), 3),
-      Fum = round(mean(fum), 3), DK = round(mean(dk), 2)),
+      RushTD = round(mean(ctd), 3),
+      PassYds = round(mean(pyds), 1), PassTD = round(mean(ptd), 3),
+      INT = round(mean(pint), 3),
+      RetTD = round(mean(rettd), 4), Fum = round(mean(fum), 3),
+      DK = round(mean(dk), 2),
+      Floor = round(as.numeric(quantile(dk, .25)), 1),
+      Ceil = round(as.numeric(quantile(dk, .90)), 1),
+      Bust = round(100 * mean(dk < 3), 1),
+      Boom = round(100 * mean(dk >= 20), 1)),
     by = .(Player = player, Team = team)]
-  stat_line <- merge(stat_line, PL[, .(Player = player, Usage = round(usage, 3),
-      YPC = round(ypc, 1), CarryUse = round(carry_usage, 3),
-      SY = sy_tilt, GL = gl_tilt, Salary = as.integer(salary_util))],
-      by = "Player", all.x = TRUE)
+  stat_line <- merge(stat_line, meta[, .(Player, Pos, Salary = DKSalary)],
+                     by = "Player", all.x = TRUE)
   stat_line[, Val := round(DK / pmax(Salary, 1) * 1000, 2)]
-  setorder(stat_line, Team, -DK)
+  setcolorder(stat_line, c("Player","Team","Pos","Salary","DK","Floor","Ceil",
+                           "Bust","Boom","Val"))
+  setorder(stat_line, -DK)
 
-  # ---- validation: the mix, against real football ---------------------------
-  # Measured on games the simulator never sees. These are the checks that say
-  # whether the sheet produced a believable afternoon, and they belong in the
-  # results rather than in a notebook.
-  vs <- A[, .(catchers = sum(rec > 0), rushers = sum(car > 0),
-              fum = sum(fum)), by = .(SimID, team)]
+  # TEAM LINE -- the whole box score, so a sheet that produces a nonsense
+  # afternoon is visible before anyone reads a player row.
+  team_line <- A[, .(Rec = sum(rec), RecYds = sum(ryds), RecTD = sum(rtd),
+                     Car = sum(car), RushYds = sum(cyds), RushTD = sum(ctd),
+                     PassYds = sum(pyds), PassTD = sum(ptd), INT = sum(pint),
+                     Fum = sum(fum), FG = sum(fgp), XP = sum(xp)),
+                 by = .(SimID, team)][
+                , .(Rec = round(mean(Rec), 1), RecYds = round(mean(RecYds)),
+                    Car = round(mean(Car), 1), RushYds = round(mean(RushYds)),
+                    PassYds = round(mean(PassYds)),
+                    PassTD = round(mean(PassTD), 2), RushTD = round(mean(RushTD), 2),
+                    INT = round(mean(INT), 2), Fum = round(mean(Fum), 2),
+                    KickPts = round(mean(FG + XP), 1),
+                    DK = round(mean(Rec + RecYds * .1 + RecTD * 6 + RushYds * .1 +
+                                    RushTD * 6 + PassYds * .04 + PassTD * 4), 1)),
+                by = .(Team = team)]
+  team_line[, `:=`(Implied = fifelse(Team == fav,
+                     round(G$total[1]/2 + G$spread[1]/2, 1),
+                     round(G$total[1]/2 - G$spread[1]/2, 1)),
+                   ScrimYds = RecYds + RushYds)]
+  team_line[, PassShare := round(PassYds / (PassYds + RushYds), 3)]
+  setcolorder(team_line, c("Team","Implied","ScrimYds","PassShare"))
+
+  # VIOLINS need the shape, not 20,000 rows a player. Downsample to a fixed
+  # budget so the browser gets a few thousand points rather than half a million.
+  nkeep <- min(1500L, n_sims)
+  dist_sample <- A[, .(dk = if (.N > nkeep) dk[sample.int(.N, nkeep)] else dk),
+                   by = .(Player = player, Team = team)]
+  dist_sample <- merge(dist_sample, meta[, .(Player, Pos)], by = "Player", all.x = TRUE)
+
+  # ---- validation: the mix, against real football --------------------------
+  # NOT DISPLAYED IN THE APP. This answers "is this sheet believable", which is
+  # a question for building the sheet rather than for reading the results, so
+  # the consumer never sees it. Kept because when a slate looks wrong it is the
+  # first thing to print: a usage vector can look plausible row by row and still
+  # produce an afternoon nobody would recognise.
+  vs   <- A[, .(catchers = sum(rec > 0), rushers = sum(car > 0),
+                fum = sum(fum)), by = .(SimID, team)]
   ypcs <- A[rec >= 3, .(y = sum(ryds) / sum(rec)), by = .(SimID, team, player)]
-  t3 <- A[, .(t = sum(rtd)), by = .(SimID, team)][t == 3]
+  t3   <- A[, .(t = sum(rtd)), by = .(SimID, team)][t == 3]
   one3 <- A[t3, on = .(SimID, team)][, .(mx = max(rtd)), by = .(SimID, team)]
-  vsum <- vs[, .(Catchers = round(mean(catchers), 2),
-                 Rushers  = round(mean(rushers), 2),
-                 FumLost  = round(mean(fum), 3)), by = .(team)]
+  vsum <- vs[,   .(Catchers = round(mean(catchers), 2),
+                   Rushers  = round(mean(rushers), 2),
+                   FumLost  = round(mean(fum), 3)), by = .(team)]
   ysum <- ypcs[, .(YPCp10 = round(quantile(y, .1), 1),
                    YPCp90 = round(quantile(y, .9), 1)), by = .(team)]
   tsum <- one3[, .(All3TD = round(100 * mean(mx == 3), 1), N = .N), by = .(team)]
-
-  # LONG, one row per check, so the real-football column is a single column
-  # rather than one repeated per metric. `Real` is measured on FBS games the
-  # simulator never sees; `Note` says what a miss would mean.
-  vrow <- function(metric, get, real, note) {
-    x <- as.list(setNames(get, c(fav, dog)))
-    data.table(Check = metric, A = x[[fav]], B = x[[dog]], Real = real, Note = note)
-  }
   g <- function(D, col) D[match(c(fav, dog), D$team)][[col]]
+  vrow <- function(metric, got, real, note)
+    data.table(Check = metric, A = got[1], B = got[2], Real = real, Note = note)
   validation <- rbindlist(list(
     vrow("Distinct catchers / game", g(vsum,"Catchers"), "7.53",
          "too many means the usage vector is padded at the tail"),
@@ -479,24 +534,17 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
          "low if the sheet names fewer backs than a real rotation"),
     vrow("Team fumbles lost / game", g(vsum,"FumLost"),  "0.564",
          "taken from the drawn game's box, not modelled"),
-    vrow("Player YPC, 10th pct",     g(ysum,"YPCp10"),   "5.3",
-         "the tilt's low end"),
-    vrow("Player YPC, 90th pct",     g(ysum,"YPCp90"),   "20.3",
-         "the tilt's high end"),
+    vrow("Player YPC, 10th pct",     g(ysum,"YPCp10"),   "5.3",  "the tilt's low end"),
+    vrow("Player YPC, 90th pct",     g(ysum,"YPCp90"),   "20.3", "the tilt's high end"),
     vrow("One man takes all 3 rec TD (%)", g(tsum,"All3TD"), "4.2",
-         "KNOWN GAP: independent dealing gives 3.2; the affinity effect that lifts real football above it is not built"),
+         "KNOWN GAP: independent dealing alone gives ~3.2 and the affinity effect that lifts real football above it is not built"),
     vrow("3-TD games observed",      g(tsum,"N"),        "-",
-         "sample size for the row above -- under ~300 that check is noise")))
+         "sample for the row above -- under ~300 that check is noise")))
   setnames(validation, c("A","B"), c(fav, dog))
-
-  team_line <- A[, .(Rec = sum(rec), RecYds = sum(ryds), Car = sum(car),
-                     RushYds = sum(cyds)), by = .(SimID, team)][
-                  , .(Rec = round(mean(Rec), 1), RecYds = round(mean(RecYds)),
-                      Car = round(mean(Car), 1), RushYds = round(mean(RushYds))),
-                  by = .(Team = team)]
 
   sport_visuals <- list(
     score_dist = score_dist, stat_line = stat_line,
+    dist_sample = dist_sample,
     validation = validation, team_line = team_line,
     pool_size = nrow(P), n_sims = n_sims,
     ess = round(cal$ess),

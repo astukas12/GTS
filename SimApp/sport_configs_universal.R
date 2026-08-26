@@ -1167,9 +1167,13 @@ SPORT_CONFIGS <- list(
            label = "Team Stack")
     ),
 
+    # DKProj / DKOwn arrive from an optional `projections` tab in the workbook
+    # (Player + ETR + Own). Absent, they stay empty and nothing else changes.
     metadata_columns = list(
-      list(name = "Pos",  label = "Position", type = "text", display = TRUE, filter = TRUE),
-      list(name = "Team", label = "Team",     type = "text", display = TRUE, filter = TRUE)
+      list(name = "Pos",    label = "Position", type = "text",    display = TRUE, filter = TRUE),
+      list(name = "Team",   label = "Team",     type = "text",    display = TRUE, filter = TRUE),
+      list(name = "DKProj", label = "ETR",      type = "numeric", display = TRUE, filter = FALSE),
+      list(name = "DKOwn",  label = "Own %",    type = "numeric", display = TRUE, filter = FALSE)
     ),
 
     portfolio_filters = list(
