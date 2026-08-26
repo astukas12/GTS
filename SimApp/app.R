@@ -18,7 +18,7 @@ source("cash_game_module.R")
 # top-level code on every upload/sim run.
 local({
   engines <- c("nascar", "mma", "tennis", "golf", "f1", "nfl", "nfl_preseason",
-                 "cbb", "nba", "soccer")
+                 "cbb", "nba", "soccer", "cfb")
   for (e in engines) {
     f <- paste0(e, "_engine.R")
     if (file.exists(f)) source(f) else warning("Engine not found at startup: ", f)
@@ -39,7 +39,8 @@ load_sport_input <- function(file_path, sport, config) {
     F1   = read_f1_input,
     CBB  = read_cbb_input,
     NBA  = read_nba_input,
-    SOCCER = read_soccer_input
+    SOCCER = read_soccer_input,
+    CFB  = read_cfb_input
   )
   if (sport %in% names(reader_map)) {
     return(reader_map[[sport]](file_path))
@@ -3500,6 +3501,7 @@ server <- function(input, output, session) {
     else if (rv$sport == "F1")      render_f1_visuals(rv$sport_visuals)
     else if (rv$sport %in% c("NFL_PRESEASON","NFL_PRESEASON_CLASSIC"))
       render_nfl_preseason_visuals(rv$sport_visuals)
+    else if (rv$sport == "CFB")     render_cfb_visuals(rv$sport_visuals)
     else NULL
   })
   
@@ -3657,6 +3659,119 @@ server <- function(input, output, session) {
              xaxis = list(title = "ETR projection", range = lim, gridcolor = "#2a2a2a"),
              yaxis = list(title = "Sim average",    range = lim, gridcolor = "#2a2a2a"),
              margin = list(l = 60, r = 30, t = 30, b = 50))
+  })
+
+
+  # ---------- College Football ----------
+  # Four views, in the order you would actually check them: did the POOL
+  # reproduce the market, does the MIX look like real football, do the TEAM
+  # LINES look like a game, and only then the players.
+  #
+  # The validation table is the one that does not exist for any other sport
+  # here, and it earns its place: a CFB sheet is ~30 hand-stated probabilities,
+  # and the failure mode is a vector that looks plausible row by row while
+  # producing an afternoon nobody would recognise -- eleven men catching a ball,
+  # or a backfield that never fumbles.
+  render_cfb_visuals <- function(visuals) {
+    req(visuals)
+    v <- visuals$validation
+    flag <- function(got, want, tol) if (is.na(got)) "" else
+      if (abs(got - want) <= tol) "ok" else "off"
+    fluidRow(column(12,
+      box(width = NULL, title = "College Football Simulation Analysis",
+          status = "primary", solidHeader = TRUE,
+
+        div(style = "margin-bottom:14px;color:#bbb;font-size:12px;",
+            sprintf("%s  |  %s games in pool  |  effective sample %s  |  %s sims",
+                    visuals$market, format(visuals$pool_size, big.mark = ","),
+                    format(visuals$ess, big.mark = ","),
+                    format(visuals$n_sims, big.mark = ","))),
+
+        div(style = "margin-bottom:14px;padding:8px 12px;border-left:3px solid #FFE500;background:#1e1e1e;color:#ddd;font-size:12px;",
+            sprintf("Pool returned total %.1f and margin %.1f against a market %s. The target was corrected to %.2f to get there -- kernel smoothing pulls every estimate toward the pool mean, so the ASK is adjusted rather than the output rescaled.",
+                    visuals$pool_total, visuals$pool_margin,
+                    visuals$market, visuals$asked_total)),
+
+        if (!is.null(visuals$ess) && visuals$ess < 150)
+          div(style = "margin-bottom:14px;padding:8px 12px;border-left:3px solid #d9534f;background:#2a1a1a;color:#f0c0c0;font-size:12px;",
+              sprintf("POOL IS THIN: effective sample %s. This matchup has few real comparables -- widen the output accordingly.",
+                      visuals$ess)),
+
+        div(style = "margin-bottom:20px;",
+            tags$p(class = "gts-sr-label", "Does the mix look like real football?"),
+            tags$p(style = "color:#888;font-size:11px;margin:-4px 0 8px 0;",
+                   "Each column beside a measurement is the same quantity on real FBS games the simulator never sees."),
+            DTOutput("cfb_valid_table")),
+        tags$hr(style = "border-color:#2a2a2a;margin:16px 0;"),
+
+        div(style = "margin-bottom:20px;",
+            tags$p(class = "gts-sr-label", "Team Lines"),
+            DTOutput("cfb_team_table")),
+        tags$hr(style = "border-color:#2a2a2a;margin:16px 0;"),
+
+        div(style = "margin-bottom:20px;",
+            tags$p(class = "gts-sr-label", "Score Range by Player"),
+            tags$p(style = "color:#888;font-size:11px;margin:-4px 0 8px 0;",
+                   "Bar spans the 10th to 90th percentile; tick is the median, dot the mean. Two players with the same mean are not the same player."),
+            plotlyOutput("cfb_range_plot", height = "760px")),
+        tags$hr(style = "border-color:#2a2a2a;margin:16px 0;"),
+
+        div(tags$p(class = "gts-sr-label", "Player Stat Lines (with the sheet inputs that produced them)"),
+            tags$p(style = "color:#888;font-size:11px;margin:-4px 0 8px 0;",
+                   "If a receiver's catches look wrong, the usage and YPC that caused them are on the same row."),
+            DTOutput("cfb_stat_table"))
+      )))
+  }
+
+  output$cfb_valid_table <- renderDT({
+    req(rv$sport == "CFB", rv$sport_visuals$validation)
+    datatable(rv$sport_visuals$validation, rownames = FALSE,
+              options = list(dom = "t", paging = FALSE, searching = FALSE,
+                             scrollX = TRUE,
+                             columnDefs = list(list(width = "38%", targets = 4))))
+  })
+
+  output$cfb_team_table <- renderDT({
+    req(rv$sport == "CFB", rv$sport_visuals$team_line)
+    datatable(rv$sport_visuals$team_line, rownames = FALSE,
+              options = list(dom = "t", paging = FALSE, searching = FALSE))
+  })
+
+  output$cfb_range_plot <- renderPlotly({
+    req(rv$sport == "CFB", rv$sport_visuals$score_dist)
+    d <- copy(rv$sport_visuals$score_dist)
+    setorder(d, Mean)
+    d[, lab := paste0(Player, "  (", Team, ")")]
+    d[, lab := factor(lab, levels = lab)]
+    plot_ly(d, y = ~lab, height = 760) %>%
+      add_segments(x = ~P10, xend = ~P90, y = ~lab, yend = ~lab,
+                   line = list(color = "#5a5a3a", width = 3),
+                   hoverinfo = "text",
+                   text = ~paste0(Player, "<br>p10 ", P10, " - p90 ", P90),
+                   showlegend = FALSE) %>%
+      add_segments(x = ~P25, xend = ~P75, y = ~lab, yend = ~lab,
+                   line = list(color = "#FFE500", width = 9),
+                   opacity = 0.55, hoverinfo = "skip", showlegend = FALSE) %>%
+      add_markers(x = ~Median, y = ~lab, marker = list(color = "#FFE500",
+                  symbol = "line-ns-open", size = 13, line = list(width = 3)),
+                  hoverinfo = "text", text = ~paste0("median ", Median),
+                  showlegend = FALSE) %>%
+      add_markers(x = ~Mean, y = ~lab, marker = list(color = "#ffffff", size = 7,
+                  line = list(color = "#111", width = 1.5)),
+                  hoverinfo = "text", text = ~paste0("mean ", Mean),
+                  showlegend = FALSE) %>%
+      layout(paper_bgcolor = "#121212", plot_bgcolor = "#141414",
+             font = list(color = "#FFFFFF", size = 11),
+             xaxis = list(title = "DraftKings points", gridcolor = "#2a2a2a"),
+             yaxis = list(title = "", automargin = TRUE),
+             margin = list(l = 10, r = 30, t = 20, b = 50))
+  })
+
+  output$cfb_stat_table <- renderDT({
+    req(rv$sport == "CFB", rv$sport_visuals$stat_line)
+    datatable(rv$sport_visuals$stat_line, rownames = FALSE,
+              options = list(dom = "tp", pageLength = 30, searching = FALSE,
+                             scrollX = TRUE))
   })
 
 

@@ -1109,6 +1109,102 @@ SPORT_CONFIGS <- list(
   )
   
   
+  ,
+
+  # ==========================================================================
+  # COLLEGE FOOTBALL (showdown)
+  # --------------------------------------------------------------------------
+  # A single game, so showdown only. The workbook is unlike every other sport
+  # here: ONE TAB PER TEAM, named by DK TeamAbbrev, with the player table in
+  # columns A..Q and the team-level inputs (kicker, both returners, the pass-
+  # share target) in a label/value block beside them from column S. Plus a
+  # `game` tab carrying the market.
+  #
+  # Detection keys on exactly that -- a `game` tab plus at least two others,
+  # and a `usage` column, which no other sport's workbook has.
+  #
+  # The engine reads it through read_cfb_input() rather than the generic
+  # loader, because the generic path cannot express "columns A:Q of every tab
+  # except one, plus a side block".
+  # ==========================================================================
+  CFB = list(
+    sport_name         = "CFB",
+    sport_display_name = "College Football",
+    player_label       = "Player",
+    player_label_plural = "Players",
+
+    detection = list(
+      custom_detect = function(sheets, file_path = NULL) {
+        has_game <- any(tolower(sheets) == "game")
+        if (!has_game || length(sheets) < 3) return(FALSE)
+        tm <- setdiff(sheets, sheets[tolower(sheets) == "game"])[1]
+        cols <- tryCatch(names(readxl::read_excel(file_path, sheet = tm, n_max = 1)),
+                         error = function(e) character(0))
+        "usage" %in% cols && "carry_usage" %in% cols
+      },
+      required_sheets    = NULL,
+      required_columns   = NULL,
+      min_sheet_matches  = 0,
+      min_column_matches = 0
+    ),
+
+    platforms    = c("DK"),
+    roster_sizes = list(DK = 6),
+    salary_caps  = list(DK = 50000),
+
+    optimization_modes = list(DK = "combinatorial_captain"),
+    max_lineups        = 5000,
+
+    showdown_config = list(
+      DK = list(enabled = TRUE, captain_multiplier = 1.5,
+                captain_salary_multiplier = 1.5, mode = "captain")
+    ),
+
+    standard_metrics = c("WinRate", "Top1Rate", "Top5Rate", "Top10Rate", "Top20Rate"),
+
+    custom_metrics = list(
+      list(name = "TeamStack", source = "Team", calculation = "team_stack",
+           label = "Team Stack")
+    ),
+
+    metadata_columns = list(
+      list(name = "Pos",  label = "Position", type = "text", display = TRUE, filter = TRUE),
+      list(name = "Team", label = "Team",     type = "text", display = TRUE, filter = TRUE)
+    ),
+
+    portfolio_filters = list(
+      rate_minimums = list(
+        list(name = "Win",   label = "Win",    step = 0.1),
+        list(name = "Top1",  label = "Top 1",  step = 0.1),
+        list(name = "Top5",  label = "Top 5",  step = 0.1),
+        list(name = "Top10", label = "Top 10", step = 0.1),
+        list(name = "Top20", label = "Top 20", step = 0.1)
+      ),
+      range_filters = list()
+    ),
+
+    platform_columns = list(
+      DK = list(salary = "DKSalary", id = "DKID", ownership = "DKOwn", score = "DKScore")
+    ),
+
+    download_formats = list(DK = "{Name} ({DKID})"),
+
+    input_file = list(
+      type            = "excel",
+      load_all_sheets = FALSE,
+      required_sheets = NULL,
+      player_sheet    = NULL,
+      required_columns = list(base = c("player"), DK = c("usage"))
+    ),
+
+    simulation = list(
+      function_name = "run_cfb_simulation",
+      output_format = list(
+        sim_results = c("SimID", "Player", "Team", "DKScore"),
+        metadata    = c("Player", "Team", "Pos", "DKID", "DKCID")
+      )
+    )
+  )
 )
 
 
