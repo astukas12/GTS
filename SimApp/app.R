@@ -3663,13 +3663,15 @@ server <- function(input, output, session) {
 
 
   # ---------- College Football ----------
-  # SUB-TABS, not one long page. Each panel renders only when its tab is
-  # selected, so a 20,000-sim slate does not build five plotly objects at once.
+  # THESE PANELS ARE ABOUT THE COMPONENTS OF A PROJECTION, not about roster
+  # construction. A mean DK score is an answer with no derivation; what makes a
+  # sheet checkable is seeing the parts -- how much of a man's points are
+  # yardage against touchdowns, how often he actually scores rather than his
+  # scoring average, and the spread of the team lines everything sits inside.
   #
   # The engine also emits a validation table comparing the simulated mix against
-  # real FBS games. It is NOT rendered: it answers "is this sheet believable",
-  # which is a question for BUILDING the sheet, not for reading results. It
-  # stays in sport_visuals for debugging.
+  # real FBS games. NOT rendered: it answers "is this sheet believable", which
+  # is a question for building the sheet. Kept in sport_visuals for debugging.
   CFB_TEAM_COL <- c(TCU = "#A87FE0", UNC = "#7BAFD4")   # cfb_team_colors.R,
   cfb_team_pal <- function(teams) {                     # lightened for black
     base <- c("#A87FE0", "#7BAFD4", "#E8B84B", "#69C08A")
@@ -3677,6 +3679,10 @@ server <- function(input, output, session) {
     for (nm in names(CFB_TEAM_COL)) if (nm %in% teams) out[nm] <- CFB_TEAM_COL[[nm]]
     out
   }
+  CFB_DARK <- function(p) p %>% layout(
+    paper_bgcolor = "#121212", plot_bgcolor = "#141414",
+    font = list(color = "#FFFFFF", size = 11),
+    legend = list(orientation = "h", y = 1.04, x = 0))
 
   render_cfb_visuals <- function(visuals) {
     req(visuals)
@@ -3696,8 +3702,7 @@ server <- function(input, output, session) {
 
         if (!is.null(visuals$ess) && visuals$ess < 150)
           div(style = "margin-bottom:12px;padding:8px 12px;border-left:3px solid #d9534f;background:#2a1a1a;color:#f0c0c0;font-size:12px;",
-              sprintf("POOL IS THIN: effective sample %s. Few real comparables for this matchup -- widen the output accordingly.",
-                      visuals$ess)),
+              sprintf("POOL IS THIN: effective sample %s. Few real comparables for this matchup.", visuals$ess)),
 
         div(class = "gts-chart-filter",
             span(class = "gts-chart-filter-label", "Teams:"),
@@ -3715,35 +3720,42 @@ server <- function(input, output, session) {
                            width = "100%")),
 
         tabsetPanel(id = "cfb_tabs", type = "tabs",
+          tabPanel("Team Outcomes", div(style = "margin-top:14px;"),
+            tags$p(style = "color:#888;font-size:11px;margin:0 0 8px 0;",
+                   "Every player number sits inside these, so if the team range is wrong nothing below it can be right."),
+            radioButtons("cfb_team_metric", NULL, inline = TRUE,
+                         choices = c("Passing yards" = "PassYds",
+                                     "Rushing yards" = "RushYds",
+                                     "Receiving yards" = "RecYds",
+                                     "Total TDs" = "TotalTD",
+                                     "Points" = "Points"),
+                         selected = "PassYds"),
+            plotlyOutput("cfb_team_violin", height = "300px"),
+            div(style = "margin-top:16px;", DTOutput("cfb_team_spread"))),
+
+          tabPanel("Where the points come from", div(style = "margin-top:14px;"),
+            tags$p(style = "color:#888;font-size:11px;margin:0 0 8px 0;",
+                   "A projection built out of yardage behaves differently from the same projection built out of touchdowns. Yardage is close to stable week to week; touchdowns are lumpy and mostly decided by who is dealt one carry from the two."),
+            plotlyOutput("cfb_components", height = "700px"),
+            div(style = "margin-top:16px;", DTOutput("cfb_comp_table"))),
+
+          tabPanel("Scoring rates", div(style = "margin-top:14px;"),
+            tags$p(style = "color:#888;font-size:11px;margin:0 0 8px 0;",
+                   "Rates, not averages. \"0.37 touchdowns a game\" is not a thing that can happen; \"scores in 31% of games, twice in 5%\" is. Blank is the share of games he records nothing at all."),
+            plotlyOutput("cfb_rates_plot", height = "620px"),
+            div(style = "margin-top:16px;", DTOutput("cfb_rates_table"))),
+
           tabPanel("Score Range", div(style = "margin-top:14px;"),
             tags$p(style = "color:#888;font-size:11px;margin:0 0 8px 0;",
-                   "Width is how often that score happens. Two players with the same average are not the same player: a short-yardage back is a spike at zero with a long tail, a possession receiver is a hump."),
+                   "The one fantasy-points view, kept because the spread is the point: bar is the middle half, thin line the 10th to 90th, white dot the mean, yellow diamond the one-in-a-hundred game."),
             plotlyOutput("cfb_violin", height = "820px")),
 
           tabPanel("Players", div(style = "margin-top:14px;"),
-            tags$p(style = "color:#888;font-size:11px;margin:0 0 8px 0;",
-                   "Simulation output only. Floor is the 25th percentile, Ceil the 90th, Bust under 3 points, Boom 20 or more, Val points per $1,000."),
-            DTOutput("cfb_stat_table")),
-
-          tabPanel("Value", div(style = "margin-top:14px;"),
-            tags$p(style = "color:#888;font-size:11px;margin:0 0 8px 0;",
-                   "Points per $1,000 of salary. Captain costs 1.5x for 1.5x the points, so this ranks the same in either slot."),
-            plotlyOutput("cfb_value", height = "620px")),
-
-          tabPanel("Ceiling vs Floor", div(style = "margin-top:14px;"),
-            tags$p(style = "color:#888;font-size:11px;margin:0 0 8px 0;",
-                   "Bust rate against boom rate. Bottom right is a cash play; top left is a tournament dart. Marker size is salary."),
-            plotlyOutput("cfb_risk", height = "620px")),
-
-          tabPanel("Teams", div(style = "margin-top:14px;"),
-            tags$p(style = "color:#888;font-size:11px;margin:0 0 8px 0;",
-                   "The simulated box score per side. Implied is the points the market prices; PassShare is the realised split of scrimmage yards."),
-            DTOutput("cfb_team_table"))
+            DTOutput("cfb_stat_table"))
         )
       )))
   }
 
-  # One filter set drives every CFB panel.
   cfb_keep <- reactive({
     req(rv$sport == "CFB", rv$sport_visuals$stat_line)
     d <- rv$sport_visuals$stat_line
@@ -3757,29 +3769,145 @@ server <- function(input, output, session) {
     k
   })
 
-  output$cfb_violin <- renderPlotly({
-    req(rv$sport == "CFB", rv$sport_visuals$dist_sample)
-    keep <- cfb_keep(); req(length(keep) > 0)
-    d   <- rv$sport_visuals$dist_sample[Player %in% keep]
-    ord <- rv$sport_visuals$stat_line[Player %in% keep][order(DK)]
-    labs <- paste0(ord$Player, "  (", ord$Pos, ")")
-    d[, lab := factor(paste0(Player, "  (", Pos, ")"), levels = labs)]
-    pal <- cfb_team_pal(sort(unique(d$Team)))
-    plot_ly(d, x = ~dk, y = ~lab, color = ~Team, colors = pal,
-            type = "violin", orientation = "h", side = "positive",
-            spanmode = "hard", points = FALSE, scalemode = "width",
+  # ---- team outcome spread -------------------------------------------------
+  output$cfb_team_violin <- renderPlotly({
+    req(rv$sport == "CFB", rv$sport_visuals$team_dist)
+    m <- input$cfb_team_metric %||% "PassYds"
+    d <- rv$sport_visuals$team_dist[Metric == m]
+    if (!is.null(input$cfb_team_filter)) d <- d[team %in% input$cfb_team_filter]
+    req(nrow(d) > 0)
+    pal <- cfb_team_pal(sort(unique(d$team)))
+    CFB_DARK(plot_ly(d, x = ~Value, y = ~team, color = ~team, colors = pal,
+            type = "violin", orientation = "h", points = FALSE, width = 0.85,
             meanline = list(visible = TRUE, color = "#ffffff", width = 1.5),
-            box = list(visible = TRUE, width = 0.25,
-                       line = list(color = "rgba(255,255,255,0.55)", width = 1)),
-            hoveron = "violins",
-            height = max(420, 27 * length(labs) + 120)) %>%
-      layout(paper_bgcolor = "#121212", plot_bgcolor = "#141414",
-             font = list(color = "#FFFFFF", size = 11),
-             xaxis = list(title = "DraftKings points", gridcolor = "#2a2a2a",
-                          zeroline = FALSE),
+            box = list(visible = TRUE, width = 0.2),
+            hoveron = "violins", showlegend = FALSE)) %>%
+      layout(violinmode = "overlay",
+             xaxis = list(title = m, gridcolor = "#2a2a2a", zeroline = FALSE),
              yaxis = list(title = "", automargin = TRUE),
-             legend = list(orientation = "h", y = 1.03, x = 0),
+             margin = list(l = 10, r = 30, t = 10, b = 44))
+  })
+
+  output$cfb_team_spread <- renderDT({
+    req(rv$sport == "CFB", rv$sport_visuals$team_spread)
+    datatable(rv$sport_visuals$team_spread, rownames = FALSE,
+              options = list(dom = "tp", pageLength = 16, searching = FALSE,
+                             scrollX = TRUE))
+  })
+
+  # ---- where the points come from ------------------------------------------
+  # FOUR groups, not eleven line items. The question is whether a projection is
+  # made of yardage or touchdowns, and eleven stacked colours answers it worse
+  # than four. The full decomposition is in the table underneath.
+  output$cfb_components <- renderPlotly({
+    req(rv$sport == "CFB", rv$sport_visuals$components)
+    keep <- cfb_keep(); req(length(keep) > 0)
+    d <- rv$sport_visuals$components[Player %in% keep]
+    g <- d[, .(Player, Team,
+               Yardage = RecYards + RushYards + PassYards,
+               Touchdowns = RecTDs + RushTDs + PassTDs + ReturnTDs,
+               Receptions = Receptions,
+               Other = Kicking + Bonuses + Turnovers,
+               Total)][order(Total)]
+    g[, lab := factor(Player, levels = Player)]
+    cols <- c(Yardage = "#FFE500", Touchdowns = "#A87FE0",
+              Receptions = "#7BAFD4", Other = "#7d7d76")
+    p <- plot_ly(height = max(360, 24 * nrow(g) + 120))
+    for (nm in c("Yardage","Touchdowns","Receptions","Other"))
+      p <- add_trace(p, x = g[[nm]], y = g$lab, name = nm, type = "bar",
+                     orientation = "h", marker = list(color = cols[[nm]]),
+                     hoverinfo = "text",
+                     text = paste0(g$Player, "<br>", nm, ": ", g[[nm]],
+                                   " of ", g$Total, " pts"))
+    CFB_DARK(p) %>%
+      layout(barmode = "stack",
+             xaxis = list(title = "DK points", gridcolor = "#2a2a2a"),
+             yaxis = list(title = "", automargin = TRUE),
              margin = list(l = 10, r = 30, t = 10, b = 50))
+  })
+
+  output$cfb_comp_table <- renderDT({
+    req(rv$sport == "CFB", rv$sport_visuals$components)
+    datatable(rv$sport_visuals$components[Player %in% cfb_keep()], rownames = FALSE,
+              options = list(dom = "tp", pageLength = 30, searching = FALSE,
+                             scrollX = TRUE))
+  })
+
+  # ---- scoring rates -------------------------------------------------------
+  output$cfb_rates_plot <- renderPlotly({
+    req(rv$sport == "CFB", rv$sport_visuals$rates)
+    keep <- cfb_keep(); req(length(keep) > 0)
+    d <- rv$sport_visuals$rates[Player %in% keep][order(AnyTD)]
+    d[, lab := factor(Player, levels = Player)]
+    CFB_DARK(plot_ly(height = max(360, 24 * nrow(d) + 120)) %>%
+      add_trace(x = d$AnyTD, y = d$lab, name = "Scores a TD", type = "bar",
+                orientation = "h", marker = list(color = "#FFE500"),
+                hoverinfo = "text",
+                text = paste0(d$Player, "<br>scores in ", d$AnyTD, "% of games")) %>%
+      add_trace(x = d$MultiTD, y = d$lab, name = "Two or more", type = "bar",
+                orientation = "h", marker = list(color = "#A87FE0"),
+                hoverinfo = "text",
+                text = paste0(d$Player, "<br>2+ TDs in ", d$MultiTD, "% of games")) %>%
+      add_trace(x = d$AnyBonus, y = d$lab, name = "100/300 yd bonus",
+                type = "scatter", mode = "markers",
+                marker = list(color = "#7BAFD4", size = 8,
+                              line = list(color = "#111", width = 1)),
+                hoverinfo = "text",
+                text = paste0(d$Player, "<br>bonus in ", d$AnyBonus, "% of games"))) %>%
+      layout(barmode = "overlay",
+             xaxis = list(title = "% of simulated games", gridcolor = "#2a2a2a"),
+             yaxis = list(title = "", automargin = TRUE),
+             margin = list(l = 10, r = 30, t = 10, b = 50))
+  })
+
+  output$cfb_rates_table <- renderDT({
+    req(rv$sport == "CFB", rv$sport_visuals$rates)
+    datatable(rv$sport_visuals$rates[Player %in% cfb_keep()], rownames = FALSE,
+              options = list(dom = "tp", pageLength = 30, searching = FALSE,
+                             scrollX = TRUE))
+  })
+
+  # ---- score range ---------------------------------------------------------
+  # A BAR, NOT A VIOLIN, AND THE DATA DECIDED THAT. Violins are right for the
+  # team outcomes -- two smooth distributions, and they render cleanly. They are
+  # wrong here: most of a 27-man showdown board is zero in the majority of sims,
+  # so the density is a spike at the origin, and plotly's width normalisation
+  # leaves the shapes wildly unequal (27px for the lead back against 2px for a
+  # depth receiver). The percentile bar says the same thing legibly.
+  output$cfb_violin <- renderPlotly({
+    req(rv$sport == "CFB", rv$sport_visuals$stat_line, rv$sport_visuals$score_dist)
+    keep <- cfb_keep(); req(length(keep) > 0)
+    d <- merge(rv$sport_visuals$score_dist[Player %in% keep],
+               rv$sport_visuals$stat_line[, .(Player, Pos)], by = "Player")
+    setorder(d, Mean)
+    d[, lab := factor(paste0(Player, "  (", Pos, ")"),
+                      levels = paste0(Player, "  (", Pos, ")"))]
+    pal <- cfb_team_pal(sort(unique(d$Team)))
+    d[, col := pal[Team]]
+    CFB_DARK(plot_ly(height = max(420, 27 * nrow(d) + 130)) %>%
+      add_segments(data = d, x = ~P10, xend = ~P90, y = ~lab, yend = ~lab,
+                   line = list(color = "#5a5a52", width = 3),
+                   hoverinfo = "text", showlegend = FALSE,
+                   text = ~paste0(Player, "<br>p10 ", P10, " to p90 ", P90)) %>%
+      add_segments(data = d, x = ~P25, xend = ~P75, y = ~lab, yend = ~lab,
+                   line = list(color = ~col, width = 11), opacity = 0.75,
+                   hoverinfo = "text", showlegend = FALSE,
+                   text = ~paste0(Player, "<br>middle half: ", P25, " to ", P75)) %>%
+      add_markers(data = d, x = ~Median, y = ~lab, showlegend = FALSE,
+                  marker = list(color = "#141414", symbol = "line-ns-open",
+                                size = 13, line = list(width = 3, color = "#141414")),
+                  hoverinfo = "text", text = ~paste0("median ", Median)) %>%
+      add_markers(data = d, x = ~Mean, y = ~lab, showlegend = FALSE,
+                  marker = list(color = "#ffffff", size = 7,
+                                line = list(color = "#111", width = 1.5)),
+                  hoverinfo = "text", text = ~paste0("mean ", Mean)) %>%
+      add_markers(data = d, x = ~P99, y = ~lab, showlegend = FALSE,
+                  marker = list(color = "#FFE500", size = 5, symbol = "diamond"),
+                  hoverinfo = "text", text = ~paste0("1-in-100 game: ", P99))) %>%
+      layout(xaxis = list(title = "DraftKings points  —  bar is the middle half, line p10 to p90, white dot the mean, yellow diamond the 1-in-100 game",
+                          gridcolor = "#2a2a2a", zeroline = FALSE),
+             yaxis = list(title = "", automargin = TRUE),
+             margin = list(l = 10, r = 30, t = 10, b = 60))
   })
 
   output$cfb_stat_table <- renderDT({
@@ -3787,57 +3915,6 @@ server <- function(input, output, session) {
     datatable(rv$sport_visuals$stat_line[Player %in% cfb_keep()], rownames = FALSE,
               options = list(dom = "tp", pageLength = 30, searching = FALSE,
                              scrollX = TRUE, order = list(list(4, "desc"))))
-  })
-
-  output$cfb_team_table <- renderDT({
-    req(rv$sport == "CFB", rv$sport_visuals$team_line)
-    datatable(rv$sport_visuals$team_line, rownames = FALSE,
-              options = list(dom = "t", paging = FALSE, searching = FALSE,
-                             scrollX = TRUE))
-  })
-
-  output$cfb_value <- renderPlotly({
-    req(rv$sport == "CFB", rv$sport_visuals$stat_line)
-    keep <- cfb_keep(); req(length(keep) > 0)
-    d <- rv$sport_visuals$stat_line[Player %in% keep][order(Val)]
-    d[, lab := factor(paste0(Player, "  (", Pos, ")"),
-                      levels = paste0(Player, "  (", Pos, ")"))]
-    pal <- cfb_team_pal(sort(unique(d$Team)))
-    plot_ly(d, x = ~Val, y = ~lab, color = ~Team, colors = pal, type = "bar",
-            orientation = "h", hoverinfo = "text",
-            text = ~paste0(Player, "<br>", DK, " pts on $",
-                           formatC(Salary, big.mark = ",", format = "d"),
-                           "<br>", Val, " per $1k"),
-            height = max(360, 23 * nrow(d) + 120)) %>%
-      layout(paper_bgcolor = "#121212", plot_bgcolor = "#141414",
-             font = list(color = "#FFFFFF", size = 11),
-             xaxis = list(title = "DK points per $1,000", gridcolor = "#2a2a2a"),
-             yaxis = list(title = "", automargin = TRUE),
-             legend = list(orientation = "h", y = 1.03, x = 0),
-             margin = list(l = 10, r = 30, t = 10, b = 50))
-  })
-
-  output$cfb_risk <- renderPlotly({
-    req(rv$sport == "CFB", rv$sport_visuals$stat_line)
-    keep <- cfb_keep(); req(length(keep) > 0)
-    d <- rv$sport_visuals$stat_line[Player %in% keep]
-    pal <- cfb_team_pal(sort(unique(d$Team)))
-    plot_ly(d, x = ~Bust, y = ~Boom, color = ~Team, colors = pal,
-            type = "scatter", mode = "markers+text",
-            text = ~Player, textposition = "top center",
-            textfont = list(size = 9, color = "#999"),
-            marker = list(size = ~pmax(8, Salary / 700),
-                          line = list(color = "#111", width = 1)),
-            hoverinfo = "text",
-            hovertext = ~paste0(Player, " (", Pos, ")<br>", DK, " pts, $",
-                                formatC(Salary, big.mark = ",", format = "d"),
-                                "<br>bust ", Bust, "%  boom ", Boom, "%")) %>%
-      layout(paper_bgcolor = "#121212", plot_bgcolor = "#141414",
-             font = list(color = "#FFFFFF", size = 11),
-             xaxis = list(title = "Bust rate % (under 3 pts)", gridcolor = "#2a2a2a"),
-             yaxis = list(title = "Boom rate % (20+ pts)", gridcolor = "#2a2a2a"),
-             legend = list(orientation = "h", y = 1.03, x = 0),
-             margin = list(l = 60, r = 30, t = 10, b = 50))
   })
 
   render_tennis_visuals <- function(visuals) {

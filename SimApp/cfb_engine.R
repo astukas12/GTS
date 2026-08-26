@@ -507,6 +507,69 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
                    by = .(Player = player, Team = team)]
   dist_sample <- merge(dist_sample, meta[, .(Player, Pos)], by = "Player", all.x = TRUE)
 
+  # ---- WHERE THE PROJECTION COMES FROM -------------------------------------
+  # A mean DK score is an answer without a derivation. These three tables are
+  # the derivation, and they are what a sheet is actually checked against:
+  # a receiver whose points are 80% touchdowns is a different object from one
+  # whose points are 80% yardage, even at the same total.
+
+  # 1. The score, decomposed into the DK line items that produced it.
+  sc <- CFB_SCORE
+  components <- A[, .(
+      Receptions = round(mean(rec) * sc$rec, 2),
+      RecYards   = round(mean(ryds) * sc$rec_yd, 2),
+      RecTDs     = round(mean(rtd) * sc$rec_td, 2),
+      RushYards  = round(mean(cyds) * sc$rush_yd, 2),
+      RushTDs    = round(mean(ctd) * sc$rush_td, 2),
+      PassYards  = round(mean(pyds) * sc$pass_yd, 2),
+      PassTDs    = round(mean(ptd) * sc$pass_td, 2),
+      Kicking    = round(mean(fgp + xp * sc$xp), 2),
+      ReturnTDs  = round(mean(rettd) * sc$return_td, 2),
+      Bonuses    = round(mean(fifelse(ryds >= 100, sc$rec_100, 0) +
+                              fifelse(cyds >= 100, sc$rush_100, 0) +
+                              fifelse(pyds >= 300, sc$pass_300, 0)), 2),
+      Turnovers  = round(mean(pint * sc$interception + fum * sc$fumble_lost), 2),
+      Total      = round(mean(dk), 2)),
+    by = .(Player = player, Team = team)][order(-Total)]
+
+  # 2. RATES, not averages. "0.37 touchdowns a game" is not a thing that can
+  # happen; "scores in 31% of games, twice in 5%" is. Multi-TD rate is the one
+  # the tournament price is really made of.
+  rates <- A[, .(
+      AnyTD     = round(100 * mean((rtd + ctd + rettd) >= 1), 1),
+      MultiTD   = round(100 * mean((rtd + ctd + rettd) >= 2), 1),
+      RecTDRate = round(100 * mean(rtd >= 1), 1),
+      RushTDRate= round(100 * mean(ctd >= 1), 1),
+      Rec100    = round(100 * mean(ryds >= 100), 1),
+      Rush100   = round(100 * mean(cyds >= 100), 1),
+      Pass300   = round(100 * mean(pyds >= 300), 1),
+      AnyBonus  = round(100 * mean(ryds >= 100 | cyds >= 100 | pyds >= 300), 1),
+      Blank     = round(100 * mean(rec == 0 & car == 0 & pyds == 0 & fgp == 0), 1)),
+    by = .(Player = player, Team = team)]
+  rates <- merge(rates, stat_line[, .(Player, Pos, DK)], by = "Player", all.x = TRUE)
+  setcolorder(rates, c("Player","Team","Pos","DK"))
+  setorder(rates, -DK)
+
+  # 3. TEAM OUTCOME SPREAD. The player numbers all sit inside these, so if the
+  # team passing range is wrong nothing downstream can be right. Downsampled
+  # for the browser the same way the player distributions are.
+  tg <- A[, .(PassYds = sum(pyds), RushYds = sum(cyds), RecYds = sum(ryds),
+              PassTD = sum(ptd), RushTD = sum(ctd), RecTD = sum(rtd),
+              TotalTD = sum(rtd) + sum(ctd),
+              Points = sum(rtd) * 6 + sum(ctd) * 6 + sum(fgp) + sum(xp)),
+          by = .(SimID, team)]
+  tkeep <- min(2000L, n_sims)
+  team_dist <- melt(tg[SimID %in% sample(unique(tg$SimID), tkeep)],
+                    id.vars = c("SimID","team"),
+                    variable.name = "Metric", value.name = "Value")
+  team_spread <- tg[, .(Mean = round(mean(PassYds), 1)), by = team]
+  team_spread <- melt(tg, id.vars = c("SimID","team"), variable.name = "Metric",
+                      value.name = "V")[
+    , .(Mean = round(mean(V), 1), P10 = round(quantile(V, .1), 1),
+        P25 = round(quantile(V, .25), 1), Median = round(median(V), 1),
+        P75 = round(quantile(V, .75), 1), P90 = round(quantile(V, .9), 1)),
+    by = .(Team = team, Metric)]
+
   # ---- validation: the mix, against real football --------------------------
   # NOT DISPLAYED IN THE APP. This answers "is this sheet believable", which is
   # a question for building the sheet rather than for reading the results, so
@@ -544,7 +607,8 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
 
   sport_visuals <- list(
     score_dist = score_dist, stat_line = stat_line,
-    dist_sample = dist_sample,
+    dist_sample = dist_sample, components = components, rates = rates,
+    team_dist = team_dist, team_spread = team_spread,
     validation = validation, team_line = team_line,
     pool_size = nrow(P), n_sims = n_sims,
     ess = round(cal$ess),
