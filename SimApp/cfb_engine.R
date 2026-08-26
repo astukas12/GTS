@@ -254,6 +254,13 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
   })
   names(setup) <- c(fav, dog)
 
+  # EVERY (game_id, pos_team) IS A CONTIGUOUS BLOCK because build_templates.R
+  # ships the file keyed that way. So the drawn games' events are gathered by
+  # integer slicing rather than 6,000 keyed joins -- the join alone was 2.4s per
+  # 3,000 sims and was the single largest cost in the engine.
+  BLK <- EV[, .(s = .I[1], e = .I[.N]), by = .(game_id, pos_team)]
+  setkey(BLK, game_id, pos_team)
+
   say(sprintf("simulating %s games", format(n_sims, big.mark = ",")), 0.12)
   out <- vector("list", length(setup))
 
@@ -261,108 +268,133 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
     cf <- setup[[si]]; tm <- cf$tm
     R <- cf$rec; S <- cf$rsh; nR <- nrow(R); nS <- nrow(S)
     pos <- setNames(R$route_base, R$player)
-    pos[S$player] <- ifelse(S$dk_pos == "QB", "QB", "RB")
-    pos[cf$qb] <- "QB"; pos[cf$k] <- "K"
-    # A returner who neither catches nor carries (UNC's McGill) appears in
-    # `who` but in none of the tables above, so give him a position explicitly.
+    if (nS) pos[S$player] <- fifelse(S$dk_pos == "QB", "QB", "RB")
+    if (!is.na(cf$qb)) pos[cf$qb] <- "QB"
+    if (!is.na(cf$k))  pos[cf$k]  <- "K"
     miss <- setdiff(cf$who, names(pos)); if (length(miss)) pos[miss] <- "WR"
     who <- cf$who; nW <- length(who)
-    iR <- match(R$player, who); iS <- match(S$player, who)
-    iQ <- match(cf$qb, who); iK <- match(cf$k, who)
-    iPR <- match(cf$pr, who); iKR <- match(cf$kr, who)
 
-    # Team-side columns for whichever side of the drawn game this team plays.
-    # NAMED v_* DELIBERATELY. `ptd` would collide with the column of the same
-    # name created below, and inside `:=` the column wins -- so `ptd = ptd[SimID]`
-    # reads the zeroes it just wrote and every passing touchdown scores nothing.
-    # Silent, and worth about 6 DK points a game on the quarterback.
     v_pyds <- draw[[paste0(cf$side, "pyds")]]
     v_ptd  <- draw[[paste0(cf$side, "ptd")]]
     v_pint <- draw[[paste0(cf$side, "pint")]]
-    dteam_col <- draw[[if (cf$side == "f") "fteam" else "dteam"]]
+    tcol   <- draw[[if (cf$side == "f") "fteam" else "dteam"]]
 
-    acc <- matrix(0, nrow = n_sims * nW, ncol = 9)   # rec ryds rtd car cyds ctd fg xp rtd6
-    simv <- rep(seq_len(n_sims), each = nW)
-    plyv <- rep(who, times = n_sims)
+    # ---- gather every drawn game's events in one shot ------------------------
+    sel <- BLK[data.table(sim = seq_len(n_sims), game_id = draw$game_id,
+                          pos_team = tcol), on = .(game_id, pos_team)]
+    sel[is.na(s), `:=`(s = 1L, e = 0L)]
+    lens <- pmax(sel$e - sel$s + 1L, 0L)
+    E2 <- EV[rep(sel$s, lens) + sequence(lens) - 1L]
+    E2[, sim := rep(sel$sim, lens)]
 
-    for (i in seq_len(n_sims)) {
-      gid <- draw$game_id[i]; pt <- dteam_col[i]
-      ev  <- EV[.(gid, pt), nomatch = 0L]
-      base <- (i - 1L) * nW
-      if (nrow(ev)) {
-        cmp <- ev[kind == CFB_EVT_CMP]
-        if (nrow(cmp) && nR) for (j in seq_len(nrow(cmp))) {
-          b <- cfb_bucket(cmp$yds[j])
-          k <- sample.int(nR, 1L, prob = R$usage * cf$lr[, b])
-          r <- base + iR[k]
-          acc[r,1] <- acc[r,1]+1; acc[r,2] <- acc[r,2]+cmp$yds[j]
-          if (isTRUE(cmp$td[j] == 1)) acc[r,3] <- acc[r,3]+1
-        }
-        run <- ev[kind == CFB_EVT_RUN]
-        if (nrow(run) && nS) for (j in seq_len(nrow(run))) {
-          gl <- !is.na(run$ytg[j]) && run$ytg[j] <= 3
-          sy <- !gl && !is.na(run$dn[j]) && !is.na(run$dist[j]) &&
-                run$dn[j] >= 3 && run$dist[j] <= 2
-          wgt <- if (gl) S$carry_usage * S$gl_tilt else
-                 if (sy) S$carry_usage * S$sy_tilt else S$carry_usage
-          k <- sample.int(nS, 1L, prob = wgt)
-          r <- base + iS[k]
-          acc[r,4] <- acc[r,4]+1; acc[r,5] <- acc[r,5]+run$yds[j]
-          if (isTRUE(run$td[j] == 1)) acc[r,6] <- acc[r,6]+1
-        }
-        # SACKS GO WHOLE TO WHOEVER WAS IN, never matched by name -- name
-        # matching returns ZERO sacks for a 388-attempt season. The box folds
-        # them into QB rushing and DK scores off the box, so they are added to
-        # his rushing yards rather than deducted separately.
-        sk <- ev[kind == CFB_EVT_SACK]
-        if (nrow(sk) && !is.na(iQ)) acc[base+iQ,5] <- acc[base+iQ,5] + sum(sk$yds)
-        # KICKS AS THEY HAPPENED, NEVER RE-ROLLED. The drawn game's point total
-        # already includes these makes; re-simulating them would break the
-        # internal consistency that resampling exists to preserve.
-        fg <- ev[kind == CFB_EVT_FG]
-        if (nrow(fg) && !is.na(iK)) {
-          made <- fg[!is.na(made) & made == 1]
-          if (nrow(made)) acc[base+iK,7] <- sum(cfb_fg_points(made$ytg))
-        }
+    # ---- deal the catches ----------------------------------------------------
+    # ONLY FIVE PROBABILITY VECTORS EXIST -- the bucket a catch falls in fully
+    # determines the odds, so every completion in every simulated game is drawn
+    # with five calls rather than one per event.
+    rec <- NULL
+    C2 <- E2[kind == CFB_EVT_CMP]
+    if (nrow(C2) && nR) {
+      C2[, b := cfb_bucket(yds)]
+      PRB <- lapply(seq_len(5L), function(b) { p <- R$usage * cf$lr[, b]; p / sum(p) })
+      C2[, w := NA_integer_]
+      for (b in seq_len(5L)) {
+        ii <- which(C2$b == b)
+        if (length(ii)) set(C2, ii, "w", sample.int(nR, length(ii), TRUE, prob = PRB[[b]]))
       }
-      if (!is.na(iK)) acc[base+iK,8] <- sum(acc[(base+1):(base+nW),3]) +
-                                        sum(acc[(base+1):(base+nW),6])
-      if (!is.na(iPR) && runif(1) < CFB_PUNT_TD_RATE) acc[base+iPR,9] <- acc[base+iPR,9]+1
-      if (!is.na(iKR) && runif(1) < CFB_KICK_TD_RATE) acc[base+iKR,9] <- acc[base+iKR,9]+1
-      if (i %% 1000 == 0)
-        say(sprintf("%s %d/%d", tm, i, n_sims), 0.12 + 0.7 * ((si-1)/2 + i/n_sims/2))
+      rec <- C2[, .(rec = .N, ryds = sum(yds),
+                    rtd = sum(td == 1L, na.rm = TRUE)), by = .(sim, w)]
+      rec[, player := R$player[w]][, w := NULL]
     }
 
-    D <- data.table(SimID = simv, player = plyv, team = tm,
-                    rec = acc[,1], ryds = acc[,2], rtd = acc[,3],
-                    car = acc[,4], cyds = acc[,5], ctd = acc[,6],
-                    fg = acc[,7], xp = acc[,8], rettd = acc[,9])
-    D[, `:=`(pyds = 0, ptd = 0, pint = 0)]
-    if (!is.na(cf$qb)) {
-      D[player == cf$qb, `:=`(pyds = v_pyds[SimID], ptd = v_ptd[SimID],
-                              pint = v_pint[SimID])]
+    # ---- deal the carries ----------------------------------------------------
+    # Three situations, so three vectors. Goal-line is read off the event
+    # (yards_to_goal <= 3) and short-yardage off down and distance -- the sheet
+    # only says how LIKELY a man is once the situation arrives, never that he
+    # owns it. Top man's realised goal-line share stays near the league's .455.
+    rsh <- NULL
+    R2 <- E2[kind == CFB_EVT_RUN]
+    if (nrow(R2) && nS) {
+      R2[, sit := fifelse(!is.na(ytg) & ytg <= 3L, 3L,
+                  fifelse(!is.na(dn) & !is.na(dist) & dn >= 3L & dist <= 2L, 2L, 1L))]
+      SPB <- list(S$carry_usage,
+                  S$carry_usage * S$sy_tilt,
+                  S$carry_usage * S$gl_tilt)
+      SPB <- lapply(SPB, function(p) p / sum(p))
+      R2[, w := NA_integer_]
+      for (q in seq_len(3L)) {
+        ii <- which(R2$sit == q)
+        if (length(ii)) set(R2, ii, "w", sample.int(nS, length(ii), TRUE, prob = SPB[[q]]))
+      }
+      rsh <- R2[, .(car = .N, cyds = sum(yds),
+                    ctd = sum(td == 1L, na.rm = TRUE)), by = .(sim, w)]
+      rsh[, player := S$player[w]][, w := NULL]
     }
-    # FUMBLES: the DRAWN GAME's team count, allocated across touches already
-    # assigned. Not dealt as events -- the PBP cannot identify which play was a
-    # fumble -- and no per-player input, because fumble rate per carry has
-    # split-half reliability of 0.084.
+
+    # Sacks whole to whoever was in; kicks exactly as they happened.
+    sk <- E2[kind == CFB_EVT_SACK, .(sk = sum(yds)), by = sim]
+    fg <- E2[kind == CFB_EVT_FG & !is.na(made) & made == 1L,
+             .(fg = sum(cfb_fg_points(ytg))), by = sim]
+
+    # ---- assemble the full (sim x player) grid -------------------------------
+    # Every player in every sim, because a zero counts: bust rate and the whole
+    # left tail of the distribution live in the games a man did nothing.
+    D <- CJ(sim = seq_len(n_sims), player = who, sorted = FALSE)
+    if (!is.null(rec)) D <- merge(D, rec, by = c("sim","player"), all.x = TRUE)
+    if (!is.null(rsh)) D <- merge(D, rsh, by = c("sim","player"), all.x = TRUE)
+    for (cl in c("rec","ryds","rtd","car","cyds","ctd"))
+      if (!cl %in% names(D)) D[, (cl) := 0] else D[is.na(get(cl)), (cl) := 0]
+
+    D[, `:=`(pyds = 0, ptd = 0, pint = 0, fgp = 0, xp = 0, rettd = 0L)]
+    if (!is.na(cf$qb)) {
+      skv <- rep(0, n_sims); skv[sk$sim] <- sk$sk
+      D[player == cf$qb, `:=`(cyds = cyds + skv[sim], pyds = v_pyds[sim],
+                              ptd = v_ptd[sim], pint = v_pint[sim])]
+    }
+    if (!is.na(cf$k)) {
+      fgv <- rep(0, n_sims); fgv[fg$sim] <- fg$fg
+      tdv <- D[, .(t = sum(rtd) + sum(ctd)), by = sim]
+      xpv <- rep(0, n_sims); xpv[tdv$sim] <- tdv$t
+      D[player == cf$k, `:=`(fgp = fgv[sim], xp = xpv[sim])]
+    }
+    if (!is.na(cf$pr)) D[player == cf$pr & runif(.N) < CFB_PUNT_TD_RATE, rettd := rettd + 1L]
+    if (!is.na(cf$kr)) D[player == cf$kr & runif(.N) < CFB_KICK_TD_RATE, rettd := rettd + 1L]
+
+    # ---- fumbles: the drawn game's count, allocated across assigned touches ---
+    # Vectorised by cumulative weight within each sim rather than a loop: draw
+    # one uniform per fumble and find which player's slice it lands in.
     D[, tch := rec + car]
     if (!is.na(cf$qb)) D[player == cf$qb, tch := tch + 25]
     D[, fwt := tch * unname(CFB_FUM_RATE[pos[player]])]
     D[is.na(fwt), fwt := 0]
-    fl <- FUM[.(draw$game_id, dteam_col), nomatch = NA]$fl
-    fl[is.na(fl)] <- sample(0:4, sum(is.na(fl)), TRUE, prob = CFB_FUM_DIST)
-    D[, fum := 0]
-    for (i in which(fl > 0)) {
-      rows <- which(D$SimID == i)
-      w <- D$fwt[rows]
-      if (sum(w) > 0) for (h in sample(rows, fl[i], TRUE, prob = w)) D$fum[h] <- D$fum[h] + 1
+    fl <- FUM[data.table(game_id = draw$game_id, team = tcol),
+              on = .(game_id, team)]$fl
+    naf <- is.na(fl)
+    if (any(naf)) fl[naf] <- sample(0:4, sum(naf), TRUE, prob = CFB_FUM_DIST)
+    D[, fum := 0L]
+    setorder(D, sim)
+    D[, cw := cumsum(fwt), by = sim]
+    tot <- D[, .(tw = max(cw)), by = sim]
+    hit <- rep(seq_len(n_sims), fl)
+    hit <- hit[tot$tw[hit] > 0]
+    if (length(hit)) {
+      u <- runif(length(hit)) * tot$tw[hit]
+      key <- D[, .(sim, cw)]
+      # rows are sim-major and contiguous, so the winner is the first cw >= u
+      offs <- (hit - 1L) * nW
+      w <- offs + vapply(seq_along(hit), function(j)
+             which.max(key$cw[(offs[j]+1L):(offs[j]+nW)] >= u[j]), 1L)
+      cnt <- tabulate(w, nbins = nrow(D))
+      D[, fum := cnt]
     }
+    D[, c("tch","fwt","cw") := NULL]
+    D[, team := tm]
     out[[si]] <- D
+    say(sprintf("%s dealt", tm), 0.12 + 0.7 * si / length(setup))
   }
 
   say("scoring", 0.88)
   A <- rbindlist(out)
+  setnames(A, "sim", "SimID")   # the dealer works in `sim`; the app contract is SimID
   sc <- CFB_SCORE
   A[, dk := rec * sc$rec + ryds * sc$rec_yd + rtd * sc$rec_td +
             cyds * sc$rush_yd + ctd * sc$rush_td +
@@ -370,7 +402,7 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
             fifelse(cyds >= 100, sc$rush_100, 0) +
             pyds * sc$pass_yd + ptd * sc$pass_td + pint * sc$interception +
             fifelse(pyds >= 300, sc$pass_300, 0) +
-            fg + xp * sc$xp + rettd * sc$return_td + fum * sc$fumble_lost]
+            fgp + xp * sc$xp + rettd * sc$return_td + fum * sc$fumble_lost]
 
   # ---- app contract ----------------------------------------------------------
   meta <- unique(PL[, .(Player = player, Team = team, Pos = dk_pos,
