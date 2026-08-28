@@ -29,6 +29,8 @@ find_optimal_lineups <- function(sim_results, config, mode = "standard", k = 3, 
     return(find_optimal_lineups_combinatorial_mvp(sim_results, config, verbose))
   } else if (mode == "preseason_classic") {
     return(find_optimal_lineups_preseason_classic(sim_results, config, k, verbose))
+  } else if (mode == "cfb_classic") {
+    return(find_optimal_lineups_cfb_classic(sim_results, config, verbose))
   } else {
     stop(paste("Unknown mode:", mode,
                "- must be 'standard', 'mvp', 'captain', 'win_based',",
@@ -1850,4 +1852,165 @@ Phase 1: optimal classic lineup for %s sims
   # them fails later, inside the scorer, rather than here.
   list(unique_lineups = uni, n_sims = length(sims), config = config,
        mode = "preseason_classic")
+}
+
+
+# =============================================================================
+# MODE: CFB CLASSIC  (QB / RB / RB / WR / WR / WR / FLEX / SFLEX, $50k cap)
+# -----------------------------------------------------------------------------
+# The first slate here that constrains BOTH position AND a binding salary cap
+# (CFB classic salaries run $3,000-$9,000, so eight studs blow $50k), so
+# selection is an exact per-sim binary LP:
+#     sum(x) == 8 ;  sum(salary * x) <= cap
+#     QB in [1,2] ;  RB in [2,4] ;  WR in [3,5]
+# Those three position bounds are exactly the condition that the chosen 8 can
+# be dealt into QB, RB, RB, WR, WR, WR, FLEX(RB/WR), SFLEX(QB/RB/WR).
+#
+# The 8 are then ASSIGNED to slots so FLEX and SFLEX hold the latest-kicking
+# players (StartOrder, for late swap) -- except a second QB, if the LP took
+# one, is forced into SFLEX because it is the only QB-eligible flex slot.
+#
+# Ranking mirrors preseason_classic: with a binding cap every sim's optimum is
+# effectively unique, so Top1Count carries little; the pool is ranked by lineup
+# mean, softened by config$pool_spread (Gumbel-top-k) for coverage.
+#
+# sim_results needs SimID, Player, FantasyPoints, Salary, Pos, StartOrder.
+# =============================================================================
+.cfb_pos_bounds <- function(config) {
+  ps <- config$position_slots %||% list(QB = 1, RB = 2, WR = 3, FLEX = 1, SFLEX = 1)
+  fl <- config$flex_eligible  %||% c("RB", "WR")
+  sf <- config$sflex_eligible %||% c("QB", "RB", "WR")
+  nflex <- ps$FLEX %||% 1L; nsflex <- ps$SFLEX %||% 1L
+  bump <- function(pos) (pos %in% fl) * nflex + (pos %in% sf) * nsflex
+  lo <- c(QB = ps$QB %||% 1L, RB = ps$RB %||% 2L, WR = ps$WR %||% 3L)
+  list(lo = lo,
+       hi = c(QB = lo[["QB"]] + bump("QB"),
+              RB = lo[["RB"]] + bump("RB"),
+              WR = lo[["WR"]] + bump("WR")),
+       size = sum(lo) + nflex + nsflex)
+}
+
+# One chosen lineup (data.table with Player, Pos, StartOrder) -> the 8 players
+# in upload order QB, RB, RB, WR, WR, WR, FLEX, SFLEX.
+.cfb_assign_slots <- function(L) {
+  L  <- as.data.table(L)
+  qb <- L[Pos == "QB"][order(StartOrder)]
+  rw <- L[Pos != "QB"]
+  two_qb   <- nrow(qb) >= 2L
+  base_qb  <- qb$Player[1]
+  sflex_qb <- if (two_qb) qb$Player[2] else NA_character_
+
+  # FLEX always drawn from the RB/WR pool; SFLEX too, unless a 2nd QB took it.
+  n_pool_flex <- 1L + as.integer(!two_qb)
+  taken <- character(0)
+  for (p in rw[order(-StartOrder)]$Player) {          # latest kickoff first
+    if (length(taken) == n_pool_flex) break
+    rest <- rw[!Player %in% c(taken, p)]
+    if (sum(rest$Pos == "RB") >= 2L && sum(rest$Pos == "WR") >= 3L)
+      taken <- c(taken, p)
+  }
+  base_pool <- rw[!Player %in% taken][order(StartOrder)]
+  rb <- base_pool[Pos == "RB"]$Player[1:2]
+  wr <- base_pool[Pos == "WR"]$Player[1:3]
+
+  tk <- rw[Player %in% taken][order(StartOrder)]      # flex fillers, earliest..latest
+  if (two_qb) { flex <- tk$Player[1];  sflex <- sflex_qb }
+  else        { flex <- tk$Player[1];  sflex <- tk$Player[2] }  # latest -> SFLEX
+
+  c(base_qb, rb, wr, flex, sflex)
+}
+
+find_optimal_lineups_cfb_classic <- function(sim_results, config, verbose = TRUE) {
+  setDT(sim_results)
+  if (!all(c("Pos", "StartOrder") %in% names(sim_results)))
+    stop("cfb_classic optimiser needs Pos and StartOrder on sim_results")
+
+  b    <- .cfb_pos_bounds(config)
+  cap  <- config$salary_cap %||% 50000
+  need <- b$size
+  max_lineups <- config$max_lineups %||% 5000L
+  sim_ids <- unique(sim_results$SimID); n_sims <- length(sim_ids)
+  start_time <- Sys.time()
+  if (verbose) cat(sprintf("\nPhase 1: CFB classic LP | %s sims | $%s cap | %d slots\n",
+                           format(n_sims, big.mark = ","),
+                           format(cap, big.mark = ","), need))
+
+  one_sim <- function(sd) {
+    sd <- sd[Salary > 0 & !is.na(Salary) & !is.na(FantasyPoints) &
+             Pos %in% c("QB", "RB", "WR")]
+    if (nrow(sd) < need) return(NULL)
+    # Trim per position to the only players that can plausibly be optimal:
+    # the top 24 by points plus the 6 cheapest (the punt plays that free cap).
+    keep <- sd[, .I[union(head(order(-FantasyPoints), 24L),
+                          head(order(Salary), 6L))], by = Pos]$V1
+    sd <- sd[sort(unique(keep))]
+    npl <- nrow(sd)
+    if (npl < need) return(NULL)
+    isq <- as.numeric(sd$Pos == "QB")
+    isr <- as.numeric(sd$Pos == "RB")
+    isw <- as.numeric(sd$Pos == "WR")
+    con <- rbind(rep(1, npl), sd$Salary, isq, isq, isr, isr, isw, isw)
+    dir <- c("==", "<=", ">=", "<=", ">=", "<=", ">=", "<=")
+    rhs <- c(need, cap,
+             b$lo[["QB"]], b$hi[["QB"]],
+             b$lo[["RB"]], b$hi[["RB"]],
+             b$lo[["WR"]], b$hi[["WR"]])
+    r <- tryCatch(lp("max", sd$FantasyPoints, con, dir, rhs, all.bin = TRUE),
+                  error = function(e) list(status = 1L))
+    if (!identical(r$status, 0L) && r$status != 0) return(NULL)
+    sel <- which(r$solution > 0.5)
+    if (length(sel) != need) return(NULL)
+    data.table(SimID = sd$SimID[sel][1],
+               Player = .cfb_assign_slots(sd[sel]),
+               slot_i = seq_len(need))
+  }
+
+  setkey(sim_results, SimID)
+  use_par <- (config$use_parallel %||% TRUE) && n_sims > 100
+  rows <- if (use_par) {
+    nc <- min(detectCores() - 1, 7)
+    if (verbose) cat(sprintf("  %d cores\n", nc))
+    cl <- makeCluster(nc, type = "PSOCK")
+    on.exit(stopCluster(cl), add = TRUE)
+    clusterEvalQ(cl, { library(data.table); library(lpSolve) })
+    clusterExport(cl, c("one_sim", "sim_results", "need", "cap", "b",
+                        ".cfb_assign_slots"), envir = environment())
+    parLapply(cl, sim_ids, function(s) one_sim(sim_results[.(s)]))
+  } else {
+    lapply(sim_ids, function(s) one_sim(sim_results[.(s)]))
+  }
+
+  full <- rbindlist(rows[!vapply(rows, is.null, logical(1))])
+  if (!nrow(full)) stop("cfb_classic optimiser: no feasible lineup in any sim")
+
+  wide <- dcast(full, SimID ~ slot_i, value.var = "Player")
+  pc <- paste0("Player", seq_len(need))
+  setnames(wide, as.character(seq_len(need)), pc)
+  key <- apply(as.matrix(wide[, ..pc]), 1L,
+               function(r) paste(sort(r), collapse = "|"))
+  wide[, lkey := key]
+  cnt <- wide[, .(Top1Count = .N), by = lkey]
+  uni <- merge(wide[!duplicated(lkey)], cnt, by = "lkey")
+
+  pmu <- sim_results[, .(mu = mean(FantasyPoints)), by = Player]
+  mu  <- setNames(pmu$mu, pmu$Player)
+  uni[, AvgScore := rowSums(matrix(mu[unlist(.SD)], nrow = nrow(uni))), .SDcols = pc]
+  sprd <- config$pool_spread %||% 0
+  if (sprd > 0) {
+    tT <- sprd * stats::sd(uni$AvgScore)
+    g  <- -log(-log(stats::runif(nrow(uni))))
+    uni[, rk := AvgScore / tT + g]
+  } else uni[, rk := AvgScore]
+  setorder(uni, -Top1Count, -rk)
+  if (nrow(uni) > max_lineups) uni <- head(uni, max_lineups)
+
+  sp  <- unique(sim_results[, .(Player, Salary)])
+  sal <- setNames(sp$Salary, sp$Player)
+  uni[, TotalSalary := rowSums(matrix(sal[unlist(.SD)], nrow = nrow(uni))), .SDcols = pc]
+  uni[, c("lkey", "rk") := NULL]
+
+  if (verbose) cat(sprintf("  %s distinct lineups | %.1fs\n",
+                           format(nrow(uni), big.mark = ","),
+                           as.numeric(difftime(Sys.time(), start_time, units = "secs"))))
+  list(unique_lineups = uni, n_sims = n_sims, config = config, mode = "cfb_classic")
 }

@@ -650,3 +650,105 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
   list(sim_results = sim_results, metadata = meta, projections = projections,
        sport_visuals = sport_visuals)
 }
+
+# =============================================================================
+# CLASSIC (multi-game full slate)
+# -----------------------------------------------------------------------------
+# The engine above is two teams by construction. A classic slate is just N of
+# those: draw each game from the pool on its own, deal it, then stack the
+# results in a SHARED SimID space so SimID k is one Monte-Carlo world across
+# every game -- correct, because the games are independent. Nothing about the
+# dealing changes here; this only loops it and glues the outputs.
+#
+# Two columns are added that the classic optimiser needs and showdown does not:
+#   GameKey     "AWAY HOME"
+#   StartOrder  the game tab's kickoff rank (1 = earliest). FLEX / SFLEX must
+#               hold the latest-starting players, so the optimiser reads this.
+# =============================================================================
+run_cfb_classic_simulation <- function(input_data, n_sims = 10000,
+                                       config = NULL, progress_callback = NULL) {
+  if (is.null(n_sims) || is.na(n_sims)) n_sims <- 10000
+  G   <- as.data.table(input_data$game)
+  TT  <- as.data.table(input_data$team)
+  PL  <- as.data.table(input_data$players)
+  PRJ <- input_data$projections
+
+  if (!"start_order" %in% names(G)) G[, start_order := seq_len(.N)]
+  setorder(G, start_order)
+  ng <- nrow(G)
+
+  say <- function(msg, frac = NULL) {
+    if (is.function(progress_callback)) try(progress_callback(msg, frac), silent = TRUE)
+    message("[cfb-classic] ", msg)
+  }
+
+  sr <- vector("list", ng); md <- vector("list", ng)
+  pj <- vector("list", ng); vis <- vector("list", ng)
+
+  for (i in seq_len(ng)) {
+    gi   <- G[i]
+    tms  <- c(gi$away, gi$home)
+    gkey <- paste(gi$away, gi$home)
+    say(sprintf("game %d/%d  %s", i, ng, gkey), (i - 1) / ng)
+
+    sub <- list(game        = gi,
+                team        = TT[team %in% tms],
+                players     = PL[team %in% tms],
+                projections = PRJ)
+    gp <- if (is.function(progress_callback))
+            function(m, f) try(progress_callback(
+                sprintf("game %d/%d: %s", i, ng, m),
+                (i - 1 + (f %||% 0)) / ng), silent = TRUE)
+          else NULL
+    res <- run_cfb_simulation(sub, n_sims = n_sims, config = config,
+                              progress_callback = gp)
+
+    so <- as.integer(gi$start_order)
+    r <- as.data.table(res$sim_results); r[, `:=`(GameKey = gkey, StartOrder = so)]
+    m <- as.data.table(res$metadata);    m[, `:=`(GameKey = gkey, StartOrder = so)]
+    sr[[i]]  <- r
+    md[[i]]  <- m
+    pj[[i]]  <- as.data.table(res$projections)
+    vis[[i]] <- res$sport_visuals
+  }
+
+  say("combining", 0.95)
+  sim_results <- rbindlist(sr, fill = TRUE)
+  metadata    <- rbindlist(md, fill = TRUE)
+  projections <- rbindlist(pj, fill = TRUE)
+
+  # The two-team engine seeds its player list with the kicker and both
+  # returners; a classic slate rosters none of those, so those names come
+  # through as NA. Drop them here rather than teach the core engine about
+  # classic.
+  sim_results <- sim_results[!is.na(Player) & Player != ""]
+  metadata    <- metadata[!is.na(Player) & Player != ""]
+  if (nrow(projections)) projections <- projections[!is.na(Player) & Player != ""]
+
+  # sport_visuals: the per-player / per-team tables just stack (tagged with the
+  # game they came from); the per-game scalars cannot, so they collapse to
+  # slate-level summaries.
+  vk <- c("score_dist", "stat_line", "dist_sample", "components", "rates",
+          "team_dist", "team_spread", "team_line", "validation")
+  sv <- list()
+  for (k in vk)
+    sv[[k]] <- rbindlist(lapply(seq_along(vis), function(j) {
+      d <- vis[[j]][[k]]
+      if (is.null(d) || !nrow(d)) return(NULL)
+      d <- as.data.table(copy(d)); d[, Game := vis[[j]]$market][]
+    }), fill = TRUE)
+
+  ess_all <- vapply(vis, function(v) as.numeric(v$ess %||% NA_real_), 0)
+  sv$pool_size   <- vis[[1]]$pool_size
+  sv$n_sims      <- n_sims
+  sv$ess         <- suppressWarnings(min(ess_all, na.rm = TRUE))
+  sv$market      <- sprintf("%d-game classic slate  |  worst-matched game ESS %s",
+                            ng, format(round(sv$ess), big.mark = ","))
+  sv$pool_total  <- NA_real_
+  sv$pool_margin <- NA_real_
+  sv$asked_total <- NA_real_
+
+  say("done", 1)
+  list(sim_results = sim_results, metadata = metadata,
+       projections = projections, sport_visuals = sv)
+}

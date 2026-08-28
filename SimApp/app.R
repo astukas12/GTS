@@ -40,7 +40,8 @@ load_sport_input <- function(file_path, sport, config) {
     CBB  = read_cbb_input,
     NBA  = read_nba_input,
     SOCCER = read_soccer_input,
-    CFB  = read_cfb_input
+    CFB  = read_cfb_input,
+    CFB_CLASSIC = read_cfb_input
   )
   if (sport %in% names(reader_map)) {
     return(reader_map[[sport]](file_path))
@@ -1019,6 +1020,19 @@ server <- function(input, output, session) {
     dl
   }
 
+  # CFB classic uploads by slot header. The cfb_classic optimiser already emits
+  # the eight players in QB/RB/RB/WR/WR/WR/FLEX/SFLEX order, so this only names
+  # them. DK calls superflex "SFLEX" on the CFB classic template.
+  cfb_classic_headers <- function(dl, platform) {
+    pc <- grep("^Player", names(dl), value = TRUE)
+    if (length(pc) != 8) return(dl)
+    hdr <- c("QB","RB","RB","WR","WR","WR","FLEX","SFLEX")
+    idx <- match(pc, names(dl))
+    setcolorder(dl, c(idx, setdiff(seq_along(dl), idx)))
+    setnames(dl, seq_along(hdr), hdr)
+    dl
+  }
+
   # DK Showdown requires at least one player from EACH team. The optimiser picks
   # the highest-scoring six per sim and in a lopsided preseason game that is
   # sometimes six from the same side -- a lineup DK refuses on upload. Drop
@@ -1133,6 +1147,7 @@ server <- function(input, output, session) {
     } else {
       d0 <- create_download_standard(optimal_lineups, metadata, platform)
       if (identical(sport, "NFL_PRESEASON_CLASSIC")) d0 <- ps_classic_headers(setDT(d0), platform)
+      if (identical(sport, "CFB_CLASSIC"))           d0 <- cfb_classic_headers(setDT(d0), platform)
       d0
     }
     # Round here rather than in each builder: the CBB and NBA download helpers
@@ -1497,6 +1512,51 @@ server <- function(input, output, session) {
         final_results <- calculate_distribution_metrics(score_matrix, lineup_data, opt_config,
                                                         ownership_data=NULL, verbose=TRUE)
         if ("AvgOwn" %in% names(final_results)) final_results[, AvgOwn := NULL]
+        rv$dk_optimal_lineups <- final_results
+
+      } else if (rv$sport == "CFB_CLASSIC") {
+        # Classic CFB: position slots AND a binding salary cap. Pos and
+        # StartOrder have to be merged back onto the optimiser input --
+        # prepare_optimization_data keeps only Player/Salary, and the
+        # cfb_classic mode needs Pos to fill QB/RB/WR and StartOrder to decide
+        # who is allowed in FLEX / SFLEX (latest kickoffs, for late swap).
+        progress$set(message="Finding optimal DraftKings lineups...", value=0)
+        opt_data <- prepare_optimization_data(rv$simulation_results, rv$sim_metadata, "DK")
+        opt_data <- merge(opt_data, rv$sim_metadata[, .(Player, Pos, StartOrder)],
+                          by="Player", all.x=TRUE)
+        # A player DK does not list cannot be rostered; an "optimal" lineup
+        # containing him will not upload.
+        dk_ok <- rv$sim_metadata[!is.na(DKID) & DKID != "" & DKID != "NA", Player]
+        opt_data <- opt_data[Player %in% dk_ok]
+        opt_config <- list(roster_size=rv$config$roster_sizes$DK, salary_cap=rv$config$salary_caps$DK,
+                           percentiles=c(0.01,0.05,0.10,0.20), platform_col="DKScore",
+                           position_slots=rv$config$position_slots,
+                           flex_eligible=rv$config$flex_eligible,
+                           sflex_eligible=rv$config$sflex_eligible,
+                           max_lineups=rv$config$max_lineups %||% 5000L,
+                           use_parallel=TRUE,
+                           pool_spread=rv$config$pool_spread %||% 0)
+        progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
+        lineup_data <- find_optimal_lineups(opt_data, opt_config, mode="cfb_classic",
+                                            k=1, verbose=TRUE)
+        # DK classic rule: >= 2 teams and >= 2 games. Never binds on a 7-game
+        # slate, cheap to guarantee anyway.
+        gtab <- as.data.table(rv$input_data$game)
+        lineup_data <- drop_invalid_classic(
+          lineup_data, rv$sim_metadata,
+          gtab[, .(AwayTeam=away, HomeTeam=home)])
+        progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
+                                    format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
+        score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
+        progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
+        own_data <- copy(rv$sim_metadata)
+        if ("DKOwn" %in% names(own_data)) { setnames(own_data, "DKOwn", "Own")
+          if (max(own_data$Own, na.rm=TRUE) > 1) own_data[, Own := Own / 100] }
+        final_results <- calculate_distribution_metrics(score_matrix, lineup_data, opt_config,
+                                                        ownership_data=own_data, verbose=TRUE)
+        final_results <- add_custom_metrics(final_results, rv$sim_metadata, rv$config)
+        for (wc in intersect(c("TotalEW","Win6Pct","Win5PlusPct"), names(final_results)))
+          final_results[, (wc) := NULL]
         rv$dk_optimal_lineups <- final_results
 
       } else {
@@ -3221,6 +3281,7 @@ server <- function(input, output, session) {
             dl[[col]] <- if(platform=="DK") paste0(dl[[col]]," (",ids,")") else paste0(ids,":",dl[[col]])
           }
           if (isTRUE(rv$sport == "NFL_PRESEASON_CLASSIC")) dl <- ps_classic_headers(dl, platform)
+          if (isTRUE(rv$sport == "CFB_CLASSIC"))           dl <- cfb_classic_headers(dl, platform)
         }
         fwrite(dl, file)
       }
@@ -3538,7 +3599,7 @@ server <- function(input, output, session) {
     else if (rv$sport == "F1")      render_f1_visuals(rv$sport_visuals)
     else if (rv$sport %in% c("NFL_PRESEASON","NFL_PRESEASON_CLASSIC"))
       render_nfl_preseason_visuals(rv$sport_visuals)
-    else if (rv$sport == "CFB")     render_cfb_visuals(rv$sport_visuals)
+    else if (rv$sport %in% c("CFB","CFB_CLASSIC")) render_cfb_visuals(rv$sport_visuals)
     else NULL
   })
   
@@ -3793,7 +3854,7 @@ server <- function(input, output, session) {
   }
 
   cfb_keep <- reactive({
-    req(rv$sport == "CFB", rv$sport_visuals$stat_line)
+    req(rv$sport %in% c("CFB","CFB_CLASSIC"), rv$sport_visuals$stat_line)
     d <- rv$sport_visuals$stat_line
     k <- d$Player
     if (!is.null(input$cfb_team_filter))
@@ -3807,7 +3868,7 @@ server <- function(input, output, session) {
 
   # ---- team outcome spread -------------------------------------------------
   output$cfb_team_violin <- renderPlotly({
-    req(rv$sport == "CFB", rv$sport_visuals$team_dist)
+    req(rv$sport %in% c("CFB","CFB_CLASSIC"), rv$sport_visuals$team_dist)
     m <- input$cfb_team_metric %||% "PassYds"
     d <- rv$sport_visuals$team_dist[Metric == m]
     if (!is.null(input$cfb_team_filter)) d <- d[team %in% input$cfb_team_filter]
@@ -3829,7 +3890,7 @@ server <- function(input, output, session) {
   # team at a glance, so each team gets one card per metric with the middle of
   # the distribution large and the tails small underneath.
   output$cfb_team_cards <- renderUI({
-    req(rv$sport == "CFB", rv$sport_visuals$team_spread)
+    req(rv$sport %in% c("CFB","CFB_CLASSIC"), rv$sport_visuals$team_spread)
     m  <- input$cfb_team_metric %||% "Points"
     d  <- rv$sport_visuals$team_spread[Metric == m]
     if (!is.null(input$cfb_team_filter)) d <- d[Team %in% input$cfb_team_filter]
@@ -3861,7 +3922,7 @@ server <- function(input, output, session) {
   # made of yardage or touchdowns, and eleven stacked colours answers it worse
   # than four. The full decomposition is in the table underneath.
   output$cfb_components <- renderPlotly({
-    req(rv$sport == "CFB", rv$sport_visuals$components)
+    req(rv$sport %in% c("CFB","CFB_CLASSIC"), rv$sport_visuals$components)
     keep <- cfb_keep(); req(length(keep) > 0)
     d <- rv$sport_visuals$components[Player %in% keep]
     g <- d[, .(Player, Team,
@@ -3888,7 +3949,7 @@ server <- function(input, output, session) {
   })
 
   output$cfb_comp_table <- renderDT({
-    req(rv$sport == "CFB", rv$sport_visuals$components)
+    req(rv$sport %in% c("CFB","CFB_CLASSIC"), rv$sport_visuals$components)
     datatable(rv$sport_visuals$components[Player %in% cfb_keep()], rownames = FALSE,
               options = list(dom = "tp", pageLength = 30, searching = FALSE,
                              scrollX = TRUE))
@@ -3896,7 +3957,7 @@ server <- function(input, output, session) {
 
   # ---- scoring rates -------------------------------------------------------
   output$cfb_rates_plot <- renderPlotly({
-    req(rv$sport == "CFB", rv$sport_visuals$rates)
+    req(rv$sport %in% c("CFB","CFB_CLASSIC"), rv$sport_visuals$rates)
     keep <- cfb_keep(); req(length(keep) > 0)
     d <- rv$sport_visuals$rates[Player %in% keep][order(AnyTD)]
     d[, lab := factor(Player, levels = Player)]
@@ -3922,7 +3983,7 @@ server <- function(input, output, session) {
   })
 
   output$cfb_rates_table <- renderDT({
-    req(rv$sport == "CFB", rv$sport_visuals$rates)
+    req(rv$sport %in% c("CFB","CFB_CLASSIC"), rv$sport_visuals$rates)
     datatable(rv$sport_visuals$rates[Player %in% cfb_keep()], rownames = FALSE,
               options = list(dom = "tp", pageLength = 30, searching = FALSE,
                              scrollX = TRUE))
@@ -3936,7 +3997,7 @@ server <- function(input, output, session) {
   # leaves the shapes wildly unequal (27px for the lead back against 2px for a
   # depth receiver). The percentile bar says the same thing legibly.
   output$cfb_violin <- renderPlotly({
-    req(rv$sport == "CFB", rv$sport_visuals$stat_line, rv$sport_visuals$score_dist)
+    req(rv$sport %in% c("CFB","CFB_CLASSIC"), rv$sport_visuals$stat_line, rv$sport_visuals$score_dist)
     keep <- cfb_keep(); req(length(keep) > 0)
     d <- merge(rv$sport_visuals$score_dist[Player %in% keep],
                rv$sport_visuals$stat_line[, .(Player, Pos)], by = "Player")
@@ -3972,7 +4033,7 @@ server <- function(input, output, session) {
   })
 
   output$cfb_stat_table <- renderDT({
-    req(rv$sport == "CFB", rv$sport_visuals$stat_line)
+    req(rv$sport %in% c("CFB","CFB_CLASSIC"), rv$sport_visuals$stat_line)
     datatable(rv$sport_visuals$stat_line[Player %in% cfb_keep()], rownames = FALSE,
               options = list(dom = "tp", pageLength = 30, searching = FALSE,
                              scrollX = TRUE, order = list(list(4, "desc"))))

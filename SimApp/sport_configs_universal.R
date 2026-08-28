@@ -1137,6 +1137,14 @@ SPORT_CONFIGS <- list(
       custom_detect = function(sheets, file_path = NULL) {
         has_game <- any(tolower(sheets) == "game")
         if (!has_game || length(sheets) < 3) return(FALSE)
+        # A classic sheet looks identical here (game tab + usage cols); it is
+        # the game tab's slate_type that splits them. Showdown wins the CFB
+        # entry, classic is CFB_CLASSIC below.
+        gt <- sheets[tolower(sheets) == "game"][1]
+        st <- tryCatch(tolower(as.character(
+                readxl::read_excel(file_path, sheet = gt, n_max = 1)$slate_type[1])),
+                error = function(e) NA_character_)
+        if (!is.na(st) && st == "classic") return(FALSE)
         tm <- setdiff(sheets, sheets[tolower(sheets) == "game"])[1]
         cols <- tryCatch(names(readxl::read_excel(file_path, sheet = tm, n_max = 1)),
                          error = function(e) character(0))
@@ -1212,6 +1220,115 @@ SPORT_CONFIGS <- list(
       output_format = list(
         sim_results = c("SimID", "Player", "Team", "DKScore"),
         metadata    = c("Player", "Team", "Pos", "DKID", "DKCID")
+      )
+    )
+  )
+
+  ,
+
+  # ==========================================================================
+  # COLLEGE FOOTBALL (classic -- full multi-game slate)
+  # --------------------------------------------------------------------------
+  # Same workbook shape as showdown (one tab per team, a `game` tab, an
+  # optional `projections` tab) but the `game` tab has ONE ROW PER GAME and
+  # carries slate_type = "classic" plus start_order (kickoff rank). No K and
+  # no DST on a CFB classic slate, so positions are QB/RB/WR only and the
+  # engine's scoring is unchanged from showdown.
+  #
+  # Roster is DK's QB / RB / RB / WR / WR / WR / FLEX / SFLEX, $50,000. FLEX
+  # takes RB/WR, SFLEX (superflex) takes QB/RB/WR. Salaries run $3k-$9k so the
+  # cap binds -- the optimiser is an exact per-sim LP (mode "cfb_classic").
+  #
+  # Detection: a `game` tab whose slate_type is "classic". The showdown CFB
+  # entry above bails out on that same string, so order does not matter.
+  # ==========================================================================
+  CFB_CLASSIC = list(
+    sport_name         = "CFB_CLASSIC",
+    sport_display_name = "College Football (Classic)",
+    player_label       = "Player",
+    player_label_plural = "Players",
+
+    detection = list(
+      custom_detect = function(sheets, file_path = NULL) {
+        if (!any(tolower(sheets) == "game")) return(FALSE)
+        gt <- sheets[tolower(sheets) == "game"][1]
+        st <- tryCatch(tolower(as.character(
+                readxl::read_excel(file_path, sheet = gt, n_max = 1)$slate_type[1])),
+                error = function(e) NA_character_)
+        if (is.na(st) || st != "classic") return(FALSE)
+        tm <- setdiff(sheets, c(sheets[tolower(sheets) == "game"],
+                                sheets[tolower(sheets) %in% c("projections", "etr")]))[1]
+        cols <- tryCatch(names(readxl::read_excel(file_path, sheet = tm, n_max = 1)),
+                         error = function(e) character(0))
+        "usage" %in% cols && "carry_usage" %in% cols
+      },
+      required_sheets    = NULL,
+      required_columns   = NULL,
+      min_sheet_matches  = 0,
+      min_column_matches = 0
+    ),
+
+    platforms    = c("DK"),
+    roster_sizes = list(DK = 8),
+    salary_caps  = list(DK = 50000),
+
+    optimization_modes = list(DK = "cfb_classic"),
+    max_lineups        = 5000,
+
+    # QB/RB/RB/WR/WR/WR/FLEX/SFLEX. The optimiser derives the LP position
+    # bounds from these three counts plus the flex eligibilities.
+    position_slots  = list(QB = 1, RB = 2, WR = 3, FLEX = 1, SFLEX = 1),
+    flex_eligible   = c("RB", "WR"),
+    sflex_eligible  = c("QB", "RB", "WR"),
+    dk_export_slots = list(DK = c("QB", "RB", "RB", "WR", "WR", "WR", "FLEX", "SFLEX")),
+
+    standard_metrics = c("WinRate", "Top1Rate", "Top5Rate", "Top10Rate", "Top20Rate"),
+
+    custom_metrics = list(
+      list(name = "TeamStack", source = "Team", calculation = "team_stack",
+           label = "Team Stack")
+    ),
+
+    # One ownership number on a classic slate -- no captain slot to price
+    # separately -- so DKOwn only, no CPTOwn.
+    metadata_columns = list(
+      list(name = "Pos",    label = "Position", type = "text",    display = TRUE, filter = TRUE),
+      list(name = "Team",   label = "Team",     type = "text",    display = TRUE, filter = TRUE),
+      list(name = "DKProj", label = "ETR",      type = "numeric", display = TRUE, filter = FALSE),
+      list(name = "DKOwn",  label = "Own %",    type = "numeric", display = TRUE, filter = FALSE)
+    ),
+
+    portfolio_filters = list(
+      rate_minimums = list(
+        list(name = "Win",   label = "Win",    step = 0.1),
+        list(name = "Top1",  label = "Top 1",  step = 0.1),
+        list(name = "Top5",  label = "Top 5",  step = 0.1),
+        list(name = "Top10", label = "Top 10", step = 0.1),
+        list(name = "Top20", label = "Top 20", step = 0.1)
+      ),
+      range_filters = list()
+    ),
+
+    platform_columns = list(
+      DK = list(salary = "DKSalary", id = "DKID",
+                ownership = "DKOwn", score = "DKScore")
+    ),
+
+    download_formats = list(DK = "{Name} ({DKID})"),
+
+    input_file = list(
+      type            = "excel",
+      load_all_sheets = FALSE,
+      required_sheets = NULL,
+      player_sheet    = NULL,
+      required_columns = list(base = c("player"), DK = c("usage"))
+    ),
+
+    simulation = list(
+      function_name = "run_cfb_classic_simulation",
+      output_format = list(
+        sim_results = c("SimID", "Player", "Team", "DKScore"),
+        metadata    = c("Player", "Team", "Pos", "DKID")
       )
     )
   )
