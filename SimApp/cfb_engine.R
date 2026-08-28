@@ -164,7 +164,11 @@ read_cfb_input <- function(file_path) {
   gtab <- sh[tolower(sh) == "game"]
   if (!length(gtab)) stop("CFB workbook needs a `game` tab")
   g <- as.data.table(readxl::read_excel(file_path, sheet = gtab[1]))
-  tms <- setdiff(sh, gtab)
+  # THE TAB NAME IS THE TEAM, so every non-`game` tab is a team -- except the
+  # optional projections tab, which must be excluded here or it is read as a
+  # team and blows up on the missing S:T block.
+  aux <- sh[tolower(sh) %in% c("projections", "etr")]
+  tms <- setdiff(sh, c(gtab, aux))
 
   pl <- rbindlist(lapply(tms, function(tm) {
     x <- as.data.table(readxl::read_excel(file_path, sheet = tm, range = readxl::cell_cols("A:Q")))
@@ -422,14 +426,26 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
                         DKSalary = as.integer(salary_util),
                         DKCSalary = as.integer(salary_cpt))])
   meta <- meta[Player %in% unique(A$player)]
-  meta[, `:=`(DKProj = NA_real_, DKOwn = 0)]
+  # CAPTAIN AND FLEX OWNERSHIP ARE DIFFERENT NUMBERS on a showdown slate, often
+  # by a factor of two or more, so they are carried separately. DKOwn is the
+  # FLEX figure and CPTOwn the captain one; the app pairs each against the
+  # matching exposure to produce CptLev and UtlLev. Collapsing them would
+  # misprice every leverage read on the board.
+  meta[, `:=`(DKProj = NA_real_, DKOwn = 0, CPTOwn = 0)]
   prj <- input_data$projections
   if (!is.null(prj) && nrow(prj)) {
     setDT(prj)
     if ("etr" %in% names(prj))
       meta[prj, DKProj := as.numeric(i.etr), on = .(Player = player)]
-    if ("own" %in% names(prj))
+    # flex ownership: `flex_own` when supplied, else the generic `own`
+    if ("flex_own" %in% names(prj))
+      meta[prj, DKOwn := as.numeric(i.flex_own), on = .(Player = player)]
+    else if ("own" %in% names(prj))
       meta[prj, DKOwn := as.numeric(i.own), on = .(Player = player)]
+    if ("cpt_own" %in% names(prj))
+      meta[prj, CPTOwn := as.numeric(i.cpt_own), on = .(Player = player)]
+    meta[is.na(DKOwn),  DKOwn  := 0]
+    meta[is.na(CPTOwn), CPTOwn := 0]
   }
 
   sim_results <- A[, .(SimID, Player = player, Team = team,

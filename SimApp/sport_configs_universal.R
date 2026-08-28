@@ -1173,7 +1173,11 @@ SPORT_CONFIGS <- list(
       list(name = "Pos",    label = "Position", type = "text",    display = TRUE, filter = TRUE),
       list(name = "Team",   label = "Team",     type = "text",    display = TRUE, filter = TRUE),
       list(name = "DKProj", label = "ETR",      type = "numeric", display = TRUE, filter = FALSE),
-      list(name = "DKOwn",  label = "Own %",    type = "numeric", display = TRUE, filter = FALSE)
+      # DKOwn is FLEX ownership, CPTOwn the captain figure. Kept apart because a
+      # showdown slate prices the two slots very differently -- Jaden Craig went
+      # 25.6% captain against 60.1% flex on the Dublin board.
+      list(name = "DKOwn",  label = "Flex Own %", type = "numeric", display = TRUE, filter = FALSE),
+      list(name = "CPTOwn", label = "CPT Own %",  type = "numeric", display = TRUE, filter = FALSE)
     ),
 
     portfolio_filters = list(
@@ -1188,10 +1192,12 @@ SPORT_CONFIGS <- list(
     ),
 
     platform_columns = list(
-      DK = list(salary = "DKSalary", id = "DKID", ownership = "DKOwn", score = "DKScore")
+      DK = list(salary = "DKSalary", id = "DKID", cpt_id = "DKCID",
+                ownership = "DKOwn", cpt_ownership = "CPTOwn",
+                score = "DKScore", cpt_multiplier = 1.5)
     ),
 
-    download_formats = list(DK = "{Name} ({DKID})"),
+    download_formats = list(DK = "{Name} ({DKID})", DK_CPT = "{Name} ({DKCID})"),
 
     input_file = list(
       type            = "excel",

@@ -2423,6 +2423,11 @@ server <- function(input, output, session) {
       is_cbb     <- isTRUE(rv$sport %in% c("CBB","NBA"))
       is_nba     <- isTRUE(rv$sport == "NBA")
       is_sd      <- platform == "SD"
+      # CFB is captain-mode on the DK platform rather than a separate SD
+      # platform, so it never sets is_sd -- but it wants the same split
+      # captain/flex exposure view that NBA showdown gets.
+      is_cfb     <- isTRUE(rv$sport == "CFB")
+      split_own  <- (is_nba && is_sd) || is_cfb
       salary_col <- if (is_sd) "DKSalary" else paste0(platform, "Salary")
       own_col    <- if (is_sd) NULL        else paste0(platform, "Own")
       cpt_cols  <- grep("^Captain", names(filtered), value=TRUE)
@@ -2461,7 +2466,11 @@ server <- function(input, output, session) {
       }
       
       # ── Build metadata column list ─────────────────────────────────────────
-      if (is_nba && is_sd) {
+      if (is_cfb) {
+        meta_cols <- intersect(c("Player","Team","Pos","DKSalary","DKCSalary",
+                                 "CPTOwn","DKOwn","DKProj"),
+                               names(rv$sim_metadata))
+      } else if (is_nba && is_sd) {
         nba_sd_meta <- intersect(c("Player","Team","SDSalary",
                                    "CPTOwn","DKOwn"),
                                  names(rv$sim_metadata))
@@ -2485,14 +2494,21 @@ server <- function(input, output, session) {
       exp_tbl <- merge(exp_tbl, rv$sim_metadata[Player %in% meta_players, ..meta_cols],
                        by="Player", all.x=TRUE)
       
-      if (is_nba && is_sd) {
+      if (split_own) {
         if ("SDSalary" %in% names(exp_tbl)) setnames(exp_tbl, "SDSalary", "Salary")
+        else if ("DKSalary" %in% names(exp_tbl) && !"Salary" %in% names(exp_tbl))
+          setnames(exp_tbl, "DKSalary", "Salary")
+        # A slate can legitimately arrive with no ownership file at all. Guard
+        # the max() so an all-NA column does not throw before the view renders.
+        own_max <- function(v) { v <- v[is.finite(v)]; if (!length(v)) NA_real_ else max(v) }
         if ("CPTOwn" %in% names(exp_tbl)) {
-          if (max(exp_tbl$CPTOwn, na.rm=TRUE) <= 1) exp_tbl[, CPTOwn := CPTOwn * 100]
+          m <- own_max(exp_tbl$CPTOwn)
+          if (!is.na(m) && m <= 1) exp_tbl[, CPTOwn := CPTOwn * 100]
           setnames(exp_tbl, "CPTOwn", "CptOwn")
         }
         if ("DKOwn" %in% names(exp_tbl)) {
-          if (max(exp_tbl$DKOwn, na.rm=TRUE) <= 1) exp_tbl[, DKOwn := DKOwn * 100]
+          m <- own_max(exp_tbl$DKOwn)
+          if (!is.na(m) && m <= 1) exp_tbl[, DKOwn := DKOwn * 100]
           setnames(exp_tbl, "DKOwn", "UtlOwn")
         }
         if ("UtilExp" %in% names(exp_tbl)) setnames(exp_tbl, "UtilExp", "UtlExp")
@@ -2506,7 +2522,7 @@ server <- function(input, output, session) {
         if (all(c("TotExp","TotOwn") %in% names(exp_tbl)))
           exp_tbl[, TotLev := round(TotExp - TotOwn, 1)]
         exp_tbl[, Exposure := NULL]
-        meta_order <- intersect(c("Player","Team","Salary"), names(exp_tbl))
+        meta_order <- intersect(c("Player","Team","Pos","Salary"), names(exp_tbl))
         split_cols <- intersect(c("CptExp","CptOwn","CptLev",
                                   "UtlExp","UtlOwn","UtlLev",
                                   "TotExp","TotOwn","TotLev"), names(exp_tbl))
@@ -2814,6 +2830,9 @@ server <- function(input, output, session) {
       is_cbb <- isTRUE(rv$sport %in% c("CBB","NBA"))
       is_nba <- isTRUE(rv$sport == "NBA")
       is_sd  <- platform == "SD"
+      # CFB runs captain mode on the DK platform, so is_sd is never TRUE for it.
+      is_cfb <- isTRUE(rv$sport == "CFB")
+      split_own <- (is_nba && is_sd) || is_cfb
       salary_col <- if (is_sd) "DKSalary" else paste0(platform, "Salary")
       own_col    <- if (is_sd) NULL        else paste0(platform, "Own")
       cpt_cols  <- grep("^Captain", names(port), value=TRUE)
@@ -2841,7 +2860,11 @@ server <- function(input, output, session) {
       }
       
       # ── Build metadata column list ─────────────────────────────────────────
-      if (is_nba && is_sd) {
+      if (is_cfb) {
+        mc <- intersect(c("Player","Team","Pos","DKSalary","DKCSalary",
+                          "CPTOwn","DKOwn","DKProj"),
+                        names(rv$sim_metadata))
+      } else if (is_nba && is_sd) {
         mc <- intersect(c("Player","Team","SDSalary",
                           "CPTOwn","DKOwn"),
                         names(rv$sim_metadata))
@@ -2894,14 +2917,21 @@ server <- function(input, output, session) {
         exp_tbl <- merge(exp_tbl, rv$sim_metadata[Player %in% meta_players, ..mc], by="Player", all.x=TRUE)
         if (salary_col %in% names(exp_tbl)) setnames(exp_tbl, salary_col, "Salary")
         
-        if (is_nba && is_sd) {
+        if (split_own) {
           if ("SDSalary" %in% names(exp_tbl)) setnames(exp_tbl, "SDSalary", "Salary")
+          else if ("DKSalary" %in% names(exp_tbl) && !"Salary" %in% names(exp_tbl))
+            setnames(exp_tbl, "DKSalary", "Salary")
+          # A slate can arrive with no ownership file. Guard the max() so an
+          # all-NA column does not throw before the view renders.
+          own_max <- function(v) { v <- v[is.finite(v)]; if (!length(v)) NA_real_ else max(v) }
           if ("CPTOwn" %in% names(exp_tbl)) {
-            if (max(exp_tbl$CPTOwn, na.rm=TRUE) <= 1) exp_tbl[, CPTOwn := CPTOwn * 100]
+            m <- own_max(exp_tbl$CPTOwn)
+            if (!is.na(m) && m <= 1) exp_tbl[, CPTOwn := CPTOwn * 100]
             setnames(exp_tbl, "CPTOwn", "CptOwn")
           }
           if ("DKOwn" %in% names(exp_tbl)) {
-            if (max(exp_tbl$DKOwn, na.rm=TRUE) <= 1) exp_tbl[, DKOwn := DKOwn * 100]
+            m <- own_max(exp_tbl$DKOwn)
+            if (!is.na(m) && m <= 1) exp_tbl[, DKOwn := DKOwn * 100]
             setnames(exp_tbl, "DKOwn", "UtlOwn")
           }
           if ("UtilExp" %in% names(exp_tbl)) setnames(exp_tbl, "UtilExp", "UtlExp")
@@ -3029,14 +3059,21 @@ server <- function(input, output, session) {
         
         exp_tbl <- merge(exp_tbl, rv$sim_metadata[Player %in% meta_players, ..mc], by="Player", all.x=TRUE)
         
-        if (is_nba && is_sd) {
+        if (split_own) {
           if ("SDSalary" %in% names(exp_tbl)) setnames(exp_tbl, "SDSalary", "Salary")
+          else if ("DKSalary" %in% names(exp_tbl) && !"Salary" %in% names(exp_tbl))
+            setnames(exp_tbl, "DKSalary", "Salary")
+          # A slate can arrive with no ownership file. Guard the max() so an
+          # all-NA column does not throw before the view renders.
+          own_max <- function(v) { v <- v[is.finite(v)]; if (!length(v)) NA_real_ else max(v) }
           if ("CPTOwn" %in% names(exp_tbl)) {
-            if (max(exp_tbl$CPTOwn, na.rm=TRUE) <= 1) exp_tbl[, CPTOwn := CPTOwn * 100]
+            m <- own_max(exp_tbl$CPTOwn)
+            if (!is.na(m) && m <= 1) exp_tbl[, CPTOwn := CPTOwn * 100]
             setnames(exp_tbl, "CPTOwn", "CptOwn")
           }
           if ("DKOwn" %in% names(exp_tbl)) {
-            if (max(exp_tbl$DKOwn, na.rm=TRUE) <= 1) exp_tbl[, DKOwn := DKOwn * 100]
+            m <- own_max(exp_tbl$DKOwn)
+            if (!is.na(m) && m <= 1) exp_tbl[, DKOwn := DKOwn * 100]
             setnames(exp_tbl, "DKOwn", "UtlOwn")
           }
           if ("UtilExp" %in% names(exp_tbl)) setnames(exp_tbl, "UtilExp", "UtlExp")
