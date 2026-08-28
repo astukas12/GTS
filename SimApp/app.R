@@ -18,7 +18,7 @@ source("cash_game_module.R")
 # top-level code on every upload/sim run.
 local({
   engines <- c("nascar", "mma", "tennis", "golf", "f1", "nfl", "nfl_preseason",
-                 "cbb", "nba", "soccer")
+                 "cbb", "nba", "soccer", "cfb")
   for (e in engines) {
     f <- paste0(e, "_engine.R")
     if (file.exists(f)) source(f) else warning("Engine not found at startup: ", f)
@@ -39,7 +39,8 @@ load_sport_input <- function(file_path, sport, config) {
     F1   = read_f1_input,
     CBB  = read_cbb_input,
     NBA  = read_nba_input,
-    SOCCER = read_soccer_input
+    SOCCER = read_soccer_input,
+    CFB  = read_cfb_input
   )
   if (sport %in% names(reader_map)) {
     return(reader_map[[sport]](file_path))
@@ -2422,6 +2423,11 @@ server <- function(input, output, session) {
       is_cbb     <- isTRUE(rv$sport %in% c("CBB","NBA"))
       is_nba     <- isTRUE(rv$sport == "NBA")
       is_sd      <- platform == "SD"
+      # CFB is captain-mode on the DK platform rather than a separate SD
+      # platform, so it never sets is_sd -- but it wants the same split
+      # captain/flex exposure view that NBA showdown gets.
+      is_cfb     <- isTRUE(rv$sport == "CFB")
+      split_own  <- (is_nba && is_sd) || is_cfb
       salary_col <- if (is_sd) "DKSalary" else paste0(platform, "Salary")
       own_col    <- if (is_sd) NULL        else paste0(platform, "Own")
       cpt_cols  <- grep("^Captain", names(filtered), value=TRUE)
@@ -2460,7 +2466,11 @@ server <- function(input, output, session) {
       }
       
       # ── Build metadata column list ─────────────────────────────────────────
-      if (is_nba && is_sd) {
+      if (is_cfb) {
+        meta_cols <- intersect(c("Player","Team","Pos","DKSalary","DKCSalary",
+                                 "CPTOwn","DKOwn","DKProj"),
+                               names(rv$sim_metadata))
+      } else if (is_nba && is_sd) {
         nba_sd_meta <- intersect(c("Player","Team","SDSalary",
                                    "CPTOwn","DKOwn"),
                                  names(rv$sim_metadata))
@@ -2484,14 +2494,21 @@ server <- function(input, output, session) {
       exp_tbl <- merge(exp_tbl, rv$sim_metadata[Player %in% meta_players, ..meta_cols],
                        by="Player", all.x=TRUE)
       
-      if (is_nba && is_sd) {
+      if (split_own) {
         if ("SDSalary" %in% names(exp_tbl)) setnames(exp_tbl, "SDSalary", "Salary")
+        else if ("DKSalary" %in% names(exp_tbl) && !"Salary" %in% names(exp_tbl))
+          setnames(exp_tbl, "DKSalary", "Salary")
+        # A slate can legitimately arrive with no ownership file at all. Guard
+        # the max() so an all-NA column does not throw before the view renders.
+        own_max <- function(v) { v <- v[is.finite(v)]; if (!length(v)) NA_real_ else max(v) }
         if ("CPTOwn" %in% names(exp_tbl)) {
-          if (max(exp_tbl$CPTOwn, na.rm=TRUE) <= 1) exp_tbl[, CPTOwn := CPTOwn * 100]
+          m <- own_max(exp_tbl$CPTOwn)
+          if (!is.na(m) && m <= 1) exp_tbl[, CPTOwn := CPTOwn * 100]
           setnames(exp_tbl, "CPTOwn", "CptOwn")
         }
         if ("DKOwn" %in% names(exp_tbl)) {
-          if (max(exp_tbl$DKOwn, na.rm=TRUE) <= 1) exp_tbl[, DKOwn := DKOwn * 100]
+          m <- own_max(exp_tbl$DKOwn)
+          if (!is.na(m) && m <= 1) exp_tbl[, DKOwn := DKOwn * 100]
           setnames(exp_tbl, "DKOwn", "UtlOwn")
         }
         if ("UtilExp" %in% names(exp_tbl)) setnames(exp_tbl, "UtilExp", "UtlExp")
@@ -2505,7 +2522,7 @@ server <- function(input, output, session) {
         if (all(c("TotExp","TotOwn") %in% names(exp_tbl)))
           exp_tbl[, TotLev := round(TotExp - TotOwn, 1)]
         exp_tbl[, Exposure := NULL]
-        meta_order <- intersect(c("Player","Team","Salary"), names(exp_tbl))
+        meta_order <- intersect(c("Player","Team","Pos","Salary"), names(exp_tbl))
         split_cols <- intersect(c("CptExp","CptOwn","CptLev",
                                   "UtlExp","UtlOwn","UtlLev",
                                   "TotExp","TotOwn","TotLev"), names(exp_tbl))
@@ -2813,6 +2830,9 @@ server <- function(input, output, session) {
       is_cbb <- isTRUE(rv$sport %in% c("CBB","NBA"))
       is_nba <- isTRUE(rv$sport == "NBA")
       is_sd  <- platform == "SD"
+      # CFB runs captain mode on the DK platform, so is_sd is never TRUE for it.
+      is_cfb <- isTRUE(rv$sport == "CFB")
+      split_own <- (is_nba && is_sd) || is_cfb
       salary_col <- if (is_sd) "DKSalary" else paste0(platform, "Salary")
       own_col    <- if (is_sd) NULL        else paste0(platform, "Own")
       cpt_cols  <- grep("^Captain", names(port), value=TRUE)
@@ -2840,7 +2860,11 @@ server <- function(input, output, session) {
       }
       
       # ── Build metadata column list ─────────────────────────────────────────
-      if (is_nba && is_sd) {
+      if (is_cfb) {
+        mc <- intersect(c("Player","Team","Pos","DKSalary","DKCSalary",
+                          "CPTOwn","DKOwn","DKProj"),
+                        names(rv$sim_metadata))
+      } else if (is_nba && is_sd) {
         mc <- intersect(c("Player","Team","SDSalary",
                           "CPTOwn","DKOwn"),
                         names(rv$sim_metadata))
@@ -2893,14 +2917,21 @@ server <- function(input, output, session) {
         exp_tbl <- merge(exp_tbl, rv$sim_metadata[Player %in% meta_players, ..mc], by="Player", all.x=TRUE)
         if (salary_col %in% names(exp_tbl)) setnames(exp_tbl, salary_col, "Salary")
         
-        if (is_nba && is_sd) {
+        if (split_own) {
           if ("SDSalary" %in% names(exp_tbl)) setnames(exp_tbl, "SDSalary", "Salary")
+          else if ("DKSalary" %in% names(exp_tbl) && !"Salary" %in% names(exp_tbl))
+            setnames(exp_tbl, "DKSalary", "Salary")
+          # A slate can arrive with no ownership file. Guard the max() so an
+          # all-NA column does not throw before the view renders.
+          own_max <- function(v) { v <- v[is.finite(v)]; if (!length(v)) NA_real_ else max(v) }
           if ("CPTOwn" %in% names(exp_tbl)) {
-            if (max(exp_tbl$CPTOwn, na.rm=TRUE) <= 1) exp_tbl[, CPTOwn := CPTOwn * 100]
+            m <- own_max(exp_tbl$CPTOwn)
+            if (!is.na(m) && m <= 1) exp_tbl[, CPTOwn := CPTOwn * 100]
             setnames(exp_tbl, "CPTOwn", "CptOwn")
           }
           if ("DKOwn" %in% names(exp_tbl)) {
-            if (max(exp_tbl$DKOwn, na.rm=TRUE) <= 1) exp_tbl[, DKOwn := DKOwn * 100]
+            m <- own_max(exp_tbl$DKOwn)
+            if (!is.na(m) && m <= 1) exp_tbl[, DKOwn := DKOwn * 100]
             setnames(exp_tbl, "DKOwn", "UtlOwn")
           }
           if ("UtilExp" %in% names(exp_tbl)) setnames(exp_tbl, "UtilExp", "UtlExp")
@@ -3028,14 +3059,21 @@ server <- function(input, output, session) {
         
         exp_tbl <- merge(exp_tbl, rv$sim_metadata[Player %in% meta_players, ..mc], by="Player", all.x=TRUE)
         
-        if (is_nba && is_sd) {
+        if (split_own) {
           if ("SDSalary" %in% names(exp_tbl)) setnames(exp_tbl, "SDSalary", "Salary")
+          else if ("DKSalary" %in% names(exp_tbl) && !"Salary" %in% names(exp_tbl))
+            setnames(exp_tbl, "DKSalary", "Salary")
+          # A slate can arrive with no ownership file. Guard the max() so an
+          # all-NA column does not throw before the view renders.
+          own_max <- function(v) { v <- v[is.finite(v)]; if (!length(v)) NA_real_ else max(v) }
           if ("CPTOwn" %in% names(exp_tbl)) {
-            if (max(exp_tbl$CPTOwn, na.rm=TRUE) <= 1) exp_tbl[, CPTOwn := CPTOwn * 100]
+            m <- own_max(exp_tbl$CPTOwn)
+            if (!is.na(m) && m <= 1) exp_tbl[, CPTOwn := CPTOwn * 100]
             setnames(exp_tbl, "CPTOwn", "CptOwn")
           }
           if ("DKOwn" %in% names(exp_tbl)) {
-            if (max(exp_tbl$DKOwn, na.rm=TRUE) <= 1) exp_tbl[, DKOwn := DKOwn * 100]
+            m <- own_max(exp_tbl$DKOwn)
+            if (!is.na(m) && m <= 1) exp_tbl[, DKOwn := DKOwn * 100]
             setnames(exp_tbl, "DKOwn", "UtlOwn")
           }
           if ("UtilExp" %in% names(exp_tbl)) setnames(exp_tbl, "UtilExp", "UtlExp")
@@ -3500,6 +3538,7 @@ server <- function(input, output, session) {
     else if (rv$sport == "F1")      render_f1_visuals(rv$sport_visuals)
     else if (rv$sport %in% c("NFL_PRESEASON","NFL_PRESEASON_CLASSIC"))
       render_nfl_preseason_visuals(rv$sport_visuals)
+    else if (rv$sport == "CFB")     render_cfb_visuals(rv$sport_visuals)
     else NULL
   })
   
@@ -3659,6 +3698,285 @@ server <- function(input, output, session) {
              margin = list(l = 60, r = 30, t = 30, b = 50))
   })
 
+
+  # ---------- College Football ----------
+  # THESE PANELS ARE ABOUT THE COMPONENTS OF A PROJECTION, not about roster
+  # construction. A mean DK score is an answer with no derivation; what makes a
+  # sheet checkable is seeing the parts -- how much of a man's points are
+  # yardage against touchdowns, how often he actually scores rather than his
+  # scoring average, and the spread of the team lines everything sits inside.
+  #
+  # The engine also emits a validation table comparing the simulated mix against
+  # real FBS games. NOT rendered: it answers "is this sheet believable", which
+  # is a question for building the sheet. Kept in sport_visuals for debugging.
+  CFB_TEAM_COL <- c(TCU = "#A87FE0", UNC = "#7BAFD4")   # cfb_team_colors.R,
+  cfb_team_pal <- function(teams) {                     # lightened for black
+    base <- c("#A87FE0", "#7BAFD4", "#E8B84B", "#69C08A")
+    out <- setNames(base[seq_along(teams)], teams)
+    for (nm in names(CFB_TEAM_COL)) if (nm %in% teams) out[nm] <- CFB_TEAM_COL[[nm]]
+    out
+  }
+  CFB_DARK <- function(p) p %>% layout(
+    paper_bgcolor = "#121212", plot_bgcolor = "#141414",
+    font = list(color = "#FFFFFF", size = 11),
+    legend = list(orientation = "h", y = 1.04, x = 0))
+
+  render_cfb_visuals <- function(visuals) {
+    req(visuals)
+    sd    <- visuals$score_dist
+    teams <- sort(unique(sd$Team))
+    poss  <- sort(unique(visuals$stat_line$Pos))
+    fluidRow(column(12,
+      box(width = NULL, title = "College Football Simulation Analysis",
+          status = "primary", solidHeader = TRUE,
+
+        div(style = "margin-bottom:12px;color:#bbb;font-size:12px;",
+            sprintf("%s  |  pool returned total %.1f / margin %.1f  |  effective sample %s of %s games  |  %s sims",
+                    visuals$market, visuals$pool_total, visuals$pool_margin,
+                    format(visuals$ess, big.mark = ","),
+                    format(visuals$pool_size, big.mark = ","),
+                    format(visuals$n_sims, big.mark = ","))),
+
+        if (!is.null(visuals$ess) && visuals$ess < 150)
+          div(style = "margin-bottom:12px;padding:8px 12px;border-left:3px solid #d9534f;background:#2a1a1a;color:#f0c0c0;font-size:12px;",
+              sprintf("POOL IS THIN: effective sample %s. Few real comparables for this matchup.", visuals$ess)),
+
+        div(class = "gts-chart-filter",
+            span(class = "gts-chart-filter-label", "Teams:"),
+            checkboxGroupInput("cfb_team_filter", NULL, choices = teams,
+                               selected = teams, inline = TRUE),
+            span(class = "gts-chart-filter-label", style = "margin-left:14px;", "Positions:"),
+            checkboxGroupInput("cfb_pos_filter", NULL, choices = poss,
+                               selected = poss, inline = TRUE)),
+        div(class = "gts-chart-filter", style = "margin-bottom:10px;",
+            span(class = "gts-chart-filter-label", "Players:"),
+            selectizeInput("cfb_player_filter", NULL, choices = sd$Player,
+                           selected = sd$Player, multiple = TRUE,
+                           options = list(plugins = list("remove_button"),
+                                          placeholder = "All players"),
+                           width = "100%")),
+
+        tabsetPanel(id = "cfb_tabs", type = "tabs",
+          tabPanel("Team Outcomes", div(style = "margin-top:14px;"),
+            radioButtons("cfb_team_metric", NULL, inline = TRUE,
+                         choices = c("Points" = "Points",
+                                     "Scrimmage yards" = "ScrimYds",
+                                     "Passing" = "PassYds",
+                                     "Rushing" = "RushYds",
+                                     "Receptions" = "Rec",
+                                     "Touchdowns" = "TotalTD"),
+                         selected = "Points"),
+            uiOutput("cfb_team_cards"),
+            plotlyOutput("cfb_team_violin", height = "260px")),
+
+          tabPanel("Where the points come from", div(style = "margin-top:14px;"),
+            tags$p(style = "color:#888;font-size:11px;margin:0 0 10px 0;",
+                   "Yardage is close to stable week to week. Touchdowns are lumpy."),
+            plotlyOutput("cfb_components", height = "700px"),
+            div(style = "margin-top:16px;", DTOutput("cfb_comp_table"))),
+
+          tabPanel("Scoring rates", div(style = "margin-top:14px;"),
+            tags$p(style = "color:#888;font-size:11px;margin:0 0 10px 0;",
+                   "How often, not how many. Blank is the share of games he records nothing at all."),
+            plotlyOutput("cfb_rates_plot", height = "620px"),
+            div(style = "margin-top:16px;", DTOutput("cfb_rates_table"))),
+
+          tabPanel("Score Range", div(style = "margin-top:14px;"),
+            tags$p(style = "color:#888;font-size:11px;margin:0 0 10px 0;",
+                   "Bar is the middle half, line the 10th to 90th, white dot the mean, diamond the one-in-a-hundred game."),
+            plotlyOutput("cfb_violin", height = "820px")),
+
+          tabPanel("Players", div(style = "margin-top:14px;"),
+            DTOutput("cfb_stat_table"))
+        )
+      )))
+  }
+
+  cfb_keep <- reactive({
+    req(rv$sport == "CFB", rv$sport_visuals$stat_line)
+    d <- rv$sport_visuals$stat_line
+    k <- d$Player
+    if (!is.null(input$cfb_team_filter))
+      k <- intersect(k, d[Team %in% input$cfb_team_filter]$Player)
+    if (!is.null(input$cfb_pos_filter))
+      k <- intersect(k, d[Pos %in% input$cfb_pos_filter]$Player)
+    if (!is.null(input$cfb_player_filter))
+      k <- intersect(k, input$cfb_player_filter)
+    k
+  })
+
+  # ---- team outcome spread -------------------------------------------------
+  output$cfb_team_violin <- renderPlotly({
+    req(rv$sport == "CFB", rv$sport_visuals$team_dist)
+    m <- input$cfb_team_metric %||% "PassYds"
+    d <- rv$sport_visuals$team_dist[Metric == m]
+    if (!is.null(input$cfb_team_filter)) d <- d[team %in% input$cfb_team_filter]
+    req(nrow(d) > 0)
+    pal <- cfb_team_pal(sort(unique(d$team)))
+    CFB_DARK(plot_ly(d, x = ~Value, y = ~team, color = ~team, colors = pal,
+            type = "violin", orientation = "h", points = FALSE, width = 0.85,
+            meanline = list(visible = TRUE, color = "#ffffff", width = 1.5),
+            box = list(visible = FALSE), hoverinfo = "none",
+            showlegend = FALSE)) %>%
+      layout(violinmode = "overlay", hovermode = FALSE,
+             xaxis = list(title = NULL, gridcolor = "#2a2a2a", zeroline = FALSE),
+             yaxis = list(title = "", automargin = TRUE),
+             margin = list(l = 10, r = 30, t = 10, b = 44))
+  })
+
+  # CARDS, NOT A SORTABLE TABLE. Ten rows of six numbers sorted by an arbitrary
+  # column answers no question anyone has. What is wanted is the range for a
+  # team at a glance, so each team gets one card per metric with the middle of
+  # the distribution large and the tails small underneath.
+  output$cfb_team_cards <- renderUI({
+    req(rv$sport == "CFB", rv$sport_visuals$team_spread)
+    m  <- input$cfb_team_metric %||% "Points"
+    d  <- rv$sport_visuals$team_spread[Metric == m]
+    if (!is.null(input$cfb_team_filter)) d <- d[Team %in% input$cfb_team_filter]
+    req(nrow(d) > 0)
+    pal <- cfb_team_pal(sort(unique(rv$sport_visuals$team_spread$Team)))
+    fmt <- function(x) if (m %in% c("TotalTD","Rec")) sprintf("%.1f", x) else
+                       formatC(round(x), big.mark = ",", format = "d")
+    div(style = "display:flex;gap:14px;flex-wrap:wrap;margin-bottom:16px;",
+      lapply(seq_len(nrow(d)), function(i) {
+        r <- d[i]; col <- pal[[r$Team]]
+        div(style = sprintf("flex:1 1 220px;background:#1a1a1a;border:1px solid #2f2f2f;border-left:4px solid %s;border-radius:4px;padding:14px 16px;", col),
+          div(style = sprintf("font-family:inherit;font-size:12px;font-weight:700;letter-spacing:.12em;color:%s;", col),
+              toupper(r$Team)),
+          div(style = "display:flex;align-items:baseline;gap:8px;margin-top:6px;",
+              span(style = "font-size:30px;font-weight:700;color:#FFE500;line-height:1;",
+                   fmt(r$Median)),
+              span(style = "font-size:12px;color:#8a8a84;", "median")),
+          div(style = "margin-top:10px;font-size:12px;color:#c8c8c2;",
+              sprintf("middle half  %s to %s", fmt(r$P25), fmt(r$P75))),
+          div(style = "margin-top:2px;font-size:12px;color:#8a8a84;",
+              sprintf("1 in 10 below %s   \u00b7   1 in 10 above %s",
+                      fmt(r$P10), fmt(r$P90)))
+        )
+      }))
+  })
+
+  # ---- where the points come from ------------------------------------------
+  # FOUR groups, not eleven line items. The question is whether a projection is
+  # made of yardage or touchdowns, and eleven stacked colours answers it worse
+  # than four. The full decomposition is in the table underneath.
+  output$cfb_components <- renderPlotly({
+    req(rv$sport == "CFB", rv$sport_visuals$components)
+    keep <- cfb_keep(); req(length(keep) > 0)
+    d <- rv$sport_visuals$components[Player %in% keep]
+    g <- d[, .(Player, Team,
+               Yardage = RecYards + RushYards + PassYards,
+               Touchdowns = RecTDs + RushTDs + PassTDs + ReturnTDs,
+               Receptions = Receptions,
+               Other = Kicking + Bonuses + Turnovers,
+               Total)][order(Total)]
+    g[, lab := factor(Player, levels = Player)]
+    cols <- c(Yardage = "#FFE500", Touchdowns = "#A87FE0",
+              Receptions = "#7BAFD4", Other = "#7d7d76")
+    p <- plot_ly(height = max(360, 24 * nrow(g) + 120))
+    for (nm in c("Yardage","Touchdowns","Receptions","Other"))
+      p <- add_trace(p, x = g[[nm]], y = g$lab, name = nm, type = "bar",
+                     orientation = "h", marker = list(color = cols[[nm]]),
+                     hoverinfo = "text",
+                     text = paste0(g$Player, "<br>", nm, ": ", g[[nm]],
+                                   " of ", g$Total, " pts"))
+    CFB_DARK(p) %>%
+      layout(barmode = "stack",
+             xaxis = list(title = "DK points", gridcolor = "#2a2a2a"),
+             yaxis = list(title = "", automargin = TRUE),
+             margin = list(l = 10, r = 30, t = 10, b = 50))
+  })
+
+  output$cfb_comp_table <- renderDT({
+    req(rv$sport == "CFB", rv$sport_visuals$components)
+    datatable(rv$sport_visuals$components[Player %in% cfb_keep()], rownames = FALSE,
+              options = list(dom = "tp", pageLength = 30, searching = FALSE,
+                             scrollX = TRUE))
+  })
+
+  # ---- scoring rates -------------------------------------------------------
+  output$cfb_rates_plot <- renderPlotly({
+    req(rv$sport == "CFB", rv$sport_visuals$rates)
+    keep <- cfb_keep(); req(length(keep) > 0)
+    d <- rv$sport_visuals$rates[Player %in% keep][order(AnyTD)]
+    d[, lab := factor(Player, levels = Player)]
+    CFB_DARK(plot_ly(height = max(360, 24 * nrow(d) + 120)) %>%
+      add_trace(x = d$AnyTD, y = d$lab, name = "Scores a TD", type = "bar",
+                orientation = "h", marker = list(color = "#FFE500"),
+                hoverinfo = "text",
+                text = paste0(d$Player, "<br>scores in ", d$AnyTD, "% of games")) %>%
+      add_trace(x = d$MultiTD, y = d$lab, name = "Two or more", type = "bar",
+                orientation = "h", marker = list(color = "#A87FE0"),
+                hoverinfo = "text",
+                text = paste0(d$Player, "<br>2+ TDs in ", d$MultiTD, "% of games")) %>%
+      add_trace(x = d$AnyBonus, y = d$lab, name = "100/300 yd bonus",
+                type = "scatter", mode = "markers",
+                marker = list(color = "#7BAFD4", size = 8,
+                              line = list(color = "#111", width = 1)),
+                hoverinfo = "text",
+                text = paste0(d$Player, "<br>bonus in ", d$AnyBonus, "% of games"))) %>%
+      layout(barmode = "overlay",
+             xaxis = list(title = "% of simulated games", gridcolor = "#2a2a2a"),
+             yaxis = list(title = "", automargin = TRUE),
+             margin = list(l = 10, r = 30, t = 10, b = 50))
+  })
+
+  output$cfb_rates_table <- renderDT({
+    req(rv$sport == "CFB", rv$sport_visuals$rates)
+    datatable(rv$sport_visuals$rates[Player %in% cfb_keep()], rownames = FALSE,
+              options = list(dom = "tp", pageLength = 30, searching = FALSE,
+                             scrollX = TRUE))
+  })
+
+  # ---- score range ---------------------------------------------------------
+  # A BAR, NOT A VIOLIN, AND THE DATA DECIDED THAT. Violins are right for the
+  # team outcomes -- two smooth distributions, and they render cleanly. They are
+  # wrong here: most of a 27-man showdown board is zero in the majority of sims,
+  # so the density is a spike at the origin, and plotly's width normalisation
+  # leaves the shapes wildly unequal (27px for the lead back against 2px for a
+  # depth receiver). The percentile bar says the same thing legibly.
+  output$cfb_violin <- renderPlotly({
+    req(rv$sport == "CFB", rv$sport_visuals$stat_line, rv$sport_visuals$score_dist)
+    keep <- cfb_keep(); req(length(keep) > 0)
+    d <- merge(rv$sport_visuals$score_dist[Player %in% keep],
+               rv$sport_visuals$stat_line[, .(Player, Pos)], by = "Player")
+    setorder(d, Mean)
+    d[, lab := factor(paste0(Player, "  (", Pos, ")"),
+                      levels = paste0(Player, "  (", Pos, ")"))]
+    pal <- cfb_team_pal(sort(unique(d$Team)))
+    d[, col := pal[Team]]
+    CFB_DARK(plot_ly(height = max(420, 27 * nrow(d) + 130)) %>%
+      add_segments(data = d, x = ~P10, xend = ~P90, y = ~lab, yend = ~lab,
+                   line = list(color = "#5a5a52", width = 3),
+                   hoverinfo = "text", showlegend = FALSE,
+                   text = ~paste0(Player, "<br>p10 ", P10, " to p90 ", P90)) %>%
+      add_segments(data = d, x = ~P25, xend = ~P75, y = ~lab, yend = ~lab,
+                   line = list(color = ~col, width = 11), opacity = 0.75,
+                   hoverinfo = "text", showlegend = FALSE,
+                   text = ~paste0(Player, "<br>middle half: ", P25, " to ", P75)) %>%
+      add_markers(data = d, x = ~Median, y = ~lab, showlegend = FALSE,
+                  marker = list(color = "#141414", symbol = "line-ns-open",
+                                size = 13, line = list(width = 3, color = "#141414")),
+                  hoverinfo = "text", text = ~paste0("median ", Median)) %>%
+      add_markers(data = d, x = ~Mean, y = ~lab, showlegend = FALSE,
+                  marker = list(color = "#ffffff", size = 7,
+                                line = list(color = "#111", width = 1.5)),
+                  hoverinfo = "text", text = ~paste0("mean ", Mean)) %>%
+      add_markers(data = d, x = ~P99, y = ~lab, showlegend = FALSE,
+                  marker = list(color = "#FFE500", size = 5, symbol = "diamond"),
+                  hoverinfo = "text", text = ~paste0("1-in-100 game: ", P99))) %>%
+      layout(xaxis = list(title = "DraftKings points", gridcolor = "#2a2a2a",
+                          zeroline = FALSE),
+             yaxis = list(title = "", automargin = TRUE),
+             margin = list(l = 10, r = 30, t = 10, b = 60))
+  })
+
+  output$cfb_stat_table <- renderDT({
+    req(rv$sport == "CFB", rv$sport_visuals$stat_line)
+    datatable(rv$sport_visuals$stat_line[Player %in% cfb_keep()], rownames = FALSE,
+              options = list(dom = "tp", pageLength = 30, searching = FALSE,
+                             scrollX = TRUE, order = list(list(4, "desc"))))
+  })
 
   render_tennis_visuals <- function(visuals) {
     all_players <- if (!is.null(visuals$score_distributions$all_wins)) {

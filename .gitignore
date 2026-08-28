@@ -23,3 +23,6 @@ TheLab/InputFiles/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Local dev launch config -- never ships to customers
+.claude/
