@@ -1890,34 +1890,67 @@ Phase 1: optimal classic lineup for %s sims
        size = sum(lo) + nflex + nsflex)
 }
 
-# One chosen lineup (data.table with Player, Pos, StartOrder) -> the 8 players
-# in upload order QB, RB, RB, WR, WR, WR, FLEX, SFLEX.
-.cfb_assign_slots <- function(L) {
-  L  <- as.data.table(L)
-  qb <- L[Pos == "QB"][order(StartOrder)]
-  rw <- L[Pos != "QB"]
-  two_qb   <- nrow(qb) >= 2L
-  base_qb  <- qb$Player[1]
-  sflex_qb <- if (two_qb) qb$Player[2] else NA_character_
-
-  # FLEX always drawn from the RB/WR pool; SFLEX too, unless a 2nd QB took it.
-  n_pool_flex <- 1L + as.integer(!two_qb)
-  taken <- character(0)
-  for (p in rw[order(-StartOrder)]$Player) {          # latest kickoff first
-    if (length(taken) == n_pool_flex) break
-    rest <- rw[!Player %in% c(taken, p)]
-    if (sum(rest$Pos == "RB") >= 2L && sum(rest$Pos == "WR") >= 3L)
-      taken <- c(taken, p)
+# Greedy pick over rows ALREADY sorted by descending points: take the best
+# player that fits the bucket cap (hi), the salary cap, and does not strand a
+# mandatory slot (lo). Near-optimal, and on a CFB classic slate the cap
+# carries several thousand dollars of slack in a typical lineup so it is only
+# reached in a minority of sims -- the caller solves the rest exactly.
+.cfb_greedy <- function(pos, sal, cap, b, need) {
+  lo <- b$lo; hi <- b$hi
+  cnt <- c(QB = 0L, RB = 0L, WR = 0L); spent <- 0; pick <- integer(0)
+  for (i in seq_along(pos)) {
+    p <- pos[i]
+    if (cnt[[p]] >= hi[[p]]) next
+    if (spent + sal[i] > cap) next
+    slots_left <- need - length(pick)
+    mand <- sum(pmax(lo[c("QB", "RB", "WR")] - cnt[c("QB", "RB", "WR")], 0L))
+    if (slots_left <= mand && cnt[[p]] >= lo[[p]]) next   # slot reserved for a min
+    pick <- c(pick, i); cnt[[p]] <- cnt[[p]] + 1L; spent <- spent + sal[i]
+    if (length(pick) == need) break
   }
-  base_pool <- rw[!Player %in% taken][order(StartOrder)]
-  rb <- base_pool[Pos == "RB"]$Player[1:2]
-  wr <- base_pool[Pos == "WR"]$Player[1:3]
+  if (length(pick) == need) pick else NULL
+}
 
-  tk <- rw[Player %in% taken][order(StartOrder)]      # flex fillers, earliest..latest
-  if (two_qb) { flex <- tk$Player[1];  sflex <- sflex_qb }
-  else        { flex <- tk$Player[1];  sflex <- tk$Player[2] }  # latest -> SFLEX
+# Assign every sim's chosen 8 to slots at once. `chosen` is long
+# (SimID, Player, Pos, StartOrder), 8 rows per sim, positionally valid
+# (QB 1-2, RB 2-4, WR 3-5). Returns long (SimID, Player, slot_i) with slot_i
+# 1..8 = QB, RB, RB, WR, WR, WR, FLEX, SFLEX.
+#
+# Rule: FLEX and SFLEX hold the latest-kicking RB/WR-eligible players -- but a
+# second QB, if the lineup has one, is forced into SFLEX (the only
+# QB-eligible flex slot), and base RB/WR minimums are honoured first.
+.cfb_assign_slots_vec <- function(chosen) {
+  d <- as.data.table(chosen)[, .(SimID, Player, Pos, StartOrder)]
+  d[, isqb := Pos == "QB"]
+  d[, nqb  := sum(isqb), by = SimID]
 
-  c(base_qb, rb, wr, flex, sflex)
+  # QB slot(s): earliest QB -> QB; a second QB -> SFLEX.
+  setorder(d, SimID, StartOrder)
+  d[isqb == TRUE, qr := rowid(SimID)]
+  d[isqb == TRUE & qr == 1L, slot := "QB"]
+  d[isqb == TRUE & qr == 2L, slot := "SFLEX"]
+
+  rw <- d[isqb == FALSE]
+  rw[, npos  := .N, by = .(SimID, Pos)]
+  rw[, quota := fifelse(Pos == "RB", npos - 2L, npos - 3L)]   # flex picks allowed per pos
+  rw[, kflex := 1L + as.integer(nqb == 1L)]                   # RW flex slots to fill
+  setorder(rw, SimID, -StartOrder)                            # latest kickoff first
+  rw[, pr := rowid(SimID, Pos)]
+  rw[, is_flex := pr <= quota]                                # exactly kflex per sim
+  rw[is_flex == TRUE, fr := rowid(SimID)]
+  rw[is_flex == TRUE & kflex == 1L, slot := "FLEX"]           # 2nd QB already holds SFLEX
+  rw[is_flex == TRUE & kflex == 2L & fr == 1L, slot := "SFLEX"]  # latest -> SFLEX
+  rw[is_flex == TRUE & kflex == 2L & fr == 2L, slot := "FLEX"]
+  rw[is_flex == FALSE & Pos == "RB", slot := "RB"]
+  rw[is_flex == FALSE & Pos == "WR", slot := "WR"]
+
+  out <- rbind(d[isqb == TRUE, .(SimID, Player, slot)],
+               rw[, .(SimID, Player, slot)])
+  ord <- c(QB = 1L, RB = 2L, WR = 4L, FLEX = 7L, SFLEX = 8L)
+  out[, so := ord[slot]]
+  setorder(out, SimID, so)
+  out[, slot_i := rowid(SimID)]
+  out[, .(SimID, Player, slot_i)]
 }
 
 find_optimal_lineups_cfb_classic <- function(sim_results, config, verbose = TRUE) {
@@ -1929,59 +1962,81 @@ find_optimal_lineups_cfb_classic <- function(sim_results, config, verbose = TRUE
   cap  <- config$salary_cap %||% 50000
   need <- b$size
   max_lineups <- config$max_lineups %||% 5000L
-  sim_ids <- unique(sim_results$SimID); n_sims <- length(sim_ids)
   start_time <- Sys.time()
-  if (verbose) cat(sprintf("\nPhase 1: CFB classic LP | %s sims | $%s cap | %d slots\n",
-                           format(n_sims, big.mark = ","),
-                           format(cap, big.mark = ","), need))
 
-  one_sim <- function(sd) {
-    sd <- sd[Salary > 0 & !is.na(Salary) & !is.na(FantasyPoints) &
-             Pos %in% c("QB", "RB", "WR")]
-    if (nrow(sd) < need) return(NULL)
-    # Trim per position to the only players that can plausibly be optimal:
-    # the top 24 by points plus the 6 cheapest (the punt plays that free cap).
-    keep <- sd[, .I[union(head(order(-FantasyPoints), 24L),
-                          head(order(Salary), 6L))], by = Pos]$V1
-    sd <- sd[sort(unique(keep))]
-    npl <- nrow(sd)
-    if (npl < need) return(NULL)
-    isq <- as.numeric(sd$Pos == "QB")
-    isr <- as.numeric(sd$Pos == "RB")
-    isw <- as.numeric(sd$Pos == "WR")
-    con <- rbind(rep(1, npl), sd$Salary, isq, isq, isr, isr, isw, isw)
-    dir <- c("==", "<=", ">=", "<=", ">=", "<=", ">=", "<=")
-    rhs <- c(need, cap,
-             b$lo[["QB"]], b$hi[["QB"]],
-             b$lo[["RB"]], b$hi[["RB"]],
-             b$lo[["WR"]], b$hi[["WR"]])
-    r <- tryCatch(lp("max", sd$FantasyPoints, con, dir, rhs, all.bin = TRUE),
-                  error = function(e) list(status = 1L))
-    if (!identical(r$status, 0L) && r$status != 0) return(NULL)
-    sel <- which(r$solution > 0.5)
-    if (length(sel) != need) return(NULL)
-    data.table(SimID = sd$SimID[sel][1],
-               Player = .cfb_assign_slots(sd[sel]),
-               slot_i = seq_len(need))
+  SR <- sim_results[!is.na(FantasyPoints) & !is.na(Salary) & Salary > 0 &
+                    Pos %in% c("QB", "RB", "WR"),
+                    .(SimID, Player, FantasyPoints, Salary, Pos, StartOrder)]
+
+  # Global candidate cut: a player who never rates near the top of his
+  # position (by mean points across every sim) cannot be in an optimal 8, and
+  # the cheapest few are kept as the punt plays that free cap. ~500 -> ~110.
+  pm <- SR[, .(mu = mean(FantasyPoints), sal = Salary[1]), by = .(Player, Pos)]
+  keep_pl <- pm[, .SD[union(head(order(-mu), 30L), head(order(sal), 8L)), Player],
+                by = Pos]$V1
+  SR <- SR[Player %chin% keep_pl]
+  all_ids <- unique(SR$SimID); n_sims_full <- length(all_ids)
+
+  # Build the candidate pool from at most phase1_sims simulations. The pool is
+  # stable well below the full run (preseason_classic measures Spearman 0.995
+  # at 5k), and score_all_lineups still scores every surviving lineup against
+  # all n_sims afterwards -- this keeps Phase 1 to a few seconds at 50k.
+  p1 <- as.integer(config$phase1_sims %||% 2500L)
+  if (n_sims_full > p1) {
+    keep_ids <- all_ids[round(seq(1, n_sims_full, length.out = p1))]
+    SR <- SR[SimID %chin% keep_ids]
   }
+  if (verbose) cat(sprintf("\nPhase 1: CFB classic | %s of %s sims | $%s cap | %d slots | %d candidates\n",
+                           format(uniqueN(SR$SimID), big.mark = ","),
+                           format(n_sims_full, big.mark = ","),
+                           format(cap, big.mark = ","), need, length(keep_pl)))
 
-  setkey(sim_results, SimID)
-  use_par <- (config$use_parallel %||% TRUE) && n_sims > 100
-  rows <- if (use_par) {
-    nc <- min(detectCores() - 1, 7)
-    if (verbose) cat(sprintf("  %d cores\n", nc))
-    cl <- makeCluster(nc, type = "PSOCK")
-    on.exit(stopCluster(cl), add = TRUE)
-    clusterEvalQ(cl, { library(data.table); library(lpSolve) })
-    clusterExport(cl, c("one_sim", "sim_results", "need", "cap", "b",
-                        ".cfb_assign_slots"), envir = environment())
-    parLapply(cl, sim_ids, function(s) one_sim(sim_results[.(s)]))
-  } else {
-    lapply(sim_ids, function(s) one_sim(sim_results[.(s)]))
+  # Point rank within (sim, position).
+  setorder(SR, SimID, -FantasyPoints)
+  SR[, pr := rowid(SimID, Pos)]
+
+  # ---- FAST PATH -----------------------------------------------------------
+  # The unconstrained best lineup: top QB, top 2 RB, top 3 WR, then the best 2
+  # of {RB3, RB4, WR4, WR5, QB2} for FLEX + SFLEX. When that lineup is already
+  # under the cap it IS the optimum (nothing to gain by downgrading a slot),
+  # and on this slate it usually is -- a typical lineup leaves $6-12k unspent.
+  base_c <- SR[(Pos == "QB" & pr == 1L) | (Pos == "RB" & pr <= 2L) |
+               (Pos == "WR" & pr <= 3L)]
+  flex_c <- SR[(Pos == "RB" & pr %in% 3:4) | (Pos == "WR" & pr %in% 4:5) |
+               (Pos == "QB" & pr == 2L)]
+  setorder(flex_c, SimID, -FantasyPoints)
+  flex_c <- flex_c[, head(.SD, 2L), by = SimID]
+  cand   <- rbindlist(list(base_c, flex_c), use.names = TRUE)
+  full8  <- cand[, .N, by = SimID][N == need, SimID]
+  cand   <- cand[SimID %chin% full8]
+  under  <- cand[, .(s = sum(Salary)), by = SimID][s <= cap, SimID]
+  fast   <- cand[SimID %chin% under]
+
+  # ---- SLOW PATH ---------------------------------------------------------
+  # Sims where the unconstrained lineup breaks the cap (or the trimmed
+  # candidate set could not field 8): greedy pick under the cap.
+  slow_ids <- setdiff(unique(SR$SimID), under)
+  slow <- NULL
+  if (length(slow_ids)) {
+    SS <- SR[SimID %chin% slow_ids]                 # already point-sorted
+    slow <- SS[, {
+      pk <- .cfb_greedy(Pos, Salary, cap, b, need)
+      if (is.null(pk)) .SD[0L] else .SD[pk]
+    }, by = SimID, .SDcols = c("Player", "Pos", "StartOrder", "Salary")]
   }
+  have_slow <- !is.null(slow) && nrow(slow) > 0L && "Player" %in% names(slow)
+  if (verbose)
+    cat(sprintf("  %s fast (under cap) + %s solved greedily\n",
+                format(length(under), big.mark = ","),
+                format(if (have_slow) uniqueN(slow$SimID) else 0L, big.mark = ",")))
 
-  full <- rbindlist(rows[!vapply(rows, is.null, logical(1))])
-  if (!nrow(full)) stop("cfb_classic optimiser: no feasible lineup in any sim")
+  chosen <- rbindlist(list(fast[, .(SimID, Player, Pos, StartOrder)],
+                           if (have_slow) slow[, .(SimID, Player, Pos, StartOrder)]),
+                      use.names = TRUE)
+  if (!nrow(chosen)) stop("cfb_classic optimiser: no feasible lineup in any sim")
+
+  # Assign each sim's 8 to QB/RB/RB/WR/WR/WR/FLEX/SFLEX (vectorised over sims).
+  full <- .cfb_assign_slots_vec(chosen)
 
   wide <- dcast(full, SimID ~ slot_i, value.var = "Player")
   pc <- paste0("Player", seq_len(need))
@@ -1992,8 +2047,7 @@ find_optimal_lineups_cfb_classic <- function(sim_results, config, verbose = TRUE
   cnt <- wide[, .(Top1Count = .N), by = lkey]
   uni <- merge(wide[!duplicated(lkey)], cnt, by = "lkey")
 
-  pmu <- sim_results[, .(mu = mean(FantasyPoints)), by = Player]
-  mu  <- setNames(pmu$mu, pmu$Player)
+  mu  <- setNames(pm$mu, pm$Player)
   uni[, AvgScore := rowSums(matrix(mu[unlist(.SD)], nrow = nrow(uni))), .SDcols = pc]
   sprd <- config$pool_spread %||% 0
   if (sprd > 0) {
@@ -2004,13 +2058,12 @@ find_optimal_lineups_cfb_classic <- function(sim_results, config, verbose = TRUE
   setorder(uni, -Top1Count, -rk)
   if (nrow(uni) > max_lineups) uni <- head(uni, max_lineups)
 
-  sp  <- unique(sim_results[, .(Player, Salary)])
-  sal <- setNames(sp$Salary, sp$Player)
+  sal <- setNames(pm$sal, pm$Player)
   uni[, TotalSalary := rowSums(matrix(sal[unlist(.SD)], nrow = nrow(uni))), .SDcols = pc]
   uni[, c("lkey", "rk") := NULL]
 
   if (verbose) cat(sprintf("  %s distinct lineups | %.1fs\n",
                            format(nrow(uni), big.mark = ","),
                            as.numeric(difftime(Sys.time(), start_time, units = "secs"))))
-  list(unique_lineups = uni, n_sims = n_sims, config = config, mode = "cfb_classic")
+  list(unique_lineups = uni, n_sims = n_sims_full, config = config, mode = "cfb_classic")
 }
