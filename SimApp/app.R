@@ -1522,7 +1522,11 @@ server <- function(input, output, session) {
         # who is allowed in FLEX / SFLEX (latest kickoffs, for late swap).
         progress$set(message="Finding optimal DraftKings lineups...", value=0)
         opt_data <- prepare_optimization_data(rv$simulation_results, rv$sim_metadata, "DK")
-        opt_data <- merge(opt_data, rv$sim_metadata[, .(Player, Pos, StartOrder)],
+        # sim_results already carries StartOrder (run_cfb_classic_simulation tags
+        # it there too), so only Pos needs merging -- pulling StartOrder again
+        # would collide into StartOrder.x / StartOrder.y and the optimiser guard
+        # would not find a plain `StartOrder`.
+        opt_data <- merge(opt_data, rv$sim_metadata[, .(Player, Pos)],
                           by="Player", all.x=TRUE)
         # A player DK does not list cannot be rostered; an "optimal" lineup
         # containing him will not upload.
