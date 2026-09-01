@@ -208,8 +208,19 @@ read_cfb_input <- function(file_path) {
 # =============================================================================
 # THE SIMULATION
 # =============================================================================
+# keep_components: return the per-sim component draws (`A`) alongside the DK
+# scores. OFF by default and the app never asks for it -- at 20k sims A is a
+# ~500k-row table for a showdown and several million for a classic slate, and
+# the app would hold it in `rv` for the whole session for no benefit.
+#
+# The daily review DOES need it: a mean DK score cannot tell you whether the
+# team rushing line was right, and "was the team wrong or were the shares
+# wrong" is not answerable from fantasy points alone. Everything downstream of
+# the scoring step already collapses A to means and quantiles, so without this
+# the component draws are computed and then thrown away.
 run_cfb_simulation <- function(input_data, n_sims = 10000,
-                               config = NULL, progress_callback = NULL) {
+                               config = NULL, progress_callback = NULL,
+                               keep_components = FALSE) {
   say <- function(msg, frac = NULL) {
     if (is.function(progress_callback)) try(progress_callback(msg, frac), silent = TRUE)
     message("[cfb] ", msg)
@@ -647,8 +658,15 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
     asked_total = round(cal$target$total, 2))
 
   say("done", 1)
-  list(sim_results = sim_results, metadata = meta, projections = projections,
-       sport_visuals = sport_visuals)
+  out <- list(sim_results = sim_results, metadata = meta, projections = projections,
+              sport_visuals = sport_visuals)
+  if (isTRUE(keep_components)) {
+    ccols <- intersect(c("SimID","player","team","rec","ryds","rtd","car","cyds",
+                         "ctd","pyds","ptd","pint","fgp","xp","rettd","fum","dk"),
+                       names(A))
+    out$sim_components <- A[, ..ccols]
+  }
+  out
 }
 
 # =============================================================================
@@ -666,7 +684,8 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
 #               hold the latest-starting players, so the optimiser reads this.
 # =============================================================================
 run_cfb_classic_simulation <- function(input_data, n_sims = 10000,
-                                       config = NULL, progress_callback = NULL) {
+                                       config = NULL, progress_callback = NULL,
+                                       keep_components = FALSE) {
   if (is.null(n_sims) || is.na(n_sims)) n_sims <- 10000
   G   <- as.data.table(input_data$game)
   TT  <- as.data.table(input_data$team)
@@ -684,6 +703,7 @@ run_cfb_classic_simulation <- function(input_data, n_sims = 10000,
 
   sr <- vector("list", ng); md <- vector("list", ng)
   pj <- vector("list", ng); vis <- vector("list", ng)
+  cp <- vector("list", ng)
 
   for (i in seq_len(ng)) {
     gi   <- G[i]
@@ -701,7 +721,8 @@ run_cfb_classic_simulation <- function(input_data, n_sims = 10000,
                 (i - 1 + (f %||% 0)) / ng), silent = TRUE)
           else NULL
     res <- run_cfb_simulation(sub, n_sims = n_sims, config = config,
-                              progress_callback = gp)
+                              progress_callback = gp,
+                              keep_components = keep_components)
 
     so <- as.integer(gi$start_order)
     r <- as.data.table(res$sim_results); r[, `:=`(GameKey = gkey, StartOrder = so)]
@@ -710,6 +731,10 @@ run_cfb_classic_simulation <- function(input_data, n_sims = 10000,
     md[[i]]  <- m
     pj[[i]]  <- as.data.table(res$projections)
     vis[[i]] <- res$sport_visuals
+    if (isTRUE(keep_components) && !is.null(res$sim_components)) {
+      cc <- res$sim_components; cc[, GameKey := gkey]
+      cp[[i]] <- cc
+    }
   }
 
   say("combining", 0.95)
@@ -749,6 +774,9 @@ run_cfb_classic_simulation <- function(input_data, n_sims = 10000,
   sv$asked_total <- NA_real_
 
   say("done", 1)
-  list(sim_results = sim_results, metadata = metadata,
-       projections = projections, sport_visuals = sv)
+  out <- list(sim_results = sim_results, metadata = metadata,
+              projections = projections, sport_visuals = sv)
+  if (isTRUE(keep_components))
+    out$sim_components <- rbindlist(cp[!vapply(cp, is.null, logical(1))], fill = TRUE)
+  out
 }

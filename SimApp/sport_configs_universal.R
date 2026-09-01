@@ -1141,9 +1141,10 @@ SPORT_CONFIGS <- list(
         # the game tab's slate_type that splits them. Showdown wins the CFB
         # entry, classic is CFB_CLASSIC below.
         gt <- sheets[tolower(sheets) == "game"][1]
-        st <- tryCatch(tolower(as.character(
-                readxl::read_excel(file_path, sheet = gt, n_max = 1)$slate_type[1])),
-                error = function(e) NA_character_)
+        st <- tryCatch({
+                v <- readxl::read_excel(file_path, sheet = gt, n_max = 1)$slate_type
+                if (length(v) == 0) NA_character_ else tolower(as.character(v[1]))
+              }, error = function(e) NA_character_)
         if (!is.na(st) && st == "classic") return(FALSE)
         tm <- setdiff(sheets, sheets[tolower(sheets) == "game"])[1]
         cols <- tryCatch(names(readxl::read_excel(file_path, sheet = tm, n_max = 1)),
@@ -1252,9 +1253,10 @@ SPORT_CONFIGS <- list(
       custom_detect = function(sheets, file_path = NULL) {
         if (!any(tolower(sheets) == "game")) return(FALSE)
         gt <- sheets[tolower(sheets) == "game"][1]
-        st <- tryCatch(tolower(as.character(
-                readxl::read_excel(file_path, sheet = gt, n_max = 1)$slate_type[1])),
-                error = function(e) NA_character_)
+        st <- tryCatch({
+                v <- readxl::read_excel(file_path, sheet = gt, n_max = 1)$slate_type
+                if (length(v) == 0) NA_character_ else tolower(as.character(v[1]))
+              }, error = function(e) NA_character_)
         if (is.na(st) || st != "classic") return(FALSE)
         tm <- setdiff(sheets, c(sheets[tolower(sheets) == "game"],
                                 sheets[tolower(sheets) %in% c("projections", "etr")]))[1]
