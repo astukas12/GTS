@@ -1525,133 +1525,262 @@ calculate_distribution_metrics <- function(score_matrix, lineup_data, config,
 
 
 
-# =============================================================================
-# MODE 4: WIN-BASED GENERATION (Tennis, MMA)
-# =============================================================================
+# -----------------------------------------------------------------------------
+# find_optimal_lineups_winbased -- Tennis pool construction, three stages.
+#
+# WHY IT IS NOT ONE STAGE. The old version built every lineup at once with
+# combn(simplify = FALSE) and then ranked them. On a 34-match slate that is
+# C(68,6) = 109,453,344 six-name character vectors, roughly 48GB, so the pool
+# simply could not be built -- the wall is around 24 matches. Nothing about the
+# ranking needed the whole set in memory at once, only the winners did.
+#
+# STAGE 1 walks the same combinations one first-player slice at a time, scores
+# each slice vectorised, and keeps a running top gate_size. Every combination is
+# still visited; none are held. Memory is flat in slate size -- 0.1s at 26
+# players, 66s at 68, against not running at all.
+#
+# STAGE 2 is the change in what gets played. Stage 1 is only a GATE: its job is
+# to put the good lineups in the room, not to pick them. The picking happens
+# here, on real simulated scores, by how often a lineup lands in the top
+# tail_frac of the field.
+#
+# WHY THE GATE RANKS ON MEAN SCORE AND NOT ON WINS. Measured on 2026-09-01
+# (68 players, 4.4M salary-feasible lineups), recall of the 5,000 best lineups
+# by top-0.1% hit rate:
+#
+#             N=5k   N=25k   N=100k   N=200k
+#   MeanScore 28.8%   70.7%   91.5%    93.9%
+#   P(>350)   28.9%   70.1%   92.2%    93.9%
+#   EW        15.0%   43.2%   79.9%    92.1%
+#   Win5plus   5.5%   20.0%   53.1%    79.0%
+#   Win6       1.1%    5.8%   29.4%    67.2%
+#
+# Expected wins correlates .994 with a mean player score but only .62 once
+# divided by salary, which is what a binding cap actually spends on -- a losing
+# tennis player still banks 23 of a winner's 67 points, and EW cannot see that.
+# Win6 is worst of all: maximising P(all six win) chases six favourites the cap
+# cannot afford. Both stay as reported columns; they are good filters and bad
+# gates.
+#
+# Variance-seeking gates do not help either, and the reason is structural: over
+# all feasible lineups the mean spans 197-342 (sd 22.9) while the lineup sd
+# spans only 41.5-57.7 (sd 2.16), uncorrelated with the mean. Six independent
+# players from six independent matches leaves construction moving location
+# about 11x more than shape. There is no boom-or-bust tennis lineup to find, so
+# a mean-shaped gate is a tail-shaped gate here. That is a tennis fact and does
+# not carry to sports where stacking creates correlation.
+#
+# GATE SIZE MATTERS MORE THAN GATE METRIC: EW at 200k beats mean score at 25k.
+# Gate loosely, let the simulation decide.
+#
+# STAGE 3 reports ExpectedWins, Win6Pct and Win5PlusPct on the surviving pool,
+# from the simulation, exactly as before. They are returned in pool order
+# because add_custom_metrics() in app.R assigns them by position.
+#
+# config knobs, all optional: max_lineups (5000), gate_size (100000),
+# gate_sims (5000), tail_frac (0.001), avoid_same_match (TRUE),
+# salary_buffers (c(1000, 2000, 5000, 10000, salary_cap)), player_match
+# (named vector Player -> Match; without it the same-match rule is skipped).
+# -----------------------------------------------------------------------------
 
 find_optimal_lineups_winbased <- function(sim_results, config, verbose = TRUE) {
-  
+
   if (verbose) cat("\nPhase 1: Generating lineups (WIN-BASED mode)...\n")
-  
+
   setDT(sim_results)
-  
+
   roster_size <- config$roster_size
-  salary_cap <- config$salary_cap
+  salary_cap  <- config$salary_cap
   target_lineups <- if (!is.null(config$max_lineups)) config$max_lineups else 5000
-  
-  players_dt <- unique(sim_results[, .(Player, Salary)])
-  players <- players_dt$Player
+  gate_size   <- if (!is.null(config$gate_size)) config$gate_size else 100000L
+  gate_sims   <- if (!is.null(config$gate_sims)) config$gate_sims else 5000L
+  tail_frac   <- if (!is.null(config$tail_frac)) config$tail_frac else 0.001
+  avoid_same_match <- if (!is.null(config$avoid_same_match)) config$avoid_same_match else TRUE
+  salary_buffers <- if (!is.null(config$salary_buffers)) config$salary_buffers
+                    else c(1000, 2000, 5000, 10000, salary_cap)
+
+  # Per-player statistics. Player order here defines the integer indices used
+  # everywhere below, so it is fixed once and never re-sorted.
+  players_dt <- sim_results[, .(Salary  = Salary[1],
+                                MeanPts = mean(FantasyPoints),
+                                WinProb = mean(Win)), by = Player]
+  setorder(players_dt, Player)
+  players   <- players_dt$Player
   n_players <- length(players)
-  n_sims <- length(unique(sim_results$SimID))
-  
-  # Analytical individual win probabilities (simulated win rate per player)
-  ind_ew <- sim_results[, .(WinProb = mean(Win)), by = Player]
-  
-  if (verbose) {
-    cat(sprintf("  %s players | Roster size: %s\n", n_players, roster_size))
+  n_sims    <- length(unique(sim_results$SimID))
+
+  if (n_players < roster_size) stop("Fewer players than roster spots")
+
+  sal  <- players_dt$Salary
+  mpts <- players_dt$MeanPts
+
+  # Same-match lookup. Two players in one match cannot both score well, so the
+  # pair is close to dead weight; excluded where the slate leaves room for it.
+  match_id <- NULL
+  if (avoid_same_match && !is.null(config$player_match)) {
+    pm <- config$player_match[players]
+    if (!anyNA(pm)) match_id <- as.integer(factor(pm))
   }
-  
-  # Generate ALL valid combinations
-  if (verbose) cat("  Generating all valid lineups...\n")
-  
-  all_combos <- combn(players, roster_size, simplify = FALSE)
-  
-  if (verbose) {
-    cat(sprintf("    Total combinations: %s\n", format(length(all_combos), big.mark = ",")))
-    cat("    Filtering by salary...\n")
-  }
-  
-  # Vectorized salary calculation - MUCH faster than loop
-  # Create salary lookup vector
-  salary_lookup <- setNames(players_dt$Salary, players_dt$Player)
-  
-  # Calculate all lineup salaries at once
-  lineup_salaries <- sapply(all_combos, function(combo) sum(salary_lookup[combo]))
-  
-  # Filter by salary range — start tight, expand if we don't have enough lineups
-  salary_buffers <- c(1000, 2000, 5000, 10000, salary_cap)  # fallback steps
-  player_cols <- paste0("Player", 1:roster_size)
-  lineups_dt  <- NULL
-  
-  for (buf in salary_buffers) {
-    min_salary <- salary_cap - buf
-    valid_idx  <- which(lineup_salaries >= min_salary & lineup_salaries <= salary_cap)
-    valid_lineups <- all_combos[valid_idx]
-    
-    if (verbose) {
-      label <- if (buf == salary_cap) "no floor" else sprintf("$%s-$%s", format(min_salary, big.mark = ","), format(salary_cap, big.mark = ","))
-      cat(sprintf("    Salary filter (%s): %s lineups\n", label, format(length(valid_lineups), big.mark = ",")))
+  pair_idx <- combn(roster_size, 2)
+
+  # ---------------------------------------------------------------------------
+  # STAGE 1: stream every combination, keep a running top gate_size by mean pts
+  # ---------------------------------------------------------------------------
+  stream_gate <- function(min_salary, use_match) {
+    best_i <- matrix(integer(0), nrow = roster_size, ncol = 0)
+    best_s <- numeric(0)
+    n_feas <- 0
+    prune  <- 3L * gate_size
+
+    for (i in seq_len(n_players - roster_size + 1L)) {
+      rest <- (i + 1L):n_players
+      if (length(rest) < roster_size - 1L) next
+
+      cb  <- combn(rest, roster_size - 1L)
+      tot <- sal[i] + colSums(matrix(sal[cb], nrow = roster_size - 1L))
+      ok  <- which(tot >= min_salary & tot <= salary_cap)
+      if (length(ok) == 0L) next
+
+      ci <- rbind(i, cb[, ok, drop = FALSE])
+
+      if (use_match && !is.null(match_id)) {
+        mm  <- matrix(match_id[ci], nrow = roster_size)
+        bad <- logical(ncol(mm))
+        for (p in seq_len(ncol(pair_idx)))
+          bad <- bad | (mm[pair_idx[1, p], ] == mm[pair_idx[2, p], ])
+        ci <- ci[, !bad, drop = FALSE]
+        if (ncol(ci) == 0L) next
+      }
+
+      n_feas <- n_feas + ncol(ci)
+      best_i <- cbind(best_i, ci)
+      best_s <- c(best_s, colSums(matrix(mpts[ci], nrow = roster_size)))
+
+      if (length(best_s) > prune) {
+        keep   <- order(best_s, decreasing = TRUE)[seq_len(gate_size)]
+        best_i <- best_i[, keep, drop = FALSE]
+        best_s <- best_s[keep]
+      }
     }
-    
-    if (length(valid_lineups) == 0) next
-    
-    # -----------------------------------------------------------------------
-    # PHASE 1A: Analytical ExpectedWins — simple sum of individual win probs
-    # Same-match pairs are self-capping (devigged ML probs already sum to 1.0)
-    # Fast: no matrix ops, runs on all valid lineups instantly
-    # -----------------------------------------------------------------------
-    lineup_list <- lapply(valid_lineups, function(x) as.list(setNames(x, paste0("Player", 1:roster_size))))
-    lineups_dt  <- rbindlist(lineup_list)
-    
-    ew_lookup <- setNames(ind_ew$WinProb, ind_ew$Player)
-    ew_mat <- matrix(ew_lookup[as.matrix(lineups_dt[, ..player_cols])],
-                     nrow = nrow(lineups_dt), ncol = roster_size)
-    lineups_dt[, ExpectedWins := rowSums(ew_mat, na.rm = TRUE)]
-    
-    if (nrow(lineups_dt) >= target_lineups) break
-    if (verbose) cat(sprintf("    Only %s lineups at this floor — expanding salary range...\n", format(nrow(lineups_dt), big.mark = ",")))
+
+    if (length(best_s) == 0L) return(NULL)
+    keep <- order(best_s, decreasing = TRUE)[seq_len(min(gate_size, length(best_s)))]
+    list(idx = best_i[, keep, drop = FALSE], n_feasible = n_feas)
   }
-  
-  if (verbose) cat("  Calculating analytical ExpectedWins...\n")
-  
-  # Take top target_lineups by analytical EW
-  setorder(lineups_dt, -ExpectedWins)
-  candidates <- lineups_dt[1:min(target_lineups, nrow(lineups_dt))]
-  setorder(candidates, -ExpectedWins)
-  
-  if (verbose) {
-    cat(sprintf("  ✓ Top %s candidates | EW range: %.2f to %.2f\n",
-                format(nrow(candidates), big.mark = ","),
-                min(candidates$ExpectedWins), max(candidates$ExpectedWins)))
-    cat("  Calculating Win6Pct / Win5PlusPct on candidates (matrix)...\n")
+
+  # Salary floor first, then the same-match rule, each relaxed only if it
+  # starves the pool. On an 8-match slate 76% of feasible lineups double up, and
+  # below six matches doubling up is forced, so the fallback is not optional.
+  gate <- NULL
+  for (use_match in c(TRUE, FALSE)) {
+    for (buf in salary_buffers) {
+      min_salary <- salary_cap - buf
+      g <- stream_gate(min_salary, use_match)
+      if (verbose) {
+        label <- if (buf >= salary_cap) "no floor"
+                 else sprintf("$%s-$%s", format(min_salary, big.mark = ","),
+                              format(salary_cap, big.mark = ","))
+        cat(sprintf("    Salary filter (%s%s): %s feasible\n", label,
+                    if (use_match && !is.null(match_id)) ", one per match" else "",
+                    format(if (is.null(g)) 0 else g$n_feasible, big.mark = ",")))
+      }
+      if (!is.null(g) && g$n_feasible >= target_lineups) { gate <- g; break }
+      if (!is.null(g) && (is.null(gate) || g$n_feasible > gate$n_feasible)) gate <- g
+    }
+    if (!is.null(gate) && gate$n_feasible >= target_lineups) break
+    if (verbose && use_match && !is.null(match_id))
+      cat("    Too few lineups with one player per match -- allowing both sides...\n")
   }
-  
-  # -----------------------------------------------------------------------
-  # PHASE 1B: Sim-based Win6/Win5+ on candidates only
-  # Matrix multiply on 10k lineups instead of 54k — fits in memory
-  # -----------------------------------------------------------------------
-  win_matrix <- dcast(sim_results, Player ~ SimID, value.var = "Win", fill = 0)
-  setkey(win_matrix, Player)
-  sim_cols   <- setdiff(names(win_matrix), "Player")
-  
-  all_players <- win_matrix$Player
-  n_cands     <- nrow(candidates)
-  
-  player_idx  <- match(as.matrix(candidates[, ..player_cols]), all_players)
-  member_mat  <- matrix(0L, nrow = n_cands, ncol = length(all_players))
-  member_mat[cbind(rep(seq_len(n_cands), times = roster_size), player_idx)] <- 1L
-  
-  win_mat     <- as.matrix(win_matrix[, ..sim_cols])
-  wins_mat    <- member_mat %*% win_mat
-  
-  candidates[, Win6Pct     := rowMeans(wins_mat >= roster_size) * 100]
-  candidates[, Win5PlusPct := rowMeans(wins_mat >= (roster_size - 1L)) * 100]
-  
-  # Final sort: EW primary, Win6Pct secondary, take top target_lineups
-  setorder(candidates, -ExpectedWins, -Win6Pct)
-  final_lineups <- candidates[1:min(target_lineups, nrow(candidates))]
-  
+  if (is.null(gate)) stop("No valid lineups found")
+
+  gate_idx <- gate$idx
+  n_cand   <- ncol(gate_idx)
+  if (verbose)
+    cat(sprintf("  Gate: %s feasible -> %s candidates\n",
+                format(gate$n_feasible, big.mark = ","), format(n_cand, big.mark = ",")))
+
+  # ---------------------------------------------------------------------------
+  # STAGE 2: the simulation picks. Rank candidates by how often they land in the
+  # top tail_frac of the field, then cut to target_lineups.
+  # ---------------------------------------------------------------------------
+  if (n_cand > target_lineups) {
+    if (verbose) cat(sprintf("  Scoring %s candidates on %s sims...\n",
+                             format(n_cand, big.mark = ","),
+                             format(min(gate_sims, n_sims), big.mark = ",")))
+
+    sub_ids    <- head(sort(unique(sim_results$SimID)), gate_sims)
+    score_wide <- dcast(sim_results[SimID %in% sub_ids], Player ~ SimID,
+                        value.var = "FantasyPoints", fill = 0)
+    setorder(score_wide, Player)
+    score_mat <- as.matrix(score_wide[, -1, with = FALSE])
+    n_sub     <- ncol(score_mat)
+
+    member <- matrix(0, nrow = n_cand, ncol = n_players)
+    member[cbind(rep(seq_len(n_cand), times = roster_size), as.vector(t(gate_idx)))] <- 1
+
+    # Blocked so the score matrix never exceeds n_cand x block in memory.
+    n_top <- max(1L, round(n_cand * tail_frac))
+    kth   <- n_cand - n_top + 1L
+    hits  <- integer(n_cand)
+    block <- 250L
+    for (a in seq(1L, n_sub, by = block)) {
+      b   <- min(a + block - 1L, n_sub)
+      sm  <- member %*% score_mat[, a:b, drop = FALSE]
+      thr <- apply(sm, 2L, function(v) sort(v, partial = kth)[kth])
+      hits <- hits + rowSums(sm >= rep(thr, each = n_cand))
+    }
+
+    gate_idx <- gate_idx[, order(hits, decreasing = TRUE)[seq_len(target_lineups)], drop = FALSE]
+    if (verbose) cat(sprintf("  Kept best %s by top-%.1f%% hit rate\n",
+                             format(target_lineups, big.mark = ","), 100 * tail_frac))
+  }
+
+  n_final <- ncol(gate_idx)
+
+  # ---------------------------------------------------------------------------
+  # STAGE 3: reported metrics on the surviving pool, from the simulation.
+  # Order must match unique_lineups -- app.R assigns these columns by position.
+  # ---------------------------------------------------------------------------
+  win_wide <- dcast(sim_results, Player ~ SimID, value.var = "Win", fill = 0)
+  setorder(win_wide, Player)
+  win_mat  <- as.matrix(win_wide[, -1, with = FALSE])
+
+  member_f <- matrix(0, nrow = n_final, ncol = n_players)
+  member_f[cbind(rep(seq_len(n_final), times = roster_size), as.vector(t(gate_idx)))] <- 1
+
+  # Blocked over sims. The whole product is n_final x n_sims -- 5,000 x 50,000
+  # is 2GB, which is most of the memory budget on an 8GB machine for a result
+  # that is only ever reduced to two counts.
+  n_win6 <- integer(n_final)
+  n_win5 <- integer(n_final)
+  n_cols <- ncol(win_mat)
+  for (a in seq(1L, n_cols, by = 2500L)) {
+    b  <- min(a + 2499L, n_cols)
+    wm <- member_f %*% win_mat[, a:b, drop = FALSE]
+    n_win6 <- n_win6 + rowSums(wm >= roster_size)
+    n_win5 <- n_win5 + rowSums(wm >= (roster_size - 1L))
+  }
+
+  win_metrics <- data.table(
+    ExpectedWins = colSums(matrix(players_dt$WinProb[gate_idx], nrow = roster_size)),
+    Win6Pct      = n_win6 / n_cols * 100,
+    Win5PlusPct  = n_win5 / n_cols * 100
+  )
+
+  player_cols <- paste0("Player", seq_len(roster_size))
+  lineup_only <- as.data.table(
+    matrix(players[gate_idx], nrow = n_final, ncol = roster_size, byrow = TRUE)
+  )
+  setnames(lineup_only, player_cols)
+
   if (verbose) {
-    cat(sprintf("  ✓ Top %s lineups selected\n", format(nrow(final_lineups), big.mark = ",")))
+    cat(sprintf("  Top %s lineups selected\n", format(n_final, big.mark = ",")))
     cat(sprintf("    ExpectedWins: %.2f to %.2f\n",
-                min(final_lineups$ExpectedWins), max(final_lineups$ExpectedWins)))
+                min(win_metrics$ExpectedWins), max(win_metrics$ExpectedWins)))
     cat(sprintf("    Win6Pct: %.1f%% to %.1f%%\n\n",
-                min(final_lineups$Win6Pct), max(final_lineups$Win6Pct)))
+                min(win_metrics$Win6Pct), max(win_metrics$Win6Pct)))
   }
-  
-  lineup_only <- final_lineups[, ..player_cols]
-  win_metrics <- final_lineups[, .(ExpectedWins, Win6Pct, Win5PlusPct)]
-  
+
   return(list(
     unique_lineups = lineup_only,
     win_metrics = win_metrics,
