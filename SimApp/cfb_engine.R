@@ -82,6 +82,10 @@ CFB_BW        <- 0.9
 # 1.0, which silently removes position from the deal entirely and lets a tight
 # end compete for a 60-yard bomb on a wideout's terms.
 CFB_BUCKETS   <- c("<=2", "3-7", "8-15", "16-30", "31+")
+# The sheet's catch columns, one per bucket, in bucket order. Expected CATCHES
+# in that band -- not shares, and they do not have to sum to anything, because
+# the engine normalises each column. See the schema note in the simulation.
+CFB_BAND_COLS <- c("c_dump", "c_shrt", "c_mid", "c_int", "c_deep")
 CFB_BUCKET_MID <- c(-0.32, 5.11, 10.91, 21.09, 44.17)  # ACTUAL bucket means
 CFB_LEAGUE_MIX <- c(0.122, 0.312, 0.322, 0.173, 0.072)
 CFB_BASE_MIX <- list(
@@ -218,15 +222,31 @@ read_cfb_input <- function(file_path) {
   aux <- sh[tolower(sh) %in% c("projections", "etr")]
   tms <- setdiff(sh, c(gtab, aux))
 
+  # LAYOUT-AGNOSTIC. The player block used to be pinned to A:Q and the team
+  # block to S:T, which meant adding a column moved both and silently broke
+  # every archived sheet. Read the whole tab instead and split it by NAME: the
+  # team block is the `field`/`value` pair, the player block is everything
+  # before it. Sheets written to either layout now load unchanged.
+  read_tab <- function(tm) {
+    x <- as.data.table(readxl::read_excel(file_path, sheet = tm,
+                                          .name_repair = "unique_quiet"))
+    fi <- which(names(x) == "field")
+    list(x = x, fi = if (length(fi)) fi[1] else NA_integer_)
+  }
+  tabs <- setNames(lapply(tms, read_tab), tms)
+
   pl <- rbindlist(lapply(tms, function(tm) {
-    x <- as.data.table(readxl::read_excel(file_path, sheet = tm, range = readxl::cell_cols("A:Q")))
+    z <- tabs[[tm]]; x <- z$x
+    if (!is.na(z$fi)) x <- x[, seq_len(z$fi - 1L), with = FALSE]
+    x <- x[, !startsWith(names(x), "..."), with = FALSE]
     x <- x[!is.na(player)]
     x[, team := tm][]
   }), fill = TRUE)
 
   tt <- rbindlist(lapply(tms, function(tm) {
-    b <- as.data.table(readxl::read_excel(file_path, sheet = tm,
-                                          range = readxl::cell_cols("S:T")))
+    z <- tabs[[tm]]
+    b <- if (is.na(z$fi)) data.table(field = character(), value = character())
+         else z$x[, z$fi + 0:1, with = FALSE]
     setnames(b, c("field", "value"))
     b <- b[!is.na(field)]
     o <- as.list(setNames(b$value, b$field))
@@ -298,6 +318,37 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
   PL[sy_share == 0, sy_share := carry_usage]
   PL[gl_share == 0, gl_share := carry_usage]
 
+  # ---- the catch schema: five band columns, or the old usage + ypc ----------
+  # A SHEET WITH BAND COLUMNS SAYS WHO CATCHES WHAT SIZE OF BALL, DIRECTLY.
+  # Each column is expected catches in that band; the engine normalises a
+  # column to shares and deals on it. There is no likelihood, no tilt and no
+  # league mix, because the operator has already answered the question those
+  # were computing an answer to.
+  #
+  # Why the columns and not usage + ypc. A single mean is 44% of shape at best,
+  # and typing a receiver's true measured yards-per-catch scored WORSE than
+  # leaving the column blank -- one exponential tilt levers exp(t * 44.17) in
+  # the top band against exp(t * 10.91) in the middle, four times the leverage,
+  # applied at full confidence to a number that is about half luck. Measured
+  # out of sample on 45,893 held-out catches, nats per catch: usage + ypc as
+  # typed -0.0008, usage + a shrunk ypc .0158, the full band table .1355.
+  #
+  # usage survives as a DERIVED quantity -- his row total over the team's --
+  # because everything downstream (the receiver set, fumble weights, the app
+  # contract) keys off it.
+  bands_typed <- all(CFB_BAND_COLS %in% names(PL))
+  if (bands_typed) {
+    for (cl in CFB_BAND_COLS) PL[[cl]] <- cfb_num(PL[[cl]])
+    # plain assignment, not `:=`, to match how the columns above are coerced --
+    # PL's self-reference is already broken by those and `:=` only warns
+    rt <- rowSums(as.matrix(PL[, ..CFB_BAND_COLS]))
+    tt_ <- stats::ave(rt, PL$team, FUN = sum)
+    PL[["usage"]] <- fifelse(tt_ > 0, rt / tt_, 0)
+  } else if (!"usage" %in% names(PL)) {
+    stop("CFB sheet has neither `usage` nor the five band columns (",
+         paste(CFB_BAND_COLS, collapse = ", "), ")")
+  }
+
   say("loading pool", 0.02)
   P   <- readRDS(file.path(CFB_DATA_DIR, "cfb_pool.rds"));   setDT(P)
   EV  <- readRDS(file.path(CFB_DATA_DIR, "cfb_events.rds")); setDT(EV)
@@ -337,8 +388,23 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
     list(tm = tm, side = if (tm == fav) "f" else "d",
          rec = R, rsh = S, qbs = Q,
          qb = if (nrow(Q)) Q$player[1] else NA_character_,
-         lr  = do.call(rbind, lapply(seq_len(nrow(R)),
-                function(k) cfb_lr(R$route_base[k], R$ypc[k]))),
+         # pb[i, b] = P(player i caught it | the catch was in band b). Under the
+         # band schema this IS the sheet, one column normalised. Under the old
+         # schema it is the Bayes step the engine has always done: the prior
+         # `usage` updated by how distinctive that size of catch is for him.
+         pb = if (!nrow(R)) matrix(0, 0, 5L) else if (bands_typed) {
+                M <- as.matrix(R[, ..CFB_BAND_COLS])
+                cs <- colSums(M)
+                # a band nobody is typed into falls back to overall usage,
+                # otherwise the drawn game's catches there have nowhere to go
+                for (b in seq_len(5L))
+                  if (cs[b] <= 0) M[, b] <- R$usage
+                sweep(M, 2, colSums(M), "/")
+              } else {
+                lr <- do.call(rbind, lapply(seq_len(nrow(R)),
+                        function(k) cfb_lr(R$route_base[k], R$ypc[k])))
+                apply(lr, 2, function(cl) { p <- R$usage * cl; p / sum(p) })
+              },
          k = tr$kicker, pr = tr$punt_returner, kr = tr$kick_returner,
          who = unique(c(R$player, S$player, Q$player,
                         tr$kicker, tr$punt_returner, tr$kick_returner)))
@@ -389,7 +455,7 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
     C2 <- E2[kind == CFB_EVT_CMP]
     if (nrow(C2) && nR) {
       C2[, b := cfb_bucket(yds)]
-      PRB <- lapply(seq_len(5L), function(b) { p <- R$usage * cf$lr[, b]; p / sum(p) })
+      PRB <- lapply(seq_len(5L), function(b) cf$pb[, b])
       C2[, w := NA_integer_]
       for (b in seq_len(5L)) {
         ii <- which(C2$b == b)
