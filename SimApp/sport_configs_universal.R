@@ -1149,7 +1149,13 @@ SPORT_CONFIGS <- list(
         tm <- setdiff(sheets, sheets[tolower(sheets) == "game"])[1]
         cols <- tryCatch(names(readxl::read_excel(file_path, sheet = tm, n_max = 1)),
                          error = function(e) character(0))
-        "usage" %in% cols && "carry_usage" %in% cols
+        # A CFB team tab carries carry_usage plus a catch schema. That is
+        # either the old `usage` column or the five band columns that
+        # replaced it on 1 Sep 2026 -- accept both, so archived sheets and
+        # new ones detect the same.
+        "carry_usage" %in% cols &&
+          ("usage" %in% cols ||
+           all(c("0-2", "3-7", "8-15", "16-30", "31+") %in% cols))
       },
       required_sheets    = NULL,
       required_columns   = NULL,
@@ -1262,7 +1268,13 @@ SPORT_CONFIGS <- list(
                                 sheets[tolower(sheets) %in% c("projections", "etr")]))[1]
         cols <- tryCatch(names(readxl::read_excel(file_path, sheet = tm, n_max = 1)),
                          error = function(e) character(0))
-        "usage" %in% cols && "carry_usage" %in% cols
+        # A CFB team tab carries carry_usage plus a catch schema. That is
+        # either the old `usage` column or the five band columns that
+        # replaced it on 1 Sep 2026 -- accept both, so archived sheets and
+        # new ones detect the same.
+        "carry_usage" %in% cols &&
+          ("usage" %in% cols ||
+           all(c("0-2", "3-7", "8-15", "16-30", "31+") %in% cols))
       },
       required_sheets    = NULL,
       required_columns   = NULL,

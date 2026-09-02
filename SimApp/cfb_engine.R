@@ -82,10 +82,11 @@ CFB_BW        <- 0.9
 # 1.0, which silently removes position from the deal entirely and lets a tight
 # end compete for a 60-yard bomb on a wideout's terms.
 CFB_BUCKETS   <- c("<=2", "3-7", "8-15", "16-30", "31+")
-# The sheet's catch columns, one per bucket, in bucket order. Expected CATCHES
-# in that band -- not shares, and they do not have to sum to anything, because
-# the engine normalises each column. See the schema note in the simulation.
-CFB_BAND_COLS <- c("c_dump", "c_shrt", "c_mid", "c_int", "c_deep")
+# The sheet's catch columns, one per bucket, in bucket order. NAMED FOR THE
+# YARDAGE THEY HOLD, because a column called `c_int` needs a legend and a
+# column called `16-30` does not. Each holds that band's SHARE and each sums to
+# 1 down the team, exactly like carry_usage. See the schema note below.
+CFB_BAND_COLS <- c("0-2", "3-7", "8-15", "16-30", "31+")
 CFB_BUCKET_MID <- c(-0.32, 5.11, 10.91, 21.09, 44.17)  # ACTUAL bucket means
 CFB_LEAGUE_MIX <- c(0.122, 0.312, 0.322, 0.173, 0.072)
 CFB_BASE_MIX <- list(
@@ -269,6 +270,28 @@ read_cfb_input <- function(file_path) {
     if (!"player" %in% names(prj) && "name" %in% names(prj))
       setnames(prj, "name", "player")
   }
+  # SALARY, DK IDS AND THE DK POSITION LIVE ON THE PROJECTIONS TAB. They are
+  # contest metadata, not modelling inputs -- they arrive with the ETR file and
+  # change when DK reprices, while a team tab is a football opinion. Keeping
+  # them apart stops a repricing from touching the tab that holds the reads.
+  # A sheet that still carries them on the team tab keeps working: only columns
+  # that are MISSING from the player block get filled in from here.
+  if (!is.null(prj) && nrow(prj)) {
+    meta_cols <- intersect(c("dk_pos", "salary_util", "salary_cpt",
+                             "dk_id_util", "dk_id_cpt"), names(prj))
+    meta_cols <- setdiff(meta_cols, names(pl))
+    if (length(meta_cols)) {
+      mp <- unique(as.data.table(prj)[, c("player", meta_cols), with = FALSE],
+                   by = "player")
+      pl <- merge(pl, mp, by = "player", all.x = TRUE, sort = FALSE)
+    }
+  }
+  if (!"dk_pos" %in% names(pl)) pl[, dk_pos := NA_character_]
+  if (!"route_base" %in% names(pl)) pl[, route_base := NA_character_]
+  # each is a football opinion about the other's blank
+  pl[is.na(route_base) | route_base == "", route_base := dk_pos]
+  pl[is.na(dk_pos) | dk_pos == "", dk_pos := route_base]
+
   list(game = g, team = tt, players = pl, projections = prj)
 }
 `%||%` <- function(a, b) if (is.null(a) || length(a) == 0 || is.na(a[1])) b else a
@@ -339,11 +362,15 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
   bands_typed <- all(CFB_BAND_COLS %in% names(PL))
   if (bands_typed) {
     for (cl in CFB_BAND_COLS) PL[[cl]] <- cfb_num(PL[[cl]])
-    # plain assignment, not `:=`, to match how the columns above are coerced --
-    # PL's self-reference is already broken by those and `:=` only warns
-    rt <- rowSums(as.matrix(PL[, ..CFB_BAND_COLS]))
-    tt_ <- stats::ave(rt, PL$team, FUN = sum)
-    PL[["usage"]] <- fifelse(tt_ > 0, rt / tt_, 0)
+    # `usage` is DERIVED, and it is not the row total -- these are shares of
+    # five different pots, and the pots are different sizes. His share of the
+    # team's catches is his band shares weighted by how often each band occurs,
+    # which is the one job CFB_LEAGUE_MIX still does. It cancels inside the
+    # deal (any common per-band divisor does), so this is its only remaining
+    # use in the engine.
+    # plain assignment, not `:=`, to match how the columns above are coerced
+    M_ <- as.matrix(PL[, ..CFB_BAND_COLS])
+    PL[["usage"]] <- as.vector(M_ %*% CFB_LEAGUE_MIX)
   } else if (!"usage" %in% names(PL)) {
     stop("CFB sheet has neither `usage` nor the five band columns (",
          paste(CFB_BAND_COLS, collapse = ", "), ")")
