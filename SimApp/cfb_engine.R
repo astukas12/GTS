@@ -15,9 +15,13 @@
 #
 # WHAT THE SHEET SUPPLIES, AND NOTHING ELSE:
 #   pass_share   who throws, and therefore who is debited the sacks
-#   usage        P(target of any given completion). Sums to 1 per team.
-#   ypc          expected yards per catch -- one exponential tilt on the
-#                position's bucket mix
+#   0-2 / 3-7 / 8-15 / 16-30 / 31+
+#                P(he caught it | the catch went that far). One column per
+#                reception-yardage band, each summing to 1 per team. This IS
+#                the deal -- there is no likelihood, no tilt and no league mix
+#                between what is typed and who gets the ball. `usage` is
+#                DERIVED from these (the band shares weighted by how often each
+#                band occurs) and `ypc` is a readback, not an input.
 #   carry_usage  P(handed any given NORMAL designed carry). Sums to 1.
 #   sy_share     P(handed a short-yardage carry: dn >= 3 & dist <= 2). Sums
 #                to 1. Blank means "same as carry_usage".
