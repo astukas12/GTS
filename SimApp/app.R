@@ -1364,8 +1364,18 @@ server <- function(input, output, session) {
       } else if (rv$sport == "TENNIS") {
         progress$set(message="Finding optimal DK Tennis lineups...", value=0)
         opt_data   <- prepare_optimization_data(rv$simulation_results, rv$sim_metadata, "DK")
+        # player_match lets the optimiser keep one player per match. It is not in
+        # opt_data -- prepare_optimization_data() only carries Player and Salary --
+        # so it is passed through the config, and the rule is skipped without it.
+        tennis_match <- setNames(as.character(rv$sim_metadata$Match),
+                                 rv$sim_metadata$Player)
         opt_config <- list(roster_size=rv$config$roster_sizes$DK, salary_cap=rv$config$salary_caps$DK,
-                           percentiles=c(0.01,0.05,0.10,0.20), platform_col="DKScore", max_lineups=5000)
+                           percentiles=c(0.01,0.05,0.10,0.20), platform_col="DKScore", max_lineups=5000,
+                           gate_size=rv$config$gate_size %||% 100000L,
+                           gate_sims=rv$config$gate_sims %||% 5000L,
+                           tail_frac=rv$config$tail_frac %||% 0.001,
+                           avoid_same_match=rv$config$avoid_same_match %||% TRUE,
+                           player_match=tennis_match)
         progress$set(detail="Generating lineups (win-based)...", value=0.1)
         lineup_result    <- find_optimal_lineups(opt_data, opt_config, mode="win_based", verbose=TRUE)
         lineup_data      <- list(unique_lineups=lineup_result$unique_lineups,
