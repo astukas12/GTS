@@ -1141,14 +1141,21 @@ SPORT_CONFIGS <- list(
         # the game tab's slate_type that splits them. Showdown wins the CFB
         # entry, classic is CFB_CLASSIC below.
         gt <- sheets[tolower(sheets) == "game"][1]
-        st <- tryCatch(tolower(as.character(
-                readxl::read_excel(file_path, sheet = gt, n_max = 1)$slate_type[1])),
-                error = function(e) NA_character_)
+        st <- tryCatch({
+                v <- readxl::read_excel(file_path, sheet = gt, n_max = 1)$slate_type
+                if (length(v) == 0) NA_character_ else tolower(as.character(v[1]))
+              }, error = function(e) NA_character_)
         if (!is.na(st) && st == "classic") return(FALSE)
         tm <- setdiff(sheets, sheets[tolower(sheets) == "game"])[1]
         cols <- tryCatch(names(readxl::read_excel(file_path, sheet = tm, n_max = 1)),
                          error = function(e) character(0))
-        "usage" %in% cols && "carry_usage" %in% cols
+        # A CFB team tab carries carry_usage plus a catch schema. That is
+        # either the old `usage` column or the five band columns that
+        # replaced it on 1 Sep 2026 -- accept both, so archived sheets and
+        # new ones detect the same.
+        "carry_usage" %in% cols &&
+          ("usage" %in% cols ||
+           all(c("0-2", "3-7", "8-15", "16-30", "31+") %in% cols))
       },
       required_sheets    = NULL,
       required_columns   = NULL,
@@ -1252,15 +1259,22 @@ SPORT_CONFIGS <- list(
       custom_detect = function(sheets, file_path = NULL) {
         if (!any(tolower(sheets) == "game")) return(FALSE)
         gt <- sheets[tolower(sheets) == "game"][1]
-        st <- tryCatch(tolower(as.character(
-                readxl::read_excel(file_path, sheet = gt, n_max = 1)$slate_type[1])),
-                error = function(e) NA_character_)
+        st <- tryCatch({
+                v <- readxl::read_excel(file_path, sheet = gt, n_max = 1)$slate_type
+                if (length(v) == 0) NA_character_ else tolower(as.character(v[1]))
+              }, error = function(e) NA_character_)
         if (is.na(st) || st != "classic") return(FALSE)
         tm <- setdiff(sheets, c(sheets[tolower(sheets) == "game"],
                                 sheets[tolower(sheets) %in% c("projections", "etr")]))[1]
         cols <- tryCatch(names(readxl::read_excel(file_path, sheet = tm, n_max = 1)),
                          error = function(e) character(0))
-        "usage" %in% cols && "carry_usage" %in% cols
+        # A CFB team tab carries carry_usage plus a catch schema. That is
+        # either the old `usage` column or the five band columns that
+        # replaced it on 1 Sep 2026 -- accept both, so archived sheets and
+        # new ones detect the same.
+        "carry_usage" %in% cols &&
+          ("usage" %in% cols ||
+           all(c("0-2", "3-7", "8-15", "16-30", "31+") %in% cols))
       },
       required_sheets    = NULL,
       required_columns   = NULL,

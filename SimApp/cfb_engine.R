@@ -15,12 +15,18 @@
 #
 # WHAT THE SHEET SUPPLIES, AND NOTHING ELSE:
 #   pass_share   who throws, and therefore who is debited the sacks
-#   usage        P(target of any given completion). Sums to 1 per team.
-#   ypc          expected yards per catch -- one exponential tilt on the
-#                position's bucket mix
-#   carry_usage  P(handed any given designed carry). Sums to 1.
-#   sy_tilt      short-yardage tilt (split-half .376)
-#   gl_tilt      goal-line tilt (.204), defaults to sy_tilt
+#   0-2 / 3-7 / 8-15 / 16-30 / 31+
+#                P(he caught it | the catch went that far). One column per
+#                reception-yardage band, each summing to 1 per team. This IS
+#                the deal -- there is no likelihood, no tilt and no league mix
+#                between what is typed and who gets the ball. `usage` is
+#                DERIVED from these (the band shares weighted by how often each
+#                band occurs) and `ypc` is a readback, not an input.
+#   carry_usage  P(handed any given NORMAL designed carry). Sums to 1.
+#   sy_share     P(handed a short-yardage carry: dn >= 3 & dist <= 2). Sums
+#                to 1. Blank means "same as carry_usage".
+#   gl_share     P(handed a goal-line carry: ytg <= 3). Sums to 1. Blank means
+#                "same as carry_usage".
 #   kicker / punt_returner / kick_returner   one name each
 #   pys_target   the pass-yard share to ASK THE POOL FOR
 #
@@ -33,6 +39,27 @@
 # carry that gets dealt: the drawn game contained a 12-yard reception from the
 # 14 that ended in the end zone, and whoever receives that event scores. There
 # is no TD share vector in this engine.
+#
+# WHY SHARES AND NOT TILTS (1 September 2026). sy_tilt and gl_tilt multiplied
+# carry_usage and were never centred, so they could not say "this man is the
+# goal-line back" without also saying "this man plays". NCST priced Will Wilson
+# as a goal-line package quarterback; carry_usage .12 with gl_tilt 1.60
+# delivered him 4.00 carries, 19.0 rushing yards and a 20-yard run in 37.4% of
+# games, for a man who runs about once. Under shares he is carry_usage .01,
+# gl_share .35 and reads as what he is.
+#
+# Measured over 286 team-seasons of play-by-play, goal-line share tracks normal
+# share at cor .801 and slope .947 -- the role is very nearly pure volume, and
+# true specialists (>=15% of goal-line carries on <5% of normal) are 40 rows in
+# 4,345, about one team in seven, half of them quarterbacks. So the schema has
+# to express the exception WITHOUT taxing the other 99%: a blank share falls
+# back to carry_usage and the deal is unchanged.
+#
+# Deleted at the same time: big_run and stuff_rate, which no version of this
+# engine ever read. Within-team rushing efficiency is not forecastable -- the
+# RB1-RB2 YPC gap is 8.3% real, a true 0.35 yds/carry or about 0.6 DK points,
+# and the sampling noise that makes up the rest is something the dealer already
+# reproduces. carry_usage alone delivers 96% of the true spread.
 #
 # DATA: cfb_data/ holds three files totalling 1.65MB, built by
 # CFB/R/build_templates.R out of 58.5MB of play-by-play that never ships.
@@ -59,12 +86,42 @@ CFB_BW        <- 0.9
 # 1.0, which silently removes position from the deal entirely and lets a tight
 # end compete for a 60-yard bomb on a wideout's terms.
 CFB_BUCKETS   <- c("<=2", "3-7", "8-15", "16-30", "31+")
+# The sheet's catch columns, one per bucket, in bucket order. NAMED FOR THE
+# YARDAGE THEY HOLD, because a column called `c_int` needs a legend and a
+# column called `16-30` does not. Each holds that band's SHARE and each sums to
+# 1 down the team, exactly like carry_usage. See the schema note below.
+CFB_BAND_COLS <- c("0-2", "3-7", "8-15", "16-30", "31+")
 CFB_BUCKET_MID <- c(-0.32, 5.11, 10.91, 21.09, 44.17)  # ACTUAL bucket means
 CFB_LEAGUE_MIX <- c(0.122, 0.312, 0.322, 0.173, 0.072)
 CFB_BASE_MIX <- list(
   WR = c(.087, .287, .347, .193, .086),
   TE = c(.094, .328, .337, .192, .050),
   RB = c(.229, .360, .273, .103, .035))
+
+# CONCENTRATION FOR THE PER-GAME BACKFIELD DIRICHLET. A team's split is not the
+# same every Saturday, and multinomial dealing alone is too tidy: the observed
+# game-to-game variance of the top back's carry share is 2.13x what dealing
+# from a fixed vector produces. Solving 1 + n/(a0+1) = 2.13 at n ~ 35 designed
+# runs a game gives a0 ~ 30. Applied to the NORMAL vector only -- short yardage
+# and the goal line are 2.5 and 1.25 carries a game, where multinomial noise
+# already dominates and a Dirichlet on top would be noise on noise.
+#
+# OPEN: 30 LOOKS TOO HIGH, and the reason is that the 2.13 was measured against
+# pure multinomial dealing at a fixed carry count, which is not what this engine
+# was doing beforehand. The drawn game already varies both the carry total and
+# the situation mix, so the engine carried a dispersion ratio of 1.41 before any
+# Dirichlet at all. Measured on the same scale (observed share variance over
+# p(1-p)/n at the mean carry count):
+#
+#   real football, 3,298 player-seasons   2.87 weighted, 3.19 for top backs
+#   engine, a0 = 30                       2.00 weighted, 2.21
+#   engine, a0 = 14                       2.69 weighted, 2.90
+#   engine, a0 = 10                       3.12 weighted, 3.24
+#
+# so the fitted value is nearer a0 = 12. Left at 30 because 30 is what was
+# agreed; changing it is a decision, not an implementation detail. Measured on
+# the UNC/TCU showdown sheet only -- confirm on a classic slate before moving it.
+CFB_CARRY_A0 <- 30
 
 # Per-touch fumble rates. The QB's is ~4x a back's because his come from SACKS
 # AND SNAPS rather than from carrying, so his weight rides on dropbacks.
@@ -170,15 +227,31 @@ read_cfb_input <- function(file_path) {
   aux <- sh[tolower(sh) %in% c("projections", "etr")]
   tms <- setdiff(sh, c(gtab, aux))
 
+  # LAYOUT-AGNOSTIC. The player block used to be pinned to A:Q and the team
+  # block to S:T, which meant adding a column moved both and silently broke
+  # every archived sheet. Read the whole tab instead and split it by NAME: the
+  # team block is the `field`/`value` pair, the player block is everything
+  # before it. Sheets written to either layout now load unchanged.
+  read_tab <- function(tm) {
+    x <- as.data.table(readxl::read_excel(file_path, sheet = tm,
+                                          .name_repair = "unique_quiet"))
+    fi <- which(names(x) == "field")
+    list(x = x, fi = if (length(fi)) fi[1] else NA_integer_)
+  }
+  tabs <- setNames(lapply(tms, read_tab), tms)
+
   pl <- rbindlist(lapply(tms, function(tm) {
-    x <- as.data.table(readxl::read_excel(file_path, sheet = tm, range = readxl::cell_cols("A:Q")))
+    z <- tabs[[tm]]; x <- z$x
+    if (!is.na(z$fi)) x <- x[, seq_len(z$fi - 1L), with = FALSE]
+    x <- x[, !startsWith(names(x), "..."), with = FALSE]
     x <- x[!is.na(player)]
     x[, team := tm][]
   }), fill = TRUE)
 
   tt <- rbindlist(lapply(tms, function(tm) {
-    b <- as.data.table(readxl::read_excel(file_path, sheet = tm,
-                                          range = readxl::cell_cols("S:T")))
+    z <- tabs[[tm]]
+    b <- if (is.na(z$fi)) data.table(field = character(), value = character())
+         else z$x[, z$fi + 0:1, with = FALSE]
     setnames(b, c("field", "value"))
     b <- b[!is.na(field)]
     o <- as.list(setNames(b$value, b$field))
@@ -201,6 +274,28 @@ read_cfb_input <- function(file_path) {
     if (!"player" %in% names(prj) && "name" %in% names(prj))
       setnames(prj, "name", "player")
   }
+  # SALARY, DK IDS AND THE DK POSITION LIVE ON THE PROJECTIONS TAB. They are
+  # contest metadata, not modelling inputs -- they arrive with the ETR file and
+  # change when DK reprices, while a team tab is a football opinion. Keeping
+  # them apart stops a repricing from touching the tab that holds the reads.
+  # A sheet that still carries them on the team tab keeps working: only columns
+  # that are MISSING from the player block get filled in from here.
+  if (!is.null(prj) && nrow(prj)) {
+    meta_cols <- intersect(c("dk_pos", "salary_util", "salary_cpt",
+                             "dk_id_util", "dk_id_cpt"), names(prj))
+    meta_cols <- setdiff(meta_cols, names(pl))
+    if (length(meta_cols)) {
+      mp <- unique(as.data.table(prj)[, c("player", meta_cols), with = FALSE],
+                   by = "player")
+      pl <- merge(pl, mp, by = "player", all.x = TRUE, sort = FALSE)
+    }
+  }
+  if (!"dk_pos" %in% names(pl)) pl[, dk_pos := NA_character_]
+  if (!"route_base" %in% names(pl)) pl[, route_base := NA_character_]
+  # each is a football opinion about the other's blank
+  pl[is.na(route_base) | route_base == "", route_base := dk_pos]
+  pl[is.na(dk_pos) | dk_pos == "", dk_pos := route_base]
+
   list(game = g, team = tt, players = pl, projections = prj)
 }
 `%||%` <- function(a, b) if (is.null(a) || length(a) == 0 || is.na(a[1])) b else a
@@ -208,8 +303,23 @@ read_cfb_input <- function(file_path) {
 # =============================================================================
 # THE SIMULATION
 # =============================================================================
+# keep_components: return the per-sim component draws (`A`) alongside the DK
+# scores. OFF by default and the app never asks for it -- at 20k sims A is a
+# ~500k-row table for a showdown and several million for a classic slate, and
+# the app would hold it in `rv` for the whole session for no benefit.
+#
+# The daily review DOES need it: a mean DK score cannot tell you whether the
+# team rushing line was right, and "was the team wrong or were the shares
+# wrong" is not answerable from fantasy points alone. Everything downstream of
+# the scoring step already collapses A to means and quantiles, so without this
+# the component draws are computed and then thrown away.
+# seed: pin the draw so two runs of the same sheet are comparable. The engine
+# seeded from Sys.time(), which makes a before/after check impossible -- a
+# change of a few tenths cannot be told apart from a different afternoon. The
+# app passes nothing and still gets a fresh game every run.
 run_cfb_simulation <- function(input_data, n_sims = 10000,
-                               config = NULL, progress_callback = NULL) {
+                               config = NULL, progress_callback = NULL,
+                               keep_components = FALSE, seed = NULL) {
   say <- function(msg, frac = NULL) {
     if (is.function(progress_callback)) try(progress_callback(msg, frac), silent = TRUE)
     message("[cfb] ", msg)
@@ -219,12 +329,56 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
   G  <- as.data.table(input_data$game)
   TT <- as.data.table(input_data$team)
   PL <- as.data.table(input_data$players)
-  for (cl in c("pass_share","usage","ypc","carry_usage","sy_tilt","gl_tilt",
+  # A sheet written before the situation shares existed carries neither column;
+  # a zero in either means "no opinion", which falls back to carry_usage. Both
+  # paths therefore reproduce the old NORMAL deal exactly. What they do NOT
+  # reproduce is the old tilts -- sy_tilt and gl_tilt are deleted, so an old
+  # sheet's goal-line opinion is dropped rather than silently reinterpreted.
+  # That is deliberate: the tilts were worth about 1.1 DK points across their
+  # whole range and were never centred.
+  for (cl in c("gl_share", "sy_share"))
+    if (!cl %in% names(PL)) PL[[cl]] <- 0
+  for (cl in c("pass_share","usage","ypc","carry_usage","gl_share","sy_share",
                "salary_util","salary_cpt","dk_id_util","dk_id_cpt"))
     if (cl %in% names(PL)) PL[[cl]] <- cfb_num(PL[[cl]])
   PL[is.na(route_base) | route_base == "", route_base := dk_pos]
-  PL[gl_tilt == 0, gl_tilt := fifelse(sy_tilt > 0, sy_tilt, 1)]
-  PL[sy_tilt == 0, sy_tilt := 1]
+  PL[sy_share == 0, sy_share := carry_usage]
+  PL[gl_share == 0, gl_share := carry_usage]
+
+  # ---- the catch schema: five band columns, or the old usage + ypc ----------
+  # A SHEET WITH BAND COLUMNS SAYS WHO CATCHES WHAT SIZE OF BALL, DIRECTLY.
+  # Each column is expected catches in that band; the engine normalises a
+  # column to shares and deals on it. There is no likelihood, no tilt and no
+  # league mix, because the operator has already answered the question those
+  # were computing an answer to.
+  #
+  # Why the columns and not usage + ypc. A single mean is 44% of shape at best,
+  # and typing a receiver's true measured yards-per-catch scored WORSE than
+  # leaving the column blank -- one exponential tilt levers exp(t * 44.17) in
+  # the top band against exp(t * 10.91) in the middle, four times the leverage,
+  # applied at full confidence to a number that is about half luck. Measured
+  # out of sample on 45,893 held-out catches, nats per catch: usage + ypc as
+  # typed -0.0008, usage + a shrunk ypc .0158, the full band table .1355.
+  #
+  # usage survives as a DERIVED quantity -- his row total over the team's --
+  # because everything downstream (the receiver set, fumble weights, the app
+  # contract) keys off it.
+  bands_typed <- all(CFB_BAND_COLS %in% names(PL))
+  if (bands_typed) {
+    for (cl in CFB_BAND_COLS) PL[[cl]] <- cfb_num(PL[[cl]])
+    # `usage` is DERIVED, and it is not the row total -- these are shares of
+    # five different pots, and the pots are different sizes. His share of the
+    # team's catches is his band shares weighted by how often each band occurs,
+    # which is the one job CFB_LEAGUE_MIX still does. It cancels inside the
+    # deal (any common per-band divisor does), so this is its only remaining
+    # use in the engine.
+    # plain assignment, not `:=`, to match how the columns above are coerced
+    M_ <- as.matrix(PL[, ..CFB_BAND_COLS])
+    PL[["usage"]] <- as.vector(M_ %*% CFB_LEAGUE_MIX)
+  } else if (!"usage" %in% names(PL)) {
+    stop("CFB sheet has neither `usage` nor the five band columns (",
+         paste(CFB_BAND_COLS, collapse = ", "), ")")
+  }
 
   say("loading pool", 0.02)
   P   <- readRDS(file.path(CFB_DATA_DIR, "cfb_pool.rds"));   setDT(P)
@@ -250,7 +404,9 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
     warning("CFB pool is thin: ESS ", round(cal$ess),
             ". Widen the bandwidth or accept a wider output.")
 
-  set.seed(as.integer(Sys.time()) %% .Machine$integer.max)
+  set.seed(if (is.null(seed) || is.na(seed))
+             as.integer(Sys.time()) %% .Machine$integer.max
+           else as.integer(seed))
   idx <- sample.int(nrow(P), n_sims, TRUE, prob = cal$w)
   draw <- P[idx]
 
@@ -261,9 +417,25 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
     Q <- PL[team == tm & pass_share > 0]
     tr <- TT[team == tm]
     list(tm = tm, side = if (tm == fav) "f" else "d",
-         rec = R, rsh = S, qb = if (nrow(Q)) Q$player[1] else NA_character_,
-         lr  = do.call(rbind, lapply(seq_len(nrow(R)),
-                function(k) cfb_lr(R$route_base[k], R$ypc[k]))),
+         rec = R, rsh = S, qbs = Q,
+         qb = if (nrow(Q)) Q$player[1] else NA_character_,
+         # pb[i, b] = P(player i caught it | the catch was in band b). Under the
+         # band schema this IS the sheet, one column normalised. Under the old
+         # schema it is the Bayes step the engine has always done: the prior
+         # `usage` updated by how distinctive that size of catch is for him.
+         pb = if (!nrow(R)) matrix(0, 0, 5L) else if (bands_typed) {
+                M <- as.matrix(R[, ..CFB_BAND_COLS])
+                cs <- colSums(M)
+                # a band nobody is typed into falls back to overall usage,
+                # otherwise the drawn game's catches there have nowhere to go
+                for (b in seq_len(5L))
+                  if (cs[b] <= 0) M[, b] <- R$usage
+                sweep(M, 2, colSums(M), "/")
+              } else {
+                lr <- do.call(rbind, lapply(seq_len(nrow(R)),
+                        function(k) cfb_lr(R$route_base[k], R$ypc[k])))
+                apply(lr, 2, function(cl) { p <- R$usage * cl; p / sum(p) })
+              },
          k = tr$kicker, pr = tr$punt_returner, kr = tr$kick_returner,
          who = unique(c(R$player, S$player, Q$player,
                         tr$kicker, tr$punt_returner, tr$kick_returner)))
@@ -283,9 +455,12 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
   for (si in seq_along(setup)) {
     cf <- setup[[si]]; tm <- cf$tm
     R <- cf$rec; S <- cf$rsh; nR <- nrow(R); nS <- nrow(S)
+    QB <- cf$qbs; nQ <- nrow(QB)
     pos <- setNames(R$route_base, R$player)
     if (nS) pos[S$player] <- fifelse(S$dk_pos == "QB", "QB", "RB")
-    if (!is.na(cf$qb)) pos[cf$qb] <- "QB"
+    # EVERY man with a pass_share is a quarterback for fumble purposes, not
+    # just the first one -- his fumbles come from sacks and snaps.
+    if (nQ) pos[QB$player] <- "QB"
     if (!is.na(cf$k))  pos[cf$k]  <- "K"
     miss <- setdiff(cf$who, names(pos)); if (length(miss)) pos[miss] <- "WR"
     who <- cf$who; nW <- length(who)
@@ -311,7 +486,7 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
     C2 <- E2[kind == CFB_EVT_CMP]
     if (nrow(C2) && nR) {
       C2[, b := cfb_bucket(yds)]
-      PRB <- lapply(seq_len(5L), function(b) { p <- R$usage * cf$lr[, b]; p / sum(p) })
+      PRB <- lapply(seq_len(5L), function(b) cf$pb[, b])
       C2[, w := NA_integer_]
       for (b in seq_len(5L)) {
         ii <- which(C2$b == b)
@@ -332,22 +507,59 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
     if (nrow(R2) && nS) {
       R2[, sit := fifelse(!is.na(ytg) & ytg <= 3L, 3L,
                   fifelse(!is.na(dn) & !is.na(dist) & dn >= 3L & dist <= 2L, 2L, 1L))]
-      SPB <- list(S$carry_usage,
-                  S$carry_usage * S$sy_tilt,
-                  S$carry_usage * S$gl_tilt)
-      SPB <- lapply(SPB, function(p) p / sum(p))
+      SPB <- lapply(list(S$carry_usage, S$sy_share, S$gl_share),
+                    function(p) p / sum(p))
       R2[, w := NA_integer_]
-      for (q in seq_len(3L)) {
+
+      # Short yardage and goal line: one vector each, dealt in one call.
+      for (q in 2:3) {
         ii <- which(R2$sit == q)
         if (length(ii)) set(R2, ii, "w", sample.int(nS, length(ii), TRUE, prob = SPB[[q]]))
+      }
+
+      # NORMAL CARRIES GET A PER-GAME DIRICHLET (see CFB_CARRY_A0). Drawing
+      # Dirichlet(a0 * carry_usage) once per simulated game and dealing from
+      # THAT is mean-preserving, so the asked share still arrives exactly on
+      # average while the week-to-week split moves the way real backfields do.
+      #
+      # Vectorised by inverse CDF rather than a per-sim loop: one cumulative
+      # weight matrix (n_sims x nS), one uniform per carry, and nS-1 passes of
+      # integer arithmetic over the whole event vector. A loop over 20,000 sims
+      # would dominate the runtime of the entire engine.
+      ii <- which(R2$sit == 1L)
+      if (length(ii)) {
+        if (nS == 1L) set(R2, ii, "w", 1L) else {
+          gsh <- matrix(rgamma(n_sims * nS,
+                               shape = rep(CFB_CARRY_A0 * SPB[[1]], each = n_sims)),
+                        nrow = n_sims, ncol = nS)
+          gsh <- gsh / rowSums(gsh)
+          for (j in 2:nS) gsh[, j] <- gsh[, j - 1L] + gsh[, j]   # cumulative
+          si_ <- R2$sim[ii]; u_ <- runif(length(ii))
+          wv <- rep(1L, length(ii))
+          for (j in seq_len(nS - 1L))
+            wv <- wv + (gsh[cbind(si_, j)] < u_)
+          set(R2, ii, "w", wv)
+        }
       }
       rsh <- R2[, .(car = .N, cyds = sum(yds),
                     ctd = sum(td == 1L, na.rm = TRUE)), by = .(sim, w)]
       rsh[, player := S$player[w]][, w := NULL]
     }
 
-    # Sacks whole to whoever was in; kicks exactly as they happened.
-    sk <- E2[kind == CFB_EVT_SACK, .(sk = sum(yds)), by = sim]
+    # SACKS ARE DEALT PER EVENT off pass_share. They used to be charged whole
+    # to Q$player[1], which made pass_share a filter rather than a probability:
+    # on a two-quarterback team the man listed first ate every sack in the
+    # game, including the ones the other quarterback took. Identical on a
+    # one-QB team. The same trick would split passing yards and touchdowns --
+    # available, deliberately not done here.
+    sk <- NULL
+    K2 <- E2[kind == CFB_EVT_SACK]
+    if (nrow(K2) && nQ) {
+      K2[, qw := if (nQ == 1L) 1L
+                 else sample.int(nQ, .N, TRUE, prob = QB$pass_share / sum(QB$pass_share))]
+      sk <- K2[, .(sk = sum(yds)), by = .(sim, qw)]
+      sk[, player := QB$player[qw]][, qw := NULL]
+    }
     fg <- E2[kind == CFB_EVT_FG & !is.na(made) & made == 1L,
              .(fg = sum(cfb_fg_points(ytg))), by = sim]
 
@@ -361,11 +573,13 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
       if (!cl %in% names(D)) D[, (cl) := 0] else D[is.na(get(cl)), (cl) := 0]
 
     D[, `:=`(pyds = 0, ptd = 0, pint = 0, fgp = 0, xp = 0, rettd = 0L)]
-    if (!is.na(cf$qb)) {
-      skv <- rep(0, n_sims); skv[sk$sim] <- sk$sk
-      D[player == cf$qb, `:=`(cyds = cyds + skv[sim], pyds = v_pyds[sim],
-                              ptd = v_ptd[sim], pint = v_pint[sim])]
-    }
+    # Passing yards, touchdowns and interceptions still ride on the first
+    # quarterback -- splitting those is scoped but not built. Sack YARDAGE now
+    # lands on whoever took the sack.
+    if (!is.na(cf$qb))
+      D[player == cf$qb, `:=`(pyds = v_pyds[sim], ptd = v_ptd[sim],
+                              pint = v_pint[sim])]
+    if (!is.null(sk)) D[sk, on = .(sim, player), cyds := cyds + i.sk]
     if (!is.na(cf$k)) {
       fgv <- rep(0, n_sims); fgv[fg$sim] <- fg$fg
       tdv <- D[, .(t = sum(rtd) + sum(ctd)), by = sim]
@@ -616,6 +830,20 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
                    FumLost  = round(mean(fum), 3)), by = .(team)]
   ysum <- ypcs[, .(YPCp10 = round(quantile(y, .1), 1),
                    YPCp90 = round(quantile(y, .9), 1)), by = .(team)]
+  # RUSHING YPC. Receiving has had this check since the engine was written and
+  # rushing has not, which matters more now: the situation-shares design drops
+  # the within-team efficiency dial on the evidence that carry_usage alone
+  # delivers 96% of the true RB1-RB2 spread. The other 4% would show up here.
+  # QBs are excluded because cyds carries their sack yardage by box convention,
+  # which would drag the low tail for a reason that has nothing to do with
+  # running the ball.
+  rbn  <- PL[dk_pos == "RB", player]
+  rypc <- A[player %in% rbn & car >= 5, .(y = sum(cyds) / sum(car)),
+            by = .(SimID, team, player)]
+  rsum <- if (nrow(rypc))
+    rypc[, .(RYPCp10 = round(quantile(y, .1), 2),
+             RYPCp90 = round(quantile(y, .9), 2)), by = .(team)]
+  else data.table(team = c(fav, dog), RYPCp10 = NA_real_, RYPCp90 = NA_real_)
   tsum <- one3[, .(All3TD = round(100 * mean(mx == 3), 1), N = .N), by = .(team)]
   g <- function(D, col) D[match(c(fav, dog), D$team)][[col]]
   vrow <- function(metric, got, real, note)
@@ -629,6 +857,10 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
          "taken from the drawn game's box, not modelled"),
     vrow("Player YPC, 10th pct",     g(ysum,"YPCp10"),   "5.3",  "the tilt's low end"),
     vrow("Player YPC, 90th pct",     g(ysum,"YPCp90"),   "20.3", "the tilt's high end"),
+    vrow("Rush YPC, 10th pct",       g(rsum,"RYPCp10"),  "2.38",
+         "RB games with 5+ carries, measured 2019-25 (the two rows above are RECEIVING)"),
+    vrow("Rush YPC, 90th pct",       g(rsum,"RYPCp90"),  "8.43",
+         "wide here means the dealer is making backs it was never asked for"),
     vrow("One man takes all 3 rec TD (%)", g(tsum,"All3TD"), "4.2",
          "KNOWN GAP: independent dealing alone gives ~3.2 and the affinity effect that lifts real football above it is not built"),
     vrow("3-TD games observed",      g(tsum,"N"),        "-",
@@ -647,8 +879,15 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
     asked_total = round(cal$target$total, 2))
 
   say("done", 1)
-  list(sim_results = sim_results, metadata = meta, projections = projections,
-       sport_visuals = sport_visuals)
+  out <- list(sim_results = sim_results, metadata = meta, projections = projections,
+              sport_visuals = sport_visuals)
+  if (isTRUE(keep_components)) {
+    ccols <- intersect(c("SimID","player","team","rec","ryds","rtd","car","cyds",
+                         "ctd","pyds","ptd","pint","fgp","xp","rettd","fum","dk"),
+                       names(A))
+    out$sim_components <- A[, ..ccols]
+  }
+  out
 }
 
 # =============================================================================
@@ -666,7 +905,8 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
 #               hold the latest-starting players, so the optimiser reads this.
 # =============================================================================
 run_cfb_classic_simulation <- function(input_data, n_sims = 10000,
-                                       config = NULL, progress_callback = NULL) {
+                                       config = NULL, progress_callback = NULL,
+                                       keep_components = FALSE, seed = NULL) {
   if (is.null(n_sims) || is.na(n_sims)) n_sims <- 10000
   G   <- as.data.table(input_data$game)
   TT  <- as.data.table(input_data$team)
@@ -684,6 +924,7 @@ run_cfb_classic_simulation <- function(input_data, n_sims = 10000,
 
   sr <- vector("list", ng); md <- vector("list", ng)
   pj <- vector("list", ng); vis <- vector("list", ng)
+  cp <- vector("list", ng)
 
   for (i in seq_len(ng)) {
     gi   <- G[i]
@@ -700,8 +941,13 @@ run_cfb_classic_simulation <- function(input_data, n_sims = 10000,
                 sprintf("game %d/%d: %s", i, ng, m),
                 (i - 1 + (f %||% 0)) / ng), silent = TRUE)
           else NULL
+    # Each game gets its own offset seed: one seed for the whole slate would
+    # make every game reproducible but ALSO make them share a draw stream, so
+    # re-ordering the slate would change every game's result.
     res <- run_cfb_simulation(sub, n_sims = n_sims, config = config,
-                              progress_callback = gp)
+                              progress_callback = gp,
+                              keep_components = keep_components,
+                              seed = if (is.null(seed)) NULL else as.integer(seed) + i)
 
     so <- as.integer(gi$start_order)
     r <- as.data.table(res$sim_results); r[, `:=`(GameKey = gkey, StartOrder = so)]
@@ -710,6 +956,10 @@ run_cfb_classic_simulation <- function(input_data, n_sims = 10000,
     md[[i]]  <- m
     pj[[i]]  <- as.data.table(res$projections)
     vis[[i]] <- res$sport_visuals
+    if (isTRUE(keep_components) && !is.null(res$sim_components)) {
+      cc <- res$sim_components; cc[, GameKey := gkey]
+      cp[[i]] <- cc
+    }
   }
 
   say("combining", 0.95)
@@ -749,6 +999,9 @@ run_cfb_classic_simulation <- function(input_data, n_sims = 10000,
   sv$asked_total <- NA_real_
 
   say("done", 1)
-  list(sim_results = sim_results, metadata = metadata,
-       projections = projections, sport_visuals = sv)
+  out <- list(sim_results = sim_results, metadata = metadata,
+              projections = projections, sport_visuals = sv)
+  if (isTRUE(keep_components))
+    out$sim_components <- rbindlist(cp[!vapply(cp, is.null, logical(1))], fill = TRUE)
+  out
 }
