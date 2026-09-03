@@ -33,7 +33,7 @@ local({
 # Config-driven input loader.
 # Sports with dedicated read_*_input() functions use those (Golf, F1, CBB).
 # All other sports are handled generically from config$input_file fields.
-load_sport_input <- function(file_path, sport, config) {
+load_sport_input <- function(file_path, sport, config, slate = NULL, game = NULL) {
   reader_map <- list(
     GOLF = read_golf_input,
     F1   = read_f1_input,
@@ -44,6 +44,10 @@ load_sport_input <- function(file_path, sport, config) {
     CFB_CLASSIC = read_cfb_input
   )
   if (sport %in% names(reader_map)) {
+    # slate/game only mean anything to the CFB reader (a multi-slate
+    # workbook); every other reader ignores them.
+    if (sport %in% c("CFB", "CFB_CLASSIC"))
+      return(reader_map[[sport]](file_path, slate = slate, game = game))
     return(reader_map[[sport]](file_path))
   }
   input_cfg <- config$input_file
@@ -203,6 +207,24 @@ ui <- dashboardPage(
       .gts-pill{height:32px;padding:0 16px;font-size:11px;font-weight:700;letter-spacing:.06em;background:#1a1a1a;color:#555;border:1px solid #2a2a2a;border-radius:16px;cursor:pointer;white-space:nowrap;transition:background .12s,color .12s,border-color .12s}
       .gts-pill:hover{background:#2a2a2a;color:#ccc;border-color:#444}
       .gts-pill.active{background:rgba(255,229,0,0.1);color:#FFE500;border-color:#FFE500}
+
+      /* Projections table filter pills — position / team / game */
+      .gts-pf{display:flex;flex-direction:column;gap:7px;margin-bottom:12px}
+      .gts-pf-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+      .gts-pf-lab{width:52px;flex-shrink:0;font-size:10px;font-weight:700;letter-spacing:.08em;color:#FFE500}
+      .gts-pf .gts-pill{height:26px;padding:0 12px;font-size:10px;letter-spacing:.04em}
+      .gts-pf-clear{color:#666;font-size:10px;font-weight:700;letter-spacing:.06em;cursor:pointer;padding:0 8px;height:26px;line-height:26px}
+      .gts-pf-clear:hover{color:#ccc}
+
+      /* Group exposure summary — BY POS / TEAM / GAME stat-tile rows above
+         an exposure or portfolio table, honouring that table's pill filter */
+      .gts-grp-summary{display:flex;flex-direction:column;gap:6px;margin-bottom:12px}
+      .gts-grp-row{display:flex;align-items:center;gap:8px}
+      .gts-grp-lab{width:52px;flex-shrink:0;font-size:10px;font-weight:700;letter-spacing:.08em;color:#FFE500}
+      .gts-grp-tiles{display:flex;gap:6px;flex-wrap:wrap}
+      .gts-grp-tile{background:#1a1a1a;border:1px solid #2a2a2a;border-radius:6px;padding:4px 10px;text-align:center;min-width:54px}
+      .gts-grp-tile-v{font-size:13px;font-weight:700;color:#FFE500;line-height:1.2}
+      .gts-grp-tile-k{font-size:9px;font-weight:700;letter-spacing:.05em;color:#888;line-height:1.3}
 
       /* Sim results control bar */
       .gts-sr-bar{display:flex;align-items:center;gap:0;background:#141414;border:1px solid #222;border-radius:6px;overflow:hidden;margin-bottom:16px}
@@ -452,7 +474,7 @@ ui <- dashboardPage(
                   
                   # Golf-only: no-cut + cut line below bar
                   uiOutput("golf_extra_ui"),
-                  
+
                   # Post-sim status
                   uiOutput("sim_complete_message"),
                   
@@ -487,6 +509,7 @@ ui <- dashboardPage(
                     # Projections table
                     box(width=NULL, title="Fantasy Projections",
                         status="primary", solidHeader=TRUE,
+                        uiOutput("sim_projections_filters"),
                         DTOutput("sim_projections_table") %>%
                           shinycssloaders::withSpinner(color="#FFE500", type=6)
                     ),
@@ -558,6 +581,12 @@ server <- function(input, output, session) {
     rv$sd_portfolio        <- NULL;  rv$sd_builds <- list();  rv$sd_build_counter <- 0
     rv$sport_visuals       <- NULL
     rv$full_sim_results    <- NULL
+    # rv$cfb_full_sim_results / _metadata (the pristine whole-card CFB_CLASSIC
+    # sim a Tournament-Lineups slate pick re-slices from) are deliberately NOT
+    # cleared here -- reset_all_state() runs on every new sim AND on every
+    # slate switch, and a switch needs that pristine copy to survive its own
+    # reset. Cleared explicitly on new upload; replaced (not cleared-then-set)
+    # by a fresh classic_main sim.
     # has_dk/fd/sd persist from upload-time detection - not reset here
     rv$dk_lock_v           <- 0L
     rv$fd_lock_v           <- 0L
@@ -621,7 +650,16 @@ server <- function(input, output, session) {
     has_sd             = TRUE,
     has_dk             = TRUE,
     sport_visuals      = NULL,
-    full_sim_results   = NULL
+    full_sim_results   = NULL,
+    # CFB multi-slate workbook: the menu of contests on this card (NULL for a
+    # legacy single-slate sheet, or every other sport), the chosen row's key
+    # (which contest Tournament Lineups is currently built for -- classic_main
+    # until picked otherwise), and the pristine whole-card sim to re-slice from.
+    cfb_slate_menu     = NULL,
+    cfb_slate_key      = NULL,
+    cfb_slate_path     = NULL,
+    cfb_full_sim_results  = NULL,
+    cfb_full_sim_metadata = NULL
   )
   
   
@@ -704,12 +742,27 @@ server <- function(input, output, session) {
         }
       }
       
+      # Multi-slate CFB workbook: the menu drives a pill row on this tab, and
+      # loading defaults to classic_main (row 1) until the user picks another.
+      rv$cfb_slate_menu <- if (rv$sport %in% c("CFB", "CFB_CLASSIC"))
+        cfb_slate_menu(input$input_file$datapath) else NULL
+      rv$cfb_slate_key    <- if (!is.null(rv$cfb_slate_menu) && nrow(rv$cfb_slate_menu))
+        rv$cfb_slate_menu$key[1] else NULL
+      rv$cfb_slate_path   <- input$input_file$datapath
+      # A new file invalidates any pristine whole-card sim from the last one.
+      rv$cfb_full_sim_results  <- NULL
+      rv$cfb_full_sim_metadata <- NULL
+
       rv$input_data <- load_sport_input(input$input_file$datapath, rv$sport, rv$config)
-      
+
     }, error = function(e) {
       rv$sport  <- NULL
       rv$config <- NULL
       rv$input_data <- NULL
+      rv$cfb_slate_menu <- NULL
+      rv$cfb_slate_key  <- NULL
+      rv$cfb_full_sim_results  <- NULL
+      rv$cfb_full_sim_metadata <- NULL
       showNotification(paste("Upload error:", e$message), type = "error", duration = 8)
     })
   })
@@ -743,6 +796,11 @@ server <- function(input, output, session) {
   
   
   # ── Simulate button segment (segment 4, appears after detection) ─────────
+  # A CFB multi-slate workbook always simulates the whole card (classic_main,
+  # every game) here -- dealing the games is the expensive part and is the
+  # same regardless of which contest you end up building lineups for. WHICH
+  # contest is a Tournament Lineups question (see cfb_lineup_slate_ui below),
+  # since it is cheap to re-slice the already-simulated results.
   output$simulate_btn_ui <- renderUI({
     req(rv$sport)
     btn_label <- switch(rv$sport,
@@ -758,8 +816,8 @@ server <- function(input, output, session) {
                      icon  = icon("play"))
     )
   })
-  
-  
+
+
   # ── Golf extra options (below bar, Golf only) ────────────────────────────
   output$golf_extra_ui <- renderUI({
     req(rv$sport == "GOLF")
@@ -872,8 +930,19 @@ server <- function(input, output, session) {
         validate_simulation_output(result$sim_results, result$metadata, rv$config)
         rv$simulation_results <- result$sim_results
         rv$sim_metadata       <- result$metadata
-        
-        
+
+        # CFB multi-slate workbook: this just simulated the WHOLE card
+        # (classic_main). Stash a pristine copy so the Tournament Lineups
+        # slate picker can re-slice down to any contest on it without
+        # re-running the dealer, and reset the picker back to classic_main.
+        if (isTRUE(rv$sport == "CFB_CLASSIC") && !is.null(rv$cfb_slate_menu) &&
+            nrow(rv$cfb_slate_menu) > 1) {
+          rv$cfb_full_sim_results  <- result$sim_results
+          rv$cfb_full_sim_metadata <- result$metadata
+          rv$cfb_slate_key         <- rv$cfb_slate_menu$key[1]
+        }
+
+
         # ── Update platform flags WITHOUT touching rv$config ────────────────
         if (rv$sport == "NASCAR") {
           rv$full_sim_results <- result$full_results
@@ -2020,6 +2089,29 @@ server <- function(input, output, session) {
   
   output$scoring_tabs_ui <- renderUI({
     req(rv$config)
+    # CFB multi-slate workbook: which contest is Tournament Lineups built for.
+    # The whole card was already simulated once on Input -- picking a row here
+    # just re-slices the pristine sim (cheap: a workbook re-read + data.table
+    # filters, no re-dealing) rather than gating the sim itself.
+    cfb_slate_selector <- if (!is.null(rv$cfb_slate_menu) && nrow(rv$cfb_slate_menu) > 1 &&
+                              !is.null(rv$cfb_full_sim_results)) {
+      menu <- rv$cfb_slate_menu
+      div(id = "cfb_lineup_slate_pills", style = "margin-bottom:14px;",
+          span(class = "gts-sr-label",
+               style = "margin-right:10px;color:#FFE500;font-size:11px;font-weight:700;letter-spacing:.06em;",
+               "SLATE:"),
+          lapply(seq_len(nrow(menu)), function(i) {
+            tags$button(
+              class = paste("gts-pill", if (identical(menu$key[i], rv$cfb_slate_key)) "active" else ""),
+              onclick = sprintf(
+                "document.querySelectorAll('#cfb_lineup_slate_pills .gts-pill').forEach(function(b){b.classList.remove('active')});
+                 this.classList.add('active');
+                 Shiny.setInputValue('cfb_lineup_slate_select','%s',{priority:'event'});",
+                menu$key[i]),
+              menu$label[i])
+          })
+      )
+    }
     # Gate the picker on available_platforms(), NOT config$platforms: the two
     # disagreeing is exactly what put a game picker on screen with no Score
     # Showdown button beside it.
@@ -2049,6 +2141,7 @@ server <- function(input, output, session) {
     active_plats <- available_platforms()
     fluidRow(box(title="Lineup Scoring", status="warning", solidHeader=TRUE, width=12,
                  p("Find and score optimal lineups across all platforms:"),
+                 cfb_slate_selector,
                  sd_game_selector,
                  fluidRow(lapply(active_plats, function(platform) {
                    pname <- switch(platform,"DK"="DraftKings","FD"="FanDuel","SD"="Showdown")
@@ -2063,7 +2156,40 @@ server <- function(input, output, session) {
                  DTOutput("lineup_results_table")
     ))
   })
-  
+
+  # Picking a contest on Tournament Lineups re-slices the ALREADY-SIMULATED
+  # whole card down to that contest -- no re-dealing. Swaps rv$sport/config
+  # (so the optimizer mode/roster shape/downstream pill filters all follow),
+  # wipes lineup/portfolio state (a different contest, not a filter on the
+  # current one), then re-slices from the pristine full-card copy so repeated
+  # switches never compound a restriction.
+  observeEvent(input$cfb_lineup_slate_select, {
+    req(rv$cfb_slate_menu, rv$cfb_slate_path, rv$cfb_full_sim_results, rv$cfb_full_sim_metadata)
+    row <- rv$cfb_slate_menu[key == input$cfb_lineup_slate_select]
+    req(nrow(row))
+    row <- row[1]
+    tryCatch({
+      # Always re-slice from the PRISTINE whole-card copy, never from
+      # rv$simulation_results (which may already be sliced to a previous
+      # pick) -- otherwise switching classic_main -> classic_2 -> SD_COLGT
+      # would compound restrictions instead of each starting fresh.
+      sliced <- cfb_reslice_for_lineups(rv$cfb_full_sim_results, rv$cfb_full_sim_metadata,
+                                        rv$cfb_slate_path, row)
+      reset_all_state()   # different contest -- old lineups/portfolio don't apply
+      rv$cfb_slate_key <- row$key
+      rv$sport         <- row$sport
+      rv$config        <- get_sport_config(rv$sport)
+      decl <- rv$config$platforms %||% c("DK")
+      rv$has_dk <- "DK" %in% decl
+      rv$has_fd <- "FD" %in% decl
+      rv$has_sd <- "SD" %in% decl
+      rv$simulation_results <- sliced$sim_results
+      rv$sim_metadata       <- sliced$metadata
+    }, error = function(e) {
+      showNotification(paste("Slate switch error:", e$message), type = "error", duration = 8)
+    })
+  })
+
   output$download_buttons_ui <- renderUI({
     ready <- c()
     if (!is.null(rv$dk_optimal_lineups)) ready <- c(ready, "DK")
@@ -2187,9 +2313,11 @@ server <- function(input, output, session) {
                                     fluidRow(box(title="Player Exposure in Filtered Pool",status="info",solidHeader=TRUE,width=12,
                                                  div(style="margin-bottom:6px;",
                                                      uiOutput(paste0(lp,"_lock_summary"), inline=TRUE)),
+                                                 uiOutput(paste0(lp,"_expfilter_ui")),
+                                                 uiOutput(paste0(lp,"_expfilter_summary")),
                                                  DTOutput(paste0(lp,"_filtered_exposure"))))
                            ),
-                           
+
                            tabPanel("Portfolio Summary",
                                     fluidRow(box(title="Portfolio Overview",status="warning",solidHeader=TRUE,width=12,
                                                  hr(style="border-color:#FFE500;"),
@@ -2198,14 +2326,18 @@ server <- function(input, output, session) {
                                                                   class="btn-danger btn-sm", style="font-weight:bold;")),
                                                  DTOutput(paste0(lp,"_builds_summary")))),
                                     fluidRow(box(title="Portfolio Player Exposure",status="info",solidHeader=TRUE,width=12,
+                                                 uiOutput(paste0(lp,"_portfilter_ui")),
+                                                 uiOutput(paste0(lp,"_portfilter_summary")),
                                                  DTOutput(paste0(lp,"_portfolio_exposure"))))
                            ),
-                           
+
                            tabPanel("Portfolio Lineups",
                                     fluidRow(box(title="All Portfolio Lineups",status="info",solidHeader=TRUE,width=12,
                                                  div(style="margin-bottom:8px;",
                                                      actionButton(paste0(lp,"_delete_selected_lineups"), "DELETE SELECTED LINEUPS",
                                                                   class="btn-danger btn-sm", style="font-weight:bold;")),
+                                                 uiOutput(paste0(lp,"_plnfilter_ui")),
+                                                 uiOutput(paste0(lp,"_plnfilter_summary")),
                                                  DTOutput(paste0(lp,"_portfolio_lineups"))))
                            )
                )
@@ -2659,6 +2791,16 @@ server <- function(input, output, session) {
       # and silently dropping him made the table disagree with the pool.
       # They sort to the bottom, so the useful rows are still on top.
       setorderv(exp_tbl, exp_sort_col, order = -1L)
+
+      # ── Pill filter + group summary (BY POS / TEAM / GAME), before the
+      # detail table narrows to what the pills picked. Summary reads the same
+      # rows the table is about to show.
+      lp_ <- tolower(platform)
+      pfx <- paste0("expfilter_", lp_)
+      exp_tbl <- apply_pill_filter(exp_tbl, pfx, input, rv$sim_metadata)
+      output[[paste0(lp_, "_expfilter_summary")]] <- renderUI(
+        group_summary_tiles(exp_tbl, exp_sort_col, rv$sim_metadata))
+
       # Pos and Team as FACTORS so DT's column filter renders a dropdown of the
       # actual values instead of a free-text box -- that is what makes "show me
       # only the TEs" one click. searching must be TRUE for column filters to
@@ -2668,7 +2810,6 @@ server <- function(input, output, session) {
       # ---- LOCK / EXCL button columns --------------------------------------
       # Placed at the left edge, next to the player name. On showdown / F1 a
       # second pair drives the captain slot, which is a separate constraint.
-      lp_ <- tolower(platform)
       show_cpt <- has_captain || length(grep("^MVP$", names(filtered), value=TRUE)) > 0 || is_f1
       la <- rv[[paste0(lp_,"_lock_any")]]; xa <- rv[[paste0(lp_,"_excl_any")]]
       exp_tbl[, LOCK := lock_btn(Player, la, "lock")]
@@ -3070,7 +3211,12 @@ server <- function(input, output, session) {
         # Every player in the sim stays in the table, including 0% ones --
         # see the note in make_filtered_exposure.
         setorderv(exp_tbl, exp_sort_col, order = -1L)
-        
+
+        pfx <- paste0("portfilter_", lp)
+        exp_tbl <- apply_pill_filter(exp_tbl, pfx, input, rv$sim_metadata)
+        output[[paste0(lp, "_portfilter_summary")]] <- renderUI(
+          group_summary_tiles(exp_tbl, exp_sort_col, rv$sim_metadata))
+
         # ── Rename to display labels now that all Exposure-dependent calcs are done ──
         in_lab  <- paste0("IN (",  n_in,  "L)")
         out_lab <- paste0("OUT (", n_out, "L)")
@@ -3212,6 +3358,12 @@ server <- function(input, output, session) {
         # Every player in the sim stays in the table, including 0% ones --
         # see the note in make_filtered_exposure.
         setorderv(exp_tbl, exp_sort_col, order = -1L)
+
+        pfx <- paste0("portfilter_", lp)
+        exp_tbl <- apply_pill_filter(exp_tbl, pfx, input, rv$sim_metadata)
+        output[[paste0(lp, "_portfilter_summary")]] <- renderUI(
+          group_summary_tiles(exp_tbl, exp_sort_col, rv$sim_metadata))
+
         for (fc in intersect(c("Pos","Position","PosGroup","Team"), names(exp_tbl)))
           if (!is.factor(exp_tbl[[fc]])) set(exp_tbl, j = fc, value = factor(exp_tbl[[fc]]))
         fcfg <- exposure_filter_cfg(exp_tbl)
@@ -3254,6 +3406,30 @@ server <- function(input, output, session) {
   make_portfolio_lineups <- function(lp) {
     renderDT({
       port <- rv[[paste0(lp,"_portfolio")]]; req(port, rv$config)
+
+      # Pill filter on a lineups table is row-level, not per-player: keep a
+      # lineup if ANY of its rostered players matches the current selection.
+      pfx     <- paste0("plnfilter_", lp)
+      allowed <- pill_allowed_players(input, pfx, rv$sim_metadata)
+      all_pc  <- grep("^Player|^Captain|^MVP|^Util|^G[1-4]$|^F[1-3]$|^C1$", names(port), value = TRUE)
+      if (!is.null(allowed) && length(all_pc)) {
+        keep <- apply(as.matrix(port[, ..all_pc]), 1, function(r) any(as.character(r) %in% allowed))
+        port <- port[keep]
+      }
+
+      # Group summary: same "% of these lineups" exposure the exposure tables
+      # show, rolled up by pos/team/game, over whatever the pill filter left.
+      n <- nrow(port)
+      cnt <- if (n && length(all_pc)) table(unlist(port[, ..all_pc])) else table(character(0))
+      meta_players <- rv$sim_metadata$Player
+      pct <- if (n) { v <- as.numeric(cnt[meta_players]); v[is.na(v)] <- 0; v / n * 100 }
+             else rep(0, length(meta_players))
+      mc  <- intersect(c("Player","Pos","PosGroup","DKPos","FDPos","Team"), names(rv$sim_metadata))
+      grp_tbl <- merge(data.table(Player = meta_players, Exposure = pct),
+                       rv$sim_metadata[, ..mc], by = "Player", all.x = TRUE)
+      output[[paste0(lp, "_plnfilter_summary")]] <- renderUI(
+        group_summary_tiles(grp_tbl, "Exposure", rv$sim_metadata))
+
       display_table <- create_portfolio_display_table(port, rv$config, lp)
       format_cols   <- tryCatch(get_format_columns(display_table, rv$config), error=function(e) character(0))
       dt <- datatable(display_table[,-"RowID"],
@@ -3268,8 +3444,29 @@ server <- function(input, output, session) {
   output$dk_portfolio_lineups <- make_portfolio_lineups("dk")
   output$fd_portfolio_lineups <- make_portfolio_lineups("fd")
   output$sd_portfolio_lineups <- make_portfolio_lineups("sd")
-  
-  
+
+  # Pill-row UI for the three tables above, one independent copy per platform.
+  # The summary-tile outputs (paste0(prefix,"_summary") minus the "_ui") are
+  # set from inside the table renderers themselves, next to the exp_tbl they
+  # describe -- see make_filtered_exposure / make_portfolio_exposure /
+  # make_portfolio_lineups.
+  make_group_filter_ui <- function(prefix) {
+    force(prefix)   # prefix is a promise over `paste0(..., lp_)` from the loop
+                    # below -- without forcing it here, all three renderUI
+                    # closures would read `lp_` lazily and see its FINAL loop
+                    # value ("sd") instead of the one each was built with.
+    renderUI({
+      req(rv$sim_metadata)
+      filter_pills_ui(prefix, rv$sim_metadata)
+    })
+  }
+  for (lp_ in c("dk", "fd", "sd")) {
+    output[[paste0(lp_, "_expfilter_ui")]]  <- make_group_filter_ui(paste0("expfilter_",  lp_))
+    output[[paste0(lp_, "_portfilter_ui")]] <- make_group_filter_ui(paste0("portfilter_", lp_))
+    output[[paste0(lp_, "_plnfilter_ui")]]  <- make_group_filter_ui(paste0("plnfilter_",  lp_))
+  }
+
+
   # ==========================================================================
   # PORTFOLIO DOWNLOADS
   # ==========================================================================
@@ -3376,8 +3573,8 @@ server <- function(input, output, session) {
   # Sport metadata per sport, driven by what's available in sim_metadata.
   # Standard: Player, Salary, Own%
   # Sport-specific: pulled from config$metadata_columns names
-  # Stats display order: Avg, Median, P90, P75, P20
-  # Download order:      Avg, Median, P20, P75, P90  (ascending percentiles)
+  # Stats display order: ETR, GTS, Median, P90, P75, P20
+  # Download order:      ETR, GTS, Median, P20, P75, P90  (ascending percentiles)
   
   build_projections <- function(platform) {
     req(rv$simulation_results, rv$sim_metadata, rv$config)
@@ -3400,9 +3597,11 @@ server <- function(input, output, session) {
     
     if (!score_col %in% names(sim)) return(NULL)
     
-    # Compute stats once — this is the expensive step at 50k sims
+    # Compute stats once — this is the expensive step at 50k sims. `GTS` is our
+    # own simulated mean (was labelled "Avg"); it sits beside ETR so the two
+    # projections read side by side.
     proj <- sim[, .(
-      Avg    = round(mean(get(score_col)),            1),
+      GTS    = round(mean(get(score_col)),            1),
       Median = round(median(get(score_col)),          1),
       P90    = round(quantile(get(score_col), 0.90),  1),
       P75    = round(quantile(get(score_col), 0.75),  1),
@@ -3437,8 +3636,11 @@ server <- function(input, output, session) {
       sport_meta_cols <- sport_meta_cols[sport_meta_cols != "PosGroup"]
     }
     
-    # Pull all sport metadata that actually exists in sim_metadata
-    available_sport_cols <- intersect(sport_meta_cols, names(meta))
+    # Pull all sport metadata that actually exists in sim_metadata. The active
+    # platform's ownership column is already merged in as `Own` above -- drop it
+    # here so it does not come through a SECOND time under its raw name.
+    available_sport_cols <- setdiff(intersect(sport_meta_cols, names(meta)),
+                                    c(own_col, "DKOwn", "FDOwn", "SDOwn"))
     if (length(available_sport_cols) > 0) {
       meta_pull <- unique(meta[, c("Player", available_sport_cols), with = FALSE])
       proj <- merge(proj, meta_pull, by = "Player", all.x = TRUE)
@@ -3453,25 +3655,187 @@ server <- function(input, output, session) {
     if ("FDPos"  %in% names(proj)) setnames(proj, "FDPos",  "Pos")
     if ("PosGroup" %in% names(proj)) setnames(proj, "PosGroup", "Pos")
     
-    setorder(proj, -Avg)
+    setorder(proj, -GTS)
     proj
   }
   
   
+  # Active platform for the results tab, resolved once.
+  results_platform <- reactive({
+    plat_sel <- input$sim_results_platform
+    avail    <- available_platforms()
+    if (!is.null(plat_sel) && nzchar(plat_sel) && plat_sel %in% avail) plat_sel
+    else if (length(avail) > 0) avail[1] else "DK"
+  })
+
+  # ── Reusable filter-pill pair: position / team / game ─────────────────────
+  # One row of pills per dimension that `meta` actually carries. Multi-select
+  # within a row (OR); rows AND together. Inputs are namespaced by `prefix`
+  # (input[[paste0(prefix,'_pos')]] etc), so each table using this pair holds
+  # its own independent selection. Originated as the Fantasy Projections
+  # table's filter row; generalized so the exposure/portfolio tables can each
+  # get their own copy without re-deriving the pill idiom.
+  filter_pills_ui <- function(prefix, meta) {
+    if (is.null(meta) || !nrow(meta)) return(NULL)
+    meta <- as.data.table(meta)
+    uniq_chr <- function(x) {
+      v <- sort(unique(as.character(x))); v[!is.na(v) & nzchar(v)]
+    }
+    pos_col <- intersect(c("Pos", "PosGroup", "DKPos", "FDPos"), names(meta))[1]
+    pos_vals <- if (!is.na(pos_col)) {
+      v <- uniq_chr(meta[[pos_col]])
+      ord <- c("QB","RB","WR","TE","K","DST","D","G","F","C","P")
+      c(intersect(ord, v), setdiff(v, ord))
+    } else character(0)
+    team_vals <- if ("Team"    %in% names(meta)) uniq_chr(meta$Team)    else character(0)
+    game_vals <- if ("GameKey" %in% names(meta)) uniq_chr(meta$GameKey) else character(0)
+    if (length(game_vals) < 2) game_vals <- character(0)   # one game = nothing to pick
+
+    if (!length(pos_vals) && !length(team_vals) && !length(game_vals)) return(NULL)
+
+    pill_row <- function(key, label, vals, show = identity) {
+      if (!length(vals)) return(NULL)
+      js <- sprintf(
+        "this.classList.toggle('active');Shiny.setInputValue('%s_%s',Array.prototype.slice.call(this.parentNode.querySelectorAll('.gts-pill.active')).map(function(b){return b.getAttribute('data-val')}),{priority:'event'});",
+        prefix, key)
+      div(class = "gts-pf-row",
+          span(class = "gts-pf-lab", label),
+          lapply(vals, function(v)
+            tags$button(class = "gts-pill", `data-val` = v, onclick = js, show(v))))
+    }
+    clear_js <- sprintf(
+      "var pf=this.closest('.gts-pf');pf.querySelectorAll('.gts-pill.active').forEach(function(b){b.classList.remove('active')});['pos','team','game'].forEach(function(k){Shiny.setInputValue('%s_'+k,[],{priority:'event'});});",
+      prefix)
+
+    div(class = "gts-pf",
+        pill_row("pos",  "POS",  pos_vals),
+        pill_row("team", "TEAM", team_vals),
+        pill_row("game", "GAME", game_vals,
+                 show = function(v) sub("\\s+", " @ ", v)),
+        div(class = "gts-pf-row",
+            span(class = "gts-pf-clear", onclick = clear_js, "✕ CLEAR")),
+        tags$script(HTML(sprintf(
+          "Shiny.setInputValue('%s_pos',[],{priority:'event'});Shiny.setInputValue('%s_team',[],{priority:'event'});Shiny.setInputValue('%s_game',[],{priority:'event'});",
+          prefix, prefix, prefix))))
+  }
+
+  # Filters a Player-keyed table by the current pill selection. Pos/Team come
+  # off `dt` itself when it carries them (a sport-renamed column like CBB's
+  # "Pos" still matches); the game filter always maps GameKey -> Player via
+  # `meta`, since `dt` rarely carries GameKey directly.
+  apply_pill_filter <- function(dt, prefix, input, meta) {
+    gs <- input[[paste0(prefix, "_game")]]
+    if (length(gs) && !is.null(meta) && "GameKey" %in% names(meta) && "Player" %in% names(dt)) {
+      meta <- as.data.table(meta)
+      keep <- meta[GameKey %in% gs, unique(as.character(Player))]
+      dt <- dt[Player %in% keep]
+    }
+    ps <- input[[paste0(prefix, "_pos")]]
+    if (length(ps)) {
+      pos_col <- intersect(c("Pos", "PosGroup", "DKPos", "FDPos"), names(dt))[1]
+      if (!is.na(pos_col)) dt <- dt[get(pos_col) %in% ps]
+    }
+    ts <- input[[paste0(prefix, "_team")]]
+    if (length(ts) && "Team" %in% names(dt)) dt <- dt[Team %in% ts]
+    dt
+  }
+
+  # Same selection, resolved to an allowed-player set instead of filtering a
+  # per-player table -- for a table with several player columns per row (a
+  # lineup), where "keep the row" means "any rostered player matches", not
+  # "this row's own Pos/Team matches". NULL means no filter is active.
+  pill_allowed_players <- function(input, prefix, meta) {
+    ps <- input[[paste0(prefix, "_pos")]]
+    ts <- input[[paste0(prefix, "_team")]]
+    gs <- input[[paste0(prefix, "_game")]]
+    if (!length(ps) && !length(ts) && !length(gs)) return(NULL)
+    if (is.null(meta) || !nrow(meta)) return(character(0))
+    meta <- as.data.table(meta)
+    keep <- rep(TRUE, nrow(meta))
+    pos_col <- intersect(c("Pos", "PosGroup", "DKPos", "FDPos"), names(meta))[1]
+    if (length(ps) && !is.na(pos_col)) keep <- keep & (as.character(meta[[pos_col]]) %in% ps)
+    if (length(ts) && "Team" %in% names(meta)) keep <- keep & (as.character(meta$Team) %in% ts)
+    if (length(gs) && "GameKey" %in% names(meta)) keep <- keep & (as.character(meta$GameKey) %in% gs)
+    unique(as.character(meta$Player[keep]))
+  }
+
+  # BY POSITION / BY TEAM / BY GAME roll-up of a Player-keyed table's value
+  # column, honouring whatever the table's own pill filter has already
+  # narrowed it to. Renders as up to three rows of small stat tiles. `dt`
+  # must carry Pos/Team already (the exposure tables merge them in from
+  # rv$sim_metadata); GameKey comes from `meta` since `dt` rarely carries it.
+  group_summary_tiles <- function(dt, value_col, meta) {
+    if (is.null(dt) || !nrow(dt) || !(value_col %in% names(dt))) return(NULL)
+    dt <- as.data.table(dt)
+    tile_row <- function(label, tbl) {
+      if (is.null(tbl) || !nrow(tbl)) return(NULL)
+      div(class = "gts-grp-row",
+          span(class = "gts-grp-lab", label),
+          div(class = "gts-grp-tiles",
+              lapply(seq_len(nrow(tbl)), function(i)
+                div(class = "gts-grp-tile",
+                    div(class = "gts-grp-tile-v", sprintf("%.0f%%", tbl$val[i])),
+                    div(class = "gts-grp-tile-k", tbl$key[i])))))
+    }
+    pos_col <- intersect(c("Pos", "PosGroup", "DKPos", "FDPos"), names(dt))[1]
+    pos_tbl <- if (!is.na(pos_col)) {
+      t <- dt[, .(val = sum(get(value_col), na.rm = TRUE)), by = c(pos_col)]
+      setnames(t, pos_col, "key")[order(-val)]
+    } else NULL
+    team_tbl <- if ("Team" %in% names(dt)) {
+      t <- dt[, .(val = sum(get(value_col), na.rm = TRUE)), by = Team]
+      setnames(t, "Team", "key")[order(-val)]
+    } else NULL
+    game_tbl <- NULL
+    if (!is.null(meta) && "GameKey" %in% names(meta) && "Player" %in% names(dt)) {
+      meta <- as.data.table(meta)
+      gk <- unique(meta[, .(Player = as.character(Player), GameKey)])
+      dg <- merge(dt, gk, by = "Player", all.x = TRUE)
+      if (uniqueN(dg$GameKey) > 1) {
+        t <- dg[, .(val = sum(get(value_col), na.rm = TRUE)), by = GameKey]
+        game_tbl <- setnames(t, "GameKey", "key")[order(-val)]
+        game_tbl[, key := sub("\\s+", " @ ", key)]
+      }
+    }
+    rows <- Filter(Negate(is.null), list(tile_row("POS", pos_tbl), tile_row("TEAM", team_tbl),
+                                         tile_row("GAME", game_tbl)))
+    if (!length(rows)) return(NULL)
+    div(class = "gts-grp-summary", rows)
+  }
+
+  # ── Projections filter pills: position / team / game ─────────────────────
+  # The <script> filter_pills_ui() emits resets the three inputs every time
+  # this UI re-renders -- i.e. on a fresh sim -- so a stale selection can
+  # never hide the whole table.
+  output$sim_projections_filters <- renderUI({
+    req(rv$simulation_results, rv$sim_metadata)
+    results_platform()                       # re-render when the platform flips
+    filter_pills_ui("projfilter", rv$sim_metadata)
+  })
+
+  # build_projections + the pill filters. Kept apart from the renderDT so the
+  # display-order / formatting code has one clean input.
+  proj_display <- reactive({
+    req(rv$simulation_results, rv$sim_metadata)
+    proj <- build_projections(results_platform())
+    req(proj); setDT(proj)
+    apply_pill_filter(proj, "projfilter", input, rv$sim_metadata)
+  })
+
   # ── Projections table display ────────────────────────────────────────────
   output$sim_projections_table <- renderDT({
     req(rv$simulation_results, rv$sim_metadata)
-    plat_sel <- input$sim_results_platform
-    avail    <- available_platforms()
-    platform <- if (!is.null(plat_sel) && nchar(plat_sel) > 0 && plat_sel %in% avail)
-      plat_sel else if (length(avail) > 0) avail[1] else "DK"
-    proj <- build_projections(platform)
+    platform <- results_platform()
+    proj <- copy(proj_display())
     req(proj)
     
-    # Display column order: Player, Salary, Own, [sport meta], Avg, Median, P90, P75, P20
+    # Display column order: Player, Salary, Own, [sport meta], ETR, GTS, Median, P90, P75, P20
+    # ETR is placed immediately before the GTS stat block so our projection and
+    # theirs sit next to each other.
     base_cols  <- intersect(c("Player","Salary","Own"), names(proj))
-    stat_cols  <- intersect(c("Avg","Median","P90","P75","P20"), names(proj))
-    skip_cols  <- c(base_cols, stat_cols, "Proj","Mins")
+    stat_cols  <- intersect(c("GTS","Median","P90","P75","P20"), names(proj))
+    etr_col    <- intersect("ETR", names(proj))
+    skip_cols  <- c(base_cols, stat_cols, etr_col, "Proj","Mins")
     sport_cols <- setdiff(names(proj), skip_cols)
     # NASCAR: Car -> Starting -> Team order
     if (rv$sport == "NASCAR") {
@@ -3479,13 +3843,12 @@ server <- function(input, output, session) {
       sport_cols <- c(intersect(nascar_order, sport_cols),
                       setdiff(sport_cols, nascar_order))
     }
-    # Put CBB Proj/ETR/Mins after salary
-    cbb_extra  <- intersect(c("Proj","ETR","Mins"), names(proj))
-    display_order <- c(base_cols, cbb_extra, sport_cols, stat_cols)
+    cbb_extra  <- intersect(c("Proj","Mins"), names(proj))
+    display_order <- c(base_cols, cbb_extra, sport_cols, etr_col, stat_cols)
     display_order <- intersect(display_order, names(proj))
     proj <- proj[, ..display_order]
-    
-    num_targets <- which(names(proj) %in% c(stat_cols, "Own", "CutProb", "WinProb", "Proj", "Mins")) - 1
+
+    num_targets <- which(names(proj) %in% c(stat_cols, etr_col, "Own", "CutProb", "WinProb", "Proj", "Mins")) - 1
     
     dt <- datatable(proj,
                     filter   = "none",
@@ -3494,7 +3857,7 @@ server <- function(input, output, session) {
                       paging     = FALSE,
                       scrollX    = TRUE,
                       scrollY    = "420px",
-                      order      = list(list(which(names(proj) == "Avg") - 1, "desc")),
+                      order      = list(list(which(names(proj) == "GTS") - 1, "desc")),
                       columnDefs = list(list(className = "dt-right", targets = num_targets))
                     ),
                     rownames = FALSE,
@@ -3513,14 +3876,14 @@ server <- function(input, output, session) {
     if ("WinProb" %in% names(proj))
       dt <- dt %>% formatPercentage("WinProb", digits = 1)
     
-    round_cols <- intersect(c("Avg","Median","P90","P75","P20","Proj","Mins"), names(proj))
+    round_cols <- intersect(c("ETR","GTS","Median","P90","P75","P20","Proj","Mins"), names(proj))
     if (length(round_cols) > 0) dt <- dt %>% formatRound(round_cols, 1)
     dt
   })
   
   
   # ── Projections CSV download ─────────────────────────────────────────────
-  # Download column order: Player, Salary, Own, [sport meta], Avg, Median, P20, P75, P90
+  # Download column order: Player, Salary, Own, [sport meta], ETR, GTS, Median, P20, P75, P90
   output$download_projections_csv <- downloadHandler(
     filename = function() {
       sport <- rv$sport %||% "sim"
@@ -3528,15 +3891,16 @@ server <- function(input, output, session) {
       paste0(sport, "_", plat, "_Projections_", format(Sys.Date(), "%Y%m%d"), ".csv")
     },
     content = function(file) {
-      proj <- build_projections(input$sim_results_platform %||% "DK")
+      proj <- copy(proj_display())          # follows the on-screen filter pills
       req(proj)
-      # Download order: Avg, Median, P20, P75, P90
+      # Download order: ETR, GTS, Median, P20, P75, P90
       base_cols  <- intersect(c("Player","Salary","Own"), names(proj))
-      dl_stats   <- intersect(c("Avg","Median","P20","P75","P90"), names(proj))
-      skip_cols  <- c(base_cols, c("Avg","Median","P90","P75","P20","Proj","Mins"))
+      dl_stats   <- intersect(c("GTS","Median","P20","P75","P90"), names(proj))
+      etr_col    <- intersect("ETR", names(proj))
+      skip_cols  <- c(base_cols, c("GTS","Median","P90","P75","P20","Proj","Mins"), etr_col)
       sport_cols <- setdiff(names(proj), skip_cols)
-      cbb_extra  <- intersect(c("Proj","ETR","Mins"), names(proj))
-      dl_order   <- c(base_cols, cbb_extra, sport_cols, dl_stats)
+      cbb_extra  <- intersect(c("Proj","Mins"), names(proj))
+      dl_order   <- c(base_cols, cbb_extra, sport_cols, etr_col, dl_stats)
       dl_order   <- intersect(dl_order, names(proj))
       fwrite(proj[, ..dl_order], file)
     }

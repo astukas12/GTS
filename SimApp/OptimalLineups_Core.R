@@ -2106,17 +2106,17 @@ find_optimal_lineups_cfb_classic <- function(sim_results, config, verbose = TRUE
   SR <- SR[Player %chin% keep_pl]
   all_ids <- unique(SR$SimID); n_sims_full <- length(all_ids)
 
-  # Build the candidate pool from at most phase1_sims simulations. The pool is
-  # stable well below the full run (preseason_classic measures Spearman 0.995
-  # at 5k), and score_all_lineups still scores every surviving lineup against
-  # all n_sims afterwards -- this keeps Phase 1 to a few seconds at 50k.
-  p1 <- as.integer(config$phase1_sims %||% 2500L)
-  if (n_sims_full > p1) {
-    keep_ids <- all_ids[round(seq(1, n_sims_full, length.out = p1))]
-    SR <- SR[SimID %chin% keep_ids]
-  }
-  if (verbose) cat(sprintf("\nPhase 1: CFB classic | %s of %s sims | $%s cap | %d slots | %d candidates\n",
-                           format(uniqueN(SR$SimID), big.mark = ","),
+  # Candidate generation runs over EVERY sim, not a subsample. It used to cap
+  # at phase1_sims (2,500 default) to keep this fast, but benchmarking showed
+  # the full 50k-sim pass costs ~10s -- cheap -- while the subsample was
+  # silently capping how many distinct lineups Phase 1 could ever find (a
+  # lineup only shows up here if ONE of the sampled sims called it optimal).
+  # A GPP portfolio's whole value is in the sims a subsample would have
+  # skipped -- the tail worlds where a chalk-adjacent longshot lineup wins --
+  # so trading diversity for a speed-up that direct measurement didn't
+  # actually need was the wrong trade. score_all_lineups (Phase 2) always
+  # scored every surviving lineup against the full n_sims regardless.
+  if (verbose) cat(sprintf("\nPhase 1: CFB classic | %s sims | $%s cap | %d slots | %d candidates\n",
                            format(n_sims_full, big.mark = ","),
                            format(cap, big.mark = ","), need, length(keep_pl)))
 
