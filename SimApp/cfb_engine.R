@@ -216,7 +216,17 @@ cfb_calibrate <- function(P, target, market, iters = 12, damp = 0.8, tol = 0.05)
 
 # One tab per team plus a `game` tab; the TAB NAME IS THE TEAM. Players occupy
 # columns A..Q and the team-level block sits beside them from column S.
-read_cfb_input <- function(file_path) {
+#
+# MULTI-SLATE WORKBOOK. A sheet whose `game` tab carries `in_classics` holds
+# every contest DK posted for the card at once -- the four-game main, a
+# two-game main, and a showdown on each game -- as ONE full-card game tab plus
+# a long `projections` tab keyed by slate. Pick the contest to simulate:
+#   read_cfb_input(path)                          -> classic_main (the superset)
+#   read_cfb_input(path, "classic_2")             -> the two-game main
+#   read_cfb_input(path, "SD", game = "COLGT")    -> that game's showdown
+# A legacy single-slate sheet has no `in_classics` column and `slate`/`game`
+# are ignored -- it loads exactly as before.
+read_cfb_input <- function(file_path, slate = NULL, game = NULL) {
   sh <- readxl::excel_sheets(file_path)
   gtab <- sh[tolower(sh) == "game"]
   if (!length(gtab)) stop("CFB workbook needs a `game` tab")
@@ -262,24 +272,63 @@ read_cfb_input <- function(file_path) {
                pys_target = as.numeric(o$pys_target %||% NA))
   }), fill = TRUE)
 
-  # OPTIONAL `projections` tab: Player + ETR + Own. When ETR ships a file for a
-  # slate, drop it in as a tab and the sim's average lands beside their number
-  # on the main table, the same way the preseason engine does it. Absent, the
-  # columns simply stay empty -- nothing else changes.
-  prj <- NULL
-  ptab <- sh[tolower(sh) %in% c("projections", "etr")]
-  if (length(ptab)) {
-    prj <- as.data.table(readxl::read_excel(file_path, sheet = ptab[1]))
-    setnames(prj, tolower(names(prj)))
-    if (!"player" %in% names(prj) && "name" %in% names(prj))
-      setnames(prj, "name", "player")
+  # OPTIONAL `projections` / `etr` tabs, read raw. `projections` carries the
+  # contest metadata (salary, DK ids, DK position, ownership); `etr` carries the
+  # slate-independent ETR points projection, one row per player. Either absent,
+  # the columns downstream simply stay empty.
+  rd_aux <- function(nm) {
+    hit <- sh[tolower(sh) == nm]
+    if (!length(hit)) return(NULL)
+    x <- as.data.table(readxl::read_excel(file_path, sheet = hit[1]))
+    setnames(x, tolower(names(x)))
+    if (!"player" %in% names(x) && "name" %in% names(x)) setnames(x, "name", "player")
+    x
   }
+  prj_raw <- rd_aux("projections")
+  etr_raw <- rd_aux("etr")
+
+  # ---- MULTI-SLATE SELECTION -----------------------------------------------
+  multi <- ("in_classics" %in% names(g)) ||
+           (!is.null(prj_raw) && "slate" %in% names(prj_raw))
+  prj <- prj_raw
+  if (multi) {
+    if (is.null(slate)) {
+      slate <- "classic_main"
+      message("[cfb] multi-slate workbook, no slate given -- defaulting to classic_main")
+    }
+    if (identical(tolower(slate), "sd")) {
+      if (is.null(game) || !nzchar(game))
+        stop("slate = \"SD\" needs game = <showdown_slice label>, e.g. \"COLGT\"")
+      sel <- g[!is.na(showdown_slice) &
+               toupper(trimws(as.character(showdown_slice))) == toupper(trimws(game))]
+      if (!nrow(sel)) stop("no game has showdown_slice == \"", game, "\" on this sheet")
+      g <- sel
+      prj_slate <- "SD"
+    } else {
+      tok <- strsplit(ifelse(is.na(g$in_classics), "", as.character(g$in_classics)),
+                      "\\s*;\\s*")
+      inrow <- vapply(tok, function(v) slate %in% v, logical(1))
+      if (!any(inrow))
+        stop("no game is in classic slate \"", slate, "\" -- check the game tab's in_classics")
+      g <- g[inrow]
+      prj_slate <- slate
+    }
+    # kickoff order re-ranks WITHIN the chosen subset (the column on the sheet
+    # is the full-card rank); FLEX/SFLEX late-swap eligibility keys off it.
+    if ("start_order" %in% names(g))
+      g[, start_order := frank(as.numeric(start_order), ties.method = "first")]
+    sel_teams <- unique(c(as.character(g$away), as.character(g$home)))
+    pl <- pl[team %in% sel_teams]
+    tt <- tt[team %in% sel_teams]
+    if (!is.null(prj) && "slate" %in% names(prj))
+      prj <- prj[as.character(slate) == prj_slate & player %in% pl$player]
+  }
+
   # SALARY, DK IDS AND THE DK POSITION LIVE ON THE PROJECTIONS TAB. They are
   # contest metadata, not modelling inputs -- they arrive with the ETR file and
-  # change when DK reprices, while a team tab is a football opinion. Keeping
-  # them apart stops a repricing from touching the tab that holds the reads.
-  # A sheet that still carries them on the team tab keeps working: only columns
-  # that are MISSING from the player block get filled in from here.
+  # change when DK reprices (and differ across the slates on one card), while a
+  # team tab is a football opinion. A sheet that still carries them on the team
+  # tab keeps working: only columns MISSING from the player block get filled in.
   if (!is.null(prj) && nrow(prj)) {
     meta_cols <- intersect(c("dk_pos", "salary_util", "salary_cpt",
                              "dk_id_util", "dk_id_cpt"), names(prj))
@@ -290,6 +339,25 @@ read_cfb_input <- function(file_path) {
       pl <- merge(pl, mp, by = "player", all.x = TRUE, sort = FALSE)
     }
   }
+
+  # The object handed downstream as `projections` is always the per-player
+  # scoreboard table the app contract expects: player + etr + own. On a multi-
+  # slate sheet that is assembled here -- ETR points from the `etr` tab, and
+  # ownership from the chosen slate's projections rows (populated for
+  # classic_main only; NA elsewhere, which the sim reads as zero).
+  if (multi) {
+    po <- data.table(player = unique(pl$player))
+    if (!is.null(etr_raw) && "etr_pts" %in% names(etr_raw))
+      po <- merge(po, unique(etr_raw[, .(player, etr = suppressWarnings(as.numeric(etr_pts)))],
+                             by = "player"), by = "player", all.x = TRUE)
+    else po[, etr := NA_real_]
+    if (!is.null(prj) && "own" %in% names(prj))
+      po <- merge(po, unique(prj[, .(player, own = suppressWarnings(as.numeric(own)))],
+                             by = "player"), by = "player", all.x = TRUE)
+    else po[, own := NA_real_]
+    prj <- po
+  }
+
   if (!"dk_pos" %in% names(pl)) pl[, dk_pos := NA_character_]
   if (!"route_base" %in% names(pl)) pl[, route_base := NA_character_]
   # each is a football opinion about the other's blank
@@ -298,10 +366,123 @@ read_cfb_input <- function(file_path) {
 
   list(game = g, team = tt, players = pl, projections = prj)
 }
+
+# One row per contest on a multi-slate workbook, for a slate-picker UI. A
+# legacy single-slate sheet (no `in_classics` on the game tab) has nothing to
+# pick -- returns NULL, and the caller shows no picker.
+#   key       stable id for the UI (a select input's value)
+#   label     what the picker shows
+#   sport     CFB_CLASSIC (classic contests) or CFB (showdowns)
+#   slate_arg / game_arg -- pass straight through to read_cfb_input()
+cfb_slate_menu <- function(file_path) {
+  sh <- readxl::excel_sheets(file_path)
+  gtab <- sh[tolower(sh) == "game"]
+  if (!length(gtab)) return(NULL)
+  g <- as.data.table(readxl::read_excel(file_path, sheet = gtab[1]))
+  if (!"in_classics" %in% names(g)) return(NULL)
+
+  tok <- strsplit(ifelse(is.na(g$in_classics), "", as.character(g$in_classics)), "\\s*;\\s*")
+  classics <- setdiff(unique(unlist(tok)), "")
+  # classic_main first, then the rest in the order they first appear.
+  classics <- c(intersect("classic_main", classics), setdiff(classics, "classic_main"))
+
+  classic_rows <- rbindlist(lapply(classics, function(cl) {
+    inrow <- vapply(tok, function(v) cl %in% v, logical(1))
+    gg <- g[inrow]
+    n  <- nrow(gg)
+    label <- if (identical(cl, "classic_main")) {
+      sprintf("Main - %d game", n)
+    } else {
+      matchups <- paste(sprintf("%s@%s", gg$away, gg$home), collapse = " + ")
+      sprintf("%d-game - %s", n, matchups)
+    }
+    # NOTE: `key` collides with data.table()'s own reserved `key=` argument --
+    # passing it by that name sets the resulting table's key column instead
+    # of creating a column called "key". Build under a safe name and rename.
+    data.table(menu_key = cl, label = label, sport = "CFB_CLASSIC",
+               slate_arg = cl, game_arg = NA_character_)
+  }))
+
+  sd_rows <- if ("showdown_slice" %in% names(g)) {
+    slices <- unique(g[!is.na(showdown_slice) & showdown_slice != "", showdown_slice])
+    rbindlist(lapply(slices, function(sl) {
+      gg <- g[showdown_slice == sl][1]
+      data.table(menu_key = paste0("SD_", sl),
+                 label = sprintf("Showdown - %s @ %s", gg$away, gg$home),
+                 sport = "CFB", slate_arg = "SD", game_arg = sl)
+    }))
+  } else NULL
+
+  out <- rbind(classic_rows, sd_rows, fill = TRUE)
+  setnames(out, "menu_key", "key")
+  out
+}
+
 `%||%` <- function(a, b) if (is.null(a) || length(a) == 0 || is.na(a[1])) b else a
 
 # =============================================================================
 # THE SIMULATION
+# The Player/Team/Pos/DKID/DKCID/DKSalary/DKCSalary/DKProj/DKOwn/CPTOwn table
+# the app contract expects, built from a player pool (`PL`, already carrying
+# salary_util/salary_cpt/dk_id_util/dk_id_cpt from read_cfb_input) plus that
+# contest's `projections` rows, restricted to `valid_players` (the players a
+# simulation actually has draws for). Split out of run_cfb_simulation so
+# cfb_reslice_for_lineups() can rebuild pricing for a different contest
+# WITHOUT re-simulating -- the metadata build is the only slate-specific part,
+# everything upstream of it (dealing the game) does not change per contest.
+cfb_build_meta <- function(PL, prj, valid_players) {
+  meta <- unique(PL[, .(Player = player, Team = team, Pos = dk_pos,
+                        DKID = as.integer(dk_id_util), DKCID = as.integer(dk_id_cpt),
+                        DKSalary = as.integer(salary_util),
+                        DKCSalary = as.integer(salary_cpt))])
+  meta <- meta[Player %in% valid_players]
+  # CAPTAIN AND FLEX OWNERSHIP ARE DIFFERENT NUMBERS on a showdown slate, often
+  # by a factor of two or more, so they are carried separately. DKOwn is the
+  # FLEX figure and CPTOwn the captain one; the app pairs each against the
+  # matching exposure to produce CptLev and UtlLev. Collapsing them would
+  # misprice every leverage read on the board.
+  meta[, `:=`(DKProj = NA_real_, DKOwn = 0, CPTOwn = 0)]
+  if (!is.null(prj) && nrow(prj)) {
+    prj <- as.data.table(prj)
+    if ("etr" %in% names(prj))
+      meta[prj, DKProj := as.numeric(i.etr), on = .(Player = player)]
+    # flex ownership: `flex_own` when supplied, else the generic `own`
+    if ("flex_own" %in% names(prj))
+      meta[prj, DKOwn := as.numeric(i.flex_own), on = .(Player = player)]
+    else if ("own" %in% names(prj))
+      meta[prj, DKOwn := as.numeric(i.own), on = .(Player = player)]
+    if ("cpt_own" %in% names(prj))
+      meta[prj, CPTOwn := as.numeric(i.cpt_own), on = .(Player = player)]
+    meta[is.na(DKOwn),  DKOwn  := 0]
+    meta[is.na(CPTOwn), CPTOwn := 0]
+  }
+  meta
+}
+
+# Re-slice an already-simulated multi-slate CARD down to one contest, WITHOUT
+# re-running the dealer. `sim_results`/`sim_metadata` are the classic_main
+# outputs -- every game on the card, drawn once (see run_cfb_classic_simulation).
+# `menu_row` is one row from cfb_slate_menu(). The workbook re-read here is
+# cheap (no simulation): it exists only to get that contest's own player set
+# and pricing off the `projections` tab. StartOrder/GameKey/Pos need no
+# adjustment -- the classic optimiser sorts them WITHIN each sim (relative
+# order), so filtering to a subset of games leaves them correct as-is.
+cfb_reslice_for_lineups <- function(sim_results, sim_metadata, file_path, menu_row) {
+  sl <- read_cfb_input(file_path, slate = menu_row$slate_arg,
+                       game = if (is.na(menu_row$game_arg)) NULL else menu_row$game_arg)
+  teams <- unique(sl$players$team)
+  sr <- as.data.table(sim_results)[Team %in% teams]
+  md <- as.data.table(sim_metadata)[Team %in% teams]
+
+  fresh    <- cfb_build_meta(sl$players, sl$projections, unique(sr$Player))
+  pcols    <- intersect(c("Pos","DKID","DKCID","DKSalary","DKCSalary","DKProj","DKOwn","CPTOwn"),
+                        names(md))
+  md[, (pcols) := NULL]
+  md <- merge(md, fresh, by = c("Player","Team"), all.x = TRUE)
+
+  list(sim_results = sr, metadata = md)
+}
+
 # =============================================================================
 # keep_components: return the per-sim component draws (`A`) alongside the DK
 # scores. OFF by default and the app never asks for it -- at 20k sims A is a
@@ -437,8 +618,13 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
                 apply(lr, 2, function(cl) { p <- R$usage * cl; p / sum(p) })
               },
          k = tr$kicker, pr = tr$punt_returner, kr = tr$kick_returner,
-         who = unique(c(R$player, S$player, Q$player,
-                        tr$kicker, tr$punt_returner, tr$kick_returner)))
+         # kicker/punt_returner/kick_returner are blank on plenty of real team
+         # tabs (no punt/kick return man named). An NA_character_ column value
+         # slipping into `who` becomes an NA "player" that rides all the way to
+         # sim_results$Player and fails validate_simulation_output downstream.
+         who = { w <- unique(c(R$player, S$player, Q$player,
+                              tr$kicker, tr$punt_returner, tr$kick_returner))
+                 w[!is.na(w) & w != ""] })
   })
   names(setup) <- c(fav, dog)
 
@@ -640,32 +826,7 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
             fgp + xp * sc$xp + rettd * sc$return_td + fum * sc$fumble_lost]
 
   # ---- app contract ----------------------------------------------------------
-  meta <- unique(PL[, .(Player = player, Team = team, Pos = dk_pos,
-                        DKID = as.integer(dk_id_util), DKCID = as.integer(dk_id_cpt),
-                        DKSalary = as.integer(salary_util),
-                        DKCSalary = as.integer(salary_cpt))])
-  meta <- meta[Player %in% unique(A$player)]
-  # CAPTAIN AND FLEX OWNERSHIP ARE DIFFERENT NUMBERS on a showdown slate, often
-  # by a factor of two or more, so they are carried separately. DKOwn is the
-  # FLEX figure and CPTOwn the captain one; the app pairs each against the
-  # matching exposure to produce CptLev and UtlLev. Collapsing them would
-  # misprice every leverage read on the board.
-  meta[, `:=`(DKProj = NA_real_, DKOwn = 0, CPTOwn = 0)]
-  prj <- input_data$projections
-  if (!is.null(prj) && nrow(prj)) {
-    setDT(prj)
-    if ("etr" %in% names(prj))
-      meta[prj, DKProj := as.numeric(i.etr), on = .(Player = player)]
-    # flex ownership: `flex_own` when supplied, else the generic `own`
-    if ("flex_own" %in% names(prj))
-      meta[prj, DKOwn := as.numeric(i.flex_own), on = .(Player = player)]
-    else if ("own" %in% names(prj))
-      meta[prj, DKOwn := as.numeric(i.own), on = .(Player = player)]
-    if ("cpt_own" %in% names(prj))
-      meta[prj, CPTOwn := as.numeric(i.cpt_own), on = .(Player = player)]
-    meta[is.na(DKOwn),  DKOwn  := 0]
-    meta[is.na(CPTOwn), CPTOwn := 0]
-  }
+  meta <- cfb_build_meta(PL, input_data$projections, unique(A$player))
 
   sim_results <- A[, .(SimID, Player = player, Team = team,
                        DKScore = round(dk, 3))]
