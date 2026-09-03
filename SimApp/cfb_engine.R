@@ -492,8 +492,13 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
         ii <- which(C2$b == b)
         if (length(ii)) set(C2, ii, "w", sample.int(nR, length(ii), TRUE, prob = PRB[[b]]))
       }
+      # rec31 is carried alongside for the READBACK, not for scoring. A band
+      # cell is edited blind unless the operator can see what it bought, and
+      # the top band is the one an edit moves hardest -- exp(t * 44.17) against
+      # exp(t * 10.91) in the middle. Costs one sum over a table already built.
       rec <- C2[, .(rec = .N, ryds = sum(yds),
-                    rtd = sum(td == 1L, na.rm = TRUE)), by = .(sim, w)]
+                    rtd = sum(td == 1L, na.rm = TRUE),
+                    rec31 = sum(b == 5L)), by = .(sim, w)]
       rec[, player := R$player[w]][, w := NULL]
     }
 
@@ -569,7 +574,7 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
     D <- CJ(sim = seq_len(n_sims), player = who, sorted = FALSE)
     if (!is.null(rec)) D <- merge(D, rec, by = c("sim","player"), all.x = TRUE)
     if (!is.null(rsh)) D <- merge(D, rsh, by = c("sim","player"), all.x = TRUE)
-    for (cl in c("rec","ryds","rtd","car","cyds","ctd"))
+    for (cl in c("rec","ryds","rtd","rec31","car","cyds","ctd"))
       if (!cl %in% names(D)) D[, (cl) := 0] else D[is.na(get(cl)), (cl) := 0]
 
     D[, `:=`(pyds = 0, ptd = 0, pint = 0, fgp = 0, xp = 0, rettd = 0L)]
@@ -882,7 +887,7 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
   out <- list(sim_results = sim_results, metadata = meta, projections = projections,
               sport_visuals = sport_visuals)
   if (isTRUE(keep_components)) {
-    ccols <- intersect(c("SimID","player","team","rec","ryds","rtd","car","cyds",
+    ccols <- intersect(c("SimID","player","team","rec","ryds","rtd","rec31","car","cyds",
                          "ctd","pyds","ptd","pint","fgp","xp","rettd","fum","dk"),
                        names(A))
     out$sim_components <- A[, ..ccols]
