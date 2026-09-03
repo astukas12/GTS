@@ -1137,15 +1137,19 @@ SPORT_CONFIGS <- list(
       custom_detect = function(sheets, file_path = NULL) {
         has_game <- any(tolower(sheets) == "game")
         if (!has_game || length(sheets) < 3) return(FALSE)
-        # A classic sheet looks identical here (game tab + usage cols); it is
-        # the game tab's slate_type that splits them. Showdown wins the CFB
-        # entry, classic is CFB_CLASSIC below.
+        # A classic sheet looks identical here (game tab + usage cols). Two
+        # signals split them, newest first: an `in_classics` column means the
+        # multi-slate workbook (its game tab is the full card -> classic); a
+        # legacy sheet says so in `slate_type`. Showdown wins the CFB entry,
+        # classic is CFB_CLASSIC below.
         gt <- sheets[tolower(sheets) == "game"][1]
-        st <- tryCatch({
-                v <- readxl::read_excel(file_path, sheet = gt, n_max = 1)$slate_type
-                if (length(v) == 0) NA_character_ else tolower(as.character(v[1]))
-              }, error = function(e) NA_character_)
-        if (!is.na(st) && st == "classic") return(FALSE)
+        gh <- tryCatch(readxl::read_excel(file_path, sheet = gt, n_max = 1),
+                       error = function(e) NULL)
+        st <- if (is.null(gh) || !"slate_type" %in% names(gh)) NA_character_
+              else tolower(as.character(gh$slate_type[1]))
+        is_classic <- (!is.null(gh) && "in_classics" %in% names(gh)) ||
+                      (!is.na(st) && st == "classic")
+        if (is_classic) return(FALSE)
         tm <- setdiff(sheets, sheets[tolower(sheets) == "game"])[1]
         cols <- tryCatch(names(readxl::read_excel(file_path, sheet = tm, n_max = 1)),
                          error = function(e) character(0))
@@ -1259,11 +1263,16 @@ SPORT_CONFIGS <- list(
       custom_detect = function(sheets, file_path = NULL) {
         if (!any(tolower(sheets) == "game")) return(FALSE)
         gt <- sheets[tolower(sheets) == "game"][1]
-        st <- tryCatch({
-                v <- readxl::read_excel(file_path, sheet = gt, n_max = 1)$slate_type
-                if (length(v) == 0) NA_character_ else tolower(as.character(v[1]))
-              }, error = function(e) NA_character_)
-        if (is.na(st) || st != "classic") return(FALSE)
+        # Classic when the game tab carries `in_classics` (the multi-slate
+        # workbook -- its game tab is the whole card) or, on a legacy sheet,
+        # slate_type == "classic".
+        gh <- tryCatch(readxl::read_excel(file_path, sheet = gt, n_max = 1),
+                       error = function(e) NULL)
+        st <- if (is.null(gh) || !"slate_type" %in% names(gh)) NA_character_
+              else tolower(as.character(gh$slate_type[1]))
+        is_classic <- (!is.null(gh) && "in_classics" %in% names(gh)) ||
+                      (!is.na(st) && st == "classic")
+        if (!is_classic) return(FALSE)
         tm <- setdiff(sheets, c(sheets[tolower(sheets) == "game"],
                                 sheets[tolower(sheets) %in% c("projections", "etr")]))[1]
         cols <- tryCatch(names(readxl::read_excel(file_path, sheet = tm, n_max = 1)),
