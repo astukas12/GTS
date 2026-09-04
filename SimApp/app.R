@@ -1666,6 +1666,14 @@ server <- function(input, output, session) {
                            phase1_sims=rv$config$phase1_sims %||% 5000L)
         progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
         lineup_data <- find_optimal_lineups(opt_data, opt_config, mode=dk_mode, k=1, verbose=TRUE)
+        # DK showdown rule: a captain-mode lineup needs players from BOTH
+        # teams -- all 6 from one side is not a legal DK entry. NFL_PRESEASON's
+        # SD button already dropped these (line ~2013); this DK button reaches
+        # the same combinatorial_captain mode for CFB and NFL_PRESEASON and was
+        # missing the same check. drop_single_team_sd() no-ops safely when
+        # metadata has no Team column (F1), so gating on mode alone is safe.
+        if (identical(dk_mode, "combinatorial_captain"))
+          lineup_data <- drop_single_team_sd(lineup_data, rv$sim_metadata)
         progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
                                     format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
         score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
