@@ -187,29 +187,94 @@ cfb_pool_weights <- function(P, target, bw = CFB_BW) {
   w / sum(w)
 }
 
-# KERNEL SMOOTHING SHRINKS EVERY ESTIMATE TOWARD THE POOL MEAN (total 53.9).
-# Ask for a 47.5-point game and the pool answers 50.6 -- correct behaviour,
-# wrong number to simulate from. The fix is to correct the TARGET, never the
-# output: if the pool returns 50.6 when asked for 47.5, ask it for less until it
-# returns 47.5. That changes WHICH GAMES GET DRAWN, so every drawn game stays a
-# real, internally consistent afternoon.
+# KERNEL SMOOTHING SHRINKS EVERY ESTIMATE TOWARD THE POOL MEAN (total 53.9,
+# pass-yard share ~.60). Ask for a 47.5-point game, or an FAU-style .78 pass
+# share, and the pool answers back toward its centre -- correct behaviour, wrong
+# number to simulate from. The fix is to correct the TARGET, never the output:
+# if the pool returns .68 when asked for .78, ask it for more until it returns
+# .78. That changes WHICH GAMES GET DRAWN, so every drawn game stays a real,
+# internally consistent afternoon.
 #
 # Rescaling a sampled line to hit the market would break the ratios inside it --
 # yards against attempts, points against touchdowns -- and those ratios are the
 # entire reason for resampling real games.
-cfb_calibrate <- function(P, target, market, iters = 12, damp = 0.8, tol = 0.05) {
-  tg <- target
+#
+# FOUR KNOBS, NOT TWO. total/absp are matched against P$pts_sum / P$margin, as
+# before. fO_pys/dO_pys -- each side's pass share of scrimmage yards, the ONLY
+# thing the style dimensions are a read on -- are now matched the same way,
+# against the pool's REALIZED share (P$fO_pys_out / P$dO_pys_out, ~41% NA before
+# 2022, so a weighted mean over the finite rows). fO_pr/dO_pr are left to pass
+# through: their target is a fixed 0.52 placeholder, not a per-team read, and
+# chasing it only spends effective sample.
+#
+# WHEN THE POOL CANNOT DELIVER. A triple-option team near .40 pass share has few
+# real comparables, and a 40-point spread has few of its own. Two guards, both
+# per iteration:
+#   * the style step only ever takes the largest fraction of itself that keeps
+#     ESS at or above ess_floor -- if that fraction is zero this iteration,
+#     style holds where it is and tries again once the market step has moved.
+#   * only once ESS has fallen below mkt_floor -- a genuinely broken pool, well
+#     under the style gate -- does the market target stop chasing the line past
+#     market +/- mkt_slack, so a pathological matchup cannot drag the drawn pool
+#     arbitrarily far to hit itself exactly. The drawn game's total/margin can
+#     then sit a couple of points off the line; that is the accepted price, and
+#     the total & margin in the return report it. Above mkt_floor the market
+#     target moves freely and lands on the line as before.
+# cal$style_frozen is TRUE when style could not reach the ask. Normal slates hit
+# neither guard -- they land on the market with the full style match.
+cfb_calibrate <- function(P, target, market, iters = 24, damp = 0.8, tol = 0.05,
+                          style_damp = 0.6, style_tol = 0.01,
+                          ess_floor = 100, mkt_floor = 55,
+                          mkt_slack = c(total = 3, absp = 3)) {
+  # NA-aware weighted mean: renormalise over the rows that carry a value.
+  wm <- function(v, w) { ok <- is.finite(v)
+                         if (!any(ok)) return(NA_real_)
+                         sum(v[ok] * w[ok]) / sum(w[ok]) }
+  sdims <- c("fO_pys", "dO_pys")
+  scols <- c("fO_pys_out", "dO_pys_out")
+  ask   <- unlist(target[sdims])                 # the style read, held fixed
+  clamp01 <- function(x) pmin(0.95, pmax(0.05, x))
+  clip    <- function(x, m) max(-m, min(m, x))
+  s_got <- function(w) { g <- vapply(scols, function(cn) wm(P[[cn]], w), numeric(1))
+                         names(g) <- sdims; g }
+  ess_of <- function(t) cfb_ess(cfb_pool_weights(P, t))
+
+  tg <- target; ess_limited <- FALSE
   for (k in seq_len(iters)) {
     w  <- cfb_pool_weights(P, tg)
     et <- sum(P$pts_sum * w); em <- sum(P$margin * w)
     dt <- market$total - et;  dm <- market$margin - em
-    if (max(abs(c(dt, dm))) < tol) break
-    tg$total <- tg$total + damp * dt
-    tg$absp  <- max(0, tg$absp + damp * dm)
+    ds <- ask - s_got(w); ds[!is.finite(ds)] <- 0
+    prev <- unlist(tg[c("total", "absp", sdims)])
+
+    # style: take the largest ESS-safe fraction of the step toward the ask
+    step <- style_damp * ds
+    for (f in c(1, .5, .25, .125, .0625, 0)) {
+      cand <- tg; cand[sdims] <- as.list(clamp01(unlist(tg[sdims]) + f * step))
+      if (f == 0 || ess_of(cand) >= ess_floor) break
+    }
+    if (f < 1 && max(abs(ds)) > style_tol) ess_limited <- TRUE
+    tg[sdims] <- as.list(clamp01(unlist(tg[sdims]) + f * step))
+
+    # market: chase total/margin freely while the pool is deep enough; once ESS
+    # is under the floor, stop pulling the target past mkt_slack of the line
+    st <- tg$total  - market$total  + damp * dt
+    sm <- tg$absp   - market$margin + damp * dm
+    if (ess_of(tg) < mkt_floor) { st <- clip(st, mkt_slack[["total"]])
+                                  sm <- clip(sm, mkt_slack[["absp"]]) }
+    tg$total <- market$total  + st
+    tg$absp  <- max(0, market$margin + sm)
+
+    now <- unlist(tg[c("total", "absp", sdims)])
+    if (max(abs(now - prev)) < 1e-3) break
   }
+
   w <- cfb_pool_weights(P, tg)
+  got <- s_got(w)
   list(target = tg, w = w, ess = cfb_ess(w),
-       total = sum(P$pts_sum * w), margin = sum(P$margin * w))
+       total = sum(P$pts_sum * w), margin = sum(P$margin * w),
+       style_ask = ask, style_got = got, style_gap = ask - got,
+       style_frozen = isTRUE(ess_limited))
 }
 
 # ---- reading the sheet -------------------------------------------------------
@@ -347,8 +412,8 @@ read_cfb_input <- function(file_path, slate = NULL, game = NULL) {
   # classic_main only; NA elsewhere, which the sim reads as zero).
   if (multi) {
     po <- data.table(player = unique(pl$player))
-    if (!is.null(etr_raw) && "etr_pts" %in% names(etr_raw))
-      po <- merge(po, unique(etr_raw[, .(player, etr = suppressWarnings(as.numeric(etr_pts)))],
+    if (!is.null(etr_raw) && "etr" %in% names(etr_raw))
+      po <- merge(po, unique(etr_raw[, .(player, etr = suppressWarnings(as.numeric(etr)))],
                              by = "player"), by = "player", all.x = TRUE)
     else po[, etr := NA_real_]
     if (!is.null(prj) && "own" %in% names(prj))
@@ -579,9 +644,15 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
                  fO_pr = 0.52, fO_pys = pys[[fav]],
                  dO_pr = 0.52, dO_pys = pys[[dog]])
   cal <- cfb_calibrate(P, target, list(total = G$total[1], margin = G$spread[1]))
-  say(sprintf("pool calibrated: ESS %.0f, total %.1f, margin %.1f",
-              cal$ess, cal$total, cal$margin), 0.08)
-  if (cal$ess < 150)
+  say(sprintf("pool calibrated: ESS %.0f, total %.1f, margin %.1f, pys f %.2f/%.2f d %.2f/%.2f%s",
+              cal$ess, cal$total, cal$margin,
+              cal$style_got[["fO_pys"]], cal$style_ask[["fO_pys"]],
+              cal$style_got[["dO_pys"]], cal$style_ask[["dO_pys"]],
+              if (isTRUE(cal$style_frozen)) " [style capped by ESS floor]" else ""), 0.08)
+  # Style calibration deliberately spends effective sample to hold the pass/run
+  # read, so an ESS of 90-150 is now the working range, not an alarm. Warn only
+  # when the pool is genuinely too thin to simulate from.
+  if (cal$ess < 60)
     warning("CFB pool is thin: ESS ", round(cal$ess),
             ". Widen the bandwidth or accept a wider output.")
 
