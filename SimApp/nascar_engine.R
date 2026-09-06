@@ -1423,7 +1423,7 @@ gts_dom_bond <- function(tau = NULL, start_weight = NULL) {
     options(gts.dom.start_weight = start_weight)
   }
   out <- list(tau = getOption("gts.dom.tau", 0),
-              start_weight = getOption("gts.dom.start_weight", 0.25))
+              start_weight = getOption("gts.dom.start_weight", 0.45))
   if (is.null(tau) && is.null(start_weight)) out else invisible(out)
 }
 
@@ -1565,10 +1565,16 @@ assign_dominator_points_from_profiles_optimized <- function(race_result, race_we
   # start_weight scales how much qualifying position constrains the match
   # relative to finishing position; see gts_dom_bond(). 1 = original behaviour.
   bond_tau    <- getOption("gts.dom.tau", 0)
-  bond_startw <- getOption("gts.dom.start_weight", 0.25)
+  # 0.45 (was 0.25): calibrated on the Cook Out Southern 500 pool, whose partial
+  # cor(StartPos, DKDomPoints | FinPos) is -0.39 — front starters score more
+  # dominator points at the same finish. 0.25 reproduced only -0.29 of that;
+  # 0.45 gets -0.31 and most of the gain, past which it flattens.
+  bond_startw <- getOption("gts.dom.start_weight", 0.45)
   # how hard a still-unassigned front starter is pulled up the queue, and how
   # far back that reaches. 0 restores the plain nearest-neighbour assignment.
-  start_boost <- getOption("gts.dom.start_boost", 0.55)
+  # 0.35 (was 0.55): with start_weight raised, the symmetric distance metric
+  # now does more of the front-starter work, so the queue-jump is dialed back.
+  start_boost <- getOption("gts.dom.start_boost", 0.35)
   start_reach <- getOption("gts.dom.start_reach", 6)
   finish_diff_matrix <- outer(driver_finishes, profile_finishes, function(x, y) abs(x - y))
   start_diff_matrix <- outer(driver_starts, profile_starts, function(x, y) abs(x - y))
