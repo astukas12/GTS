@@ -185,14 +185,15 @@ shiny::testServer(server, {
   chk("exposure_table (pooled)", output$exposure_table)
   chk("proj_table", output$proj_table)
 
-  # Showdown exposure table: salary shows as whole $K, projections are gone
-  # (they live in proj_table now), and there is no CPT-salary column.
+  # Showdown exposure table: salary shows as $K to 1dp, projections and the game
+  # Total are gone (projections live in proj_table now), no CPT-salary column.
   de <- display_exposure(ex$tbl, slot_split = TRUE, include_proj = FALSE)
   ok_cols <- "Salary ($K)" %in% names(de) && !("Salary" %in% names(de)) &&
-             !any(c("Proj %","Field vs Proj","Proj","CPT Salary","Proj CPT %") %in% names(de))
-  sal_whole <- all(de$`Salary ($K)` == round(de$`Salary ($K)`), na.rm = TRUE)
-  say("  CFB-SD exposure cols lean + $K salary:", ok_cols && sal_whole, "(expect TRUE)")
-  if (!(ok_cols && sal_whole)) { FAILS <<- FAILS + 1; say("   FAIL") }
+             !any(c("Proj %","Field vs Proj","Proj","CPT Salary","Proj CPT %","Total") %in% names(de))
+  sal_k <- all(de$`Salary ($K)` == round(de$`Salary ($K)`, 1), na.rm = TRUE) &&
+           max(de$`Salary ($K)`, na.rm = TRUE) < 100
+  say("  CFB-SD exposure cols lean + $K salary:", ok_cols && sal_k, "(expect TRUE)")
+  if (!(ok_cols && sal_k)) { FAILS <<- FAILS + 1; say("   FAIL") }
 
   # Combo is slot-qualified: choices carry "(CPT)" / "(FLEX)" and the hit test
   # matches slot+player, not player anywhere.

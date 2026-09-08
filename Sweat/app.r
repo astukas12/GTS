@@ -487,7 +487,7 @@ SPORTS <- list(
     read_input = function(path, sheets) read_input_cfb(path, sheets, showdown = TRUE),
     input_hint = "the single-game showdown slate workbook (game + team sheets + projections)",
     group_dims = c("Position" = "Pos", "Team" = "Team", "Salary Tier" = "SalaryTier"),
-    extra_cols = c("Pos" = "Pos", "Team" = "Team", "Salary" = "Salary", "Total" = "Total"),
+    extra_cols = c("Pos" = "Pos", "Team" = "Team", "Salary" = "Salary"),
     # Proj / Proj Own % / Proj CPT % render in their own section under the
     # exposure table, not inline - see the My Sweat projections block.
     proj_own   = "ProjOwn"
@@ -1510,7 +1510,7 @@ server <- function(input, output, session) {
                              backgroundPosition = "center")
     }
     # Salary-style columns read better without decimals.
-    whole <- intersect(c("Salary", "Salary ($K)", "Start", "DKMax", "Slots", "Locked Slots",
+    whole <- intersect(c("Salary", "Start", "DKMax", "Slots", "Locked Slots",
                          "Total Slots", "Times Used", "Contest Players",
                          "Revealed", "Entries"), num_cols)
     frac  <- setdiff(num_cols, whole)
@@ -1529,9 +1529,9 @@ server <- function(input, output, session) {
     keep <- c("Player", unname(ex))
     d    <- tb[, keep, with = FALSE]
     setnames(d, c(adapter()$entity, names(ex)))
-    # Salary reads as $K, whole numbers - no cents, no thousands separators.
+    # Salary reads as $K to one decimal - no thousands separators.
     if ("Salary" %in% names(d)) {
-      d[, Salary := round(Salary / 1000)]
+      d[, Salary := round(Salary / 1000, 1)]
       setnames(d, "Salary", "Salary ($K)")
     }
     if (any(!tb$Revealed)) d[, Status := fifelse(tb$Revealed, "Revealed", "Locked")]
