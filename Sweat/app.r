@@ -374,9 +374,9 @@ read_input_cfb <- function(path, sheets, showdown = FALSE) {
       prj <- data.table(PlayerX = trimws(as.character(x$player)),
                         PosX = toupper(chr(x, "dk_pos")), SalaryX = num(x, "salary_util"),
                         ProjX = num(x, "etr"), ProjOwn = as_pct(num(x, "own")),
-                        # Showdown workbooks also price the captain slot and
-                        # project its ownership separately; NA in a classic sheet.
-                        SalaryCptX = num(x, "salary_cpt"), CptOwnX = as_pct(num(x, "cpt_own")))
+                        # Showdown workbooks also project captain ownership
+                        # separately (NA in a classic sheet).
+                        CptOwnX = as_pct(num(x, "cpt_own")))
       prj <- prj[!is.na(PlayerX) & nzchar(PlayerX)]
       prj[, Key := norm_name(PlayerX)]
       prj <- unique(prj, by = "Key")
@@ -408,12 +408,9 @@ read_input_cfb <- function(path, sheets, showdown = FALSE) {
   m[, Salary := pick(Salary, gc("SalaryX"))]
   m[, Proj   := pick(gc("ProjX"), gc("ProjY"))]
   if (!"ProjOwn" %in% names(m)) m[, ProjOwn := NA_real_]
-  if (showdown) {
-    m[, SalaryCpt := gc("SalaryCptX")]
-    m[, CptOwn    := gc("CptOwnX")]
-  }
+  if (showdown) m[, CptOwn := gc("CptOwnX")]
   for (cl in intersect(c("PlayerX", "PlayerY", "TeamY", "PosX", "SalaryX", "ProjX", "ProjY",
-                         "SalaryCptX", "CptOwnX"),
+                         "CptOwnX"),
                        names(m))) m[, (cl) := NULL]
 
   g <- rd(gsheet)
@@ -490,9 +487,9 @@ SPORTS <- list(
     read_input = function(path, sheets) read_input_cfb(path, sheets, showdown = TRUE),
     input_hint = "the single-game showdown slate workbook (game + team sheets + projections)",
     group_dims = c("Position" = "Pos", "Team" = "Team", "Salary Tier" = "SalaryTier"),
-    extra_cols = c("Pos" = "Pos", "Team" = "Team", "Salary" = "Salary",
-                   "CPT Salary" = "SalaryCpt", "Proj" = "Proj",
-                   "Proj CPT %" = "CptOwn", "Total" = "Total"),
+    extra_cols = c("Pos" = "Pos", "Team" = "Team", "Salary" = "Salary", "Total" = "Total"),
+    # Proj / Proj Own % / Proj CPT % render in their own section under the
+    # exposure table, not inline - see the My Sweat projections block.
     proj_own   = "ProjOwn"
   ),
   NBA = list(
@@ -1513,7 +1510,7 @@ server <- function(input, output, session) {
                              backgroundPosition = "center")
     }
     # Salary-style columns read better without decimals.
-    whole <- intersect(c("Salary", "Start", "DKMax", "Slots", "Locked Slots",
+    whole <- intersect(c("Salary", "Salary ($K)", "Start", "DKMax", "Slots", "Locked Slots",
                          "Total Slots", "Times Used", "Contest Players",
                          "Revealed", "Entries"), num_cols)
     frac  <- setdiff(num_cols, whole)
@@ -1526,12 +1523,17 @@ server <- function(input, output, session) {
   # slot_split = TRUE (showdown only) replaces the pooled Your % / Field % pair
   # with captain and flex columns; the pooled numbers are still one radio click
   # away.
-  display_exposure <- function(tb, slot_split = FALSE) {
+  display_exposure <- function(tb, slot_split = FALSE, include_proj = !slot_split) {
     if (is.null(tb) || !nrow(tb)) return(NULL)
     ex   <- extra_cols()
     keep <- c("Player", unname(ex))
     d    <- tb[, keep, with = FALSE]
     setnames(d, c(adapter()$entity, names(ex)))
+    # Salary reads as $K, whole numbers - no cents, no thousands separators.
+    if ("Salary" %in% names(d)) {
+      d[, Salary := round(Salary / 1000)]
+      setnames(d, "Salary", "Salary ($K)")
+    }
     if (any(!tb$Revealed)) d[, Status := fifelse(tb$Revealed, "Revealed", "Locked")]
     split_on <- slot_split && all(c("CptUserExp", "FlexUserExp") %in% names(tb))
     if (split_on) {
@@ -1546,7 +1548,7 @@ server <- function(input, output, session) {
       d[, `Field %` := tb$FieldExp]
       d[, Leverage  := tb$Leverage]
     }
-    if ("ProjOwnPct" %in% names(tb)) {
+    if (include_proj && "ProjOwnPct" %in% names(tb)) {
       d[, `Proj %`        := tb$ProjOwnPct]
       d[, `Field vs Proj` := tb$FieldVsProj]
     }
@@ -1662,6 +1664,15 @@ server <- function(input, output, session) {
                " fills - RB, WR, TE and FLEX (or CPT and UTIL) are pooled together.")),
       DTOutput("exposure_table"),
 
+      if ("CPT" %in% ad$slots && "ProjOwnPct" %in% names(ex$tbl)) tagList(
+        br(),
+        h4("Projections"),
+        p(style = "color:#CCCCCC;",
+          "Points and ownership projections from your input sheet, with how far ",
+          "the field landed from them."),
+        DTOutput("proj_table")
+      ),
+
       br(),
       h4("Positive Leverage"),
       plotlyOutput("positive_leverage_plot", height = "430px"),
@@ -1683,9 +1694,28 @@ server <- function(input, output, session) {
 
   output$exposure_table <- renderDT({
     tb <- filtered_exposure(); req(tb)
-    split <- "CPT" %in% adapter()$slots && identical(input$sd_exposure_view, "split")
-    gt_table(display_exposure(tb, slot_split = split),
+    showdown <- "CPT" %in% adapter()$slots
+    split <- showdown && identical(input$sd_exposure_view, "split")
+    # Showdown keeps projections out of the exposure table entirely - they get
+    # their own section below.
+    gt_table(display_exposure(tb, slot_split = split, include_proj = !showdown),
              bar_col = if (split) "Your CPT %" else "Your %")
+  })
+
+  # Projections section - showdown only. Keeps the exposure table lean and puts
+  # every projection-derived number (points, own %, captain own %, field-vs-proj)
+  # in one place.
+  output$proj_table <- renderDT({
+    tb <- filtered_exposure(); req(tb, "CPT" %in% adapter()$slots)
+    d <- data.table(Player = tb$Player)
+    if ("Proj" %in% names(tb))       d[, Proj := tb$Proj]
+    if ("ProjOwnPct" %in% names(tb)) d[, `Proj Own %` := tb$ProjOwnPct]
+    if ("CptOwn" %in% names(tb))     d[, `Proj CPT %` := tb$CptOwn]
+    d[, `Field Own %` := tb$FieldExp]
+    if ("FieldVsProj" %in% names(tb)) d[, `Field vs Proj` := tb$FieldVsProj]
+    setnames(d, "Player", adapter()$entity)
+    ord <- if ("Proj" %in% names(d)) order(-d$Proj) else order(-d$`Field Own %`)
+    gt_table(d[ord], bar_col = if ("Proj Own %" %in% names(d)) "Proj Own %" else NULL)
   })
 
   output$positive_leverage_plot <- renderPlotly({ leverage_plot(filtered_exposure(), "positive") })

@@ -183,6 +183,16 @@ shiny::testServer(server, {
   chk("exposure_table (split)", output$exposure_table)
   session$setInputs(sd_exposure_view = "pooled")
   chk("exposure_table (pooled)", output$exposure_table)
+  chk("proj_table", output$proj_table)
+
+  # Showdown exposure table: salary shows as whole $K, projections are gone
+  # (they live in proj_table now), and there is no CPT-salary column.
+  de <- display_exposure(ex$tbl, slot_split = TRUE, include_proj = FALSE)
+  ok_cols <- "Salary ($K)" %in% names(de) && !("Salary" %in% names(de)) &&
+             !any(c("Proj %","Field vs Proj","Proj","CPT Salary","Proj CPT %") %in% names(de))
+  sal_whole <- all(de$`Salary ($K)` == round(de$`Salary ($K)`), na.rm = TRUE)
+  say("  CFB-SD exposure cols lean + $K salary:", ok_cols && sal_whole, "(expect TRUE)")
+  if (!(ok_cols && sal_whole)) { FAILS <<- FAILS + 1; say("   FAIL") }
 
   # Combo is slot-qualified: choices carry "(CPT)" / "(FLEX)" and the hit test
   # matches slot+player, not player anywhere.
