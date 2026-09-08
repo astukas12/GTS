@@ -823,10 +823,16 @@ ui <- fluidPage(
       }
       
       table.dataTable thead th {
-        background: linear-gradient(135deg, #FFE500 0%, #FFA500 100%);
-        color: #000000;
+        background: #141414 !important;
+        color: #FFE500 !important;
         font-weight: 700;
         border-bottom: 2px solid #FFE500;
+      }
+      table.dataTable thead th.sorting:after,
+      table.dataTable thead th.sorting_asc:after,
+      table.dataTable thead th.sorting_desc:after {
+        color: #FFE500;
+        opacity: 0.45;
       }
       
       table.dataTable tbody tr {
@@ -1490,24 +1496,21 @@ server <- function(input, output, session) {
   # One consistent look for every table in the app. Rounds whatever numeric
   # columns are present rather than assuming a fixed schema, because the
   # columns differ by sport.
-  gt_table <- function(tb, bar_col = NULL, page = 25, digits = 1) {
+  gt_table <- function(tb, page = 25, digits = 1) {
     if (is.null(tb) || !nrow(tb)) return(msg_table("Nothing to show for this filter."))
     num_cols <- names(tb)[vapply(tb, is.numeric, logical(1))]
     d <- datatable(tb, rownames = FALSE,
                    options = list(pageLength = page, dom = "frtip",
                                   columnDefs = list(list(className = "dt-center",
                                                          targets = "_all"))))
-    for (lv in intersect(c("Leverage", "CPT Lev", "FLEX Lev"), names(tb))) {
+    # The only cell colouring in the app: every signed "how far from even"
+    # column gets the same red-below-zero / green-above-zero treatment, so the
+    # meaning is identical wherever it appears. No per-column bars or fills.
+    signed <- c("Leverage", "CPT Lev", "FLEX Lev", "Field vs Proj")
+    for (lv in intersect(signed, names(tb))) {
       d <- d %>% formatStyle(lv,
                              color = styleInterval(0, c("#dc3545", "#28a745")),
                              fontWeight = "bold")
-    }
-    if (!is.null(bar_col) && bar_col %in% names(tb)) {
-      d <- d %>% formatStyle(bar_col,
-                             background = styleColorBar(c(0, 100), "#FFE500"),
-                             backgroundSize = "100% 90%",
-                             backgroundRepeat = "no-repeat",
-                             backgroundPosition = "center")
     }
     # Salary-style columns read better without decimals.
     whole <- intersect(c("Salary", "Start", "DKMax", "Slots", "Locked Slots",
@@ -1698,8 +1701,7 @@ server <- function(input, output, session) {
     split <- showdown && identical(input$sd_exposure_view, "split")
     # Showdown keeps projections out of the exposure table entirely - they get
     # their own section below.
-    gt_table(display_exposure(tb, slot_split = split, include_proj = !showdown),
-             bar_col = if (split) "Your CPT %" else "Your %")
+    gt_table(display_exposure(tb, slot_split = split, include_proj = !showdown))
   })
 
   # Projections section - showdown only. Keeps the exposure table lean and puts
@@ -1715,7 +1717,7 @@ server <- function(input, output, session) {
     if ("FieldVsProj" %in% names(tb)) d[, `Field vs Proj` := tb$FieldVsProj]
     setnames(d, "Player", adapter()$entity)
     ord <- if ("Proj" %in% names(d)) order(-d$Proj) else order(-d$`Field Own %`)
-    gt_table(d[ord], bar_col = if ("Proj Own %" %in% names(d)) "Proj Own %" else NULL)
+    gt_table(d[ord])
   })
 
   output$positive_leverage_plot <- renderPlotly({ leverage_plot(filtered_exposure(), "positive") })
@@ -1849,7 +1851,7 @@ server <- function(input, output, session) {
     if (!is.null(input$group_value) && length(input$group_value)) {
       tb <- tb[get(gd) %in% input$group_value]
     }
-    gt_table(display_exposure(tb), bar_col = "Your %")
+    gt_table(display_exposure(tb))
   })
 
   # --- Lock Status --------------------------------------------------------
@@ -2061,7 +2063,7 @@ server <- function(input, output, session) {
     disp[, `Your Alive %`  := tb$UserExp]
     disp[, `Field Alive %` := tb$FieldExp]
     disp[, Leverage        := tb$Leverage]
-    gt_table(disp[order(-`Your Alive %`, -`Field Alive %`)], bar_col = "Your Alive %")
+    gt_table(disp[order(-`Your Alive %`, -`Field Alive %`)])
   })
 
   # --- Combo Analysis -----------------------------------------------------
@@ -2166,7 +2168,7 @@ server <- function(input, output, session) {
     disp[, `Your %`  := tb$UserExp]
     disp[, `Field %` := tb$FieldExp]
     disp[, Leverage  := tb$Leverage]
-    gt_table(disp[order(-`Your %`, -`Field %`)], bar_col = "Your %")
+    gt_table(disp[order(-`Your %`, -`Field %`)])
   })
 
   # --- Dupe Analysis ------------------------------------------------------
@@ -2214,12 +2216,7 @@ server <- function(input, output, session) {
               options = list(pageLength = 25, dom = "frtip",
                              columnDefs = list(list(width = "60%", targets = 0),
                                                list(className = "dt-center", targets = 1:2)))) %>%
-      formatRound("% of Contest", 2) %>%
-      formatStyle("Times Used",
-                  background = styleColorBar(c(0, max(top$N)), "#FFE500"),
-                  backgroundSize = "100% 90%",
-                  backgroundRepeat = "no-repeat",
-                  backgroundPosition = "center")
+      formatRound("% of Contest", 2)
   })
 }
 
