@@ -790,7 +790,17 @@ find_optimal_lineups_combinatorial_captain <- function(sim_results, config, verb
   
   sim_ids <- unique(sim_results$SimID)
   n_sims  <- length(sim_ids)
-  
+
+  # Player -> Team map for the min-2-teams constraint. A single-game (showdown)
+  # roster that is all six from one side is an invalid DK/FD upload, so those
+  # lineups must never enter the pool. No-op when the engine carries no Team
+  # column or the slate is effectively one team (MMA fights, F1).
+  p2t <- NULL
+  if ("Team" %in% names(sim_results)) {
+    u <- unique(sim_results[!is.na(Team), .(Player, Team)])
+    if (uniqueN(u$Team) >= 2) p2t <- setNames(as.character(u$Team), u$Player)
+  }
+
   if (verbose) cat(sprintf("  %d players | %s sims | $%s cap | %.1fx captain\n",
                            n_players, format(n_sims, big.mark=","),
                            format(salary_cap, big.mark=","), cpt_multiplier))
@@ -887,7 +897,17 @@ find_optimal_lineups_combinatorial_captain <- function(sim_results, config, verb
   })
   
   all_lineups <- rbindlist(lineup_list)
-  
+
+  # min-2-teams: drop any CPT+UTIL roster that is a single team before ranking.
+  if (!is.null(p2t) && nrow(all_lineups)) {
+    slot_cols <- c("Captain", grep("^Util", names(all_lineups), value = TRUE))
+    ndis <- apply(all_lineups[, ..slot_cols], 1L,
+                  function(r) uniqueN(na.omit(p2t[as.character(r)])))
+    all_lineups <- all_lineups[ndis >= 2]
+    if (verbose) cat(sprintf("  min-2-teams: %s lineups after dropping single-team rosters\n",
+                             format(nrow(all_lineups), big.mark = ",")))
+  }
+
   counts <- all_lineups[, .(Top1Count   = .N,
                             TotalSalary = TotalSalary[1],
                             AvgScore    = mean(TotalScore)),
@@ -946,6 +966,15 @@ find_optimal_lineups_combinatorial_mvp <- function(sim_results, config, verbose 
 
   sim_ids <- unique(sim_results$SimID)
   n_sims  <- length(sim_ids)
+
+  # Player -> Team map for the min-2-teams constraint (see combinatorial_captain).
+  # A single-team MVP+FLEX roster is an invalid DK/FD upload. No-op without a
+  # Team column or on an effectively one-team slate.
+  p2t <- NULL
+  if ("Team" %in% names(sim_results)) {
+    u <- unique(sim_results[!is.na(Team), .(Player, Team)])
+    if (uniqueN(u$Team) >= 2) p2t <- setNames(as.character(u$Team), u$Player)
+  }
 
   if (verbose) cat(sprintf("  %d players | %s sims | $%s cap | %.1fx MVP score, %.2fx MVP salary\n",
                            n_players, format(n_sims, big.mark=","),
@@ -1046,13 +1075,23 @@ find_optimal_lineups_combinatorial_mvp <- function(sim_results, config, verbose 
 
   all_lineups <- rbindlist(lineup_list)
 
+  # min-2-teams: drop any MVP+FLEX roster that is a single team before ranking.
+  if (!is.null(p2t) && nrow(all_lineups)) {
+    slot_cols <- c("MVP", grep("^Player[0-9]", names(all_lineups), value = TRUE))
+    ndis <- apply(all_lineups[, ..slot_cols], 1L,
+                  function(r) uniqueN(na.omit(p2t[as.character(r)])))
+    all_lineups <- all_lineups[ndis >= 2]
+    if (verbose) cat(sprintf("  min-2-teams: %s lineups after dropping single-team rosters\n",
+                             format(nrow(all_lineups), big.mark = ",")))
+  }
+
   counts <- all_lineups[, .(Top1Count   = .N,
                             TotalSalary = TotalSalary[1],
                             AvgScore    = mean(TotalScore)),
                         by = Lineup]
   setorder(counts, -Top1Count)
   if (nrow(counts) > max_lineups) counts <- counts[1:max_lineups]
-  
+
   parts <- strsplit(counts$Lineup, "\\|")
   unique_lineups <- data.table(MVP = sapply(parts, `[`, 1))
   for (k in seq_len(n_flex)) {

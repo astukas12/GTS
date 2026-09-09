@@ -1064,7 +1064,24 @@ server <- function(input, output, session) {
     }
     intersect(pct_cols, names(display_table))
   }
-  
+
+  # House convention (Sweat / the NASCAR sheet): show a salary as "$K" to one
+  # decimal -- "7.8K", not "7800".
+  #  * salary_to_k() divides the column in the render-local table by 1000 (safe:
+  #    these display tables are rebuilt every render) so DT's numeric sort still
+  #    works. Must run BEFORE datatable(), which serialises the data.
+  #  * fmt_k() adds the client-side "K" suffix; run it on the widget after.
+  salary_to_k <- function(tbl, cols) {
+    for (c_ in intersect(cols, names(tbl)))
+      set(tbl, j = c_, value = as.numeric(tbl[[c_]]) / 1000)
+    invisible(tbl)
+  }
+  fmt_k <- function(dt, cols) {
+    if (!length(cols)) return(dt)
+    DT::formatCurrency(dt, cols, currency = "K", before = FALSE,
+                       interval = 3, mark = ",", digits = 1)
+  }
+
   create_download_standard <- function(optimal_lineups, metadata, platform) {
     player_cols    <- grep("^Player", names(optimal_lineups), value=TRUE)
     id_col         <- paste0(platform, "ID")
@@ -2410,11 +2427,15 @@ server <- function(input, output, session) {
                                                    )
                                                  )
                                     )),
+                                    uiOutput(paste0(lp,"_teamsplit_ui")),
                                     fluidRow(box(title="Player Exposure in Filtered Pool",status="info",solidHeader=TRUE,width=12,
                                                  div(style="margin-bottom:6px;",
                                                      uiOutput(paste0(lp,"_lock_summary"), inline=TRUE)),
-                                                 uiOutput(paste0(lp,"_expfilter_ui")),
-                                                 uiOutput(paste0(lp,"_expfilter_summary")),
+                                                 tags$details(style="margin-bottom:6px;",
+                                                   tags$summary("Filters & group totals",
+                                                                style="cursor:pointer;font-size:11px;color:#FFE500;"),
+                                                   uiOutput(paste0(lp,"_expfilter_ui")),
+                                                   uiOutput(paste0(lp,"_expfilter_summary"))),
                                                  DTOutput(paste0(lp,"_filtered_exposure"))))
                            ),
 
@@ -2425,9 +2446,13 @@ server <- function(input, output, session) {
                                                      actionButton(paste0(lp,"_delete_selected_builds"), "DELETE SELECTED BUILDS",
                                                                   class="btn-danger btn-sm", style="font-weight:bold;")),
                                                  DTOutput(paste0(lp,"_builds_summary")))),
+                                    uiOutput(paste0(lp,"_teamsplit_port_ui")),
                                     fluidRow(box(title="Portfolio Player Exposure",status="info",solidHeader=TRUE,width=12,
-                                                 uiOutput(paste0(lp,"_portfilter_ui")),
-                                                 uiOutput(paste0(lp,"_portfilter_summary")),
+                                                 tags$details(style="margin-bottom:6px;",
+                                                   tags$summary("Filters & group totals",
+                                                                style="cursor:pointer;font-size:11px;color:#FFE500;"),
+                                                   uiOutput(paste0(lp,"_portfilter_ui")),
+                                                   uiOutput(paste0(lp,"_portfilter_summary"))),
                                                  DTOutput(paste0(lp,"_portfolio_exposure"))))
                            ),
 
@@ -2453,21 +2478,39 @@ server <- function(input, output, session) {
   # ==========================================================================
   
   # Lock / exclude is driven entirely from the exposure table: each row has its
-  # own LOCK and EXCL button. This is just a one-line count plus a clear-all,
-  # sitting directly above the table rather than in a panel at the top.
+  # own LOCK and EXCL button. This is a single compact chip line sitting directly
+  # above the table -- one chip per constrained player (green = locked, red =
+  # excluded, "C:" prefix = captain-slot only), then the counts and a clear-all.
   make_lock_summary_ui <- function(lp) {
     renderUI({
-      n <- length(rv[[paste0(lp,"_lock_any")]]) + length(rv[[paste0(lp,"_excl_any")]]) +
-           length(rv[[paste0(lp,"_lock_cpt")]]) + length(rv[[paste0(lp,"_excl_cpt")]])
+      la <- rv[[paste0(lp,"_lock_any")]]; xa <- rv[[paste0(lp,"_excl_any")]]
+      lc <- rv[[paste0(lp,"_lock_cpt")]]; xc <- rv[[paste0(lp,"_excl_cpt")]]
+      n  <- length(la) + length(xa) + length(lc) + length(xc)
       if (n == 0) return(
         span("Click LOCK or EXCL on any row to constrain the pool.",
              style="color:#777;font-size:11px;"))
-      tagList(
-        span(sprintf("%d constraint%s active", n, if (n == 1) "" else "s"),
-             style="color:#FFE500;font-size:11px;font-weight:bold;margin-right:10px;"),
-        actionLink(paste0(lp,"_clear_locks"), "clear all",
-                   style="color:#ff6b6b;font-size:11px;font-weight:bold;")
-      )
+      short <- function(p) { w <- strsplit(p, "\\s+")[[1]]; if (length(w) > 1) paste(substr(w[1],1,1), tail(w,1)[1]) else p }
+      chip  <- function(txt, kind) {
+        bg <- if (kind == "lock") "rgba(76,175,80,0.22)" else "rgba(255,107,107,0.20)"
+        bd <- if (kind == "lock") "#4caf50" else "#ff6b6b"
+        span(txt, style=sprintf("display:inline-block;font-size:10px;padding:1px 6px;margin:0 4px 2px 0;border-radius:9px;background:%s;border:1px solid %s;color:#eee;", bg, bd))
+      }
+      items <- c(
+        lapply(la, function(p) chip(short(p), "lock")),
+        lapply(lc, function(p) chip(paste0("C:", short(p)), "lock")),
+        lapply(xa, function(p) chip(short(p), "excl")),
+        lapply(xc, function(p) chip(paste0("C:", short(p)), "excl")))
+      cap_n <- 8L
+      shown <- if (length(items) > cap_n)
+        c(items[seq_len(cap_n)], list(span(sprintf("+%d more", length(items) - cap_n),
+                                           style="font-size:10px;color:#999;margin-right:6px;")))
+      else items
+      div(style="line-height:1.6;",
+          tagList(shown),
+          span(sprintf("%d locked / %d excluded", length(la) + length(lc), length(xa) + length(xc)),
+               style="font-size:10px;color:#FFE500;font-weight:bold;margin:0 8px;"),
+          actionLink(paste0(lp,"_clear_locks"), "clear all",
+                     style="color:#ff6b6b;font-size:10px;font-weight:bold;"))
     })
   }
   output$dk_lock_summary <- make_lock_summary_ui("dk")
@@ -2539,7 +2582,7 @@ server <- function(input, output, session) {
         # panel's JS -- that is why Lock/Exclude fell back to raw multi-selects
         # instead of searchable selectize boxes.
         if (!is.finite(mn) || !is.finite(mx) || mn == mx) return(NULL)
-        if (cfg$format=="k")     { mn <- floor(mn/1000);  mx <- ceiling(mx/1000); lbl <- paste0(cfg$label," (K)") }
+        if (cfg$format=="k")     { mn <- floor(mn/100)/10; mx <- ceiling(mx/100)/10; lbl <- paste0(cfg$label," (K)") }
         else if (cfg$format=="whole") { mn <- floor(mn); mx <- ceiling(mx); lbl <- cfg$label }
         else { mn <- floor(mn*10)/10; mx <- ceiling(mx*10)/10; lbl <- cfg$label }
         sliderInput(paste0(lp,"_filter_",col,"_v",ver), lbl, min=mn, max=mx, value=c(mn,mx), step=cfg$step, width="100%")
@@ -2663,6 +2706,39 @@ server <- function(input, output, session) {
           if (length(lc)) lineups <- lineups[get(cap_cols[1]) %in% lc]
           if (length(ec)) lineups <- lineups[!get(cap_cols[1]) %in% ec]
         }
+
+        # TEAM-SPLIT pre-filters (NFL showdown). Narrow the pool to a chosen
+        # split, a captain team, or a minimum count from one side.
+        ts <- teamsplit_ctx(lp)
+        if (!is.null(ts) && nrow(lineups)) {
+          sel_split <- input[[paste0(lp,"_ts_split")]]
+          sel_cptt  <- input[[paste0(lp,"_ts_cptteam")]]
+          min_n     <- suppressWarnings(as.numeric(input[[paste0(lp,"_ts_minn")]]))
+          min_team  <- input[[paste0(lp,"_ts_minteam")]]
+          need_split <- (!is.null(sel_split) && !identical(sel_split, "(any)")) ||
+                        (!is.null(sel_cptt)  && !identical(sel_cptt,  "(any)")) ||
+                        (!is.null(min_team)  && !identical(min_team,  "(any)") &&
+                         !is.na(min_n) && min_n > 0)
+          if (need_split) {
+            cap_tm <- ts$p2t[as.character(lineups[[ts$cap_col]])]
+            tmat   <- matrix(ts$p2t[as.character(unlist(lineups[, ts$slot_cols, with = FALSE]))],
+                             nrow = nrow(lineups))
+            n_a <- rowSums(tmat == ts$teams[1], na.rm = TRUE)
+            cnt_team <- function(tm) if (identical(tm, ts$teams[1])) n_a else ts$roster - n_a
+            keep <- rep(TRUE, nrow(lineups))
+            if (!is.null(sel_split) && !identical(sel_split, "(any)")) {
+              cpt_cnt <- ifelse(cap_tm == ts$teams[1], n_a, ts$roster - n_a)
+              lab <- sprintf("CPT %s · %d-%d", cap_tm, cpt_cnt, ts$roster - cpt_cnt)
+              keep <- keep & (lab == sel_split)
+            }
+            if (!is.null(sel_cptt) && !identical(sel_cptt, "(any)"))
+              keep <- keep & (cap_tm == sel_cptt)
+            if (!is.null(min_team) && !identical(min_team, "(any)") && !is.na(min_n) && min_n > 0)
+              keep <- keep & (cnt_team(min_team) >= min_n)
+            keep[is.na(keep)] <- FALSE
+            lineups <- lineups[keep]
+          }
+        }
       }
       lineups
     })
@@ -2733,11 +2809,23 @@ server <- function(input, output, session) {
       # platform, so it never sets is_sd -- but it wants the same split
       # captain/flex exposure view that NBA showdown gets.
       is_cfb     <- isTRUE(rv$sport == "CFB")
-      split_own  <- (is_nba && is_sd) || is_cfb
+      # NFL showdown runs captain (DK) / MVP (FD) mode on the DK/FD platform, not
+      # a separate SD platform. When the sheet carries captain-slot ownership
+      # (cptown -> CPTOwn on DK, mvpown -> MVPOwn on FD) give it the same split
+      # CPT/flex ownership view CFB and NBA-SD get; otherwise the flat view.
+      is_nfl_sd  <- isTRUE(rv$sport == "NFL") &&
+                    length(grep("^Captain$|^MVP$", names(filtered), value = TRUE)) > 0
+      cptown_col  <- if (platform == "FD") "MVPOwn" else "CPTOwn"
+      flexown_col <- if (platform == "FD") "FDOwn"  else "DKOwn"
+      has_nfl_cptown <- is_nfl_sd && cptown_col %in% names(rv$sim_metadata) &&
+                        any(rv$sim_metadata[[cptown_col]] > 0, na.rm = TRUE)
+      split_own  <- (is_nba && is_sd) || is_cfb || has_nfl_cptown
       salary_col <- if (is_sd) "DKSalary" else paste0(platform, "Salary")
       own_col    <- if (is_sd) NULL        else paste0(platform, "Own")
       cpt_cols  <- grep("^Captain", names(filtered), value=TRUE)
       util_cols <- grep("^Util",    names(filtered), value=TRUE)
+      if (is_nfl_sd && !length(cpt_cols))  cpt_cols  <- grep("^MVP$",      names(filtered), value=TRUE)
+      if (is_nfl_sd && !length(util_cols)) util_cols <- grep("^Player[0-9]", names(filtered), value=TRUE)
       all_pc    <- grep("^Player|^Captain|^MVP|^Util|^G[1-4]$|^F[1-3]$|^C1$", names(filtered), value=TRUE)
       has_captain <- length(cpt_cols) > 0
       n_lineups  <- nrow(filtered)
@@ -2786,6 +2874,9 @@ server <- function(input, output, session) {
         nba_meta <- intersect(c("Player", pos_col_nba, salary_col, own_col, "Team"),
                               names(rv$sim_metadata))
         meta_cols <- nba_meta
+      } else if (has_nfl_cptown) {
+        meta_cols <- intersect(c("Player","Team","Pos", salary_col, cptown_col, flexown_col),
+                               names(rv$sim_metadata))
       } else {
         # "Pos" as well as "Position": the preseason engine writes the column as
         # Pos, so listing only Position silently dropped the position from the
@@ -2802,20 +2893,24 @@ server <- function(input, output, session) {
       
       if (split_own) {
         if ("SDSalary" %in% names(exp_tbl)) setnames(exp_tbl, "SDSalary", "Salary")
-        else if ("DKSalary" %in% names(exp_tbl) && !"Salary" %in% names(exp_tbl))
-          setnames(exp_tbl, "DKSalary", "Salary")
+        else if (!"Salary" %in% names(exp_tbl)) {
+          sc <- intersect(c("DKSalary","FDSalary"), names(exp_tbl))
+          if (length(sc)) setnames(exp_tbl, sc[1], "Salary")
+        }
         # A slate can legitimately arrive with no ownership file at all. Guard
         # the max() so an all-NA column does not throw before the view renders.
+        # cptown_col / flexown_col are CPTOwn / DKOwn on a DK captain slate
+        # (CFB, NBA-SD) and MVPOwn / FDOwn on an NFL FanDuel single-game slate.
         own_max <- function(v) { v <- v[is.finite(v)]; if (!length(v)) NA_real_ else max(v) }
-        if ("CPTOwn" %in% names(exp_tbl)) {
-          m <- own_max(exp_tbl$CPTOwn)
-          if (!is.na(m) && m <= 1) exp_tbl[, CPTOwn := CPTOwn * 100]
-          setnames(exp_tbl, "CPTOwn", "CptOwn")
+        if (cptown_col %in% names(exp_tbl)) {
+          m <- own_max(exp_tbl[[cptown_col]])
+          if (!is.na(m) && m <= 1) exp_tbl[, (cptown_col) := get(cptown_col) * 100]
+          setnames(exp_tbl, cptown_col, "CptOwn")
         }
-        if ("DKOwn" %in% names(exp_tbl)) {
-          m <- own_max(exp_tbl$DKOwn)
-          if (!is.na(m) && m <= 1) exp_tbl[, DKOwn := DKOwn * 100]
-          setnames(exp_tbl, "DKOwn", "UtlOwn")
+        if (flexown_col %in% names(exp_tbl)) {
+          m <- own_max(exp_tbl[[flexown_col]])
+          if (!is.na(m) && m <= 1) exp_tbl[, (flexown_col) := get(flexown_col) * 100]
+          setnames(exp_tbl, flexown_col, "UtlOwn")
         }
         if ("UtilExp" %in% names(exp_tbl)) setnames(exp_tbl, "UtilExp", "UtlExp")
         if (all(c("CptExp","CptOwn") %in% names(exp_tbl)))
@@ -2932,6 +3027,12 @@ server <- function(input, output, session) {
       exp_tbl[, .rowstate := fifelse(Player %in% lock_all, "lock",
                              fifelse(Player %in% excl_all, "excl", ""))]
 
+      # Salary as $K (house convention). Divide before datatable() serialises.
+      cap <- rv$config$salary_caps[[platform]] %||% 50000
+      sal_col_disp <- if ("Sal" %in% names(exp_tbl)) "Sal" else if ("Salary" %in% names(exp_tbl)) "Salary" else NULL
+      show_sal_k <- !is.null(sal_col_disp) && cap >= 1000
+      if (show_sal_k) salary_to_k(exp_tbl, sal_col_disp)
+
       fcfg <- exposure_filter_cfg(exp_tbl)
       nm        <- names(exp_tbl)
       ix <- function(cn) if (cn %in% nm) which(nm == cn) - 1L else integer(0)
@@ -2978,17 +3079,117 @@ server <- function(input, output, session) {
                         "Exposure","FlexExp","OwnProj","Leverage",
                         "CutProb","RGProj","RGMin","Proj","Sim"), names(exp_tbl))
       if (length(rc) > 0) dt <- dt %>% formatRound(rc, 1)
-      cap <- rv$config$salary_caps[[platform]] %||% 50000
-      sal_col_disp <- if ("Sal" %in% names(exp_tbl)) "Sal" else if ("Salary" %in% names(exp_tbl)) "Salary" else NULL
-      if (!is.null(sal_col_disp) && cap >= 1000) dt <- dt %>% formatCurrency(sal_col_disp,"$",digits=0)
+      if (show_sal_k) dt <- fmt_k(dt, sal_col_disp)
       dt
     })
   }
   output$dk_filtered_exposure <- make_filtered_exposure(dk_filtered_lineups, "DK")
   output$fd_filtered_exposure <- make_filtered_exposure(fd_filtered_lineups, "FD")
   output$sd_filtered_exposure <- make_filtered_exposure(sd_filtered_lineups, "SD")
-  
-  
+
+
+  # ==========================================================================
+  # TEAM-SPLIT BREAKDOWN + FILTERS  (NFL showdown only)
+  # ==========================================================================
+  # A single-game showdown roster is 6 players across exactly two teams. This
+  # shows the pool by roster split -- "CPT SEA · 4-2" is 4 SEA (incl. captain) +
+  # 2 NE -- and lets the pool be narrowed to a split, a captain team, or a
+  # minimum count from one side. Hidden on every non-showdown slate.
+
+  teamsplit_ctx <- function(lp) {
+    if (!isTRUE(rv$sport == "NFL")) return(NULL)
+    md <- rv$sim_metadata
+    if (is.null(md) || !"Team" %in% names(md)) return(NULL)
+    opt <- rv[[paste0(lp, "_optimal_lineups")]]
+    if (is.null(opt)) return(NULL)
+    cap_col <- intersect(c("Captain", "MVP"), names(opt))
+    if (!length(cap_col)) return(NULL)
+    teams <- sort(unique(as.character(md$Team[!is.na(md$Team) & nzchar(md$Team)])))
+    if (length(teams) != 2) return(NULL)
+    slot_cols <- grep("^Captain$|^MVP$|^Util|^Player[0-9]", names(opt), value = TRUE)
+    list(teams = teams, cap_col = cap_col[1], slot_cols = slot_cols,
+         p2t = setNames(as.character(md$Team), md$Player),
+         roster = length(slot_cols))
+  }
+
+  # label each lineup with its "CPT <team> · <cptCount>-<otherCount>" split.
+  lineup_split_label <- function(dt, ctx) {
+    if (is.null(dt) || !nrow(dt)) return(character(0))
+    cap_tm <- ctx$p2t[as.character(dt[[ctx$cap_col]])]
+    tmat   <- matrix(ctx$p2t[as.character(unlist(dt[, ctx$slot_cols, with = FALSE]))],
+                     nrow = nrow(dt))
+    a <- ctx$teams[1]
+    n_a <- rowSums(tmat == a, na.rm = TRUE)
+    n_b <- ctx$roster - n_a
+    cpt_cnt <- ifelse(cap_tm == a, n_a, n_b)
+    oth_cnt <- ctx$roster - cpt_cnt
+    sprintf("CPT %s · %d-%d", cap_tm, cpt_cnt, oth_cnt)
+  }
+
+  teamsplit_table <- function(dt, ctx) {
+    labs <- lineup_split_label(dt, ctx)
+    if (!length(labs)) return(NULL)
+    tb <- as.data.table(table(Split = labs))[order(-N)]
+    tb[, `%` := round(N / sum(N) * 100, 1)]
+    tags$table(class = "table table-condensed", style = "width:auto;font-size:11px;margin:0;",
+      tags$thead(tags$tr(tags$th("Split"), tags$th("N"), tags$th("%"))),
+      tags$tbody(lapply(seq_len(nrow(tb)), function(i)
+        tags$tr(tags$td(tb$Split[i]),
+                tags$td(format(tb$N[i], big.mark = ",")),
+                tags$td(sprintf("%.1f%%", tb$`%`[i]))))))
+  }
+
+  make_teamsplit_ui <- function(lp, filtered_reactive) {
+    output[[paste0(lp, "_teamsplit_tbl")]] <- renderUI({
+      ctx <- teamsplit_ctx(lp); if (is.null(ctx)) return(NULL)
+      teamsplit_table(filtered_reactive(), ctx)
+    })
+    renderUI({
+      ctx <- teamsplit_ctx(lp); if (is.null(ctx)) return(NULL)
+      # 6 roster spots across 2 teams; the captain's team can hold anywhere from
+      # 1 (just the captain) to 5 -- a 6-0 is invalid and never in the pool.
+      splits <- c("(any)", unlist(lapply(c(ctx$teams[1], ctx$teams[2]), function(tm)
+        sprintf("CPT %s · %d-%d", tm, 5:1, 1:5))))
+      keep_sel <- function(id, choices) {
+        cur <- isolate(input[[paste0(lp, id)]])
+        if (!is.null(cur) && cur %in% choices) cur else choices[1]
+      }
+      fluidRow(box(title = "Team Split", status = "warning", solidHeader = TRUE,
+                   width = 12, collapsible = TRUE,
+        fluidRow(
+          column(3, selectInput(paste0(lp, "_ts_split"), "Split",
+                                choices = splits, selected = keep_sel("_ts_split", splits))),
+          column(3, selectInput(paste0(lp, "_ts_cptteam"), "CPT team",
+                                choices = c("(any)", ctx$teams),
+                                selected = keep_sel("_ts_cptteam", c("(any)", ctx$teams)))),
+          column(3, numericInput(paste0(lp, "_ts_minn"), "Min from team", value = 0, min = 0,
+                                 max = ctx$roster, step = 1)),
+          column(3, selectInput(paste0(lp, "_ts_minteam"), " ",
+                                choices = c("(any)", ctx$teams),
+                                selected = keep_sel("_ts_minteam", c("(any)", ctx$teams))))
+        ),
+        uiOutput(paste0(lp, "_teamsplit_tbl"))))
+    })
+  }
+  output$dk_teamsplit_ui <- make_teamsplit_ui("dk", dk_filtered_lineups)
+  output$fd_teamsplit_ui <- make_teamsplit_ui("fd", fd_filtered_lineups)
+  output$sd_teamsplit_ui <- make_teamsplit_ui("sd", sd_filtered_lineups)
+
+  make_teamsplit_port_ui <- function(lp) {
+    renderUI({
+      ctx <- teamsplit_ctx(lp); if (is.null(ctx)) return(NULL)
+      port <- rv[[paste0(lp, "_portfolio")]]
+      if (is.null(port) || !nrow(port)) return(NULL)
+      fluidRow(box(title = "Portfolio Team Split", status = "info", solidHeader = TRUE,
+                   width = 12, collapsible = TRUE,
+                   teamsplit_table(port, ctx)))
+    })
+  }
+  output$dk_teamsplit_port_ui <- make_teamsplit_port_ui("dk")
+  output$fd_teamsplit_port_ui <- make_teamsplit_port_ui("fd")
+  output$sd_teamsplit_port_ui <- make_teamsplit_port_ui("sd")
+
+
   # ==========================================================================
   # ADD BUILD
   # ==========================================================================
@@ -3147,11 +3348,21 @@ server <- function(input, output, session) {
       is_sd  <- platform == "SD"
       # CFB runs captain mode on the DK platform, so is_sd is never TRUE for it.
       is_cfb <- isTRUE(rv$sport == "CFB")
-      split_own <- (is_nba && is_sd) || is_cfb
+      # NFL showdown: captain (DK) / MVP (FD) mode on the DK/FD platform. Split
+      # ownership when the sheet carries cptown / mvpown -- see make_filtered_exposure.
+      is_nfl_sd  <- isTRUE(rv$sport == "NFL") &&
+                    length(grep("^Captain$|^MVP$", names(port), value = TRUE)) > 0
+      cptown_col  <- if (platform == "FD") "MVPOwn" else "CPTOwn"
+      flexown_col <- if (platform == "FD") "FDOwn"  else "DKOwn"
+      has_nfl_cptown <- is_nfl_sd && cptown_col %in% names(rv$sim_metadata) &&
+                        any(rv$sim_metadata[[cptown_col]] > 0, na.rm = TRUE)
+      split_own <- (is_nba && is_sd) || is_cfb || has_nfl_cptown
       salary_col <- if (is_sd) "DKSalary" else paste0(platform, "Salary")
       own_col    <- if (is_sd) NULL        else paste0(platform, "Own")
       cpt_cols  <- grep("^Captain", names(port), value=TRUE)
       util_cols <- grep("^Util",    names(port), value=TRUE)
+      if (is_nfl_sd && !length(cpt_cols))  cpt_cols  <- grep("^MVP$",      names(port), value=TRUE)
+      if (is_nfl_sd && !length(util_cols)) util_cols <- grep("^Player[0-9]", names(port), value=TRUE)
       all_pc    <- grep("^Player|^Captain|^MVP|^Util|^G[1-4]$|^F[1-3]$|^C1$", names(port), value=TRUE)
       has_captain <- length(cpt_cols) > 0
       meta_players <- if (is_sd) {
@@ -3186,6 +3397,9 @@ server <- function(input, output, session) {
       } else if (is_nba) {
         pos_col_nba <- if (platform == "FD") "FDPos" else "DKPos"
         mc <- intersect(c("Player", pos_col_nba, salary_col, own_col, "Team"),
+                        names(rv$sim_metadata))
+      } else if (has_nfl_cptown) {
+        mc <- intersect(c("Player","Team","Pos", salary_col, cptown_col, flexown_col),
                         names(rv$sim_metadata))
       } else {
         mc <- intersect(c("Player","PlayerType",salary_col,own_col,
@@ -3234,20 +3448,24 @@ server <- function(input, output, session) {
         
         if (split_own) {
           if ("SDSalary" %in% names(exp_tbl)) setnames(exp_tbl, "SDSalary", "Salary")
-          else if ("DKSalary" %in% names(exp_tbl) && !"Salary" %in% names(exp_tbl))
-            setnames(exp_tbl, "DKSalary", "Salary")
-          # A slate can arrive with no ownership file. Guard the max() so an
-          # all-NA column does not throw before the view renders.
-          own_max <- function(v) { v <- v[is.finite(v)]; if (!length(v)) NA_real_ else max(v) }
-          if ("CPTOwn" %in% names(exp_tbl)) {
-            m <- own_max(exp_tbl$CPTOwn)
-            if (!is.na(m) && m <= 1) exp_tbl[, CPTOwn := CPTOwn * 100]
-            setnames(exp_tbl, "CPTOwn", "CptOwn")
+          else if (!"Salary" %in% names(exp_tbl)) {
+            sc <- intersect(c("DKSalary","FDSalary"), names(exp_tbl))
+            if (length(sc)) setnames(exp_tbl, sc[1], "Salary")
           }
-          if ("DKOwn" %in% names(exp_tbl)) {
-            m <- own_max(exp_tbl$DKOwn)
-            if (!is.na(m) && m <= 1) exp_tbl[, DKOwn := DKOwn * 100]
-            setnames(exp_tbl, "DKOwn", "UtlOwn")
+          # A slate can arrive with no ownership file. Guard the max() so an
+          # all-NA column does not throw before the view renders. cptown_col /
+          # flexown_col: CPTOwn / DKOwn on a DK captain slate, MVPOwn / FDOwn on
+          # an NFL FanDuel single-game slate.
+          own_max <- function(v) { v <- v[is.finite(v)]; if (!length(v)) NA_real_ else max(v) }
+          if (cptown_col %in% names(exp_tbl)) {
+            m <- own_max(exp_tbl[[cptown_col]])
+            if (!is.na(m) && m <= 1) exp_tbl[, (cptown_col) := get(cptown_col) * 100]
+            setnames(exp_tbl, cptown_col, "CptOwn")
+          }
+          if (flexown_col %in% names(exp_tbl)) {
+            m <- own_max(exp_tbl[[flexown_col]])
+            if (!is.na(m) && m <= 1) exp_tbl[, (flexown_col) := get(flexown_col) * 100]
+            setnames(exp_tbl, flexown_col, "UtlOwn")
           }
           if ("UtilExp" %in% names(exp_tbl)) setnames(exp_tbl, "UtilExp", "UtlExp")
           if (all(c("CptExp","CptOwn") %in% names(exp_tbl)))
@@ -3340,6 +3558,10 @@ server <- function(input, output, session) {
         
         for (fc in intersect(c("Pos","Position","PosGroup","Team"), names(exp_tbl)))
           if (!is.factor(exp_tbl[[fc]])) set(exp_tbl, j = fc, value = factor(exp_tbl[[fc]]))
+        cap <- rv$config$salary_caps[[platform]] %||% 50000
+        sal_col_disp <- if ("Sal" %in% names(exp_tbl)) "Sal" else if ("Salary" %in% names(exp_tbl)) "Salary" else NULL
+        show_sal_k <- !is.null(sal_col_disp) && cap >= 1000
+        if (show_sal_k) salary_to_k(exp_tbl, sal_col_disp)
         fcfg <- exposure_filter_cfg(exp_tbl)
         dt <- datatable(exp_tbl, filter = fcfg$filter,
                         options=list(pageLength=50,scrollX=TRUE,searching=TRUE,lengthChange=FALSE,dom='tp',
@@ -3352,9 +3574,7 @@ server <- function(input, output, session) {
                           in_lab, out_lab, tot_lab, "IN-OUT",
                           cpt_in_lab, cpt_out_lab, utl_in_lab, utl_out_lab), names(exp_tbl))
         if (length(rc) > 0) dt <- dt %>% formatRound(rc, 1)
-        cap <- rv$config$salary_caps[[platform]] %||% 50000
-        sal_col_disp <- if ("Sal" %in% names(exp_tbl)) "Sal" else if ("Salary" %in% names(exp_tbl)) "Salary" else NULL
-        if (!is.null(sal_col_disp) && cap >= 1000) dt <- dt %>% formatCurrency(sal_col_disp,"$",digits=0)
+        if (show_sal_k) dt <- fmt_k(dt, sal_col_disp)
         dt
       } else {
         # ── Normal mode: single exposure column across full portfolio ─────────
@@ -3381,20 +3601,24 @@ server <- function(input, output, session) {
         
         if (split_own) {
           if ("SDSalary" %in% names(exp_tbl)) setnames(exp_tbl, "SDSalary", "Salary")
-          else if ("DKSalary" %in% names(exp_tbl) && !"Salary" %in% names(exp_tbl))
-            setnames(exp_tbl, "DKSalary", "Salary")
-          # A slate can arrive with no ownership file. Guard the max() so an
-          # all-NA column does not throw before the view renders.
-          own_max <- function(v) { v <- v[is.finite(v)]; if (!length(v)) NA_real_ else max(v) }
-          if ("CPTOwn" %in% names(exp_tbl)) {
-            m <- own_max(exp_tbl$CPTOwn)
-            if (!is.na(m) && m <= 1) exp_tbl[, CPTOwn := CPTOwn * 100]
-            setnames(exp_tbl, "CPTOwn", "CptOwn")
+          else if (!"Salary" %in% names(exp_tbl)) {
+            sc <- intersect(c("DKSalary","FDSalary"), names(exp_tbl))
+            if (length(sc)) setnames(exp_tbl, sc[1], "Salary")
           }
-          if ("DKOwn" %in% names(exp_tbl)) {
-            m <- own_max(exp_tbl$DKOwn)
-            if (!is.na(m) && m <= 1) exp_tbl[, DKOwn := DKOwn * 100]
-            setnames(exp_tbl, "DKOwn", "UtlOwn")
+          # A slate can arrive with no ownership file. Guard the max() so an
+          # all-NA column does not throw before the view renders. cptown_col /
+          # flexown_col: CPTOwn / DKOwn on a DK captain slate, MVPOwn / FDOwn on
+          # an NFL FanDuel single-game slate.
+          own_max <- function(v) { v <- v[is.finite(v)]; if (!length(v)) NA_real_ else max(v) }
+          if (cptown_col %in% names(exp_tbl)) {
+            m <- own_max(exp_tbl[[cptown_col]])
+            if (!is.na(m) && m <= 1) exp_tbl[, (cptown_col) := get(cptown_col) * 100]
+            setnames(exp_tbl, cptown_col, "CptOwn")
+          }
+          if (flexown_col %in% names(exp_tbl)) {
+            m <- own_max(exp_tbl[[flexown_col]])
+            if (!is.na(m) && m <= 1) exp_tbl[, (flexown_col) := get(flexown_col) * 100]
+            setnames(exp_tbl, flexown_col, "UtlOwn")
           }
           if ("UtilExp" %in% names(exp_tbl)) setnames(exp_tbl, "UtilExp", "UtlExp")
           if (all(c("CptExp","CptOwn") %in% names(exp_tbl)))
@@ -3466,6 +3690,10 @@ server <- function(input, output, session) {
 
         for (fc in intersect(c("Pos","Position","PosGroup","Team"), names(exp_tbl)))
           if (!is.factor(exp_tbl[[fc]])) set(exp_tbl, j = fc, value = factor(exp_tbl[[fc]]))
+        cap <- rv$config$salary_caps[[platform]] %||% 50000
+        sal_col_disp <- if ("Sal" %in% names(exp_tbl)) "Sal" else if ("Salary" %in% names(exp_tbl)) "Salary" else NULL
+        show_sal_k <- !is.null(sal_col_disp) && cap >= 1000
+        if (show_sal_k) salary_to_k(exp_tbl, sal_col_disp)
         fcfg <- exposure_filter_cfg(exp_tbl)
         dt <- datatable(exp_tbl, filter = fcfg$filter,
                         options=list(pageLength=50,scrollX=TRUE,searching=TRUE,lengthChange=FALSE,dom='tp',
@@ -3476,9 +3704,7 @@ server <- function(input, output, session) {
                           "Exposure","FlexExp","OwnProj","Leverage",
                           "CutProb","RGProj","RGMin","Proj","Sim"), names(exp_tbl))
         if (length(rc) > 0) dt <- dt %>% formatRound(rc, 1)
-        cap <- rv$config$salary_caps[[platform]] %||% 50000
-        sal_col_disp <- if ("Sal" %in% names(exp_tbl)) "Sal" else if ("Salary" %in% names(exp_tbl)) "Salary" else NULL
-        if (!is.null(sal_col_disp) && cap >= 1000) dt <- dt %>% formatCurrency(sal_col_disp,"$",digits=0)
+        if (show_sal_k) dt <- fmt_k(dt, sal_col_disp)
         dt
       }
     })
@@ -3532,12 +3758,15 @@ server <- function(input, output, session) {
 
       display_table <- create_portfolio_display_table(port, rv$config, lp)
       format_cols   <- tryCatch(get_format_columns(display_table, rv$config), error=function(e) character(0))
+      cap_pl     <- rv$config$salary_caps[[toupper(lp)]] %||% 50000
+      show_sal_k <- "Salary" %in% names(display_table) && cap_pl >= 1000
+      if (show_sal_k) salary_to_k(display_table, "Salary")
       dt <- datatable(display_table[,-"RowID"],
                       options=list(pageLength=50,scrollX=TRUE,searching=FALSE,lengthChange=FALSE,dom='tp'),
                       selection=list(mode='multiple', target='row'),
                       escape=FALSE, rownames=FALSE)
       if(length(format_cols)>0) dt <- dt %>% formatRound(format_cols,1)
-      if("Salary" %in% names(display_table)) dt <- dt %>% formatCurrency("Salary","$",digits=0)
+      if (show_sal_k) dt <- fmt_k(dt, "Salary")
       dt
     })
   }

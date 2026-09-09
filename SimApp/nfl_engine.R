@@ -828,7 +828,8 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
   meta[, `:=`(DKID = NA_integer_, DKCID = NA_integer_,
               DKSalary = NA_integer_, DKCSalary = NA_integer_,
               FDID = NA_integer_, FDSalary = NA_integer_,
-              DKProj = NA_real_, DKOwn = 0, CPTOwn = 0, FDProj = NA_real_, FDOwn = 0)]
+              DKProj = NA_real_, DKOwn = 0, CPTOwn = 0,
+              FDProj = NA_real_, FDOwn = 0, MVPOwn = 0)]
   prj <- input_data$projections
   if (!is.null(prj) && nrow(as.data.table(prj))) {
     prj <- as.data.table(prj)
@@ -836,6 +837,12 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
     if ("dkown"  %in% names(prj)) meta[prj, DKOwn  := as.numeric(i.dkown),  on = .(Player = player)]
     if ("fdproj" %in% names(prj)) meta[prj, FDProj := as.numeric(i.fdproj), on = .(Player = player)]
     if ("fdown"  %in% names(prj)) meta[prj, FDOwn  := as.numeric(i.fdown),  on = .(Player = player)]
+    # Showdown captain-slot ownership: `cptown` (DK Captain) / `mvpown` (FD MVP),
+    # read straight off the projections tab like the flat own columns above. The
+    # Portfolio Builder splits ownership/leverage by premium vs flex slot when
+    # these are present (see app.R make_filtered_exposure).
+    if ("cptown" %in% names(prj)) meta[prj, CPTOwn := as.numeric(i.cptown), on = .(Player = player)]
+    if ("mvpown" %in% names(prj)) meta[prj, MVPOwn := as.numeric(i.mvpown), on = .(Player = player)]
     for (idc in intersect(c("dkid", "dk_id"), names(prj)))
       meta[prj, DKID := suppressWarnings(as.integer(get(paste0("i.", idc)))), on = .(Player = player)]
     for (sc in intersect(c("salary", "dksalary", "dk_salary"), names(prj)))
@@ -846,7 +853,8 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
     for (sc in intersect(c("fdsalary", "fd_salary"), names(prj)))
       meta[prj, FDSalary := suppressWarnings(as.integer(get(paste0("i.", sc)))), on = .(Player = player)]
   }
-  meta[is.na(DKOwn), DKOwn := 0][is.na(CPTOwn), CPTOwn := 0][is.na(FDOwn), FDOwn := 0]
+  meta[is.na(DKOwn), DKOwn := 0][is.na(CPTOwn), CPTOwn := 0]
+  meta[is.na(FDOwn), FDOwn := 0][is.na(MVPOwn), MVPOwn := 0]
 
   sim_results <- A[, .(SimID, Player = player, Team = team,
                        DKScore, FDScore)]

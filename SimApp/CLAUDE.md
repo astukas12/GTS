@@ -65,6 +65,26 @@ single documented interface yet.
 Note `nfl_preseason_engine.R` here duplicates `nfl_engine.R` in the Preseason
 fork under `Documents\GTS\NFL\Preseason\`. Fixes to one do not reach the other.
 
+## Showdown captain/MVP ownership (`nfl_engine.R` + Portfolio Builder)
+
+The `projections` tab may carry `cptown` (DK Captain-slot ownership) and
+`mvpown` (FD MVP-slot ownership) alongside `dkown` / `fdown`. `nfl_engine.R`
+reads them into `meta$CPTOwn` / `meta$MVPOwn` (both default 0). When present and
+non-zero, the Portfolio Builder splits the exposure tables into
+`CptOwn/CptLev · UtlOwn/UtlLev · TotOwn/TotLev` (the same view CFB and NBA
+showdown use); absent, it keeps the flat `OwnProj`/`Leverage` view. On the FD
+tab the "Cpt*" columns are the MVP slot. Gate in `app.R` is `has_nfl_cptown`
+inside `make_filtered_exposure` / `make_portfolio_exposure`.
+
+## Showdown optimizers guarantee ≥ 2 teams
+
+`find_optimal_lineups_combinatorial_captain` / `_combinatorial_mvp`
+(`OptimalLineups_Core.R`) drop any single-team roster before ranking — a 6-0
+lineup is an invalid DK/FD upload. No-op when the engine emits no `Team` column
+or the slate is one team. The LP modes (`find_optimal_lineups_captain` / `_mvp`,
+used by MMA/NBA/tennis SD) do not yet enforce this; the download-layer
+`drop_single_team_sd` still backs them up.
+
 ## Running it
 
 A working launch config lives at `TheLab/.claude/launch.json` (name: `simapp`)
