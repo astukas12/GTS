@@ -914,88 +914,138 @@ find_optimal_lineups_combinatorial_captain <- function(sim_results, config, verb
 }
 
 
+# =============================================================================
+# MODE 7: COMBINATORIAL MVP (FanDuel single-game / MVP format)
+# The MVP earns mvp_multiplier x score and costs mvp_salary_multiplier x salary;
+# the other (roster_size - 1) AnyFLEX slots are 1x / 1x.
+#
+#   * FD MMA sets mvp_salary_multiplier = 1.0 -- the top scorer is then always
+#     the optimal MVP, since making him MVP costs nothing extra.
+#   * FD NFL 6-man single game sets it to 1.5 -- MVPing an expensive top scorer
+#     can then bust the cap where MVPing the 2nd-best scorer would fit, so every
+#     player has to be tried as MVP. Same vectorised candidate loop as
+#     combinatorial_captain (the two formats are the same algorithm), with
+#     MVP / Player1..N column names.
+# =============================================================================
 find_optimal_lineups_combinatorial_mvp <- function(sim_results, config, verbose = TRUE) {
-  # FD MVP format: highest scorer per sim IS the MVP.
-  # Score is at 1.5x but salary counts at face value — same ID whether MVP or flex.
-  # So the optimal lineup is simply: pick the top scorer as MVP, then greedily
-  # fill 5 flex slots with the next-highest scorers under the remaining salary cap.
-  # No inner loop over candidates needed.
-  
   if (verbose) cat("\nPhase 1: Finding optimal lineup per sim (greedy MVP)...\n")
-  
+
   setDT(sim_results)
   roster_size    <- config$roster_size
   salary_cap     <- config$salary_cap
   mvp_multiplier <- if (!is.null(config$mvp_multiplier)) config$mvp_multiplier else 1.5
+  mvp_sal_mult   <- if (!is.null(config$mvp_salary_multiplier)) config$mvp_salary_multiplier else 1.0
   max_lineups    <- if (!is.null(config$max_lineups)) config$max_lineups else 5000L
   n_flex         <- roster_size - 1L
   start_time     <- Sys.time()
-  
-  players_dt <- unique(sim_results[, .(Player, Salary)])[Salary > 0 & !is.na(Salary)]
-  sim_ids    <- unique(sim_results$SimID)
-  n_sims     <- length(sim_ids)
-  
-  if (verbose) cat(sprintf("  %d players | %s sims | $%s cap | %.1fx MVP score\n",
-                           nrow(players_dt), format(n_sims, big.mark=","),
-                           format(salary_cap, big.mark=","), mvp_multiplier))
-  
-  setkey(sim_results, SimID)
-  prog_freq <- max(1L, n_sims %/% 10L)
-  lineup_list <- vector("list", n_sims)
-  
-  for (i in seq_along(sim_ids)) {
-    sid      <- sim_ids[i]
-    sim_data <- sim_results[.(sid)][Salary > 0 & !is.na(Salary) & !is.na(FantasyPoints)]
-    if (nrow(sim_data) < roster_size) next
-    
-    # Sort by score descending — highest scorer is always the MVP
-    setorder(sim_data, -FantasyPoints)
-    scores  <- sim_data$FantasyPoints
-    sals    <- sim_data$Salary
-    players <- sim_data$Player
-    n_p     <- nrow(sim_data)
-    
-    # Row 1 (highest scorer) is MVP; salary at face value toward cap
-    mvp_sal <- sals[1]
+
+  players_dt  <- unique(sim_results[Salary > 0 & !is.na(Salary), .(Player, Salary)])
+  all_players <- players_dt$Player
+  salaries    <- players_dt$Salary
+  n_players   <- nrow(players_dt)
+
+  sim_ids <- unique(sim_results$SimID)
+  n_sims  <- length(sim_ids)
+
+  if (verbose) cat(sprintf("  %d players | %s sims | $%s cap | %.1fx MVP score, %.2fx MVP salary\n",
+                           n_players, format(n_sims, big.mark=","),
+                           format(salary_cap, big.mark=","), mvp_multiplier, mvp_sal_mult))
+
+  # Score matrix: n_players x n_sims (collapse any duplicate player-sim rows first)
+  sim_results_clean <- sim_results[Salary > 0 & !is.na(Salary) & !is.na(FantasyPoints),
+                                   .(FantasyPoints = mean(FantasyPoints, na.rm = TRUE)),
+                                   by = .(Player, SimID)]
+  score_wide <- dcast(sim_results_clean, Player ~ SimID,
+                      value.var = "FantasyPoints", fun.aggregate = mean, fill = 0)
+  score_wide <- score_wide[match(all_players, Player)]
+  score_mat  <- as.matrix(score_wide[, -1L, with = FALSE])  # n_players x n_sims
+
+  best_score <- rep(-Inf, n_sims)
+  best_mvp   <- character(n_sims)
+  best_flex  <- matrix(NA_character_, nrow = n_flex, ncol = n_sims)
+  best_sal   <- numeric(n_sims)
+
+  # Outer loop: every player as MVP candidate. Inner work vectorised over sims.
+  for (ci in seq_len(n_players)) {
+    mvp_sal <- salaries[ci] * mvp_sal_mult
     if (mvp_sal > salary_cap) next
-    rem_cap <- salary_cap - mvp_sal
-    
-    # Greedy fill 5 flex from remaining players under remaining cap
-    picked_f   <- character(n_flex)
-    n_picked   <- 0L
-    sal_used   <- 0
-    flex_score <- 0
-    
-    for (j in 2:n_p) {
-      if (n_picked == n_flex) break
-      if (sal_used + sals[j] <= rem_cap) {
-        n_picked           <- n_picked + 1L
-        picked_f[n_picked] <- players[j]
-        sal_used           <- sal_used + sals[j]
-        flex_score         <- flex_score + scores[j]
+
+    rem_cap       <- salary_cap - mvp_sal
+    mvp_score_vec <- score_mat[ci, ] * mvp_multiplier  # n_sims vector
+
+    # FLEX pool = every player except this MVP candidate
+    fi    <- seq_len(n_players)[-ci]
+    f_sal <- salaries[fi]
+    f_mat <- score_mat[fi, , drop = FALSE]   # (n_players-1) x n_sims
+    n_f   <- length(fi)
+
+    # ord_mat[r, s] = index into fi of the r-th best FLEX in sim s
+    ord_mat <- apply(f_mat, 2L, function(x) order(x, decreasing = TRUE))
+
+    n_picked  <- integer(n_sims)
+    sal_used  <- numeric(n_sims)
+    score_acc <- numeric(n_sims)
+    pick_mat  <- matrix(NA_character_, nrow = n_flex, ncol = n_sims)
+
+    for (r in seq_len(n_f)) {
+      done <- (n_picked == n_flex)
+      if (all(done)) break
+      active <- which(!done)
+
+      j_vec <- ord_mat[r, active]          # FLEX index for each active sim
+      add   <- f_sal[j_vec] + sal_used[active] <= rem_cap
+      take  <- active[add]
+      jt    <- j_vec[add]
+
+      if (length(take)) {
+        n_picked[take]  <- n_picked[take] + 1L
+        sal_used[take]  <- sal_used[take] + f_sal[jt]
+        score_acc[take] <- score_acc[take] + f_mat[cbind(jt, take)]
+        for (ii in seq_along(take)) {
+          pick_mat[n_picked[take[ii]], take[ii]] <- all_players[fi[jt[ii]]]
+        }
       }
     }
-    
-    if (n_picked == n_flex) {
-      total_score <- scores[1] * mvp_multiplier + flex_score
-      sig <- paste(c(players[1], sort(picked_f)), collapse = "|")
-      row <- data.table(Lineup = sig, TotalSalary = mvp_sal + sal_used,
-                        TotalScore = total_score)
-      row[, MVP := players[1]]
-      for (k in seq_len(n_flex)) row[[paste0("Player", k)]] <- sort(picked_f)[k]
-      lineup_list[[i]] <- row
-    }
-    
-    if (verbose && i %% prog_freq == 0L) {
-      elapsed <- as.numeric(difftime(Sys.time(), start_time, units="secs"))
-      cat(sprintf("\r  Phase 1: %d%% | %.1fs", round(i/n_sims*100), elapsed))
-      flush.console()
-    }
+
+    complete <- which(n_picked == n_flex)
+    if (!length(complete)) next
+
+    total  <- mvp_score_vec[complete] + score_acc[complete]
+    better <- complete[total > best_score[complete]]
+    if (!length(better)) next
+
+    best_score[better]  <- total[match(better, complete)]
+    best_mvp[better]     <- all_players[ci]
+    best_sal[better]     <- mvp_sal + sal_used[better]
+    best_flex[, better]  <- pick_mat[, better]
   }
-  if (verbose) cat("\n")
-  
-  all_lineups <- rbindlist(lineup_list[!sapply(lineup_list, is.null)])
-  
+
+  has_lineup <- which(!is.na(best_mvp) & best_mvp != "")
+
+  # No feasible lineup in any sim -- almost always a sheet with no FD salaries or
+  # a cap smaller than the cheapest roster. Return an empty but well-formed
+  # result so the caller reports "0 lineups" instead of erroring on `by=Lineup`.
+  if (!length(has_lineup)) {
+    if (verbose) cat("  no feasible lineup (check FD salary data / cap)\n")
+    empty <- data.table(MVP = character(0))
+    for (k in seq_len(n_flex)) empty[[paste0("Player", k)]] <- character(0)
+    empty[, `:=`(TotalSalary = numeric(0), Top1Count = integer(0), AvgScore = numeric(0))]
+    return(list(unique_lineups = empty, n_sims = n_sims, config = config,
+                mode = "combinatorial_mvp"))
+  }
+
+  lineup_list <- lapply(has_lineup, function(s) {
+    flex_s <- sort(na.omit(best_flex[, s]))
+    sig <- paste(c(best_mvp[s], flex_s), collapse = "|")
+    row <- data.table(Lineup = sig, TotalSalary = best_sal[s],
+                      TotalScore = best_score[s])
+    row[, MVP := best_mvp[s]]
+    for (k in seq_len(n_flex)) row[[paste0("Player", k)]] <- flex_s[k]
+    row
+  })
+
+  all_lineups <- rbindlist(lineup_list)
+
   counts <- all_lineups[, .(Top1Count   = .N,
                             TotalSalary = TotalSalary[1],
                             AvgScore    = mean(TotalScore)),

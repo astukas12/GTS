@@ -1918,7 +1918,12 @@ server <- function(input, output, session) {
         opt_data   <- prepare_optimization_data(rv$simulation_results, rv$sim_metadata, "FD")
         opt_config <- list(roster_size=rv$config$roster_sizes$FD, salary_cap=rv$config$salary_caps$FD,
                            percentiles=c(0.01,0.05,0.10,0.20), platform_col="FDScore",
-                           mvp_multiplier=1.5, progress_frequency=500, use_parallel=TRUE, max_lineups=5000)
+                           mvp_multiplier=1.5,
+                           # MVP salary multiplier: 1.5 for FD NFL 6-man single game
+                           # (MVP is priced at 1.5x), 1.0 for FD MMA. combinatorial_mvp
+                           # defaults it to 1.0, so it must be copied in here.
+                           mvp_salary_multiplier=rv$config$platform_columns$FD$mvp_salary_multiplier %||% 1.0,
+                           progress_frequency=500, use_parallel=TRUE, max_lineups=5000)
         progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
         lineup_data <- find_optimal_lineups(opt_data, opt_config, mode=fd_mode, k=1, verbose=TRUE)
         progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
