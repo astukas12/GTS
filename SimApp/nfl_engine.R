@@ -29,7 +29,7 @@
 # Kicker + DST are eligible in showdown on both sites.
 #
 # WHAT THE SHEET SUPPLIES, AND NOTHING ELSE (see GTS/NFL/R/slate_sheet.R):
-#   pass_share    who throws, and therefore who is debited the sacks
+#   pass_share    who throws (and takes the drawn game's interceptions)
 #   0-2 / 3-7 / 8-15 / 16-30 / 31+
 #                 P(he caught it | the catch went that far). One column per
 #                 completion-yardage band, each summing to 1 down the team.
@@ -44,11 +44,14 @@
 #   pys_target    the pass-yard share of scrimmage to ASK THE POOL for
 #
 # WHAT COMES FROM THE DRAWN GAME AND TAKES NO INPUT: passing yards, attempts,
-# interceptions (read off the opponent's drawn defensive box), sack yardage,
-# field goal distances and results, every DST counting stat, points allowed,
-# team fumbles lost. Each was tested for player signal and found to have little
-# or none (QB INT split-half 0.125, kicker FG% -0.04, README "Turnovers and
-# kicking").
+# interceptions (read off the opponent's drawn defensive box), field goal
+# distances and results, every DST counting stat, points allowed, team fumbles
+# lost. Each was tested for player signal and found to have little or none
+# (QB INT split-half 0.125, kicker FG% -0.04, README "Turnovers and kicking").
+#
+# SACKS have no offensive-side effect: a sacked QB loses nothing here (rushing
+# and passing lines are untouched), and the only sack scoring is +1 per sack to
+# the opponent DST, credited from that team's drawn defensive box.
 #
 # TOUCHDOWNS ARE NEVER ALLOCATED. A TD is a property of the catch or the carry
 # that gets dealt. Whoever receives the end-zone event scores. Return TDs come
@@ -460,20 +463,6 @@ nfl_deal_rushing <- function(events, shares, players, a0 = NFL_CARRY_A0, n_sims)
   out[, player := players[w]][, w := NULL][]
 }
 
-# debit the drawn game's sack yardage to the passer(s), whole, by pass_share.
-nfl_deal_sacks <- function(events, pass_share, qbs) {
-  nQ <- length(qbs)
-  E <- data.table::as.data.table(events)
-  if (!nrow(E) || !nQ)
-    return(data.table(sim = integer(0), player = character(0), sack_yds = numeric(0)))
-  E <- data.table::copy(E[is.finite(sim)])
-  ps <- as.numeric(pass_share); ps[!is.finite(ps) | ps < 0] <- 0
-  ps <- if (sum(ps) <= 0) rep(1 / nQ, nQ) else ps / sum(ps)
-  E[, w := if (nQ == 1L) 1L else sample.int(nQ, .N, replace = TRUE, prob = ps)]
-  out <- E[, .(sack_yds = sum(yds)), by = .(sim, w)]
-  out[, player := qbs[w]][, w := NULL][]
-}
-
 # =============================================================================
 # READING THE SHEET  -- one tab per team + a `game` tab, readxl (SimApp parity).
 # Mirrors GTS/NFL/R/slate_sheet.R::read_slate_sheet in shape: the player table
@@ -736,7 +725,6 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
 
     cmpE  <- E2[kind == NFL_EVT_CMP,  .(sim, yds, td, rz)]
     runE  <- E2[kind == NFL_EVT_RUN,  .(sim, yds, td, gl, sy)]
-    sackE <- E2[kind == NFL_EVT_SACK, .(sim, yds)]
     fgv   <- rep(0, n_sims)
     fgg   <- E2[kind == NFL_EVT_FG & !is.na(made) & made == 1L,
                 .(fg = sum(nfl_fg_points(ytg))), by = sim]
@@ -744,7 +732,6 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
 
     rec <- if (nR) nfl_deal_receiving(cmpE, cf$pb, cf$pb_rz, R$player, n_sims = n_sims) else NULL
     rsh <- if (nS) nfl_deal_rushing(runE, S[, .(carry_usage, sy_share, gl_share)], S$player, n_sims = n_sims) else NULL
-    sk  <- if (nQ) nfl_deal_sacks(sackE, QB$pass_share, QB$player) else NULL
 
     # ---- assemble the (sim x player) grid --------------------------------
     D <- CJ(sim = seq_len(n_sims), player = cf$who, sorted = FALSE)
@@ -766,7 +753,6 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
       inv <- cf$pint_src$def_int
       D[player == cf$qb, `:=`(pyds = pv[sim], ptd = ptv[sim], pint = inv[sim])]
     }
-    if (!is.null(sk)) D[sk, on = .(sim, player), cyds := cyds + i.sack_yds]
 
     # kicker: FG points as they were kicked + one XP per offensive TD (v1
     # approximation -- slim carries no XP event; missed XP / 2pt not modelled).
