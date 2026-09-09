@@ -41,11 +41,15 @@ load_sport_input <- function(file_path, sport, config, slate = NULL, game = NULL
     NBA  = read_nba_input,
     SOCCER = read_soccer_input,
     CFB  = read_cfb_input,
-    CFB_CLASSIC = read_cfb_input
+    CFB_CLASSIC = read_cfb_input,
+    NFL  = read_nfl_input,
+    NFL_CLASSIC = read_nfl_input
   )
   if (sport %in% names(reader_map)) {
     # slate/game only mean anything to the CFB reader (a multi-slate
-    # workbook); every other reader ignores them.
+    # workbook); every other reader ignores them. NFL v1 has no multi-slate
+    # workbook (nfl_slate_menu is always NULL), so read_nfl_input takes only
+    # the path.
     if (sport %in% c("CFB", "CFB_CLASSIC"))
       return(reader_map[[sport]](file_path, slate = slate, game = game))
     return(reader_map[[sport]](file_path))

@@ -308,103 +308,235 @@ SPORT_CONFIGS <- list(
   
   
   # ==========================================================================
-  # NFL
+  # NFL (showdown -- one game)
+  # --------------------------------------------------------------------------
+  # Rebuilt on the CFB core (BUILD QUEUE part 11b, 8 Sep 2026). The old
+  # InputMaker.R workbook (_Rushing / _Receiving / _Passing / Salaries /
+  # Similar_Games sheets) is retired; the new sheet is GTS/NFL/R/slate_sheet.R
+  # -- one tab per team carrying carry_usage + the five catch-band columns
+  # (0-2 / 3-7 / 8-15 / 16-30 / 31+) plus the NFL-only dials rz_tgt_share /
+  # qb_rush_read / availability, and a `game` tab whose slate_type splits
+  # showdown from classic. Mirrors CFB / CFB_CLASSIC. Engine: nfl_engine.R
+  # (run_nfl_simulation), reader: read_nfl_input (wired in app.R's reader_map).
+  #
+  # NFL_PRESEASON / NFL_PRESEASON_CLASSIC are SEPARATE sports on a different
+  # engine and workbook -- untouched by this entry.
   # ==========================================================================
   NFL = list(
     sport_name         = "NFL",
     sport_display_name = "NFL",
     player_label       = "Player",
     player_label_plural = "Players",
-    
+
     detection = list(
       custom_detect = function(sheets, file_path = NULL) {
-        has_rushing   <- any(grepl("_Rushing$",   sheets))
-        has_receiving <- any(grepl("_Receiving$", sheets))
-        has_passing   <- any(grepl("_Passing$",   sheets))
-        has_salaries  <- "Salaries" %in% sheets
-        has_similar   <- "Similar_Games" %in% sheets
-        has_rushing && has_receiving && has_passing && has_salaries && has_similar
+        has_game <- any(tolower(sheets) == "game")
+        if (!has_game || length(sheets) < 3) return(FALSE)
+        gt <- sheets[tolower(sheets) == "game"][1]
+        gh <- tryCatch(readxl::read_excel(file_path, sheet = gt, n_max = 1),
+                       error = function(e) NULL)
+        st <- if (is.null(gh) || !"slate_type" %in% names(gh)) NA_character_
+              else tolower(as.character(gh$slate_type[1]))
+        # Showdown wins the NFL entry; a classic sheet is NFL_CLASSIC below and
+        # this entry bails on it, so order does not matter.
+        if (!is.na(st) && st == "classic") return(FALSE)
+        tm <- setdiff(sheets, c(sheets[tolower(sheets) == "game"],
+                                sheets[tolower(sheets) %in% c("projections", "etr")]))[1]
+        cols <- tryCatch(names(readxl::read_excel(file_path, sheet = tm, n_max = 1)),
+                         error = function(e) character(0))
+        # An NFL team tab carries carry_usage + the five band columns AND at
+        # least one NFL-only dial. CFB's banded team tab has the first two but
+        # none of the third set, so a CFB sheet falls through to the CFB entry.
+        "carry_usage" %in% cols &&
+          all(c("0-2", "3-7", "8-15", "16-30", "31+") %in% cols) &&
+          any(c("rz_tgt_share", "qb_rush_read", "availability") %in% cols)
       },
-      required_sheets   = NULL,
-      required_columns  = NULL,
-      min_sheet_matches = 0,
+      required_sheets    = NULL,
+      required_columns   = NULL,
+      min_sheet_matches  = 0,
       min_column_matches = 0
     ),
-    
+
     platforms    = c("DK", "FD"),
     roster_sizes = list(DK = 6, FD = 6),
     salary_caps  = list(DK = 50000, FD = 60000),
-    
+
+    optimization_modes = list(DK = "combinatorial_captain", FD = "combinatorial_mvp"),
+    max_lineups        = 5000,
+
     showdown_config = list(
-      DK = list(enabled = TRUE,  captain_multiplier = 1.5, captain_salary_multiplier = 1.5, mode = "captain"),
-      FD = list(enabled = TRUE,  mvp_multiplier = 1.5,     mvp_salary_multiplier = 1.5,     mode = "mvp")
+      DK = list(enabled = TRUE, captain_multiplier = 1.5,
+                captain_salary_multiplier = 1.5, mode = "captain"),
+      FD = list(enabled = TRUE, mvp_multiplier = 1.5,
+                mvp_salary_multiplier = 1.5, mode = "mvp")
     ),
-    
-    standard_metrics = c(
-      "WinRate", "Top1Rate", "Top5Rate", "Top10Rate", "Top20Rate",
-      "TotalSalary", "AvgOwn"
-    ),
-    
+
+    standard_metrics = c("WinRate", "Top1Rate", "Top5Rate", "Top10Rate", "Top20Rate"),
+
     custom_metrics = list(
       list(name = "TeamStack", source = "Team", calculation = "team_stack", label = "Team Stack")
     ),
-    
+
     metadata_columns = list(
-      list(name = "Pos",  label = "Position", type = "text", display = TRUE, filter = TRUE),
-      list(name = "Team", label = "Team",     type = "text", display = TRUE, filter = FALSE)
+      list(name = "Pos",    label = "Position", type = "text",    display = TRUE, filter = TRUE),
+      list(name = "Team",   label = "Team",     type = "text",    display = TRUE, filter = TRUE),
+      list(name = "DKProj", label = "ETR",      type = "numeric", display = TRUE, filter = FALSE),
+      list(name = "DKOwn",  label = "Flex Own %", type = "numeric", display = TRUE, filter = FALSE),
+      list(name = "CPTOwn", label = "CPT Own %",  type = "numeric", display = TRUE, filter = FALSE)
     ),
-    
+
     portfolio_filters = list(
       rate_minimums = list(
-        list(name = "Win",   label = "Win",   step = 0.1),
-        list(name = "Top1",  label = "Top 1", step = 0.1),
-        list(name = "Top5",  label = "Top 5", step = 0.1),
+        list(name = "Win",   label = "Win",    step = 0.1),
+        list(name = "Top1",  label = "Top 1",  step = 0.1),
+        list(name = "Top5",  label = "Top 5",  step = 0.1),
         list(name = "Top10", label = "Top 10", step = 0.1),
         list(name = "Top20", label = "Top 20", step = 0.1)
       ),
-      range_filters = list(
-        list(name = "Salary",   label = "Salary (K)", column = "TotalSalary",            step = 0.1, format = "salary_k"),
-        list(name = "AvgOwn",   label = "Avg Own",    column = "AvgOwn",                step = 0.1, format = "decimal")
-      )
+      range_filters = list()
     ),
-    
+
     platform_columns = list(
-      DK = list(salary = "DKSalary", id = "DKID", ownership = "DKOwn", score = "DKScore"),
+      DK = list(salary = "DKSalary", id = "DKID", cpt_id = "DKCID",
+                ownership = "DKOwn", cpt_ownership = "CPTOwn",
+                score = "DKScore", cpt_multiplier = 1.5),
       FD = list(salary = "FDSalary", id = "FDID", ownership = "FDOwn", score = "FDScore",
                 has_mvp = TRUE, mvp_multiplier = 1.5, mvp_salary_multiplier = 1.5)
     ),
-    
-    download_formats = list(DK = "{Name} ({DKID})", FD = "{FDID}:{Name}"),
-    
+
+    download_formats = list(DK = "{Name} ({DKID})", DK_CPT = "{Name} ({DKCID})",
+                            FD = "{FDID}:{Name}"),
+
     input_file = list(
       type            = "excel",
-      load_all_sheets = TRUE,
-      required_sheets = c("Salaries", "Similar_Games"),
-      player_sheet    = "Salaries",
-      required_columns = list(
-        base     = c("Name", "Team"),
-        DK       = c("DKSal", "DKID", "DKFOwn", "Pos"),
-        FD       = c("FDSal", "FDID", "FDFOwn"),
-        metadata = c("Team")
-      )
+      load_all_sheets = FALSE,
+      required_sheets = NULL,
+      player_sheet    = NULL,
+      required_columns = list(base = c("player"))
     ),
-    
+
     simulation = list(
       function_name = "run_nfl_simulation",
       output_format = list(
         sim_results = c("SimID", "Player", "Team", "DKScore", "FDScore"),
-        metadata    = c("Player", "Team", "Pos",
-                        "DKSalary", "DKID", "DKOwn",
-                        "FDSalary", "FDID", "FDOwn")
+        metadata    = c("Player", "Team", "Pos", "DKID", "DKSalary", "FDID", "FDSalary")
       )
+    )
+  )
+
+  ,
+
+  # ==========================================================================
+  # NFL (classic -- full multi-game slate)
+  # --------------------------------------------------------------------------
+  # Same workbook shape as showdown (one tab per team, a `game` tab, an
+  # optional `projections` tab) but the `game` tab has ONE ROW PER GAME and
+  # carries slate_type = "classic" plus start_order (kickoff rank).
+  #
+  # DK classic roster QB / RB / RB / WR / WR / WR / TE / FLEX / DST, $50,000.
+  # FD classic swaps the DST slot for a K, $60,000. FLEX takes RB/WR/TE.
+  #
+  # Detection: a `game` tab whose slate_type is "classic". The showdown NFL
+  # entry above bails on that same string, so order does not matter.
+  #
+  # OPEN (part 12): the lineup optimiser wiring mirrors NFL_PRESEASON_CLASSIC
+  # (preseason_classic mode -- position slots, cap NOT treated as binding). A
+  # real NFL classic slate has a binding cap, so a cap-aware LP and the
+  # DK-DST / FD-K per-platform roster split are part-12 work. The sim + the
+  # projections table (the 11b verification bar) do not touch the optimiser.
+  # ==========================================================================
+  NFL_CLASSIC = list(
+    sport_name          = "NFL_CLASSIC",
+    sport_display_name  = "NFL (Classic)",
+    player_label        = "Player",
+    player_label_plural = "Players",
+
+    detection = list(
+      custom_detect = function(sheets, file_path = NULL) {
+        if (!any(tolower(sheets) == "game")) return(FALSE)
+        gt <- sheets[tolower(sheets) == "game"][1]
+        gh <- tryCatch(readxl::read_excel(file_path, sheet = gt, n_max = 1),
+                       error = function(e) NULL)
+        st <- if (is.null(gh) || !"slate_type" %in% names(gh)) NA_character_
+              else tolower(as.character(gh$slate_type[1]))
+        if (is.na(st) || st != "classic") return(FALSE)
+        tm <- setdiff(sheets, c(sheets[tolower(sheets) == "game"],
+                                sheets[tolower(sheets) %in% c("projections", "etr")]))[1]
+        cols <- tryCatch(names(readxl::read_excel(file_path, sheet = tm, n_max = 1)),
+                         error = function(e) character(0))
+        "carry_usage" %in% cols &&
+          all(c("0-2", "3-7", "8-15", "16-30", "31+") %in% cols) &&
+          any(c("rz_tgt_share", "qb_rush_read", "availability") %in% cols)
+      },
+      required_sheets    = NULL,
+      required_columns   = NULL,
+      min_sheet_matches  = 0,
+      min_column_matches = 0
     ),
-    max_lineups = 5000,
-    
-    # DK bulk upload column headers (in player slot order)
-    # NFL DK: QB + 2RB + 3WR + TE + FLEX + DST
+
+    platforms    = c("DK", "FD"),
+    roster_sizes = list(DK = 9, FD = 9),
+    salary_caps  = list(DK = 50000, FD = 60000),
+
+    optimization_modes = list(DK = "preseason_classic", FD = "preseason_classic"),
+    max_lineups        = 5000,
+
+    # DK classic: QB / RB / RB / WR / WR / WR / TE / FLEX / DST.
+    position_slots = list(QB = 1, RB = 2, WR = 3, TE = 1, FLEX = 1, DST = 1),
+    flex_eligible  = c("RB", "WR", "TE"),
+
+    standard_metrics = c("WinRate", "Top1Rate", "Top5Rate", "Top10Rate", "Top20Rate"),
+
+    custom_metrics = list(
+      list(name = "TeamStack", source = "Team", calculation = "team_stack", label = "Team Stack")
+    ),
+
+    metadata_columns = list(
+      list(name = "Pos",    label = "Position", type = "text",    display = TRUE, filter = TRUE),
+      list(name = "Team",   label = "Team",     type = "text",    display = TRUE, filter = TRUE),
+      list(name = "DKProj", label = "ETR",      type = "numeric", display = TRUE, filter = FALSE),
+      list(name = "DKOwn",  label = "Own %",    type = "numeric", display = TRUE, filter = FALSE)
+    ),
+
+    portfolio_filters = list(
+      rate_minimums = list(
+        list(name = "Win",   label = "Win",    step = 0.1),
+        list(name = "Top1",  label = "Top 1",  step = 0.1),
+        list(name = "Top5",  label = "Top 5",  step = 0.1),
+        list(name = "Top10", label = "Top 10", step = 0.1),
+        list(name = "Top20", label = "Top 20", step = 0.1)
+      ),
+      range_filters = list()
+    ),
+
+    platform_columns = list(
+      DK = list(salary = "DKSalary", id = "DKID", ownership = "DKOwn", score = "DKScore"),
+      FD = list(salary = "FDSalary", id = "FDID", ownership = "FDOwn", score = "FDScore")
+    ),
+
+    download_formats = list(DK = "{Name} ({DKID})", FD = "{FDID}:{Name}"),
+
+    input_file = list(
+      type            = "excel",
+      load_all_sheets = FALSE,
+      required_sheets = NULL,
+      player_sheet    = NULL,
+      required_columns = list(base = c("player"))
+    ),
+
+    # DK bulk upload column headers, in player-slot order. DK classic carries a
+    # DST slot; FD classic swaps it for a K.
     dk_export_slots = list(
       DK = c("QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "DST"),
       FD = c("QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "K")
+    ),
+
+    simulation = list(
+      function_name = "run_nfl_classic_simulation",
+      output_format = list(
+        sim_results = c("SimID", "Player", "Team", "DKScore", "FDScore"),
+        metadata    = c("Player", "Team", "Pos", "DKID", "DKSalary", "FDID", "FDSalary")
+      )
     )
   ),
   

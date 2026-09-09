@@ -1,1420 +1,1076 @@
-# ============================================================================
-# NFL SIMULATION ENGINE - Based on original standalone app
-# ============================================================================
+# =============================================================================
+# nfl_engine.R -- NFL, DraftKings + FanDuel, classic + showdown
+# -----------------------------------------------------------------------------
+# SIMULATE A REAL SUNDAY, THEN DEAL IT OUT. Every simulated game here is an
+# actual historical NFL game -- BOTH TEAMS, as played -- drawn from a
+# 1,359-game pool (2021-2025 REG) matched on both teams' pre-game profiles and
+# calibrated to the market. Its completions, designed runs, sacks and field
+# goals are dealt to this slate's players one event at a time.
+#
+# Because events are DEALT rather than shared out, player totals sum to the team
+# line by construction -- there is no reconciliation step in this file. Blowout
+# substitution needs no model: the sampled game carries its own score, so a
+# flattened backfield arrives already correlated with the margin that caused it.
+#
+# NO ERA LOGIC HERE. The event pool (slim_<year>_era.rds) is already detrended
+# to 2026-equivalent units at build time (GTS/NFL/R/build_templates.R, BUILD
+# QUEUE part 1). The engine reads it raw and carries no era knob. The pool it
+# draws from is correct by construction.
+#
+# PLATFORM-NEUTRAL SIM, SCORING AT THE END. The deal produces raw stat lines
+# (pass / rush / rec yards, TDs, receptions, carries, sack yards, INT, the DST
+# components, kicking). Scoring is a separate layer: nfl_score_lines(A, "DK")
+# is full PPR (1.0 / rec) with the yardage bonuses and a DST slot; "FD" is half
+# PPR (0.5 / rec), no bonuses, a K slot. TD and yardage values are shared.
+#
+# CLASSIC vs SHOWDOWN: the SAME sim. Showdown is one game; classic loops the
+# two-team core over N games in a shared SimID space. The CPT (DK) / MVP (FD)
+# 1.5x multiplier is the optimiser's job -- this engine emits the UTIL score.
+# Kicker + DST are eligible in showdown on both sites.
+#
+# WHAT THE SHEET SUPPLIES, AND NOTHING ELSE (see GTS/NFL/R/slate_sheet.R):
+#   pass_share    who throws, and therefore who is debited the sacks
+#   0-2 / 3-7 / 8-15 / 16-30 / 31+
+#                 P(he caught it | the catch went that far). One column per
+#                 completion-yardage band, each summing to 1 down the team.
+#                 THIS is the deal -- no likelihood, no tilt, no league mix.
+#   rz_tgt_share  P(he is the target | the completion was inside the 20). A
+#                 SECOND player vector, dealt against only for rz events. Blank
+#                 = the positional multiplier (TE 1.25 / RB 1.01 / WR 0.91).
+#   carry_usage   P(handed any given NORMAL designed carry). Sums to 1.
+#   sy_share      P(handed a short-yardage carry: dn>=3 & dist<=2). Blank = carry_usage.
+#   gl_share      P(handed a goal-line carry: ytg<=3). Blank = carry_usage.
+#   qb_rush_read  designed-run archetype scalar (currently a readback only -- QB
+#                 designed runs ride the drawn game; efficiency is the pool's).
+#   kicker / punt_returner / kick_returner / dst   one name / identity each
+#   pys_target    the pass-yard share of scrimmage to ASK THE POOL for
+#
+# WHAT COMES FROM THE DRAWN GAME AND TAKES NO INPUT: passing yards, attempts,
+# interceptions (read off the opponent's drawn defensive box), sack yardage,
+# field goal distances and results, every DST counting stat, points allowed,
+# team fumbles lost. Each was tested for player signal and found to have little
+# or none (QB INT split-half 0.125, kicker FG% -0.04, README "Turnovers and
+# kicking").
+#
+# TOUCHDOWNS ARE NEVER ALLOCATED. A TD is a property of the catch or the carry
+# that gets dealt. Whoever receives the end-zone event scores. Return TDs come
+# from the drawn game's defensive box and credit BOTH the DST row and the
+# designated returner (the same event, two rosters -- never a second draw).
+#
+# DATA: NFL_DATA_DIR / NFL_DB_DIR below. ~1.7MB of rds, built by GTS/NFL/R out
+# of play-by-play that never ships. See nfl_data_dir() for the search order.
+# =============================================================================
 
-library(data.table)
-library(readxl)
-library(dplyr)
+suppressPackageStartupMessages({
+  library(data.table)
+})
 
-# ============================================================================
-# HELPER: DST Detection
-# ============================================================================
-
-has_dst_scoring <- function(similar_games, team_names) {
-  team1_for_cols <- gsub("_", " ", team_names[1])
-  team2_for_cols <- gsub("_", " ", team_names[2])
-  
-  def_cols <- c(
-    paste0(team1_for_cols, "_Def_Sacks"),
-    paste0(team1_for_cols, "_Def_Ints"),
-    paste0(team1_for_cols, "_Def_Fum"),
-    paste0(team1_for_cols, "_Def_Pts_Allow"),
-    paste0(team2_for_cols, "_Def_Sacks"),
-    paste0(team2_for_cols, "_Def_Ints"),
-    paste0(team2_for_cols, "_Def_Fum"),
-    paste0(team2_for_cols, "_Def_Pts_Allow")
-  )
-  
-  all_exist <- all(def_cols %in% names(similar_games))
-  return(all_exist)
+# ---- where the pool lives ---------------------------------------------------
+# Search order, first hit wins:
+#   1. options(nfl.data_dir = ...) / options(nfl.db_dir = ...)   -- the test sets this
+#   2. SimApp/nfl_data/  (relative)                              -- future packaging (part 12)
+#   3. the GTS/NFL working tree                                  -- dev fallback
+nfl_data_dir <- function() {
+  o <- getOption("nfl.data_dir")
+  if (!is.null(o) && dir.exists(o)) return(o)
+  if (dir.exists("nfl_data") && file.exists(file.path("nfl_data", "slim_2025_era.rds")))
+    return("nfl_data")
+  "C:/Users/astuk/OneDrive/Documents/GTS/NFL/data"
+}
+nfl_db_dir <- function() {
+  o <- getOption("nfl.db_dir")
+  if (!is.null(o) && dir.exists(o)) return(o)
+  if (dir.exists("nfl_data") && file.exists(file.path("nfl_data", "nfl_dst_box.rds")))
+    return("nfl_data")
+  "C:/Users/astuk/OneDrive/Documents/GTS/NFL/db"
 }
 
-simulate_team_game <- function(sim_id,
-                               team_name,
-                               team_data,
-                               sampled_game,
-                               dk_salaries,
-                               similar_games,
-                               use_dst = FALSE,
-                               opponent_ints = 0) {
-  # Sheet names have underscores, Similar_Games columns have spaces
-  team_name_for_cols <- gsub("_", " ", team_name)
-  
-  # Extract game stats
-  rush_col <- paste0(team_name_for_cols, "_Rush")
-  pass_col <- paste0(team_name_for_cols, "_Pass")
-  rush_td_col <- paste0(team_name_for_cols, "_Rush_TDs")
-  pass_td_col <- paste0(team_name_for_cols, "_Pass_TDs")
-  fg_col <- paste0(team_name_for_cols, "_FGs")
-  
-  team_rush_yds <- as.numeric(sampled_game[[rush_col]])
-  team_pass_yds <- as.numeric(sampled_game[[pass_col]])
-  team_rush_tds <- as.numeric(sampled_game[[rush_td_col]])
-  team_pass_tds <- as.numeric(sampled_game[[pass_td_col]])
-  team_fgs <- as.numeric(sampled_game[[fg_col]])
-  
-  # Validate and set defaults
-  if (is.na(team_rush_yds) ||
-      length(team_rush_yds) == 0)
-    team_rush_yds <- 0
-  if (is.na(team_pass_yds) ||
-      length(team_pass_yds) == 0)
-    team_pass_yds <- 0
-  if (is.na(team_rush_tds) ||
-      length(team_rush_tds) == 0)
-    team_rush_tds <- 0
-  if (is.na(team_pass_tds) ||
-      length(team_pass_tds) == 0)
-    team_pass_tds <- 0
-  if (is.na(team_fgs) || length(team_fgs) == 0)
-    team_fgs <- 0
-  
-  # Pre-allocate results list
-  all_player_results <- list()
-  result_idx <- 1
-  
-  # Helper function: Calculate compression factor based on team total extremeness
-  # Higher team totals = more compression (narrower individual ranges)
-  calculate_compression <- function(team_total, similar_games_column) {
-    if (length(similar_games_column) == 0 ||
-        is.na(team_total))
-      return(0)
-    
-    # Calculate percentile of this team total
-    team_percentile <- ecdf(similar_games_column)(team_total)
-    
-    # Compression increases as we move away from median (0.50)
-    # Distance from median: 0 (at median) to 0.5 (at extremes)
-    distance_from_median <- abs(team_percentile - 0.50)
-    
-    # Convert to compression: 0 at median, up to 0.85 at extremes
-    # This means at 99th percentile, we compress range by 85%
-    compression <- distance_from_median * 1.7  # 0.5 * 1.7 = 0.85 max
-    compression <- min(compression, 0.85)  # Cap at 85%
-    
-    return(compression)
-  }
-  
-  # Helper function: sample from percentiles with optional compression
-  # compression = 0 means full range, compression = 0.85 means very narrow range around median
-  sample_from_percentiles <- function(floor,
-                                      p25,
-                                      p50,
-                                      p75,
-                                      ceiling,
-                                      compression = 0) {
-    percentile <- runif(1, 0, 1)
-    
-    # Apply compression by squeezing percentile toward 0.50 (median)
-    if (compression > 0) {
-      # Compress the percentile range toward median
-      compressed_percentile <- 0.50 + (percentile - 0.50) * (1 - compression)
-      percentile <- compressed_percentile
-    }
-    
-    if (percentile <= 0.05) {
-      return(0)  # Below floor = injury/benched
-    } else if (percentile <= 0.25) {
-      return(floor + (p25 - floor) * (percentile - 0.05) / 0.20)
-    } else if (percentile <= 0.50) {
-      return(p25 + (p50 - p25) * (percentile - 0.25) / 0.25)
-    } else if (percentile <= 0.75) {
-      return(p50 + (p75 - p50) * (percentile - 0.50) / 0.25)
-    } else if (percentile <= 0.95) {
-      return(p75 + (ceiling - p75) * (percentile - 0.75) / 0.20)
-    } else {
-      return(ceiling)  # Hard ceiling at P95
-    }
-  }
-  
-  # CALCULATE COMPRESSION FACTORS based on team total extremeness
-  rush_compression <- calculate_compression(team_rush_yds, similar_games[[rush_col]])
-  pass_compression <- calculate_compression(team_pass_yds, similar_games[[pass_col]])
-  
-  # RUSHING
-  rushing_data <- team_data$rushing
-  n_rushers <- nrow(rushing_data)
-  
-  if (n_rushers > 0) {
-    # Smart allocation with cumulative adjustment
-    rush_yds_allocation <- numeric(n_rushers)
-    remaining_share <- 1.0
-    allocated_share <- 0.0
-    
-    for (i in 1:n_rushers) {
-      floor_pct <- rushing_data$Floor[i]
-      p25_pct <- rushing_data$Pct_P25[i]
-      p50_pct <- rushing_data$Pct_P50[i]
-      p75_pct <- rushing_data$Pct_P75[i]
-      ceiling_pct <- rushing_data$Ceiling[i]
-      
-      # Handle NAs
-      if (is.na(floor_pct))
-        floor_pct <- 0
-      if (is.na(p25_pct))
-        p25_pct <- floor_pct
-      if (is.na(p50_pct))
-        p50_pct <- p25_pct
-      if (is.na(p75_pct))
-        p75_pct <- p50_pct
-      if (is.na(ceiling_pct))
-        ceiling_pct <- p75_pct
-      
-      # SMART STOP: If we've allocated 98%+ and this player has Floor=0, skip
-      if (allocated_share > 0.98 && floor_pct == 0) {
-        rush_yds_allocation[i] <- 0
-        next
-      }
-      
-      # Sample player share WITH COMPRESSION
-      player_share <- sample_from_percentiles(floor_pct,
-                                              p25_pct,
-                                              p50_pct,
-                                              p75_pct,
-                                              ceiling_pct,
-                                              rush_compression)
-      
-      # CUMULATIVE ADJUSTMENT
-      if (i > 1 && remaining_share < 1.0) {
-        # Only count remaining players who are expected to play (P50 > 1%)
-        remaining_players_expected <- rushing_data$Pct_P50[(i):n_rushers]
-        remaining_players_expected[is.na(remaining_players_expected)] <- 0
-        remaining_players_expected <- remaining_players_expected[remaining_players_expected > 0.01]
-        
-        expected_remaining <- sum(remaining_players_expected, na.rm = TRUE)
-        
-        if (expected_remaining > 0) {
-          adjustment_factor <- remaining_share / expected_remaining
-          adjustment_factor <- max(0.5, min(2.0, adjustment_factor))
-          player_share <- player_share * adjustment_factor
-        }
-      }
-      
-      # Ensure player doesn't exceed remaining share
-      player_share <- min(player_share, remaining_share)
-      player_share <- max(0, player_share)
-      
-      # SMART ROUNDING: If remaining < 5%, give it all to this player or none
-      if (remaining_share < 0.05) {
-        if (player_share >= remaining_share * 0.5) {
-          player_share <- remaining_share  # Give the scraps
-        } else {
-          player_share <- 0  # Not worth it
-        }
-      }
-      
-      rush_yds_allocation[i] <- round(team_rush_yds * player_share)
-      remaining_share <- remaining_share - player_share
-      allocated_share <- allocated_share + player_share
-      
-      # HARD STOP: If we've allocated everything, done
-      if (remaining_share <= 0.01) {
-        # Zero out remaining players
-        if (i < n_rushers) {
-          rush_yds_allocation[(i + 1):n_rushers] <- 0
-        }
-        break
-      }
-    }
-    
-    # IMPROVED SWEEP UP: Distribute remaining yards respecting ceiling constraints
-    if (remaining_share > 0.01) {
-      # Pass 1: Go through players from top, cap at 20% of remaining per player
-      for (i in 1:n_rushers) {
-        if (remaining_share <= 0.01)
-          break
-        
-        ceiling_pct <- rushing_data$Ceiling[i]
-        if (is.na(ceiling_pct))
-          ceiling_pct <- rushing_data$Pct_P75[i]
-        if (is.na(ceiling_pct))
-          ceiling_pct <- 1.0
-        
-        current_share <- rush_yds_allocation[i] / team_rush_yds
-        room_to_ceiling <- ceiling_pct - current_share
-        
-        if (room_to_ceiling > 0.01) {
-          additional_share <- min(
-            remaining_share,
-            room_to_ceiling,
-            remaining_share * 0.20  # Cap at 20% per iteration
-          )
-          
-          additional_yards <- round(team_rush_yds * additional_share)
-          rush_yds_allocation[i] <- rush_yds_allocation[i] + additional_yards
-          remaining_share <- remaining_share - additional_share
-        }
-      }
-      
-      # Pass 2: If still remaining, go through again without 20% cap
-      if (remaining_share > 0.01) {
-        for (i in 1:n_rushers) {
-          if (remaining_share <= 0.01)
-            break
-          
-          ceiling_pct <- rushing_data$Ceiling[i]
-          if (is.na(ceiling_pct))
-            ceiling_pct <- 1.0
-          
-          current_share <- rush_yds_allocation[i] / team_rush_yds
-          room_to_ceiling <- ceiling_pct - current_share
-          
-          if (room_to_ceiling > 0.01) {
-            additional_share <- min(remaining_share, room_to_ceiling)
-            additional_yards <- round(team_rush_yds * additional_share)
-            
-            rush_yds_allocation[i] <- rush_yds_allocation[i] + additional_yards
-            remaining_share <- remaining_share - additional_share
-          }
-        }
-      }
-      
-      # Pass 3: Final cleanup - distribute evenly RESPECTING CEILINGS
-      if (remaining_share > 0.01) {
-        final_remaining_yards <- round(team_rush_yds * remaining_share)
-        
-        # Only give to players who still have room to ceiling
-        for (yard in 1:final_remaining_yards) {
-          # Find players with room to ceiling
-          players_with_room <- numeric(0)
-          room_amounts <- numeric(0)
-          
-          for (i in 1:n_rushers) {
-            if (rush_yds_allocation[i] > 0) {
-              # Only active players
-              ceiling_pct <- rushing_data$Ceiling[i]
-              if (is.na(ceiling_pct))
-                ceiling_pct <- 1.0
-              
-              current_share <- rush_yds_allocation[i] / team_rush_yds
-              room <- ceiling_pct - current_share
-              
-              if (room > 0.001) {
-                # Has room
-                players_with_room <- c(players_with_room, i)
-                room_amounts <- c(room_amounts, room)
-              }
-            }
-          }
-          
-          # If no one has room, we're done (better to under-allocate than break ceilings)
-          if (length(players_with_room) == 0)
-            break
-          
-          # Give 1 yard to a random player with room (equal probability)
-          selected <- sample(players_with_room, 1)
-          rush_yds_allocation[selected] <- rush_yds_allocation[selected] + 1
-        }
-      }
-    }
-    
-    # Second pass: Allocate rushing TDs with 70% input rate / 30% production + diminishing returns
-    td_allocation <- rep(0, n_rushers)
-    if (team_rush_tds > 0) {
-      # Historical TD rates (70% weight)
-      td_rates <- as.numeric(rushing_data$TD_Rate)
-      td_rates[is.na(td_rates)] <- 0
-      td_rates[td_rates < 0] <- 0
-      
-      # Production in this sim (30% weight)
-      production_weight <- rush_yds_allocation / max(rush_yds_allocation, 1)
-      
-      # 70/30 split
-      td_probs <- (td_rates * 0.7) + (production_weight * 0.3)
-      
-      # Only players with rush yards are eligible
-      eligible <- which(rush_yds_allocation > 0)
-      
-      if (length(eligible) > 0 && sum(td_probs[eligible]) > 0) {
-        td_probs_eligible <- td_probs[eligible]
-        td_probs_eligible <- td_probs_eligible / sum(td_probs_eligible)
-        
-        # Allocate TDs with diminishing returns
-        for (td in 1:team_rush_tds) {
-          selected_idx <- sample(1:length(eligible), 1, prob = td_probs_eligible)
-          selected <- eligible[selected_idx]
-          
-          td_allocation[selected] <- td_allocation[selected] + 1
-          
-          # AGGRESSIVE diminishing returns: Each TD drastically reduces probability
-          # After 1 TD: 0.3x probability
-          # After 2 TDs: 0.09x probability (basically impossible to get 3rd)
-          reduction_factor <- 0.3^td_allocation[selected]
-          td_probs_eligible[selected_idx] <- td_probs_eligible[selected_idx] * reduction_factor
-          
-          if (sum(td_probs_eligible) > 0) {
-            td_probs_eligible <- td_probs_eligible / sum(td_probs_eligible)
-          } else {
-            td_probs_eligible <- rep(1 / length(eligible), length(eligible))
-          }
-        }
-      }
-    }
-    
-    # CONSTRAINT: Rush TD requires rush yards > 0
-    for (i in 1:n_rushers) {
-      if (td_allocation[i] > 0 && rush_yds_allocation[i] == 0) {
-        rush_yds_allocation[i] <- 1
-      }
-    }
-    
-    # WORKLOAD CONSTRAINT: Track rushing outcomes for receiving cap
-    player_rush_outcome <- list()
-    
-    for (i in 1:n_rushers) {
-      if (rush_yds_allocation[i] > 0) {
-        rush_share <- rush_yds_allocation[i] / max(team_rush_yds, 1)
-        p75 <- rushing_data$Pct_P75[i]
-        
-        # If rushing outcome >= P75, mark as "hot"
-        if (!is.na(p75) && p75 > 0 && rush_share >= p75) {
-          player_rush_outcome[[rushing_data$Player[i]]] <- "hot"
-        }
-      }
-    }
-    
-    # Create player results
-    for (i in 1:n_rushers) {
-      all_player_results[[result_idx]] <- list(
-        SimID = sim_id,
-        Team = team_name,
-        Player = rushing_data$Player[i],
-        PassYds = 0,
-        PassTDs = 0L,
-        INTs = 0L,
-        RushYds = rush_yds_allocation[i],
-        RushTDs = as.integer(td_allocation[i]),
-        Recs = 0L,
-        RecYds = 0,
-        RecTDs = 0L,
-        FGsMade = 0L,
-        FG_Under30 = 0L,
-        FG_30_39 = 0L,
-        FG_40_49 = 0L,
-        FG_50Plus = 0L,
-        XPs = 0L,
-        FumLost = 0L
-      )
-      result_idx <- result_idx + 1
-    }
-  }
-  
-  # RECEIVING
-  receiving_data <- team_data$receiving
-  n_receivers <- nrow(receiving_data)
-  
-  if (n_receivers > 0) {
-    # Get team total receptions from similar game
-    team_recs_col <- paste0(team_name_for_cols, "_Recs")
-    team_total_recs <- as.numeric(sampled_game[[team_recs_col]])
-    if (is.na(team_total_recs) ||
-        length(team_total_recs) == 0)
-      team_total_recs <- 0
-    
-    # First pass: Allocate receiving yards with smart cumulative adjustment
-    rec_yds_allocation <- numeric(n_receivers)
-    ypr_values <- numeric(n_receivers)
-    remaining_share <- 1.0
-    allocated_share <- 0.0
-    
-    for (i in 1:n_receivers) {
-      floor_pct <- receiving_data$Floor[i]
-      p25_pct <- receiving_data$Pct_P25[i]
-      p50_pct <- receiving_data$Pct_P50[i]
-      p75_pct <- receiving_data$Pct_P75[i]
-      ceiling_pct <- receiving_data$Ceiling[i]
-      
-      # Handle NAs
-      if (is.na(floor_pct))
-        floor_pct <- 0
-      if (is.na(p25_pct))
-        p25_pct <- floor_pct
-      if (is.na(p50_pct))
-        p50_pct <- p25_pct
-      if (is.na(p75_pct))
-        p75_pct <- p50_pct
-      if (is.na(ceiling_pct))
-        ceiling_pct <- p75_pct
-      
-      # WORKLOAD CONSTRAINT: If player had hot rushing game, cap receiving at P50
-      player_name <- receiving_data$Player[i]
-      if (player_name %in% names(player_rush_outcome)) {
-        if (player_rush_outcome[[player_name]] == "hot") {
-          ceiling_pct <- min(ceiling_pct, p50_pct)
-        }
-      }
-      
-      # Sample player share WITH COMPRESSION
-      target_share <- sample_from_percentiles(floor_pct,
-                                              p25_pct,
-                                              p50_pct,
-                                              p75_pct,
-                                              ceiling_pct,
-                                              pass_compression)
-      
-      # CUMULATIVE ADJUSTMENT
-      if (i > 1 && remaining_share < 1.0) {
-        # Only count remaining players who are expected to play (P50 > 1%)
-        remaining_players_expected <- receiving_data$Pct_P50[(i):n_receivers]
-        remaining_players_expected[is.na(remaining_players_expected)] <- 0
-        remaining_players_expected <- remaining_players_expected[remaining_players_expected > 0.01]
-        
-        expected_remaining <- sum(remaining_players_expected, na.rm = TRUE)
-        
-        if (expected_remaining > 0) {
-          adjustment_factor <- remaining_share / expected_remaining
-          adjustment_factor <- max(0.5, min(2.0, adjustment_factor))
-          target_share <- target_share * adjustment_factor
-        }
-      }
-      
-      # Ensure player doesn't exceed remaining share
-      target_share <- min(target_share, remaining_share)
-      target_share <- max(0, target_share)
-      
-      # SMART ROUNDING: If remaining < 5%, give it all or none
-      if (remaining_share < 0.05) {
-        if (target_share >= remaining_share * 0.5) {
-          target_share <- remaining_share
-        } else {
-          target_share <- 0
-        }
-      }
-      
-      rec_yds_allocation[i] <- round(team_pass_yds * target_share)
-      remaining_share <- remaining_share - target_share
-      allocated_share <- allocated_share + target_share
-      
-      ypr <- receiving_data$YPR[i]
-      if (is.na(ypr) || ypr <= 0)
-        ypr <- 10
-      ypr_values[i] <- ypr
-      
-      # HARD STOP: If we've allocated everything, done
-      if (remaining_share <= 0.01) {
-        if (i < n_receivers) {
-          rec_yds_allocation[(i + 1):n_receivers] <- 0
-          ypr_values[(i + 1):n_receivers] <- 10
-        }
-        break
-      }
-    }
-    
-    # IMPROVED SWEEP UP: Distribute remaining yards respecting ceiling constraints
-    if (remaining_share > 0.01) {
-      # Pass 1: Go through players from top, cap at 20% of remaining per player
-      for (i in 1:n_receivers) {
-        if (remaining_share <= 0.01)
-          break
-        
-        ceiling_pct <- receiving_data$Ceiling[i]
-        if (is.na(ceiling_pct))
-          ceiling_pct <- receiving_data$Pct_P75[i]
-        if (is.na(ceiling_pct))
-          ceiling_pct <- 1.0
-        
-        current_share <- rec_yds_allocation[i] / team_pass_yds
-        room_to_ceiling <- ceiling_pct - current_share
-        
-        if (room_to_ceiling > 0.01) {
-          additional_share <- min(
-            remaining_share,
-            room_to_ceiling,
-            remaining_share * 0.20  # Cap at 20% per iteration
-          )
-          
-          additional_yards <- round(team_pass_yds * additional_share)
-          rec_yds_allocation[i] <- rec_yds_allocation[i] + additional_yards
-          remaining_share <- remaining_share - additional_share
-        }
-      }
-      
-      # Pass 2: If still remaining, go through again without 20% cap
-      if (remaining_share > 0.01) {
-        for (i in 1:n_receivers) {
-          if (remaining_share <= 0.01)
-            break
-          
-          ceiling_pct <- receiving_data$Ceiling[i]
-          if (is.na(ceiling_pct))
-            ceiling_pct <- 1.0
-          
-          current_share <- rec_yds_allocation[i] / team_pass_yds
-          room_to_ceiling <- ceiling_pct - current_share
-          
-          if (room_to_ceiling > 0.01) {
-            additional_share <- min(remaining_share, room_to_ceiling)
-            additional_yards <- round(team_pass_yds * additional_share)
-            
-            rec_yds_allocation[i] <- rec_yds_allocation[i] + additional_yards
-            remaining_share <- remaining_share - additional_share
-          }
-        }
-      }
-      
-      # Pass 3: Final cleanup - distribute evenly RESPECTING CEILINGS
-      if (remaining_share > 0.01) {
-        final_remaining_yards <- round(team_pass_yds * remaining_share)
-        
-        # Only give to players who still have room to ceiling
-        for (yard in 1:final_remaining_yards) {
-          # Find players with room to ceiling
-          players_with_room <- numeric(0)
-          room_amounts <- numeric(0)
-          
-          for (i in 1:n_receivers) {
-            if (rec_yds_allocation[i] > 0) {
-              # Only active players
-              ceiling_pct <- receiving_data$Ceiling[i]
-              if (is.na(ceiling_pct))
-                ceiling_pct <- 1.0
-              
-              current_share <- rec_yds_allocation[i] / team_pass_yds
-              room <- ceiling_pct - current_share
-              
-              if (room > 0.001) {
-                # Has room
-                players_with_room <- c(players_with_room, i)
-                room_amounts <- c(room_amounts, room)
-              }
-            }
-          }
-          
-          # If no one has room, we're done (better to under-allocate than break ceilings)
-          if (length(players_with_room) == 0)
-            break
-          
-          # Give 1 yard to a random player with room (equal probability)
-          selected <- sample(players_with_room, 1)
-          rec_yds_allocation[selected] <- rec_yds_allocation[selected] + 1
-        }
-      }
-    }
-    
-    # DYNAMIC YPR ADJUSTMENT: Adjust YPR based on actual yards vs expected
-    # High yardage games likely had explosive plays (higher YPR)
-    adjusted_ypr_values <- ypr_values  # Start with historical
-    
-    for (i in 1:n_receivers) {
-      if (rec_yds_allocation[i] > 0) {
-        # Calculate expected yards for this player based on P50
-        p50_pct <- receiving_data$Pct_P50[i]
-        if (is.na(p50_pct) || p50_pct <= 0)
-          p50_pct <- 0.01
-        
-        expected_yds <- team_pass_yds * p50_pct
-        
-        if (expected_yds > 0) {
-          # Calculate how actual compares to expected
-          yards_ratio <- rec_yds_allocation[i] / expected_yds
-          
-          # If significantly OVER expected (explosive game), increase YPR
-          if (yards_ratio > 1.3) {
-            # Scale factor: the more explosive, the higher YPR
-            # 1.3x expected = 1.09x YPR
-            # 2.0x expected = 1.21x YPR
-            # 3.0x expected = 1.51x YPR
-            ypr_multiplier <- 1 + (yards_ratio - 1) * 0.3
-            
-            # Cap at 2.0x historical YPR
-            ypr_multiplier <- min(ypr_multiplier, 2.0)
-            
-            adjusted_ypr_values[i] <- ypr_values[i] * ypr_multiplier
-            
-          } else if (yards_ratio < 0.7) {
-            # If UNDER expected (possession/short-catch role), decrease YPR slightly
-            # 0.7x expected = 0.97x YPR
-            # 0.5x expected = 0.95x YPR
-            ypr_multiplier <- 0.9 + (yards_ratio * 0.1)
-            ypr_multiplier <- max(ypr_multiplier, 0.7)  # Floor at 70%
-            
-            adjusted_ypr_values[i] <- ypr_values[i] * ypr_multiplier
-          }
-          # If yards_ratio between 0.7-1.3, no adjustment (normal game)
-        }
-      }
-    }
-    
-    # Second pass: Allocate receptions using POISSON DISTRIBUTION
-    # This prevents unrealistic combinations like "4 catches for 1 yard"
-    rec_allocation <- rep(0, n_receivers)
-    
-    if (team_total_recs > 0) {
-      # Step 1: Calculate expected catches for each player based on their yards and historical YPR
-      expected_catches <- numeric(n_receivers)
-      
-      for (i in 1:n_receivers) {
-        if (rec_yds_allocation[i] > 0) {
-          # Expected catches = yards / YPR
-          expected_catches[i] <- rec_yds_allocation[i] / adjusted_ypr_values[i]
-          expected_catches[i] <- max(1, expected_catches[i])  # Min 1 if they have yards
-          
-          # Sample from Poisson distribution for realistic variance
-          simulated_catches <- rpois(1, lambda = expected_catches[i])
-          simulated_catches <- max(1, simulated_catches)  # Ensure at least 1
-          
-          # Cap at reasonable maximum (prevent outliers like 50 catches)
-          max_realistic <- ceiling(expected_catches[i] * 1.5)
-          rec_allocation[i] <- min(simulated_catches, max_realistic)
-        }
-      }
-      
-      # Step 2: Scale to match team total receptions
-      actual_total <- sum(rec_allocation)
-      
-      # If we're over team total, remove catches intelligently
-      while (sum(rec_allocation) > team_total_recs) {
-        # Find player who can best afford to lose a catch
-        # (high catch count, maintains reasonable YPR after reduction)
-        cushion <- numeric(n_receivers)
-        for (i in 1:n_receivers) {
-          if (rec_allocation[i] > 1 && rec_yds_allocation[i] > 0) {
-            # How far above minimum can we go?
-            new_ypr_if_reduced <- rec_yds_allocation[i] / (rec_allocation[i] - 1)
-            # Prefer reducing from players with low YPR impact
-            cushion[i] <- rec_allocation[i] - 1
-          } else {
-            cushion[i] <- -999  # Don't reduce below 1
-          }
-        }
-        
-        if (max(cushion) <= 0)
-          break  # Can't reduce any more
-        
-        reduce_idx <- which.max(cushion)
-        rec_allocation[reduce_idx] <- rec_allocation[reduce_idx] - 1
-      }
-      
-      # If we're under team total, add catches intelligently
-      while (sum(rec_allocation) < team_total_recs) {
-        # Find players who could plausibly have more catches
-        room <- numeric(n_receivers)
-        for (i in 1:n_receivers) {
-          if (rec_yds_allocation[i] > 0) {
-            # Max realistic catches = yards / (YPR * 0.7) - generous allowance for short catches
-            max_plausible <- ceiling(rec_yds_allocation[i] / (adjusted_ypr_values[i] * 0.7))
-            room[i] <- max(0, max_plausible - rec_allocation[i])
-          } else {
-            room[i] <- 0  # Don't add to players with 0 yards
-          }
-        }
-        
-        if (sum(room) == 0)
-          break  # No room to add
-        
-        # Add to player weighted by room available
-        add_probs <- room / sum(room)
-        add_idx <- sample(1:n_receivers, 1, prob = add_probs)
-        rec_allocation[add_idx] <- rec_allocation[add_idx] + 1
-      }
-      
-      # Step 3: FINAL VALIDATION - ensure no impossible combinations
-      for (i in 1:n_receivers) {
-        # Yards > 0 ??? catches >= 1
-        if (rec_yds_allocation[i] > 0 && rec_allocation[i] == 0) {
-          rec_allocation[i] <- 1
-        }
-        
-        # Prevent absurd YPR (catches way too high for yards)
-        if (rec_allocation[i] > 0 && rec_yds_allocation[i] > 0) {
-          actual_ypr <- rec_yds_allocation[i] / rec_allocation[i]
-          # If YPR drops below 3.0, that's too many catches for the yards
-          if (actual_ypr < 3.0) {
-            # Reduce catches to maintain at least 3.0 YPR
-            rec_allocation[i] <- max(1, floor(rec_yds_allocation[i] / 3.0))
-          }
-        }
-      }
-    }
-    
-    # Third pass: Allocate receiving TDs with 70% input rate / 30% production + diminishing returns
-    td_allocation <- rep(0, n_receivers)
-    if (team_pass_tds > 0) {
-      # Historical TD rates (70% weight)
-      td_rates <- as.numeric(receiving_data$TD_Rate)
-      td_rates[is.na(td_rates)] <- 0
-      td_rates[td_rates < 0] <- 0
-      
-      # Production in this sim (30% weight)
-      # Combine yards and receptions
-      production_weight <- (rec_yds_allocation / max(rec_yds_allocation, 1)) * 0.5 +
-        (rec_allocation / max(rec_allocation, 1)) * 0.5
-      
-      # 70/30 split
-      td_probs <- (td_rates * 0.7) + (production_weight * 0.3)
-      
-      # Only players who caught passes are eligible
-      eligible <- which(rec_allocation > 0)
-      
-      if (length(eligible) > 0 && sum(td_probs[eligible]) > 0) {
-        td_probs_eligible <- td_probs[eligible]
-        td_probs_eligible <- td_probs_eligible / sum(td_probs_eligible)
-        
-        # Allocate TDs with diminishing returns
-        for (td in 1:team_pass_tds) {
-          selected_idx <- sample(1:length(eligible), 1, prob = td_probs_eligible)
-          selected <- eligible[selected_idx]
-          
-          td_allocation[selected] <- td_allocation[selected] + 1
-          
-          # AGGRESSIVE diminishing returns: Each TD drastically reduces probability
-          # After 1 TD: 0.3x probability
-          # After 2 TDs: 0.09x probability (basically impossible to get 3rd)
-          reduction_factor <- 0.3^td_allocation[selected]
-          td_probs_eligible[selected_idx] <- td_probs_eligible[selected_idx] * reduction_factor
-          
-          if (sum(td_probs_eligible) > 0) {
-            td_probs_eligible <- td_probs_eligible / sum(td_probs_eligible)
-          } else {
-            td_probs_eligible <- rep(1 / length(eligible), length(eligible))
-          }
-        }
-      }
-    }
-    
-    # CONSTRAINT: If player has rec TDs, ensure catches >= TDs
-    for (i in 1:n_receivers) {
-      if (td_allocation[i] > 0 && rec_allocation[i] < td_allocation[i]) {
-        needed_catches <- td_allocation[i] - rec_allocation[i]
-        rec_allocation[i] <- rec_allocation[i] + needed_catches
-        
-        # Take from others proportionally
-        for (take in 1:needed_catches) {
-          eligible_to_reduce <- which(rec_allocation > td_allocation &
-                                        (1:n_receivers) != i)
-          if (length(eligible_to_reduce) > 0) {
-            excess <- rec_allocation[eligible_to_reduce] - td_allocation[eligible_to_reduce]
-            max_idx <- eligible_to_reduce[which.max(excess)]
-            rec_allocation[max_idx] <- rec_allocation[max_idx] - 1
-          } else {
-            break
-          }
-        }
-      }
-    }
-    
-    # FINAL VALIDATION
-    for (i in 1:n_receivers) {
-      # Yards > 0 ??? catches >= 1
-      if (rec_yds_allocation[i] > 0 && rec_allocation[i] == 0) {
-        rec_allocation[i] <- 1
-      }
-      # TDs > 0 ??? catches >= TDs
-      if (td_allocation[i] > 0 &&
-          rec_allocation[i] < td_allocation[i]) {
-        rec_allocation[i] <- td_allocation[i]
-      }
-    }
-    
-    # Now create player results
-    for (i in 1:n_receivers) {
-      player_name <- receiving_data$Player[i]
-      existing_idx <- which(sapply(all_player_results, function(x)
-        x$Player == player_name))
-      
-      if (length(existing_idx) > 0) {
-        all_player_results[[existing_idx[1]]]$Recs <- as.integer(rec_allocation[i])
-        all_player_results[[existing_idx[1]]]$RecYds <- rec_yds_allocation[i]
-        all_player_results[[existing_idx[1]]]$RecTDs <- as.integer(td_allocation[i])
-      } else {
-        all_player_results[[result_idx]] <- list(
-          SimID = sim_id,
-          Team = team_name,
-          Player = player_name,
-          PassYds = 0,
-          PassTDs = 0L,
-          INTs = 0L,
-          RushYds = 0,
-          RushTDs = 0L,
-          Recs = as.integer(rec_allocation[i]),
-          RecYds = rec_yds_allocation[i],
-          RecTDs = as.integer(td_allocation[i]),
-          FGsMade = 0L,
-          FG_Under30 = 0L,
-          FG_30_39 = 0L,
-          FG_40_49 = 0L,
-          FG_50Plus = 0L,
-          XPs = 0L,
-          FumLost = 0L
-        )
-        result_idx <- result_idx + 1
-      }
-    }
-  }
-  
-  # PASSING
-  passing_data <- team_data$passing
-  
-  if (nrow(passing_data) > 0) {
-    for (i in 1:nrow(passing_data)) {
-      pass_share <- passing_data$Pass_Share[i]
-      if (is.na(pass_share))
-        pass_share <- 0
-      
-      player_pass_yds <- round(team_pass_yds * pass_share)
-      player_pass_tds <- round(team_pass_tds * pass_share)
-      
-      player_name <- passing_data$Player[i]
-      existing_idx <- which(sapply(all_player_results, function(x)
-        x$Player == player_name))
-      
-      if (length(existing_idx) > 0) {
-        all_player_results[[existing_idx[1]]]$PassYds <- player_pass_yds
-        all_player_results[[existing_idx[1]]]$PassTDs <- player_pass_tds
-        all_player_results[[existing_idx[1]]]$INTs <- as.integer(opponent_ints)
-      } else {
-        all_player_results[[result_idx]] <- list(
-          SimID = sim_id,
-          Team = team_name,
-          Player = player_name,
-          PassYds = player_pass_yds,
-          PassTDs = player_pass_tds,
-          INTs = as.integer(opponent_ints),
-          RushYds = 0,
-          RushTDs = 0L,
-          Recs = 0L,
-          RecYds = 0,
-          RecTDs = 0L,
-          FGsMade = 0L,
-          FG_Under30 = 0L,
-          FG_30_39 = 0L,
-          FG_40_49 = 0L,
-          FG_50Plus = 0L,
-          XPs = 0L,
-          FumLost = 0L
-        )
-        result_idx <- result_idx + 1
-      }
-    }
-  }
-  
-  # KICKING
-  kicking_data <- team_data$kicking
-  total_xps <- team_rush_tds + team_pass_tds
-  
-  # Get kicker name from kicking sheet
-  kicker <- if (nrow(kicking_data) > 0 &&
-                "Kicker" %in% names(kicking_data)) {
-    kicking_data$Kicker[1]
-  } else {
-    paste0(team_name, " K")
-  }
-  
-  fg_under30 <- 0L
-  fg_30_39 <- 0L
-  fg_40_49 <- 0L
-  fg_50plus <- 0L
-  
-  if (team_fgs > 0) {
-    distance_probs <- as.numeric(kicking_data$Percentage) / 100
-    for (fg in 1:team_fgs) {
-      distance_cat <- sample(1:4, 1, prob = distance_probs)
-      if (distance_cat == 1)
-        fg_under30 <- fg_under30 + 1L
-      else if (distance_cat == 2)
-        fg_30_39 <- fg_30_39 + 1L
-      else if (distance_cat == 3)
-        fg_40_49 <- fg_40_49 + 1L
-      else
-        fg_50plus <- fg_50plus + 1L
-    }
-  }
-  
-  all_player_results[[result_idx]] <- list(
-    SimID = sim_id,
-    Team = team_name,
-    Player = kicker,
-    PassYds = 0,
-    PassTDs = 0L,
-    INTs = 0L,
-    RushYds = 0,
-    RushTDs = 0L,
-    Recs = 0L,
-    RecYds = 0,
-    RecTDs = 0L,
-    FGsMade = as.integer(team_fgs),
-    FG_Under30 = fg_under30,
-    FG_30_39 = fg_30_39,
-    FG_40_49 = fg_40_49,
-    FG_50Plus = fg_50plus,
-    XPs = as.integer(total_xps),
-    FumLost = 0L
-  )
-  
-  # Convert to data.table
-  results <- rbindlist(all_player_results, use.names = TRUE, fill = TRUE)
-  
-  # Calculate fantasy points (same as CFB version)
-  results[, `:=`(
-    PassPts = (PassYds * 0.04) + (PassTDs * 4) - INTs + ifelse(PassYds >= 300, 3, 0),
-    RushPts = (RushYds * 0.1) + (RushTDs * 6) + ifelse(RushYds >= 100, 3, 0),
-    RecPts = Recs + (RecYds * 0.1) + (RecTDs * 6) + ifelse(RecYds >= 100, 3, 0),
-    KickPts = XPs + (FG_Under30 * 3) + (FG_30_39 * 3) + (FG_40_49 * 4) + (FG_50Plus * 5),
-    FumPts = FumLost * -1
-  )]
-  
-  results[, TotalPts := PassPts + RushPts + RecPts + KickPts + FumPts]
-  
-  return(results)
-}
-run_simulations <- function(input_data, n_sims) {
-  cat(sprintf(
-    "\n=== RUNNING %s SIMULATIONS ===\n",
-    format(n_sims, big.mark = ",")
-  ))
-  
-  cat("\n=== DEBUG: Inside run_simulations ===\n")
-  cat("input_data names:", paste(names(input_data), collapse=", "), "\n")
-  team_names <- input_data$team_names
-  cat("team_names:", paste(team_names, collapse=" vs "), "\n")
-  similar_games <- input_data$similar_games
-  dk_salaries <- input_data$dk_salaries
-  cat("similar_games class:", class(similar_games), "\n")
-  cat("similar_games rows:", nrow(similar_games), "\n")
-  
-  team1_data <- input_data[[team_names[1]]]
-  cat("dk_salaries class:", class(dk_salaries), "\n")
-  cat("dk_salaries rows:", nrow(dk_salaries), "\n")
-  cat("dk_salaries columns:", paste(names(dk_salaries), collapse=", "), "\n")
-  cat("First Team:", dk_salaries$Team[1], "\n")
-  cat("=== DEBUG: End initial setup ===\n\n")
-  team2_data <- input_data[[team_names[2]]]
-  
-  # Detect DST scoring (NFL vs CFB)
-  use_dst <- has_dst_scoring(similar_games, team_names)
-  
-  cat(sprintf("Teams: %s vs %s\n", team_names[1], team_names[2]))
-  cat(sprintf("Similar games: %d\n", nrow(similar_games)))
-  
-  if (use_dst) {
-    cat("??? DST scoring detected (NFL mode)\n\n")
-  } else {
-    cat("??? No DST data (CFB mode)\n\n")
-  }
-  
-  # Pre-allocate (2 teams + 2 DST if NFL)
-  list_size <- if (use_dst)
-    n_sims * 4
-  else
-    n_sims * 2
-  all_results <- vector("list", list_size)
-  result_idx <- 1
-  
-  # Pre-fetch DST names and column names if using DST (avoid repeated operations in loop)
-  team1_dst_name <- NULL
-  team2_dst_name <- NULL
-  def1_sacks_col <- NULL
-  def1_ints_col <- NULL
-  def1_fum_col <- NULL
-  def1_pts_col <- NULL
-  def2_sacks_col <- NULL
-  def2_ints_col <- NULL
-  def2_fum_col <- NULL
-  def2_pts_col <- NULL
-  
-  if (use_dst) {
-    # Pre-fetch DST names
-    team1_dst_name <- dk_salaries %>%
-      filter(Team == team_names[1], Pos == "DST") %>%
-      pull(Name)
-    if (length(team1_dst_name) == 0)
-      team1_dst_name <- paste0(team_names[1], " DST")
-    else
-      team1_dst_name <- team1_dst_name[1]
-    
-    team2_dst_name <- dk_salaries %>%
-      filter(Team == team_names[2], Pos == "DST") %>%
-      pull(Name)
-    if (length(team2_dst_name) == 0)
-      team2_dst_name <- paste0(team_names[2], " DST")
-    else
-      team2_dst_name <- team2_dst_name[1]
-    
-    # Pre-build column names
-    def1_sacks_col <- paste0(team_names[1], "_Def_Sacks")
-    def1_ints_col <- paste0(team_names[1], "_Def_Ints")
-    def1_fum_col <- paste0(team_names[1], "_Def_Fum")
-    def1_pts_col <- paste0(team_names[1], "_Def_Pts_Allow")
-    def1_tds_col <- paste0(team_names[1], "_Def_TDs")
-    def1_safeties_col <- paste0(team_names[1], "_Def_Safeties")
-    
-    def2_sacks_col <- paste0(team_names[2], "_Def_Sacks")
-    def2_ints_col <- paste0(team_names[2], "_Def_Ints")
-    def2_fum_col <- paste0(team_names[2], "_Def_Fum")
-    def2_pts_col <- paste0(team_names[2], "_Def_Pts_Allow")
-    def2_tds_col <- paste0(team_names[2], "_Def_TDs")
-    def2_safeties_col <- paste0(team_names[2], "_Def_Safeties")
-  }
-  
-  batch_size <- 500
-  n_batches <- ceiling(n_sims / batch_size)
-  start_time <- Sys.time()
-  
-  for (batch in 1:n_batches) {
-    start_sim <- (batch - 1) * batch_size + 1
-    end_sim <- min(batch * batch_size, n_sims)
-    
-    for (sim in start_sim:end_sim) {
-      sampled_game <- similar_games[sample(nrow(similar_games), 1), ]
-      
-      # Extract opponent INTs first (if using DST)
-      team1_opponent_ints <- 0
-      team2_opponent_ints <- 0
-      
-      if (use_dst) {
-        team1_dst_ints <- as.numeric(sampled_game[[def1_ints_col]])
-        team2_dst_ints <- as.numeric(sampled_game[[def2_ints_col]])
-        if (is.na(team1_dst_ints))
-          team1_dst_ints <- 0
-        if (is.na(team2_dst_ints))
-          team2_dst_ints <- 0
-        
-        # Team1's defense INTs ??? Team2's QB threw them
-        team2_opponent_ints <- team1_dst_ints
-        # Team2's defense INTs ??? Team1's QB threw them
-        team1_opponent_ints <- team2_dst_ints
-      }
-      
-      team1_result <- simulate_team_game(
-        sim,
-        team_names[1],
-        team1_data,
-        sampled_game,
-        dk_salaries,
-        similar_games,
-        use_dst,
-        team1_opponent_ints
-      )
-      all_results[[result_idx]] <- team1_result
-      result_idx <- result_idx + 1
-      
-      team2_result <- simulate_team_game(
-        sim,
-        team_names[2],
-        team2_data,
-        sampled_game,
-        dk_salaries,
-        similar_games,
-        use_dst,
-        team2_opponent_ints
-      )
-      all_results[[result_idx]] <- team2_result
-      result_idx <- result_idx + 1
-      
-      # CREATE DST PLAYERS (NFL MODE)
-      if (use_dst) {
-        # Extract remaining defensive stats (INTs already extracted above for QB assignment)
-        team1_dst_sacks <- as.numeric(sampled_game[[def1_sacks_col]])
-        team1_dst_fum <- as.numeric(sampled_game[[def1_fum_col]])
-        team1_dst_pts_allow <- as.numeric(sampled_game[[def1_pts_col]])
-        team1_dst_def_tds <- as.numeric(sampled_game[[def1_tds_col]])
-        team1_dst_safeties <- as.numeric(sampled_game[[def1_safeties_col]])
-        
-        team2_dst_sacks <- as.numeric(sampled_game[[def2_sacks_col]])
-        team2_dst_fum <- as.numeric(sampled_game[[def2_fum_col]])
-        team2_dst_pts_allow <- as.numeric(sampled_game[[def2_pts_col]])
-        team2_dst_def_tds <- as.numeric(sampled_game[[def2_tds_col]])
-        team2_dst_safeties <- as.numeric(sampled_game[[def2_safeties_col]])
-        
-        # Validate (INTs already validated above)
-        if (is.na(team1_dst_sacks))
-          team1_dst_sacks <- 0
-        if (is.na(team1_dst_fum))
-          team1_dst_fum <- 0
-        if (is.na(team1_dst_pts_allow))
-          team1_dst_pts_allow <- 20
-        if (is.na(team1_dst_def_tds))
-          team1_dst_def_tds <- 0
-        if (is.na(team1_dst_safeties))
-          team1_dst_safeties <- 0
-        if (is.na(team2_dst_sacks))
-          team2_dst_sacks <- 0
-        if (is.na(team2_dst_fum))
-          team2_dst_fum <- 0
-        if (is.na(team2_dst_pts_allow))
-          team2_dst_pts_allow <- 20
-        if (is.na(team2_dst_def_tds))
-          team2_dst_def_tds <- 0
-        if (is.na(team2_dst_safeties))
-          team2_dst_safeties <- 0
-        
-        # PRE-CALCULATE DST fantasy points (FAST - no vectorization needed)
-        team1_pts_allow_score <- if (team1_dst_pts_allow == 0)
-          10
-        else
-          if (team1_dst_pts_allow <= 6)
-            7
-        else
-          if (team1_dst_pts_allow <= 13)
-            4
-        else
-          if (team1_dst_pts_allow <= 20)
-            1
-        else
-          if (team1_dst_pts_allow <= 27)
-            0
-        else
-          if (team1_dst_pts_allow <= 34)
-            - 1
-        else-4
-        
-        team2_pts_allow_score <- if (team2_dst_pts_allow == 0)
-          10
-        else
-          if (team2_dst_pts_allow <= 6)
-            7
-        else
-          if (team2_dst_pts_allow <= 13)
-            4
-        else
-          if (team2_dst_pts_allow <= 20)
-            1
-        else
-          if (team2_dst_pts_allow <= 27)
-            0
-        else
-          if (team2_dst_pts_allow <= 34)
-            - 1
-        else-4
-        
-        team1_dst_total <- (team1_dst_sacks * 1) + (team1_dst_ints * 2) + (team1_dst_fum * 2) +
-          team1_pts_allow_score + (team1_dst_def_tds * 6) + (team1_dst_safeties * 2)
-        team2_dst_total <- (team2_dst_sacks * 1) + (team2_dst_ints * 2) + (team2_dst_fum * 2) +
-          team2_pts_allow_score + (team2_dst_def_tds * 6) + (team2_dst_safeties * 2)
-        
-        # Store DST with pre-calculated points
-        team1_dst_result <- data.table(
-          SimID = sim,
-          Team = team_names[1],
-          Player = team1_dst_name,
-          PassYds = 0,
-          PassTDs = 0L,
-          INTs = 0L,
-          RushYds = 0,
-          RushTDs = 0L,
-          Recs = 0L,
-          RecYds = 0,
-          RecTDs = 0L,
-          FGsMade = 0L,
-          FG_Under30 = 0L,
-          FG_30_39 = 0L,
-          FG_40_49 = 0L,
-          FG_50Plus = 0L,
-          XPs = 0L,
-          FumLost = 0L,
-          PassPts = 0,
-          RushPts = 0,
-          RecPts = 0,
-          KickPts = 0,
-          FumPts = 0,
-          DSTPts = team1_dst_total,
-          TotalPts = team1_dst_total
-        )
-        
-        team2_dst_result <- data.table(
-          SimID = sim,
-          Team = team_names[2],
-          Player = team2_dst_name,
-          PassYds = 0,
-          PassTDs = 0L,
-          INTs = 0L,
-          RushYds = 0,
-          RushTDs = 0L,
-          Recs = 0L,
-          RecYds = 0,
-          RecTDs = 0L,
-          FGsMade = 0L,
-          FG_Under30 = 0L,
-          FG_30_39 = 0L,
-          FG_40_49 = 0L,
-          FG_50Plus = 0L,
-          XPs = 0L,
-          FumLost = 0L,
-          PassPts = 0,
-          RushPts = 0,
-          RecPts = 0,
-          KickPts = 0,
-          FumPts = 0,
-          DSTPts = team2_dst_total,
-          TotalPts = team2_dst_total
-        )
-        
-        all_results[[result_idx]] <- team1_dst_result
-        result_idx <- result_idx + 1
-        all_results[[result_idx]] <- team2_dst_result
-        result_idx <- result_idx + 1
-        
-        # (INTs now assigned directly to QB in simulate_team_game function)
-      }
-    }
-    
-    if (batch %% 5 == 0 || batch == n_batches) {
-      elapsed <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
-      sims_done <- end_sim
-      rate <- sims_done / elapsed
-      eta <- (n_sims - sims_done) / rate
-      
-      cat(
-        sprintf(
-          "Batch %d/%d: %d/%d sims (%.1f%%) | %.0f sims/sec | ETA: %.0fs\n",
-          batch,
-          n_batches,
-          sims_done,
-          n_sims,
-          (sims_done / n_sims) * 100,
-          rate,
-          eta
-        )
-      )
-    }
-    
-    if (batch %% 10 == 0)
-      gc(verbose = FALSE, full = FALSE)
-  }
-  
-  combined <- rbindlist(all_results, use.names = TRUE, fill = TRUE)
-  
-  total_time <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
-  cat(
-    sprintf(
-      "\n??? Complete! %.1f seconds (%.0f sims/sec)\n\n",
-      total_time,
-      n_sims / total_time
-    )
-  )
-  
-  return(combined)
+NFL_SEASONS <- 2021:2025
+
+# =============================================================================
+# CONSTANTS -- every one measured on 2021-2025 REG (GTS/NFL, parts 1-9)
+# =============================================================================
+
+# Event kind codes, as build_templates.R writes them (identical to CFB).
+NFL_EVT_SACK <- 1L; NFL_EVT_FG <- 2L; NFL_EVT_RUN <- 3L; NFL_EVT_CMP <- 4L
+
+# Six pool dimensions, same SET as CFB. LEVEL = total, absp (the market).
+# COMPOSITION = each side's pass rate and pass share of scrimmage yards. NFL
+# teams are ~3x more alike on composition than CFB teams, so market leans wider:
+# 1.5 / 0.7 vs CFB's 1.4 / 1.0. Re-fit on the LOO backtest is BUILD QUEUE part 4.
+NFL_POOL_DIMS      <- c("total", "absp", "fO_pr", "fO_pys", "dO_pr", "dO_pys")
+NFL_POOL_W         <- c(1.5, 1.5, 0.7, 0.7, 0.7, 0.7)
+NFL_POOL_BW        <- 0.9
+NFL_ESS_FLOOR      <- 150
+NFL_ESS_HARDFLOOR  <- 60
+
+# Completion yardage bands + the league's own mix, era-adjusted pool.
+NFL_BAND_EDGES     <- c(-Inf, 2, 7, 15, 30, Inf)
+NFL_BAND_COLS      <- c("0-2", "3-7", "8-15", "16-30", "31+")
+NFL_BAND_MID       <- c(0, 5, 11, 22, 45)
+NFL_LEAGUE_BAND_MIX<- c(0.1118, 0.3299, 0.3435, 0.1688, 0.0460)
+
+# Per-position 5-band base mix -- fallback for an untyped catcher / an empty band.
+NFL_BASE_MIX <- list(
+  WR = c(.079, .300, .360, .187, .074),
+  TE = c(.090, .330, .350, .180, .050),
+  RB = c(.210, .360, .290, .105, .035))
+
+# Backfield latent draw: Dirichlet(a0 * carry_usage) once per simulated game,
+# NORMAL carries only. NFL carries run 4.08x multinomial (CFB 2.78x) on fewer
+# carries a game -- both push a0 well below CFB's 30. Tuned to the 4.08x
+# headline on 8,000 pool draws (PART5_SHARE_CURVES_REPORT.md).
+NFL_CARRY_A0 <- 6.5
+
+# Catch dispersion: a mild per-(sim,band) Dirichlet jitter, NEW for NFL (CFB
+# dealt flat). NFL receptions run ~1.15-1.33x multinomial; a0 = 60 lands
+# realised total-reception dispersion ~1.17x. a0 = Inf collapses to flat.
+NFL_CATCH_A0 <- 60
+
+# Blank-fallback red-zone positional multiplier on open-field target share.
+NFL_RZ_POS_FACTOR <- c(WR = 0.91, TE = 1.25, RB = 1.01)
+
+# Per-touch fumble-lost weights, CARRIED FROM CFB (9,932 team-games) pending an
+# NFL re-measure (BUILD QUEUE part 14 / open item #8). The QB's is ~4x a back's
+# because his come from sacks and snaps; his weight rides on dropbacks. The
+# drawn game supplies the COUNT (opponent defensive box); this only spreads it.
+NFL_FUM_RATE <- c(QB = .0244, WR = .0078, TE = .0078, RB = .0056, K = 0, DST = 0)
+
+# =============================================================================
+# DK / FD SCORING TABLES
+# -----------------------------------------------------------------------------
+# TD and yardage values are shared. What differs: reception weight (DK 1.0 /
+# FD 0.5), the yardage BONUSES (DK only), and the fumble-lost penalty.
+#
+# FANDUEL TABLE -- pinned to FanDuel's published NFL fantasy rules, Sept 2026,
+# WITH THREE ITEMS FLAGGED that could not be re-confirmed against a live source
+# this session (README open item #9):
+#   * FD fumble lost = -2  [FLAGGED]  (DK is -1; FD has historically been -2 for
+#     a lost fumble by an offensive player -- verify before Week 1 ships).
+#   * FD kicker distance bands 0-39 / 40-49 / 50+  ->  3 / 4 / 5  [FLAGGED]
+#     (believed current; FanDuel used a flat "FG made = 3" in older rule sets).
+#   * FD missed-XP = -1  [FLAGGED]  (v1 approximates XP made = offensive TD
+#     count, so no misses are generated -- this constant is dormant).
+# Anything here that a Week-1 rules check contradicts is a one-line edit.
+# =============================================================================
+NFL_SCORE <- list(
+  DK = list(
+    pass_yd = 0.04, pass_td = 4, interception = -1, pass_300 = 3,
+    rush_yd = 0.10, rush_td = 6, rush_100 = 3,
+    rec = 1.0, rec_yd = 0.10, rec_td = 6, rec_100 = 3,
+    fumble_lost = -1, return_td = 6,
+    xp = 1, xp_miss = 0),
+  FD = list(
+    pass_yd = 0.04, pass_td = 4, interception = -1, pass_300 = 0,
+    rush_yd = 0.10, rush_td = 6, rush_100 = 0,
+    rec = 0.5, rec_yd = 0.10, rec_td = 6, rec_100 = 0,
+    fumble_lost = -2, return_td = 6,
+    xp = 1, xp_miss = -1))
+
+# DST points-allowed tier -- identical on DK and FD (README "Scoring").
+nfl_dst_pa_tier <- function(pa) {
+  data.table::fifelse(pa <= 0, 10,
+    data.table::fifelse(pa <= 6, 7,
+    data.table::fifelse(pa <= 13, 4,
+    data.table::fifelse(pa <= 20, 1,
+    data.table::fifelse(pa <= 27, 0,
+    data.table::fifelse(pa <= 34, -1, -4))))))
 }
 
-# ============================================================================
-# WRAPPER FOR UNIVERSAL APP
-# ============================================================================
+# DST fantasy points. Sack +1, INT +2, fumble recovery +2, TD (any) +6,
+# safety +2, blocked kick +2, plus the PA tier. Same on both sites.
+nfl_dst_score <- function(x) {
+  g <- function(nm) { v <- x[[nm]]; if (is.null(v)) 0 else data.table::fifelse(is.na(v), 0, v) }
+  g("def_sacks") * 1 + g("def_int") * 2 + g("def_fum_rec") * 2 +
+    g("def_td") * 6 + g("def_safety") * 2 + g("def_block") * 2 +
+    nfl_dst_pa_tier(g("pa"))
+}
 
-run_nfl_simulation <- function(input_data, n_sims, config, progress_callback = NULL) {
-  
-  cat("\n=== DEBUG: Starting NFL simulation wrapper ===\n")
-  
-  # Check if we need to load team sheets (universal app only loads required_sheets)
-  if (is.null(input_data$team_names) && !any(grepl("_Rushing$", names(input_data)))) {
-    cat("DEBUG: Team sheets not loaded, need to load them from file\n")
-    
-    # Get file path - this is a hack but needed since universal app doesn't load all sheets
-    # The input_data should have a file_path attribute, but if not, we're stuck
-    stop("ERROR: Team sheets (NE_Rushing, SEA_Rushing, etc.) were not loaded. 
-         The universal app needs to be updated to load ALL sheets for NFL, not just required_sheets.
-         Add 'load_all_sheets = TRUE' handling to the app's file loading code.")
+# =============================================================================
+# SMALL HELPERS
+# =============================================================================
+
+`%||%` <- function(a, b) if (is.null(a) || length(a) == 0 || (length(a) == 1 && is.na(a))) b else a
+nfl_num <- function(x) { x <- suppressWarnings(as.numeric(x)); data.table::fifelse(is.na(x), 0, x) }
+nfl_ess <- function(w) { w <- w / sum(w); 1 / sum(w^2) }
+
+# band index 1..5 for a completion yardage (matches build_templates.R::band_of).
+nfl_band_of <- function(y) as.integer(cut(y, NFL_BAND_EDGES, labels = FALSE, right = TRUE))
+
+# DK / FD field-goal points by attempt. Distance = yards_to_goal + 17 (10 for
+# the end zone, 7 for the snap). Bands 0-39 / 40-49 / 50+ -> 3 / 4 / 5, same on
+# both sites. Take the makes as they happened -- do not re-roll.
+nfl_fg_points <- function(ytg) { d <- ytg + 17
+  data.table::fifelse(d < 40, 3, data.table::fifelse(d < 50, 4, 5)) }
+
+# Per-game Dirichlet winners, vectorised (inverse-CDF over a cumulative
+# n_sims x nP weight matrix). Within a simulated game every event dealt through
+# one call shares a single Dirichlet(a0 * base_p) draw -- this is what creates
+# the game-to-game "featured or not" swing. a0 = Inf -> plain multinomial.
+nfl_dirichlet_winners <- function(sim_idx, base_p, a0, n_sims) {
+  nP <- length(base_p)
+  if (nP == 1L) return(rep(1L, length(sim_idx)))
+  if (!length(sim_idx)) return(integer(0))
+  if (!is.finite(a0))
+    return(sample.int(nP, length(sim_idx), replace = TRUE, prob = base_p))
+  g <- matrix(stats::rgamma(n_sims * nP,
+                            shape = rep(pmax(a0 * base_p, 1e-6), each = n_sims)),
+              nrow = n_sims, ncol = nP)
+  g <- g / rowSums(g)
+  for (j in 2:nP) g[, j] <- g[, j - 1L] + g[, j]
+  u <- stats::runif(length(sim_idx))
+  wv <- rep(1L, length(sim_idx))
+  for (j in seq_len(nP - 1L)) wv <- wv + (g[cbind(sim_idx, j)] < u)
+  wv
+}
+
+# =============================================================================
+# POOL MATCHING  (inlined from GTS/NFL/R/build_pool.R -- CFB's mechanism)
+# =============================================================================
+
+# One row per GAME: favourite side (f*) and underdog side (d*), priors + outcomes.
+nfl_pool_frame <- function(seasons = NFL_SEASONS) {
+  P <- readRDS(file.path(nfl_data_dir(), "nfl_profiles_with_priors.rds")); setDT(P)
+  P <- P[season %in% seasons & !is.na(spread) & !is.na(total)]
+  P[, is_fav := (is_home & spread > 0) | (!is_home & spread < 0)]   # + spread = home favoured
+  P <- P[, if (.N == 2 && sum(is_fav) == 1) .SD, by = game_id]
+
+  side <- function(d, pre) {
+    s <- d[, .(game_id, team, season, total, absp = abs(spread), neutral,
+               O_pr = pri_pass_rate, O_pys = pri_pyd_share,
+               D_pr = pri_d_pr,      D_pys = pri_d_pys,
+               points, yds,
+               cmp, pass_yds, pass_td, carries, rush_yds, rush_td, sacks, sack_yds)]
+    nm <- setdiff(names(s), c("game_id", "season", "total", "absp", "neutral"))
+    setnames(s, nm, paste0(pre, nm)); s
   }
-  
-  # Restructure if needed
-  if (is.null(input_data$team_names)) {
-    sheet_names <- names(input_data)
-    cat("Sheet names loaded:", paste(sheet_names, collapse=", "), "\n")
-    
-    if (any(grepl("_Rushing$", sheet_names))) {
-      rushing_sheets <- grep("_Rushing$", sheet_names, value = TRUE)
-      team_names <- gsub("_Rushing$", "", rushing_sheets)
-      
-      cat("Detected teams:", paste(team_names, collapse=" vs "), "\n")
-      
-      restructured <- list()
-      restructured$team_names <- team_names
-      
-      for (team in team_names) {
-        cat("Loading data for team:", team, "\n")
-        restructured[[team]] <- list(
-          rushing = as.data.frame(input_data[[paste0(team, "_Rushing")]]),
-          receiving = as.data.frame(input_data[[paste0(team, "_Receiving")]]),
-          passing = as.data.frame(input_data[[paste0(team, "_Passing")]]),
-          kicking = as.data.frame(input_data[[paste0(team, "_Kicking")]])
-        )
+  Fs <- side(P[is_fav == TRUE],  "f")
+  Ds <- side(P[is_fav == FALSE], "d")[, .SD, .SDcols = !c("season", "total", "absp", "neutral")]
+  G  <- merge(Fs, Ds, by = "game_id")
+  G[, `:=`(pts_sum = fpoints + dpoints, margin = fpoints - dpoints)]
+  setnames(G, c("fpoints", "dpoints"), c("ptsF", "ptsD"))
+  G[complete.cases(G[, ..NFL_POOL_DIMS])]
+}
+
+nfl_wmean <- function(v, w) { ok <- is.finite(v)
+  if (!any(ok)) return(NA_real_); sum(v[ok] * w[ok]) / sum(w[ok]) }
+
+# Raw kernel weights over the pool. Soft weights only -- no hard filters.
+nfl_pool_weights <- function(G, target, bw = NFL_POOL_BW, weights = NFL_POOL_W) {
+  tgt <- unlist(target)[NFL_POOL_DIMS]
+  if (anyNA(tgt)) stop("pool target missing: ",
+                       paste(NFL_POOL_DIMS[is.na(tgt)], collapse = ", "))
+  M  <- as.matrix(G[, ..NFL_POOL_DIMS])
+  mu <- colMeans(M); sg <- apply(M, 2, sd)
+  Mz <- sweep(sweep(M, 2, mu, "-"), 2, sg, "/")
+  tz <- (tgt - mu) / sg
+  d2 <- rowSums(sweep((sweep(Mz, 2, tz, "-"))^2, 2, weights, "*"))
+  w  <- exp(-d2 / (2 * bw^2)); w[!is.finite(w)] <- 0; w <- w / sum(w)
+  list(w = w, ess = nfl_ess(w), n = nrow(G), bw = bw, weights = weights)
+}
+
+# Damped fixed point on the two MARKET dims only. Style targets are your read
+# on the teams, not something to solve for. Ported verbatim from CFB.
+nfl_calibrate_target <- function(G, target, market, bw = NFL_POOL_BW,
+                                 weights = NFL_POOL_W, iters = 12, damp = 0.8,
+                                 tol = 0.05) {
+  tg <- target
+  tlo <- min(G$total); thi <- max(G$total); shi <- max(G$absp)
+  for (k in seq_len(iters)) {
+    w  <- nfl_pool_weights(G, tg, bw = bw, weights = weights)$w
+    et <- nfl_wmean(G$pts_sum, w); em <- nfl_wmean(G$margin, w)
+    if (!is.finite(et) || !is.finite(em)) break
+    dt <- market$total - et; dm <- market$margin - em
+    if (max(abs(c(dt, dm))) < tol) break
+    tg$total <- min(max(tg$total + damp * dt, tlo), thi)
+    tg$absp  <- min(max(tg$absp  + damp * dm, 0),   shi)
+  }
+  r <- nfl_pool_weights(G, tg, bw = bw, weights = weights)
+  list(target = tg, ess = r$ess, iters = k,
+       total = nfl_wmean(G$pts_sum, r$w), margin = nfl_wmean(G$margin, r$w))
+}
+
+# THE ESS GUARD -- relax or refuse, never warn-and-proceed. Ladder: composition
+# widens first, bandwidth next, market last; re-calibrate at every rung; stop at
+# the first rung >= floor; refuse (stop()) if the ladder is spent below the hard
+# floor. Ported from GTS/NFL/R/build_pool.R.
+nfl_pool_weights_guarded <- function(G, target, market,
+                                     floor_ess = NFL_ESS_FLOOR,
+                                     hard_ess  = NFL_ESS_HARDFLOOR,
+                                     bw = NFL_POOL_BW, verbose = TRUE) {
+  w0 <- NFL_POOL_W
+  rungs <- list(
+    list(lab = "as asked",               w = w0,                          bw = bw),
+    list(lab = "dO weight x0.55",         w = w0 * c(1,1,1,1,.55,.55),      bw = bw),
+    list(lab = "fO+dO weight x0.55",      w = w0 * c(1,1,.55,.55,.55,.55),  bw = bw),
+    list(lab = "fO+dO weight x0.30",      w = w0 * c(1,1,.30,.30,.30,.30),  bw = bw),
+    list(lab = "style x0.30, bw x1.3",    w = w0 * c(1,1,.30,.30,.30,.30),  bw = bw * 1.3),
+    list(lab = "style x0.30, bw x1.7",    w = w0 * c(1,1,.30,.30,.30,.30),  bw = bw * 1.7),
+    list(lab = "style x0.30, bw x1.7, mkt x0.75",
+         w = w0 * c(.75,.75,.30,.30,.30,.30), bw = bw * 1.7),
+    list(lab = "style x0.30, bw x1.7, mkt x0.55",
+         w = w0 * c(.55,.55,.30,.30,.30,.30), bw = bw * 1.7))
+  tried <- list()
+  for (i in seq_along(rungs)) {
+    rg  <- rungs[[i]]
+    cal <- nfl_calibrate_target(G, target, market, bw = rg$bw, weights = rg$w)
+    r   <- nfl_pool_weights(G, cal$target, bw = rg$bw, weights = rg$w)
+    tried[[i]] <- data.table(rung = i - 1L, move = rg$lab, ess = r$ess,
+                             total = cal$total, margin = cal$margin)
+    if (r$ess >= floor_ess) {
+      if (verbose && i > 1) {
+        cat(sprintf("[nfl] ESS guard: relaxed to rung %d (%s) -- ESS %.0f\n",
+                    i - 1L, rg$lab, r$ess)); print(rbindlist(tried), digits = 4)
       }
-      
-      cat("Loading Salaries sheet...\n")
-      restructured$salaries <- as.data.frame(input_data$Salaries)
-      cat("Salaries columns:", paste(names(restructured$salaries), collapse=", "), "\n")
-      cat("Salaries rows:", nrow(restructured$salaries), "\n")
-      
-      cat("Loading Similar_Games sheet...\n")
-      restructured$similar_games <- as.data.frame(input_data$Similar_Games)
-      cat("Similar_Games rows:", nrow(restructured$similar_games), "\n")
-      
-      restructured$dk_salaries <- as.data.frame(input_data$Salaries)
-      cat("dk_salaries set with", nrow(restructured$dk_salaries), "rows\n")
-      
-      input_data <- restructured
+      return(list(w = r$w, ess = r$ess, n = r$n, bw = rg$bw, target = cal$target,
+                  total = cal$total, margin = cal$margin,
+                  relaxed = i > 1L, rung = i - 1L, ladder = rbindlist(tried)))
     }
-  } else {
-    cat("team_names already exists in input_data\n")
-    input_data$dk_salaries <- as.data.frame(input_data$salaries)
   }
-  
-  cat("Calling run_simulations with n_sims =", n_sims, "\n")
-  cat("=== DEBUG: End of wrapper setup ===\n\n")
-  
-  # Run the original simulation function
-  all_results <- run_simulations(input_data, n_sims)
-  
-  # Rename TotalPts to DKScore and FDScore
-  setDT(all_results)
-  all_results[, DKScore := TotalPts]
-  all_results[, FDScore := TotalPts]
-  
-  # Calculate player averages from simulations
-  player_stats <- all_results[, .(
-    Sim_DK_Mean = mean(DKScore),
-    Sim_DK_Median = median(DKScore),
-    Sim_DK_StdDev = sd(DKScore),
-    Sim_DK_Min = min(DKScore),
-    Sim_DK_Max = max(DKScore),
-    Sim_FD_Mean = mean(FDScore),
-    Sim_FD_Median = median(FDScore),
-    Sim_FD_StdDev = sd(FDScore)
-  ), by = .(Player, Team)]
-  
-  # Create metadata from salaries (just base player info for sim display)
-  salaries_dt <- as.data.table(input_data$salaries)
-  metadata <- unique(salaries_dt[, .(
-    Player = Name,
-    Team = Team,
-    Pos = Pos,
-    DKSalary = as.numeric(DKSal),
-    DKID = as.character(DKID),
-    DKOwn = as.numeric(DKFOwn),
-    FDSalary = as.numeric(FDSal),
-    FDID = as.character(FDID),
-    FDOwn = as.numeric(FDFOwn),
-    # Captain/MVP columns for lineup optimizer
-    DKCID = as.character(DKCID),
-    DKCSalary = as.numeric(DKCSal),
-    DKCOwn = as.numeric(DKCOwn),
-    FDMSalary = as.numeric(FDMSal),
-    FDMOwn = as.numeric(FDMOwn),
-    # ETR projections
-    ETR_DK = as.numeric(ETR_DK),
-    ETR_FD = as.numeric(ETR_FD)
-  )])
-  
-  # Merge sim stats with metadata
-  projections <- merge(metadata, player_stats, by = c("Player", "Team"), all.x = TRUE)
-  
-  # Calculate variance metrics
-  projections[, DK_Variance := Sim_DK_Mean - ETR_DK]
-  projections[, DK_Pct_Diff := round((DK_Variance / ETR_DK) * 100, 1)]
-  projections[, FD_Variance := Sim_FD_Mean - ETR_FD]
-  projections[, FD_Pct_Diff := round((FD_Variance / ETR_FD) * 100, 1)]
-  
-  # Calculate value (points per $1K)
-  projections[, DK_Value_ETR := round(ETR_DK / (DKSalary / 1000), 2)]
-  projections[, DK_Value_Sim := round(Sim_DK_Mean / (DKSalary / 1000), 2)]
-  projections[, FD_Value_ETR := round(ETR_FD / (FDSalary / 1000), 2)]
-  projections[, FD_Value_Sim := round(Sim_FD_Mean / (FDSalary / 1000), 2)]
-  
-  # Sort by DK variance (biggest differences first)
-  setorder(projections, -DK_Variance)
-  
-  return(list(
-    sim_results = all_results,
-    metadata = metadata,
-    projections = projections
-  ))
+  best <- rbindlist(tried)
+  if (verbose) { cat("[nfl] ESS guard: ladder exhausted --\n"); print(best, digits = 4) }
+  if (max(best$ess) < hard_ess)
+    stop(sprintf("REFUSED: NFL pool ESS tops out at %.0f (hard floor %d) for this ask -- ",
+                 max(best$ess), hard_ess),
+         "no comparable game in the pool. Widen the output by hand or add the ",
+         "2019-2020 low-weight tail (BUILD QUEUE part 4).")
+  i <- which.max(best$ess); rg <- rungs[[i]]
+  cal <- nfl_calibrate_target(G, target, market, bw = rg$bw, weights = rg$w)
+  r   <- nfl_pool_weights(G, cal$target, bw = rg$bw, weights = rg$w)
+  list(w = r$w, ess = r$ess, n = r$n, bw = rg$bw, target = cal$target,
+       total = cal$total, margin = cal$margin, relaxed = TRUE, rung = i - 1L, ladder = best)
+}
+
+# =============================================================================
+# THE ALLOCATORS  (inlined from GTS/NFL/R/share_curves.R + rz_role.R + dst.R,
+# runtime paths only -- the DB builders and split-half harnesses stay in the
+# GTS/NFL tree. Numbers here MUST match those files.)
+# =============================================================================
+
+# (nP x 5) P(player | catch in band b) from a roster carrying the 5 band cols.
+# A band nobody is typed into falls back to `usage` (or a flat split).
+nfl_catch_pb <- function(R, band_cols = NFL_BAND_COLS) {
+  nR <- nrow(R); if (!nR) return(matrix(0, 0, 5L))
+  M <- as.matrix(R[, ..band_cols]); M[!is.finite(M)] <- 0
+  fallback <- if ("usage" %in% names(R) && sum(R$usage, na.rm = TRUE) > 0) R$usage else rep(1 / nR, nR)
+  cs <- colSums(M)
+  for (b in seq_len(5L)) if (cs[b] <= 0) M[, b] <- fallback
+  sweep(M, 2, colSums(M), "/")
+}
+
+# list(normal, sy, gl) carry-probability vectors. Blank / 0 sy_share|gl_share
+# falls back to carry_usage.
+nfl_carry_pb <- function(S) {
+  cu <- as.numeric(S$carry_usage); cu[!is.finite(cu)] <- 0
+  pick <- function(col) {
+    v <- if (col %in% names(S)) as.numeric(S[[col]]) else rep(NA_real_, nrow(S))
+    v[!is.finite(v) | v == 0] <- NA_real_
+    ifelse(is.na(v), cu, v)
+  }
+  norm1 <- function(p) { s <- sum(p); if (s <= 0) rep(1 / length(p), length(p)) else p / s }
+  list(normal = norm1(cu), sy = norm1(pick("sy_share")), gl = norm1(pick("gl_share")))
+}
+
+# P(player | the completion was flagged inside-20). Typed rz_tgt_share wins;
+# blank = positional multiplier on open-field target share, renormalised.
+nfl_rz_pb <- function(R, k_rz = 12) {
+  nR <- nrow(R); if (!nR) return(numeric(0))
+  pos <- as.character(R$pos); pos[is.na(pos) | !pos %in% names(NFL_RZ_POS_FACTOR)] <- "WR"
+  if (all(NFL_BAND_COLS %in% names(R))) {
+    M <- as.matrix(R[, ..NFL_BAND_COLS]); M[!is.finite(M)] <- 0; s <- rowSums(M)
+  } else if ("usage" %in% names(R)) s <- as.numeric(R$usage) else s <- rep(1, nR)
+  s[!is.finite(s) | s < 0] <- 0
+  s <- if (sum(s) <= 0) rep(1 / nR, nR) else s / sum(s)
+  seed <- s * NFL_RZ_POS_FACTOR[pos]; seed <- seed / sum(seed)
+  raw <- seed
+  if ("rz_tgt_share" %in% names(R)) {
+    tv <- as.numeric(R$rz_tgt_share); ok <- is.finite(tv) & tv > 0
+    raw[ok] <- tv[ok]
+  }
+  raw[!is.finite(raw) | raw < 0] <- 0
+  if (sum(raw) <= 0) return(rep(1 / nR, nR))
+  raw / sum(raw)
+}
+
+# deal a drawn game's completion events to pass-catchers, CATCH BY CATCH, with
+# the inside-20 branch spliced in. rz == 0 -> band deal; rz == 1 -> one shared
+# per-sim Dirichlet(a0 * pb_rz). Returns per (sim, player): rec, ryds, rtd,
+# rec_b5 (31+ readback), rec_rz (inside-20 readback).
+nfl_deal_receiving <- function(events, pb, pb_rz, players, a0 = NFL_CATCH_A0, n_sims) {
+  nP <- length(players)
+  E <- data.table::as.data.table(events)
+  empty <- data.table(sim = integer(0), player = character(0), rec = integer(0),
+                       ryds = numeric(0), rtd = numeric(0),
+                       rec_b5 = integer(0), rec_rz = integer(0))
+  if (!nrow(E) || !nP) return(empty)
+  E <- E[is.finite(sim)]
+  rzc  <- if ("rz" %in% names(E)) E$rz else rep(0L, nrow(E))
+  E_of <- E[is.na(rzc) | rzc != 1L]
+  E_rz <- E[!is.na(rzc) & rzc == 1L]
+
+  # open field: band by band, one Dirichlet draw per (sim, band)
+  of <- empty[0]
+  if (nrow(E_of)) {
+    E_of <- data.table::copy(E_of)
+    E_of[, b := nfl_band_of(yds)][, w := NA_integer_]
+    for (bb in seq_len(5L)) {
+      ii <- which(E_of$b == bb)
+      if (length(ii))
+        data.table::set(E_of, ii, "w", nfl_dirichlet_winners(E_of$sim[ii], pb[, bb], a0, n_sims))
+    }
+    of <- E_of[, .(rec = .N, ryds = sum(yds), rtd = sum(td == 1L, na.rm = TRUE),
+                   rec_b5 = sum(b == 5L)), by = .(sim, w)]
+    of[, player := players[w]][, w := NULL][, rec_rz := 0L]
+  }
+  # inside 20: one shared per-sim player vector
+  rz <- empty[0]
+  if (nrow(E_rz)) {
+    E_rz <- data.table::copy(E_rz)
+    E_rz[, w := nfl_dirichlet_winners(sim, pb_rz, a0, n_sims)]
+    rz <- E_rz[, .(rec = .N, ryds = sum(yds), rtd = sum(td == 1L, na.rm = TRUE),
+                   rec_b5 = sum(nfl_band_of(yds) == 5L)), by = .(sim, w)]
+    rz[, player := players[w]][, w := NULL][, rec_rz := rec]
+  }
+  both <- data.table::rbindlist(list(of, rz), use.names = TRUE)
+  both[, .(rec = sum(rec), ryds = sum(ryds), rtd = sum(rtd),
+           rec_b5 = sum(rec_b5), rec_rz = sum(rec_rz)), by = .(sim, player)]
+}
+
+# deal a drawn game's designed runs to runners (QB included), CARRY BY CARRY.
+# Three situations read off the EVENT: goal line (gl==1) first, then short
+# yardage (sy==1), then normal. Normal carries get the per-game Dirichlet.
+nfl_deal_rushing <- function(events, shares, players, a0 = NFL_CARRY_A0, n_sims) {
+  nP <- length(players)
+  E <- data.table::as.data.table(events)
+  if (!nrow(E) || !nP)
+    return(data.table(sim = integer(0), player = character(0), car = integer(0),
+                      cyds = numeric(0), ctd = numeric(0)))
+  E <- data.table::copy(E[is.finite(sim)])
+  gl <- if ("gl" %in% names(E)) E$gl else 0L
+  sy <- if ("sy" %in% names(E)) E$sy else 0L
+  E[, sit := data.table::fifelse(!is.na(gl) & gl == 1L, 3L,
+             data.table::fifelse(!is.na(sy) & sy == 1L, 2L, 1L))]
+  P <- nfl_carry_pb(shares)
+  E[, w := NA_integer_]
+  for (q in 2:3) {
+    ii <- which(E$sit == q)
+    if (length(ii))
+      data.table::set(E, ii, "w", sample.int(nP, length(ii), replace = TRUE,
+                                             prob = if (q == 2L) P$sy else P$gl))
+  }
+  ii <- which(E$sit == 1L)
+  if (length(ii))
+    data.table::set(E, ii, "w", nfl_dirichlet_winners(E$sim[ii], P$normal, a0, n_sims))
+  out <- E[, .(car = .N, cyds = sum(yds), ctd = sum(td == 1L, na.rm = TRUE)), by = .(sim, w)]
+  out[, player := players[w]][, w := NULL][]
+}
+
+# debit the drawn game's sack yardage to the passer(s), whole, by pass_share.
+nfl_deal_sacks <- function(events, pass_share, qbs) {
+  nQ <- length(qbs)
+  E <- data.table::as.data.table(events)
+  if (!nrow(E) || !nQ)
+    return(data.table(sim = integer(0), player = character(0), sack_yds = numeric(0)))
+  E <- data.table::copy(E[is.finite(sim)])
+  ps <- as.numeric(pass_share); ps[!is.finite(ps) | ps < 0] <- 0
+  ps <- if (sum(ps) <= 0) rep(1 / nQ, nQ) else ps / sum(ps)
+  E[, w := if (nQ == 1L) 1L else sample.int(nQ, .N, replace = TRUE, prob = ps)]
+  out <- E[, .(sack_yds = sum(yds)), by = .(sim, w)]
+  out[, player := qbs[w]][, w := NULL][]
+}
+
+# =============================================================================
+# READING THE SHEET  -- one tab per team + a `game` tab, readxl (SimApp parity).
+# Mirrors GTS/NFL/R/slate_sheet.R::read_slate_sheet in shape: player table from
+# columns A..N, the kicker / returners / DST identity as a field/value block
+# from column S, `pys_target` melted onto the team table from the game tab.
+# =============================================================================
+NFL_PLAYER_COLS <- c("player", "route_base", "pass_share",
+                     "0-2", "3-7", "8-15", "16-30", "31+", "rz_tgt_share",
+                     "carry_usage", "sy_share", "gl_share", "qb_rush_read", "availability")
+NFL_TEAM_FIELDS <- c("kicker", "punt_returner", "kick_returner", "dst", "notes")
+NFL_NUM_COLS    <- c("pass_share", NFL_BAND_COLS, "rz_tgt_share",
+                     "carry_usage", "sy_share", "gl_share", "qb_rush_read")
+
+read_nfl_input <- function(file_path, slate = NULL, game = NULL) {
+  sh <- readxl::excel_sheets(file_path)
+  gtab <- sh[tolower(sh) == "game"]
+  if (!length(gtab)) stop("NFL workbook needs a `game` tab")
+  g <- as.data.table(readxl::read_excel(file_path, sheet = gtab[1]))
+  for (nm in c("date", "slate_id", "away", "home", "market_source", "notes", "slate_type"))
+    if (nm %in% names(g)) g[[nm]] <- as.character(g[[nm]])
+  if ("start_order" %in% names(g)) g[, start_order := suppressWarnings(as.integer(start_order))]
+  if (!"slate_type" %in% names(g) || is.na(g$slate_type[1]) || !nzchar(g$slate_type[1]))
+    g[, slate_type := if (nrow(g) == 1L) "showdown" else "classic"]
+  g[, slate_type := tolower(as.character(slate_type))]
+
+  aux <- sh[tolower(sh) %in% c("projections", "etr")]
+  tms <- setdiff(sh, c(gtab, aux))
+
+  read_tab <- function(tm) {
+    x <- as.data.table(readxl::read_excel(file_path, sheet = tm,
+                                          .name_repair = "unique_quiet"))
+    fi <- which(names(x) == "field")
+    list(x = x, fi = if (length(fi)) fi[1] else NA_integer_)
+  }
+  tabs <- setNames(lapply(tms, read_tab), tms)
+
+  # player block: everything left of the `field`/`value` team block
+  pl <- rbindlist(lapply(tms, function(tm) {
+    z <- tabs[[tm]]; x <- z$x
+    if (!is.na(z$fi)) x <- x[, seq_len(z$fi - 1L), with = FALSE]
+    x <- x[, !startsWith(names(x), "..."), with = FALSE]
+    for (nm in setdiff(NFL_PLAYER_COLS, names(x)))
+      x[, (nm) := if (nm %in% NFL_NUM_COLS) NA_real_ else NA_character_]
+    x <- x[!is.na(player) & nzchar(as.character(player))]
+    x[, team := tm][]
+  }), fill = TRUE)
+
+  # team block: the field/value pair
+  tt <- rbindlist(lapply(tms, function(tm) {
+    z <- tabs[[tm]]
+    b <- if (is.na(z$fi)) data.table(field = character(), value = character())
+         else z$x[, z$fi + 0:1, with = FALSE]
+    setnames(b, c("field", "value")); b <- b[!is.na(field)]
+    o <- as.list(setNames(as.character(b$value), b$field))
+    data.table(team = tm,
+               kicker        = o$kicker        %||% NA_character_,
+               punt_returner = o$punt_returner %||% NA_character_,
+               kick_returner = o$kick_returner %||% NA_character_,
+               dst           = o$dst           %||% NA_character_,
+               notes         = o$notes         %||% NA_character_)
+  }), fill = TRUE)
+  tt[is.na(dst) | !nzchar(trimws(dst)), dst := team]
+
+  # melt pys_target + derive the DST opponent from the game tab
+  tt[, `:=`(pys_target = NA_real_, dst_opp = NA_character_)]
+  for (i in seq_len(nrow(tt))) {
+    tm <- tt$team[i]; row <- g[away == tm | home == tm][1]
+    if (nrow(row)) {
+      tt$pys_target[i] <- if (identical(row$away, tm)) suppressWarnings(as.numeric(row$pys_target_away))
+                          else                          suppressWarnings(as.numeric(row$pys_target_home))
+      tt$dst_opp[i]    <- if (identical(row$away, tm)) row$home else row$away
+    }
+  }
+
+  # numeric coercion + blank-share defaults (blank sy/gl -> carry_usage)
+  setDT(pl)
+  for (cl in NFL_NUM_COLS) if (cl %in% names(pl)) set(pl, j = cl, value = suppressWarnings(as.numeric(pl[[cl]])))
+  for (cl in NFL_BAND_COLS) pl[is.na(get(cl)), (cl) := 0]
+  pl[is.na(pass_share),  pass_share  := 0]
+  pl[is.na(carry_usage), carry_usage := 0]
+  pl[is.na(route_base) | route_base == "", route_base := "WR"]
+  pl[, availability := tolower(trimws(ifelse(is.na(availability), "", availability)))]
+  pl[is.na(sy_share) | sy_share == 0, sy_share := carry_usage]
+  pl[is.na(gl_share) | gl_share == 0, gl_share := carry_usage]
+  # a man flagged `out` holds no share (the sheet validator guarantees this;
+  # belt-and-braces here so a hand-edited sheet can't smuggle one in).
+  if (any(pl$availability == "out")) {
+    for (cl in c("pass_share", "carry_usage", "sy_share", "gl_share", NFL_BAND_COLS,
+                 "rz_tgt_share"))
+      pl[availability == "out", (cl) := 0]
+  }
+
+  prj <- NULL
+  hit <- sh[tolower(sh) == "projections"]
+  if (length(hit)) {
+    prj <- as.data.table(readxl::read_excel(file_path, sheet = hit[1]))
+    setnames(prj, tolower(names(prj)))
+    if (!"player" %in% names(prj) && "name" %in% names(prj)) setnames(prj, "name", "player")
+  }
+
+  list(game = g, team = tt, players = pl, projections = prj)
+}
+
+# a lightweight menu for a slate picker. NFL v1 has no multi-slate workbook, so
+# this is always NULL (the caller shows no picker). Mirrors cfb_slate_menu.
+nfl_slate_menu <- function(file_path) NULL
+
+# =============================================================================
+# SCORING  -- platform-neutral stat lines in, DK / FD fantasy points out.
+# `A` carries, per (SimID, player): rec ryds rtd  car cyds ctd  pyds ptd pint
+# fgp xp rettd fum  and, for the DST row, def_sacks def_int def_fum_rec def_td
+# def_block def_safety pa (is_dst == TRUE). Returns a numeric vector.
+# =============================================================================
+nfl_score_lines <- function(A, platform = c("DK", "FD")) {
+  platform <- match.arg(platform)
+  s  <- NFL_SCORE[[platform]]
+  is_dst <- if ("is_dst" %in% names(A)) A$is_dst %in% TRUE else rep(FALSE, nrow(A))
+  off <- with(A,
+    rec * s$rec + ryds * s$rec_yd + rtd * s$rec_td +
+    cyds * s$rush_yd + ctd * s$rush_td +
+    pyds * s$pass_yd + ptd * s$pass_td + pint * s$interception +
+    data.table::fifelse(ryds >= 100, s$rec_100, 0) +
+    data.table::fifelse(cyds >= 100, s$rush_100, 0) +
+    data.table::fifelse(pyds >= 300, s$pass_300, 0) +
+    fgp + xp * s$xp + rettd * s$return_td + fum * s$fumble_lost)
+  dst <- nfl_dst_score(A)
+  data.table::fifelse(is_dst, dst, off)
+}
+
+# =============================================================================
+# THE TWO-TEAM CORE  -- used directly for a showdown slate, and looped by
+# run_nfl_classic_simulation for a full slate.
+# =============================================================================
+run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
+                               progress_callback = NULL, keep_components = FALSE,
+                               seed = NULL, .slate_type = NULL) {
+  say <- function(msg, frac = NULL) {
+    if (is.function(progress_callback)) try(progress_callback(msg, frac), silent = TRUE)
+    message("[nfl] ", msg)
+  }
+  if (is.null(n_sims) || is.na(n_sims)) n_sims <- 10000
+  n_sims <- as.integer(n_sims)
+
+  G  <- as.data.table(input_data$game)
+  TT <- as.data.table(input_data$team)
+  PL <- copy(as.data.table(input_data$players))
+  slate_type <- .slate_type %||% (if ("slate_type" %in% names(G)) tolower(G$slate_type[1]) else "showdown")
+
+  setDT(PL)
+  for (cl in NFL_NUM_COLS) if (cl %in% names(PL)) set(PL, j = cl, value = nfl_num(PL[[cl]]))
+  if (!"route_base" %in% names(PL)) PL[, route_base := "WR"]
+  PL[is.na(route_base) | route_base == "", route_base := "WR"]
+  PL[, pos := fifelse(route_base %in% c("WR", "TE", "RB", "QB", "K", "DST"), route_base, "WR")]
+  PL[sy_share == 0, sy_share := carry_usage]
+  PL[gl_share == 0, gl_share := carry_usage]
+  # `usage` -- DERIVED from the bands (the row's band shares weighted by the
+  # league mix). Downstream keys off it; it cancels inside the deal.
+  M_ <- as.matrix(PL[, ..NFL_BAND_COLS]); M_[!is.finite(M_)] <- 0
+  PL[, usage := as.vector(M_ %*% NFL_LEAGUE_BAND_MIX)]
+
+  # ---- which slate team is the favourite -----------------------------------
+  # spread is HOME-RELATIVE, signed, + = home favoured (nflfastR / the NFL
+  # sheet convention -- the OPPOSITE of CFB).
+  away <- as.character(G$away[1]); home <- as.character(G$home[1])
+  spread <- suppressWarnings(as.numeric(G$spread[1]))
+  fav <- if (is.finite(spread) && spread < 0) away else home
+  dog <- setdiff(c(away, home), fav)
+  pys <- setNames(suppressWarnings(as.numeric(TT$pys_target)), TT$team)
+
+  say("loading pool", 0.03)
+  Gp <- nfl_pool_frame()
+  med_pr <- stats::median(c(Gp$fO_pr, Gp$dO_pr), na.rm = TRUE)
+  pys_f <- if (is.finite(pys[[fav]] %||% NA)) pys[[fav]] else stats::median(Gp$fO_pys)
+  pys_d <- if (is.finite(pys[[dog]] %||% NA)) pys[[dog]] else stats::median(Gp$dO_pys)
+  total  <- suppressWarnings(as.numeric(G$total[1]))
+  target <- list(total = total, absp = abs(spread),
+                 fO_pr = med_pr, fO_pys = pys_f,
+                 dO_pr = med_pr, dO_pys = pys_d)
+  r <- nfl_pool_weights_guarded(Gp, target, market = list(total = total, margin = abs(spread)),
+                                verbose = FALSE)
+  say(sprintf("pool calibrated: ESS %.0f%s, total %.1f, margin %.1f, pys f %.2f d %.2f",
+              r$ess, if (r$relaxed) sprintf(" [relaxed to rung %d]", r$rung) else "",
+              r$total, r$margin, pys_f, pys_d), 0.08)
+
+  set.seed(if (is.null(seed) || is.na(seed))
+             as.integer(Sys.time()) %% .Machine$integer.max else as.integer(seed))
+  idx  <- sample.int(nrow(Gp), n_sims, TRUE, prob = r$w)
+  draw <- Gp[idx]
+
+  say("loading events", 0.12)
+  EV <- rbindlist(lapply(NFL_SEASONS, function(y) {
+    x <- readRDS(file.path(nfl_data_dir(), sprintf("slim_%d_era.rds", y))); setDT(x)
+    x[, .(game_id, posteam, kind, yds, made, ytg, td, rz, gl, sy)]
+  }))
+  setkey(EV, game_id, posteam)
+  BLK <- EV[, .(s = .I[1], e = .I[.N]), by = .(game_id, posteam)]; setkey(BLK, game_id, posteam)
+
+  DSTB <- readRDS(file.path(nfl_db_dir(), "nfl_dst_box.rds")); setDT(DSTB)
+  setkey(DSTB, game_id, def_team)
+  dst_cols <- c("def_sacks", "def_int", "def_fum_rec", "def_td", "def_block", "def_safety", "pa", "pf")
+
+  # per-sim DST line for a drawn-game identity (the defence paired with that
+  # offence in the real game). NO EXTRA DRAW -- same game_id the offence used.
+  dst_for <- function(team_ids) {
+    S <- data.table(game_id = draw$game_id, def_team = team_ids)
+    D <- DSTB[S, on = .(game_id, def_team)]
+    for (cc in setdiff(dst_cols, "pa")) D[is.na(get(cc)), (cc) := 0]
+    D[, ret_td := def_td][]
+  }
+  dl_fav <- dst_for(draw$fteam)   # our fav team's defence in the drawn game
+  dl_dog <- dst_for(draw$dteam)
+
+  # ---- per-team setup ------------------------------------------------------
+  setup <- lapply(c(fav, dog), function(tm) {
+    side_ev  <- if (tm == fav) "f" else "d"
+    pool_tm  <- if (tm == fav) draw$fteam else draw$dteam
+    tr <- TT[team == tm]
+    P  <- PL[team == tm]
+    # catchers = any band mass; runners = carry_usage > 0; passers = pass_share > 0
+    R <- P[pos %in% c("WR", "TE", "RB")]
+    if (nrow(R)) R <- R[rowSums(as.matrix(R[, ..NFL_BAND_COLS])) > 0]
+    S <- P[carry_usage > 0]
+    Q <- P[pass_share > 0]
+    list(tm = tm, side = side_ev, pool_tm = pool_tm,
+         rec = R, rsh = S, qbs = Q,
+         qb = if (nrow(Q)) Q$player[1] else NA_character_,
+         pb    = nfl_catch_pb(R),
+         pb_rz = nfl_rz_pb(R),
+         k = tr$kicker, pr = tr$punt_returner, kr = tr$kick_returner,
+         dst_id = if (!is.na(tr$dst) && nzchar(trimws(tr$dst))) tr$dst else tm,
+         dl = if (tm == fav) dl_fav else dl_dog,
+         pint_src = if (tm == fav) dl_dog else dl_fav,   # our QB's INTs = opp defence's picks
+         who = { w <- unique(c(R$player, S$player, Q$player,
+                               tr$kicker, tr$punt_returner, tr$kick_returner))
+                 w[!is.na(w) & w != ""] })
+  })
+  names(setup) <- c(fav, dog)
+
+  say(sprintf("simulating %s games", format(n_sims, big.mark = ",")), 0.2)
+  out <- vector("list", length(setup))
+
+  for (si in seq_along(setup)) {
+    cf <- setup[[si]]; tm <- cf$tm
+    R <- cf$rec; S <- cf$rsh; QB <- cf$qbs
+    nR <- nrow(R); nS <- nrow(S); nQ <- nrow(QB)
+
+    pos <- setNames(rep("WR", length(cf$who)), cf$who)
+    if (nR) pos[R$player] <- R$pos
+    if (nS) pos[S$player] <- fifelse(S$pos == "QB", "QB", "RB")
+    if (nQ) pos[QB$player] <- "QB"
+    if (!is.na(cf$k)) pos[cf$k] <- "K"
+    miss <- setdiff(cf$who, names(pos)); if (length(miss)) pos[miss] <- "WR"
+
+    # ---- gather every drawn game's events for this side, one shot ----------
+    sel <- BLK[data.table(game_id = draw$game_id, posteam = cf$pool_tm)][, sim := .I]
+    sel[is.na(s), `:=`(s = 1L, e = 0L)]
+    lens <- pmax(sel$e - sel$s + 1L, 0L)
+    E2 <- EV[rep(sel$s, lens) + sequence(lens) - 1L]
+    E2[, sim := rep(sel$sim, lens)]
+
+    cmpE  <- E2[kind == NFL_EVT_CMP,  .(sim, yds, td, rz)]
+    runE  <- E2[kind == NFL_EVT_RUN,  .(sim, yds, td, gl, sy)]
+    sackE <- E2[kind == NFL_EVT_SACK, .(sim, yds)]
+    fgv   <- rep(0, n_sims)
+    fgg   <- E2[kind == NFL_EVT_FG & !is.na(made) & made == 1L,
+                .(fg = sum(nfl_fg_points(ytg))), by = sim]
+    if (nrow(fgg)) fgv[fgg$sim] <- fgg$fg
+
+    rec <- if (nR) nfl_deal_receiving(cmpE, cf$pb, cf$pb_rz, R$player, n_sims = n_sims) else NULL
+    rsh <- if (nS) nfl_deal_rushing(runE, S[, .(carry_usage, sy_share, gl_share)], S$player, n_sims = n_sims) else NULL
+    sk  <- if (nQ) nfl_deal_sacks(sackE, QB$pass_share, QB$player) else NULL
+
+    # ---- assemble the (sim x player) grid --------------------------------
+    D <- CJ(sim = seq_len(n_sims), player = cf$who, sorted = FALSE)
+    if (!is.null(rec)) D <- merge(D, rec, by = c("sim", "player"), all.x = TRUE)
+    if (!is.null(rsh)) D <- merge(D, rsh, by = c("sim", "player"), all.x = TRUE)
+    for (cl in c("rec", "ryds", "rtd", "rec_b5", "rec_rz", "car", "cyds", "ctd"))
+      if (!cl %in% names(D)) D[, (cl) := 0] else D[is.na(get(cl)), (cl) := 0]
+    D[, `:=`(pyds = 0, ptd = 0, pint = 0, fgp = 0, xp = 0, rettd = 0L, fum = 0L,
+             is_dst = FALSE,
+             def_sacks = 0, def_int = 0, def_fum_rec = 0, def_td = 0,
+             def_block = 0, def_safety = 0, pa = NA_real_)]
+
+    # passing line -> the first QB. yards / TDs come from the drawn game (they
+    # equal the summed dealt receiving line by construction); INTs come from the
+    # opponent's drawn defensive box.
+    if (!is.na(cf$qb)) {
+      pv  <- draw[[paste0(cf$side, "pass_yds")]]
+      ptv <- draw[[paste0(cf$side, "pass_td")]]
+      inv <- cf$pint_src$def_int
+      D[player == cf$qb, `:=`(pyds = pv[sim], ptd = ptv[sim], pint = inv[sim])]
+    }
+    if (!is.null(sk)) D[sk, on = .(sim, player), cyds := cyds + i.sack_yds]
+
+    # kicker: FG points as they were kicked + one XP per offensive TD (v1
+    # approximation -- slim carries no XP event; missed XP / 2pt not modelled).
+    if (!is.na(cf$k)) {
+      tdv <- D[, .(t = sum(rtd) + sum(ctd)), by = sim]
+      xpv <- rep(0, n_sims); xpv[tdv$sim] <- tdv$t
+      D[player == cf$k, `:=`(fgp = fgv[sim], xp = xpv[sim])]
+    }
+
+    # return TDs: the drawn game's non-offensive return-TD count, credited to
+    # ONE returner slot (KR first, else PR) at +6 each -- the same events the
+    # DST row also scores. v1 does not split defensive vs ST return TDs.
+    ret_slot <- if (!is.na(cf$kr) && nzchar(cf$kr)) cf$kr
+                else if (!is.na(cf$pr) && nzchar(cf$pr)) cf$pr else NA_character_
+    if (!is.na(ret_slot)) {
+      rtv <- cf$dl$ret_td
+      D[player == ret_slot, rettd := rettd + rtv[sim]]
+    }
+
+    # fumbles lost: the drawn game's count (our fumbles lost = the opponent
+    # defence's fumble recoveries), spread across assigned touches by the
+    # per-touch weights. Vectorised by cumulative weight within each sim.
+    flv <- cf$pint_src$def_fum_rec
+    D[, tch := rec + car]
+    if (!is.na(cf$qb)) D[player == cf$qb, tch := tch + 25]
+    D[, fwt := tch * unname(NFL_FUM_RATE[pos[player]])]
+    D[is.na(fwt), fwt := 0]
+    setorder(D, sim)
+    D[, cw := cumsum(fwt), by = sim]
+    tw <- D[, .(tw = max(cw)), by = sim]$tw
+    hit <- rep(seq_len(n_sims), pmax(round(flv), 0L))
+    hit <- hit[tw[hit] > 0]
+    if (length(hit)) {
+      nW <- length(cf$who)
+      u  <- runif(length(hit)) * tw[hit]
+      cwv <- D$cw
+      offs <- (hit - 1L) * nW
+      w <- offs + vapply(seq_along(hit), function(j)
+             which.max(cwv[(offs[j] + 1L):(offs[j] + nW)] >= u[j]), 1L)
+      D[, fum := tabulate(w, nbins = nrow(D))]
+    }
+    D[, c("tch", "fwt", "cw") := NULL]
+
+    # ---- the DST row -----------------------------------------------------
+    dl <- cf$dl
+    Ddst <- data.table(sim = seq_len(n_sims), player = cf$dst_id,
+                       rec = 0, ryds = 0, rtd = 0, rec_b5 = 0, rec_rz = 0,
+                       car = 0, cyds = 0, ctd = 0,
+                       pyds = 0, ptd = 0, pint = 0, fgp = 0, xp = 0, rettd = 0L, fum = 0L,
+                       is_dst = TRUE,
+                       def_sacks = dl$def_sacks, def_int = dl$def_int,
+                       def_fum_rec = dl$def_fum_rec, def_td = dl$def_td,
+                       def_block = dl$def_block, def_safety = dl$def_safety,
+                       pa = dl$pa)
+    D[, team := tm]; Ddst[, team := tm]
+    out[[si]] <- rbindlist(list(D, Ddst), use.names = TRUE, fill = TRUE)
+    say(sprintf("%s dealt", tm), 0.2 + 0.6 * si / length(setup))
+  }
+
+  say("scoring", 0.85)
+  A <- rbindlist(out, use.names = TRUE, fill = TRUE)
+  setnames(A, "sim", "SimID")
+  A[, DKScore := round(nfl_score_lines(A, "DK"), 3)]
+  A[, FDScore := round(nfl_score_lines(A, "FD"), 3)]
+
+  # ---- position + metadata --------------------------------------------------
+  posmap <- unique(PL[, .(player, Pos = pos)])
+  posmap <- rbind(posmap, TT[, .(player = dst, Pos = "DST")], fill = TRUE)
+  posmap <- unique(posmap, by = "player")
+  meta <- unique(A[, .(Player = player, Team = team)])
+  meta <- merge(meta, posmap, by.x = "Player", by.y = "player", all.x = TRUE)
+  meta[is.na(Pos), Pos := "WR"]
+  meta[, `:=`(DKID = NA_integer_, DKCID = NA_integer_,
+              DKSalary = NA_integer_, DKCSalary = NA_integer_,
+              FDID = NA_integer_, FDSalary = NA_integer_,
+              DKProj = NA_real_, DKOwn = 0, CPTOwn = 0, FDProj = NA_real_, FDOwn = 0)]
+  prj <- input_data$projections
+  if (!is.null(prj) && nrow(as.data.table(prj))) {
+    prj <- as.data.table(prj)
+    if ("dkproj" %in% names(prj)) meta[prj, DKProj := as.numeric(i.dkproj), on = .(Player = player)]
+    if ("dkown"  %in% names(prj)) meta[prj, DKOwn  := as.numeric(i.dkown),  on = .(Player = player)]
+    if ("fdproj" %in% names(prj)) meta[prj, FDProj := as.numeric(i.fdproj), on = .(Player = player)]
+    if ("fdown"  %in% names(prj)) meta[prj, FDOwn  := as.numeric(i.fdown),  on = .(Player = player)]
+    for (idc in intersect(c("dkid", "dk_id"), names(prj)))
+      meta[prj, DKID := suppressWarnings(as.integer(get(paste0("i.", idc)))), on = .(Player = player)]
+    for (sc in intersect(c("salary", "dksalary", "dk_salary"), names(prj)))
+      meta[prj, DKSalary := suppressWarnings(as.integer(get(paste0("i.", sc)))), on = .(Player = player)]
+  }
+  meta[is.na(DKOwn), DKOwn := 0][is.na(CPTOwn), CPTOwn := 0][is.na(FDOwn), FDOwn := 0]
+
+  sim_results <- A[, .(SimID, Player = player, Team = team,
+                       DKScore, FDScore)]
+  sim_results <- merge(sim_results, meta[, .(Player, DKSalary, DKID, FDSalary)],
+                       by = "Player", all.x = TRUE, sort = FALSE)
+  sim_results[, DKOwn := 0]
+
+  projections <- A[, .(DKProj = round(mean(DKScore), 2), FDProj = round(mean(FDScore), 2)),
+                   by = .(Player = player)]
+
+  say("summaries", 0.93)
+  sv <- nfl_sport_visuals(A, meta, draw, fav, dog, total, spread, r, nrow(Gp), n_sims, slate_type)
+  # the drawn game per SimID, for acceptance checks / debugging (small: n_sims rows)
+  sv$draw <- data.table(SimID = seq_len(n_sims), game_id = draw$game_id,
+                        fav = fav, dog = dog, fteam = draw$fteam, dteam = draw$dteam,
+                        fpass_yds = draw$fpass_yds, dpass_yds = draw$dpass_yds,
+                        fcarries = draw$fcarries, dcarries = draw$dcarries,
+                        fcmp = draw$fcmp, dcmp = draw$dcmp,
+                        frush_yds = draw$frush_yds, drush_yds = draw$drush_yds,
+                        ptsF = draw$ptsF, ptsD = draw$ptsD)
+
+  say("done", 1)
+  res <- list(sim_results = sim_results, metadata = meta, projections = projections,
+              sport_visuals = sv)
+  if (isTRUE(keep_components)) {
+    ccols <- intersect(c("SimID", "player", "team", "is_dst", "rec", "ryds", "rtd",
+                         "rec_b5", "rec_rz", "car", "cyds", "ctd", "pyds", "ptd", "pint",
+                         "fgp", "xp", "rettd", "fum", "def_sacks", "def_int", "def_fum_rec",
+                         "def_td", "def_block", "pa", "DKScore", "FDScore"), names(A))
+    res$sim_components <- A[, ..ccols]
+  }
+  res
+}
+
+# =============================================================================
+# sport_visuals -- the read-back tables. A subset of CFB's set, plus FD.
+# =============================================================================
+nfl_sport_visuals <- function(A, meta, draw, fav, dog, total, spread, r, pool_n, n_sims, slate_type) {
+  P <- A[is_dst == FALSE]
+  stat_line <- P[, .(
+      Rec = round(mean(rec), 2), RecYds = round(mean(ryds), 1), RecTD = round(mean(rtd), 3),
+      Car = round(mean(car), 2), RushYds = round(mean(cyds), 1), RushTD = round(mean(ctd), 3),
+      PassYds = round(mean(pyds), 1), PassTD = round(mean(ptd), 3), INT = round(mean(pint), 3),
+      RetTD = round(mean(rettd), 4), Fum = round(mean(fum), 3),
+      DK = round(mean(DKScore), 2), FD = round(mean(FDScore), 2),
+      Floor = round(as.numeric(quantile(DKScore, .25)), 1),
+      Ceil  = round(as.numeric(quantile(DKScore, .90)), 1),
+      Bust = round(100 * mean(DKScore < 3), 1), Boom = round(100 * mean(DKScore >= 20), 1)),
+    by = .(Player = player, Team = team)]
+  dst_line <- A[is_dst == TRUE, .(
+      Sacks = round(mean(def_sacks), 2), INT = round(mean(def_int), 2),
+      FumRec = round(mean(def_fum_rec), 2), DefTD = round(mean(def_td), 3),
+      PA = round(mean(pa, na.rm = TRUE), 1),
+      DK = round(mean(DKScore), 2), FD = round(mean(FDScore), 2)),
+    by = .(Player = player, Team = team)]
+  stat_line <- merge(stat_line, meta[, .(Player, Pos)], by = "Player", all.x = TRUE)
+  setorder(stat_line, -DK)
+
+  team_line <- P[, .(Rec = sum(rec), RecYds = sum(ryds), RecTD = sum(rtd),
+                     Car = sum(car), RushYds = sum(cyds), RushTD = sum(ctd),
+                     PassYds = sum(pyds), PassTD = sum(ptd), INT = sum(pint), Fum = sum(fum),
+                     KickPts = sum(fgp + xp)),
+                 by = .(SimID, team)][
+                 , .(Rec = round(mean(Rec), 1), RecYds = round(mean(RecYds)),
+                     Car = round(mean(Car), 1), RushYds = round(mean(RushYds)),
+                     PassYds = round(mean(PassYds)),
+                     PassTD = round(mean(PassTD), 2), RushTD = round(mean(RushTD), 2),
+                     INT = round(mean(INT), 2), Fum = round(mean(Fum), 2),
+                     KickPts = round(mean(KickPts), 1)),
+                 by = .(Team = team)]
+  team_line[, `:=`(Implied = fifelse(Team == fav,
+                     round(total / 2 - spread / 2, 1),   # spread is home-relative; fav implied
+                     round(total / 2 + spread / 2, 1)),
+                   ScrimYds = RecYds + RushYds)]
+  # the favourite's implied points regardless of home/away:
+  fav_imp <- total / 2 + abs(spread) / 2
+  team_line[, Implied := fifelse(Team == fav, round(fav_imp, 1), round(total - fav_imp, 1))]
+  team_line[, PassShare := round(PassYds / pmax(PassYds + RushYds, 1), 3)]
+  setcolorder(team_line, c("Team", "Implied", "ScrimYds", "PassShare"))
+
+  components <- P[, .(
+      Receptions = round(mean(rec) * 1.0, 2),
+      RecYards   = round(mean(ryds) * 0.1, 2),
+      RecTDs     = round(mean(rtd) * 6, 2),
+      RushYards  = round(mean(cyds) * 0.1, 2),
+      RushTDs    = round(mean(ctd) * 6, 2),
+      PassYards  = round(mean(pyds) * 0.04, 2),
+      PassTDs    = round(mean(ptd) * 4, 2),
+      Kicking    = round(mean(fgp + xp), 2),
+      ReturnTDs  = round(mean(rettd) * 6, 2),
+      Turnovers  = round(mean(pint * -1 + fum * -1), 2),
+      DK_Total   = round(mean(DKScore), 2)),
+    by = .(Player = player, Team = team)][order(-DK_Total)]
+
+  rates <- P[, .(
+      AnyTD    = round(100 * mean((rtd + ctd + rettd) >= 1), 1),
+      MultiTD  = round(100 * mean((rtd + ctd + rettd) >= 2), 1),
+      Rec100   = round(100 * mean(ryds >= 100), 1),
+      Rush100  = round(100 * mean(cyds >= 100), 1),
+      Pass300  = round(100 * mean(pyds >= 300), 1),
+      Blank    = round(100 * mean(rec == 0 & car == 0 & pyds == 0 & fgp == 0), 1)),
+    by = .(Player = player, Team = team)]
+  rates <- merge(rates, stat_line[, .(Player, Pos, DK)], by = "Player", all.x = TRUE)
+  setorder(rates, -DK)
+
+  ptsv <- data.table(SimID = seq_len(n_sims), f = draw$ptsF, d = draw$ptsD)
+  tg <- P[, .(PassYds = sum(pyds), RushYds = sum(cyds), Rec = sum(rec),
+              TotalTD = sum(rtd) + sum(ctd)), by = .(SimID, team)]
+  tg[ptsv, Points := fifelse(team == fav, i.f, i.d), on = "SimID"]
+  tg[, ScrimYds := PassYds + RushYds]
+  TEAM_METRICS <- c("Points", "ScrimYds", "PassYds", "RushYds", "Rec", "TotalTD")
+  for (cc in TEAM_METRICS) tg[[cc]] <- as.numeric(tg[[cc]])
+  team_spread <- melt(tg, id.vars = c("SimID", "team"), measure.vars = TEAM_METRICS,
+                      variable.name = "Metric", value.name = "V")[
+    , .(Mean = round(mean(V), 1), P10 = round(quantile(V, .1), 1),
+        P25 = round(quantile(V, .25), 1), Median = round(median(V), 1),
+        P75 = round(quantile(V, .75), 1), P90 = round(quantile(V, .9), 1)),
+    by = .(Team = team, Metric)]
+
+  score_dist <- rbind(
+    stat_line[, .(Player, Team, Pos, Mean = DK, Floor, Ceil, Bust, Boom)],
+    dst_line[, .(Player, Team, Pos = "DST", Mean = DK, Floor = NA_real_, Ceil = NA_real_,
+                 Bust = NA_real_, Boom = NA_real_)], fill = TRUE)[order(-Mean)]
+
+  list(stat_line = stat_line, dst_line = dst_line, team_line = team_line,
+       components = components, rates = rates, team_spread = team_spread,
+       score_dist = score_dist,
+       pool_size = pool_n, n_sims = n_sims, ess = round(r$ess),
+       slate_type = slate_type,
+       market = sprintf("%s slate | fav %s | total %.1f, spread %+.1f (home-rel)",
+                        slate_type, fav, total, spread),
+       pool_total = round(r$total, 1), pool_margin = round(r$margin, 1),
+       asked_total = round(r$target$total, 2))
+}
+
+# =============================================================================
+# CLASSIC (multi-game full slate) -- N two-team sims stacked in a shared SimID
+# space (the games are independent, so SimID k is one Monte-Carlo world across
+# the card). Adds GameKey / StartOrder for the classic optimiser. Mirrors
+# run_cfb_classic_simulation.
+# =============================================================================
+run_nfl_classic_simulation <- function(input_data, n_sims = 10000, config = NULL,
+                                       progress_callback = NULL, keep_components = FALSE,
+                                       seed = NULL) {
+  if (is.null(n_sims) || is.na(n_sims)) n_sims <- 10000
+  G   <- copy(as.data.table(input_data$game))
+  TT  <- as.data.table(input_data$team)
+  PL  <- copy(as.data.table(input_data$players))
+  PRJ <- input_data$projections
+  if (!"start_order" %in% names(G) || anyNA(G$start_order)) G[, start_order := seq_len(.N)]
+  setorder(G, start_order)
+  ng <- nrow(G)
+
+  say <- function(msg, frac = NULL) {
+    if (is.function(progress_callback)) try(progress_callback(msg, frac), silent = TRUE)
+    message("[nfl-classic] ", msg)
+  }
+
+  sr <- vector("list", ng); md <- vector("list", ng)
+  pj <- vector("list", ng); vis <- vector("list", ng); cp <- vector("list", ng)
+
+  for (i in seq_len(ng)) {
+    gi  <- G[i]; tms <- c(gi$away, gi$home); gkey <- paste(gi$away, gi$home)
+    say(sprintf("game %d/%d  %s", i, ng, gkey), (i - 1) / ng)
+    sub <- list(game = gi, team = TT[team %in% tms], players = PL[team %in% tms],
+                projections = PRJ)
+    gp <- if (is.function(progress_callback))
+            function(m, f) try(progress_callback(sprintf("game %d/%d: %s", i, ng, m),
+                                                 (i - 1 + (f %||% 0)) / ng), silent = TRUE) else NULL
+    res <- run_nfl_simulation(sub, n_sims = n_sims, config = config, progress_callback = gp,
+                              keep_components = keep_components, .slate_type = "classic",
+                              seed = if (is.null(seed)) NULL else as.integer(seed) + i)
+    so <- as.integer(gi$start_order)
+    sr[[i]] <- as.data.table(res$sim_results)[, `:=`(GameKey = gkey, StartOrder = so)]
+    md[[i]] <- as.data.table(res$metadata)[,   `:=`(GameKey = gkey, StartOrder = so)]
+    pj[[i]] <- as.data.table(res$projections)
+    vis[[i]] <- res$sport_visuals
+    if (isTRUE(keep_components) && !is.null(res$sim_components)) {
+      cc <- res$sim_components; cc[, GameKey := gkey]; cp[[i]] <- cc
+    }
+  }
+
+  say("combining", 0.95)
+  sim_results <- rbindlist(sr, fill = TRUE)
+  metadata    <- rbindlist(md, fill = TRUE)
+  projections <- rbindlist(pj, fill = TRUE)
+  sim_results <- sim_results[!is.na(Player) & Player != ""]
+  metadata    <- metadata[!is.na(Player) & Player != ""]
+  if (nrow(projections)) projections <- projections[!is.na(Player) & Player != ""]
+
+  vk <- c("stat_line", "dst_line", "team_line", "components", "rates", "team_spread", "score_dist")
+  sv <- list()
+  for (k in vk)
+    sv[[k]] <- rbindlist(lapply(seq_along(vis), function(j) {
+      d <- vis[[j]][[k]]
+      if (is.null(d) || !nrow(d)) return(NULL)
+      as.data.table(copy(d))[, Game := vis[[j]]$market][]
+    }), fill = TRUE)
+  ess_all <- vapply(vis, function(v) as.numeric(v$ess %||% NA_real_), 0)
+  sv$pool_size <- vis[[1]]$pool_size
+  sv$n_sims    <- n_sims
+  sv$ess       <- suppressWarnings(min(ess_all, na.rm = TRUE))
+  sv$slate_type <- "classic"
+  sv$market    <- sprintf("%d-game classic slate | worst-matched game ESS %s",
+                          ng, format(round(sv$ess), big.mark = ","))
+
+  say("done", 1)
+  out <- list(sim_results = sim_results, metadata = metadata,
+              projections = projections, sport_visuals = sv)
+  if (isTRUE(keep_components))
+    out$sim_components <- rbindlist(cp[!vapply(cp, is.null, logical(1))], fill = TRUE)
+  out
 }
