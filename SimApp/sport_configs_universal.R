@@ -315,7 +315,7 @@ SPORT_CONFIGS <- list(
   # Similar_Games sheets) is retired; the new sheet is GTS/NFL/R/slate_sheet.R
   # -- one tab per team carrying carry_usage + the five catch-band columns
   # (0-2 / 3-7 / 8-15 / 16-30 / 31+) plus the NFL-only dials rz_tgt_share /
-  # qb_rush_read / availability, and a `game` tab whose slate_type splits
+  # availability, and a `game` tab whose slate_type splits
   # showdown from classic. Mirrors CFB / CFB_CLASSIC. Engine: nfl_engine.R
   # (run_nfl_simulation), reader: read_nfl_input (wired in app.R's reader_map).
   #
@@ -349,7 +349,7 @@ SPORT_CONFIGS <- list(
         # none of the third set, so a CFB sheet falls through to the CFB entry.
         "carry_usage" %in% cols &&
           all(c("0-2", "3-7", "8-15", "16-30", "31+") %in% cols) &&
-          any(c("rz_tgt_share", "qb_rush_read", "availability") %in% cols)
+          any(c("rz_tgt_share", "availability") %in% cols)
       },
       required_sheets    = NULL,
       required_columns   = NULL,
@@ -470,7 +470,7 @@ SPORT_CONFIGS <- list(
                          error = function(e) character(0))
         "carry_usage" %in% cols &&
           all(c("0-2", "3-7", "8-15", "16-30", "31+") %in% cols) &&
-          any(c("rz_tgt_share", "qb_rush_read", "availability") %in% cols)
+          any(c("rz_tgt_share", "availability") %in% cols)
       },
       required_sheets    = NULL,
       required_columns   = NULL,
