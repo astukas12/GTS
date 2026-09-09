@@ -145,6 +145,12 @@ run("CFB Showdown (FSU@SMU)",
     dims = c("Pos","Team","SalaryTier"),
     expect_sport = "Showdown", expect_key = "CFB-SD", expect_conserve = 600)
 
+run("Soccer classic (UCL 9 Sep)",
+    "C:/Users/astuk/Downloads/contest-standings-195376207.csv",
+    "C:/Users/astuk/OneDrive/Documents/GTS/Soccer/Soccer_Input_Combined.xlsx",
+    dims = c("Pos","Team","Opp","Game","SalaryTier"),
+    expect_sport = "Soccer", expect_key = "Soccer", expect_conserve = 800)
+
 # ---- targeted assertions ----
 say("\n===== targeted checks =====")
 shiny::testServer(server, {
@@ -163,6 +169,23 @@ shiny::testServer(server, {
   n <- sum(players()$Matched)
   say("  fuzzy cutoff vs wrong CFB slate: matched =", n, "(expect 0)")
   if (n != 0) { FAILS <<- FAILS + 1; say("   FAIL") }
+  ms <- paste(as.character(output$meta_status), collapse = " ")
+  say("  wrong CFB slate still flagged 'Check the file pairing':", grepl("Check the file pairing", ms))
+  if (!grepl("Check the file pairing", ms)) { FAILS <<- FAILS + 1; say("   FAIL") }
+})
+shiny::testServer(server, {
+  # Soccer's input sheet is modelled players only, so ~26% of the contest pool
+  # (all sub-2% drafted) is unmatched. The ownership-weighted check must NOT
+  # cry wrong-slate on that.
+  session$setInputs(file = list(datapath = "C:/Users/astuk/Downloads/contest-standings-195376207.csv", name = "c.csv"),
+                    input_file = list(datapath = "C:/Users/astuk/OneDrive/Documents/GTS/Soccer/Soccer_Input_Combined.xlsx",
+                                      name = "s.xlsx"), sport_override = "Auto-detect")
+  pl <- players()
+  say("  soccer matched:", sum(pl$Matched), "of", nrow(pl))
+  ms <- paste(as.character(output$meta_status), collapse = " ")
+  flagged <- grepl("Check the file pairing", ms)
+  say("  soccer NOT flagged wrong-slate:", !flagged)
+  if (flagged) { FAILS <<- FAILS + 1; say("   FAIL") }
 })
 shiny::testServer(server, {
   session$setInputs(file = list(datapath = "C:/Users/astuk/Downloads/contest-standings-195045051.csv", name = "c.csv"),

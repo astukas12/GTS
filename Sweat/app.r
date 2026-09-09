@@ -26,7 +26,8 @@ options(shiny.maxRequestSize = 100*1024^2)
 # of all sports rather than any one sport's slots.
 SLOT_TOKENS <- c("CNSTR", "CPT", "FLEX", "S-FLEX", "UTIL",
                  "QB", "RB", "WR", "TE", "DST", "K",
-                 "PG", "SG", "SF", "PF", "C", "G", "F", "D", "P")
+                 "PG", "SG", "SF", "PF", "C", "G", "F", "D", "P",
+                 "M", "GK")
 
 LOCKED_TOKEN <- "LOCKED"
 
@@ -436,6 +437,55 @@ read_input_cfb <- function(path, sheets, showdown = FALSE) {
   unique(m, by = "Key")
 }
 
+# --- Soccer (classic) ---------------------------------------------------
+# Players sheet: DK_Name, Team, Opp, DK_RosterPos, DK_Salary, MIN (plus per-stat
+# share columns we do not use here). The roster position DK actually drafts by
+# is DK_RosterPos - D / M / F / GK, or "M/F" for a dual-eligible player - not
+# Pos, which is the tactical role (FB / CM / W / CB / ST). The Games sheet
+# carries the match total.
+read_input_soccer <- function(path, sheets) {
+  if (!"Players" %in% sheets) stop("Soccer input needs a 'Players' sheet.")
+  d <- as.data.table(readxl::read_excel(path, sheet = "Players"))
+  name_col <- intersect(c("DK_Name", "Player", "Name"), names(d))[1]
+  if (is.na(name_col)) stop("'Players' sheet has no DK_Name/Player column.")
+
+  num <- function(cl) if (cl %in% names(d)) suppressWarnings(as.numeric(d[[cl]])) else NA_real_
+  chr <- function(cl) if (cl %in% names(d)) trimws(as.character(d[[cl]])) else NA_character_
+
+  m <- data.table(
+    Player = trimws(as.character(d[[name_col]])),
+    Team   = toupper(chr("Team")),
+    Opp    = toupper(chr("Opp")),
+    Pos    = toupper(chr("DK_RosterPos")),
+    Salary = num("DK_Salary"),
+    Min    = num("MIN")
+  )
+  m <- m[!is.na(Player) & nzchar(Player)]
+
+  if ("Games" %in% sheets) {
+    g <- as.data.table(readxl::read_excel(path, sheet = "Games"))
+    if (all(c("Home", "Away") %in% names(g))) {
+      gtot <- if ("Total" %in% names(g)) suppressWarnings(as.numeric(g$Total)) else rep(NA_real_, nrow(g))
+      home <- toupper(trimws(as.character(g$Home)))
+      away <- toupper(trimws(as.character(g$Away)))
+      gl <- unique(rbind(
+        data.table(Team = home, Game = paste0(home, "@", away), Total = gtot),
+        data.table(Team = away, Game = paste0(home, "@", away), Total = gtot)
+      ), by = "Team")
+      m <- merge(m, gl[!is.na(Team)], by = "Team", all.x = TRUE)
+    }
+  }
+  if (!"Game" %in% names(m))  m[, Game := NA_character_]
+  if (!"Total" %in% names(m)) m[, Total := NA_real_]
+
+  m[, SalaryTier := bucket_quantile(
+      Salary, 5,
+      fmt = function(v) paste0("$", formatC(round(v), format = "d", big.mark = ",")))]
+  m <- m[!is.na(Player) & nzchar(Player)]
+  m[, Key := norm_name(Player)]
+  unique(m, by = "Key")
+}
+
 SPORTS <- list(
   NASCAR = list(
     label      = "NASCAR",
@@ -503,6 +553,18 @@ SPORTS <- list(
     read_input = NULL, input_hint = NULL,
     group_dims = character(0), extra_cols = character(0), proj_own = NULL
   ),
+  Soccer = list(
+    label      = "Soccer",
+    entity     = "Player",
+    slots      = c("D", "M", "F", "GK", "UTIL"),
+    read_input = read_input_soccer,
+    input_hint = "Players sheet (DK_Name, Team, Opp, DK_RosterPos, DK_Salary, MIN) + Games sheet",
+    group_dims = c("Position" = "Pos", "Team" = "Team", "Opponent" = "Opp",
+                   "Match" = "Game", "Salary Tier" = "SalaryTier"),
+    extra_cols = c("Pos" = "Pos", "Team" = "Team", "Opp" = "Opp",
+                   "Salary" = "Salary", "Min" = "Min", "Total" = "Total"),
+    proj_own   = NULL
+  ),
   MMA = list(
     label      = "MMA",
     entity     = "Fighter",
@@ -564,6 +626,9 @@ detect_sport <- function(slot_tokens) {
   # College football is QB/RB/WR/FLEX like the NFL but adds a superflex, so it
   # has to be tested first or it would come back as NFL.
   if (has("S-FLEX"))                      return("CFB")
+  # Soccer classic is D/M/F/GK/UTIL. GK is unique to soccer - no other DK sport
+  # has a keeper slot - so it settles the sport before the UTIL->CBB line does.
+  if (has("GK"))                          return("Soccer")
   if (any(c("QB", "DST") %in% tk))        return("NFL")
   if (any(c("PG", "SG", "PF") %in% tk))   return("NBA")
   # MMA Showdown is "CPT <name> F <name> ..." - the F is what separates it
@@ -1108,9 +1173,12 @@ server <- function(input, output, session) {
     if (!is.null(input$sport_override) && input$sport_override != "Auto-detect") {
       return(input$sport_override)
     }
-    # A supplied input workbook identifies the sport; the contest's slot set
-    # says whether this is its classic or its showdown variant.
-    if (!is.null(input$input_file)) {
+    # When the roster shape alone is ambiguous (generic Showdown, or nothing
+    # recognised), let a supplied workbook name the sport - its sheet signature
+    # is decisive - and the slot set say classic vs showdown. An unambiguous
+    # slot detection (Soccer's GK, NASCAR's lone D, ...) is trusted as-is, so a
+    # shared sheet name like "IDs" can't drag it somewhere else.
+    if (ct$detected %in% c("Showdown", "Unknown") && !is.null(input$input_file)) {
       fam <- tryCatch(identify_workbook_family(readxl::excel_sheets(input$input_file$datapath)),
                       error = function(e) NA_character_)
       k <- family_to_key(fam, "CPT" %in% ct$slot_tokens)
@@ -1295,17 +1363,28 @@ server <- function(input, output, session) {
           paste0("Sim input matched all ", n_tot, " contest ",
                  tolower(ad$entity), "s."))
     } else {
-      # A large miss rate almost always means the input file is for a
-      # different slate, which is worth saying out loud rather than quietly
-      # dropping those rows from every table.
-      bad <- length(missed) / max(n_tot, 1) > 0.2
+      # A wrong-slate file misses the players the field actually drafted; a
+      # "modelled players only" sheet (soccer, CFB) misses only near-0%
+      # scrubs. So weight the gap by ownership, not raw count: what share of
+      # the field's total drafted exposure is unaccounted for.
+      own_all  <- sum(pl$DKFieldPct, na.rm = TRUE)
+      own_miss <- sum(pl[Matched == FALSE, DKFieldPct], na.rm = TRUE)
+      miss_share <- if (isTRUE(own_all > 0)) own_miss / own_all else length(missed) / max(n_tot, 1)
+      bad <- miss_share > 0.12
       div(class = if (bad) "gt-note warn" else "gt-note",
           paste0(if (bad) "Check the file pairing. " else "",
                  "Sim input matched ", n_hit, " of ", n_tot, " contest ",
                  tolower(ad$entity), "s. Unmatched: ",
                  paste(head(missed, 12), collapse = ", "),
                  if (length(missed) > 12) paste0(" (+", length(missed) - 12, " more)") else "",
-                 if (bad) " - that is a big enough gap that this input file is probably for a different slate." else ""))
+                 if (bad)
+                   paste0(" - and those account for ", round(miss_share * 100),
+                          "% of the field's drafted exposure, so this input file is probably for a different slate.")
+                 else if (isTRUE(own_all > 0))
+                   paste0(" - all under ",
+                          formatC(max(pl[Matched == FALSE, DKFieldPct], 0, na.rm = TRUE), format = "f", digits = 1),
+                          "% drafted, so the tables are effectively complete.")
+                 else ""))
     }
   })
 
@@ -1513,7 +1592,7 @@ server <- function(input, output, session) {
                              fontWeight = "bold")
     }
     # Salary-style columns read better without decimals.
-    whole <- intersect(c("Salary", "Start", "DKMax", "Slots", "Locked Slots",
+    whole <- intersect(c("Salary", "Start", "DKMax", "Min", "Slots", "Locked Slots",
                          "Total Slots", "Times Used", "Contest Players",
                          "Revealed", "Entries"), num_cols)
     frac  <- setdiff(num_cols, whole)
