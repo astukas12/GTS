@@ -40,8 +40,6 @@
 #   carry_usage   P(handed any given NORMAL designed carry). Sums to 1.
 #   sy_share      P(handed a short-yardage carry: dn>=3 & dist<=2). Blank = carry_usage.
 #   gl_share      P(handed a goal-line carry: ytg<=3). Blank = carry_usage.
-#   qb_rush_read  designed-run archetype scalar (currently a readback only -- QB
-#                 designed runs ride the drawn game; efficiency is the pool's).
 #   kicker / punt_returner / kick_returner / dst   one name / identity each
 #   pys_target    the pass-yard share of scrimmage to ASK THE POOL for
 #
@@ -140,18 +138,15 @@ NFL_FUM_RATE <- c(QB = .0244, WR = .0078, TE = .0078, RB = .0056, K = 0, DST = 0
 # DK / FD SCORING TABLES
 # -----------------------------------------------------------------------------
 # TD and yardage values are shared. What differs: reception weight (DK 1.0 /
-# FD 0.5), the yardage BONUSES (DK only), and the fumble-lost penalty.
+# FD 0.5) and the fumble-lost penalty (DK -1 / FD -2). The 300-pass / 100-rush /
+# 100-rec game bonuses are +3 on BOTH sites.
 #
-# FANDUEL TABLE -- pinned to FanDuel's published NFL fantasy rules, Sept 2026,
-# WITH THREE ITEMS FLAGGED that could not be re-confirmed against a live source
-# this session (README open item #9):
-#   * FD fumble lost = -2  [FLAGGED]  (DK is -1; FD has historically been -2 for
-#     a lost fumble by an offensive player -- verify before Week 1 ships).
-#   * FD kicker distance bands 0-39 / 40-49 / 50+  ->  3 / 4 / 5  [FLAGGED]
-#     (believed current; FanDuel used a flat "FG made = 3" in older rule sets).
-#   * FD missed-XP = -1  [FLAGGED]  (v1 approximates XP made = offensive TD
-#     count, so no misses are generated -- this constant is dormant).
-# Anything here that a Week-1 rules check contradicts is a one-line edit.
+# FANDUEL TABLE -- reconciled against FanDuel's live "Rules & Scoring" panel
+# for the Week-1 NE @ SEA slate (Sept 2026). Confirmed there: the +3 yardage
+# bonuses (AnyFLEX tier; 4.5 at MVP = flat 1.5x), fumble lost = -2, FG bands
+# 0-39 / 40-49 / 50+ -> 3 / 4 / 5, reception 0.5, XP made = 1. FanDuel's panel
+# shows no missed-XP penalty; xp_miss = -1 is kept but stays dormant (v1
+# approximates XP made = offensive TD count, so no misses are generated).
 # =============================================================================
 NFL_SCORE <- list(
   DK = list(
@@ -161,9 +156,9 @@ NFL_SCORE <- list(
     fumble_lost = -1, return_td = 6,
     xp = 1, xp_miss = 0),
   FD = list(
-    pass_yd = 0.04, pass_td = 4, interception = -1, pass_300 = 0,
-    rush_yd = 0.10, rush_td = 6, rush_100 = 0,
-    rec = 0.5, rec_yd = 0.10, rec_td = 6, rec_100 = 0,
+    pass_yd = 0.04, pass_td = 4, interception = -1, pass_300 = 3,
+    rush_yd = 0.10, rush_td = 6, rush_100 = 3,
+    rec = 0.5, rec_yd = 0.10, rec_td = 6, rec_100 = 3,
     fumble_lost = -2, return_td = 6,
     xp = 1, xp_miss = -1))
 
@@ -481,16 +476,16 @@ nfl_deal_sacks <- function(events, pass_share, qbs) {
 
 # =============================================================================
 # READING THE SHEET  -- one tab per team + a `game` tab, readxl (SimApp parity).
-# Mirrors GTS/NFL/R/slate_sheet.R::read_slate_sheet in shape: player table from
-# columns A..N, the kicker / returners / DST identity as a field/value block
-# from column S, `pys_target` melted onto the team table from the game tab.
+# Mirrors GTS/NFL/R/slate_sheet.R::read_slate_sheet in shape: the player table
+# runs from column A up to the kicker / returners / DST identity field/value
+# block at column S, `pys_target` melted onto the team table from the game tab.
 # =============================================================================
 NFL_PLAYER_COLS <- c("player", "route_base", "pass_share",
                      "0-2", "3-7", "8-15", "16-30", "31+", "rz_tgt_share",
-                     "carry_usage", "sy_share", "gl_share", "qb_rush_read", "availability")
+                     "carry_usage", "sy_share", "gl_share", "availability")
 NFL_TEAM_FIELDS <- c("kicker", "punt_returner", "kick_returner", "dst", "notes")
 NFL_NUM_COLS    <- c("pass_share", NFL_BAND_COLS, "rz_tgt_share",
-                     "carry_usage", "sy_share", "gl_share", "qb_rush_read")
+                     "carry_usage", "sy_share", "gl_share")
 
 read_nfl_input <- function(file_path, slate = NULL, game = NULL) {
   sh <- readxl::excel_sheets(file_path)
