@@ -859,6 +859,11 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
       meta[prj, DKID := suppressWarnings(as.integer(get(paste0("i.", idc)))), on = .(Player = player)]
     for (sc in intersect(c("salary", "dksalary", "dk_salary"), names(prj)))
       meta[prj, DKSalary := suppressWarnings(as.integer(get(paste0("i.", sc)))), on = .(Player = player)]
+    # FanDuel ids / salaries -- needed for the FD classic optimiser + upload.
+    for (idc in intersect(c("fdid", "fd_id"), names(prj)))
+      meta[prj, FDID := suppressWarnings(as.integer(get(paste0("i.", idc)))), on = .(Player = player)]
+    for (sc in intersect(c("fdsalary", "fd_salary"), names(prj)))
+      meta[prj, FDSalary := suppressWarnings(as.integer(get(paste0("i.", sc)))), on = .(Player = player)]
   }
   meta[is.na(DKOwn), DKOwn := 0][is.na(CPTOwn), CPTOwn := 0][is.na(FDOwn), FDOwn := 0]
 

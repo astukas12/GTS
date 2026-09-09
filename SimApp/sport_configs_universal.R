@@ -434,16 +434,20 @@ SPORT_CONFIGS <- list(
   # carries slate_type = "classic" plus start_order (kickoff rank).
   #
   # DK classic roster QB / RB / RB / WR / WR / WR / TE / FLEX / DST, $50,000.
-  # FD classic swaps the DST slot for a K, $60,000. FLEX takes RB/WR/TE.
+  # FD classic is the IDENTICAL shape at $60,000 -- verified 9 Sep 2026 against
+  # FanDuel's current published NFL rules: FD classic has NO kicker (kickers are
+  # showdown / single-game only) and its 9th slot is DEF, not K. So one roster,
+  # one optimiser, both platforms; FanDuel just names the last slot DEF on
+  # upload. The README / 11b "FD swaps DST -> K" assumption was wrong.
+  # FLEX takes RB/WR/TE.
   #
   # Detection: a `game` tab whose slate_type is "classic". The showdown NFL
   # entry above bails on that same string, so order does not matter.
   #
-  # OPEN (part 12): the lineup optimiser wiring mirrors NFL_PRESEASON_CLASSIC
-  # (preseason_classic mode -- position slots, cap NOT treated as binding). A
-  # real NFL classic slate has a binding cap, so a cap-aware LP and the
-  # DK-DST / FD-K per-platform roster split are part-12 work. The sim + the
-  # projections table (the 11b verification bar) do not touch the optimiser.
+  # Part 12a wired the optimiser: mode "nfl_classic" (OptimalLineups_Core.R) is
+  # an exact per-sim classic optimum under a BINDING salary cap, mirroring
+  # "cfb_classic" over five positions + a fixed DST slot. app.R has NFL_CLASSIC
+  # branches in run_dk_optimization / run_fd_optimization.
   # ==========================================================================
   NFL_CLASSIC = list(
     sport_name          = "NFL_CLASSIC",
@@ -478,10 +482,12 @@ SPORT_CONFIGS <- list(
     roster_sizes = list(DK = 9, FD = 9),
     salary_caps  = list(DK = 50000, FD = 60000),
 
-    optimization_modes = list(DK = "preseason_classic", FD = "preseason_classic"),
+    optimization_modes = list(DK = "nfl_classic", FD = "nfl_classic"),
     max_lineups        = 5000,
 
-    # DK classic: QB / RB / RB / WR / WR / WR / TE / FLEX / DST.
+    # QB / RB / RB / WR / WR / WR / TE / FLEX / DST -- DK and FD, same shape.
+    # The optimiser derives the LP position bounds from these counts plus the
+    # FLEX eligibility (QB in [1,1], RB [2,3], WR [3,4], TE [1,2], DST [1,1]).
     position_slots = list(QB = 1, RB = 2, WR = 3, TE = 1, FLEX = 1, DST = 1),
     flex_eligible  = c("RB", "WR", "TE"),
 
@@ -524,11 +530,12 @@ SPORT_CONFIGS <- list(
       required_columns = list(base = c("player"))
     ),
 
-    # DK bulk upload column headers, in player-slot order. DK classic carries a
-    # DST slot; FD classic swaps it for a K.
+    # Bulk-upload column headers, in player-slot order. DK and FD classic are the
+    # same nine slots; ps_classic_headers() renames the last one DEF for the FD
+    # file. (FanDuel NFL classic has no kicker slot -- showdown only.)
     dk_export_slots = list(
       DK = c("QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "DST"),
-      FD = c("QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "K")
+      FD = c("QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "DST")
     ),
 
     simulation = list(
