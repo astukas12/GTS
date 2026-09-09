@@ -2629,9 +2629,9 @@ server <- function(input, output, session) {
   # VERSION-BASED LOCK/EXCLUDE RESET
   # ==========================================================================
   
-  observeEvent(rv$dk_optimal_lineups, { rv$dk_lock_v <- rv$dk_lock_v + 1L; rv$dk_slider_v <- rv$dk_slider_v + 1L; clear_lock_state("dk") })
-  observeEvent(rv$fd_optimal_lineups, { rv$fd_lock_v <- rv$fd_lock_v + 1L; rv$fd_slider_v <- rv$fd_slider_v + 1L; clear_lock_state("fd") })
-  observeEvent(rv$sd_optimal_lineups, { rv$sd_lock_v <- rv$sd_lock_v + 1L; rv$sd_slider_v <- rv$sd_slider_v + 1L; clear_lock_state("sd") })
+  observeEvent(rv$dk_optimal_lineups, { rv$dk_lock_v <- rv$dk_lock_v + 1L; rv$dk_slider_v <- rv$dk_slider_v + 1L; clear_lock_state("dk"); teamsplit_seed("dk") })
+  observeEvent(rv$fd_optimal_lineups, { rv$fd_lock_v <- rv$fd_lock_v + 1L; rv$fd_slider_v <- rv$fd_slider_v + 1L; clear_lock_state("fd"); teamsplit_seed("fd") })
+  observeEvent(rv$sd_optimal_lineups, { rv$sd_lock_v <- rv$sd_lock_v + 1L; rv$sd_slider_v <- rv$sd_slider_v + 1L; clear_lock_state("sd"); teamsplit_seed("sd") })
   
   
   # ==========================================================================
@@ -3156,11 +3156,25 @@ server <- function(input, output, session) {
                 tags$span(class = "tsp-pct", sprintf("%.1f%%", sh$pct[i])),
                 if (interactive) tags$span(class = "tsp-x", onclick = js_x, HTML("&times;")))
     })
-    if (interactive && (length(lk) || length(ex)))
+    # The pool starts with every split locked (all selected), so "clear" only
+    # earns its place once the selection has actually been narrowed.
+    narrowed <- length(ex) > 0 || length(lk) != nrow(sh)
+    if (interactive && narrowed)
       pills <- c(pills, list(tags$span(class = "gts-tspill-clear",
         onclick = sprintf("Shiny.setInputValue('%s_ts_clear',Math.random(),{priority:'event'});", lp),
-        "clear")))
+        "reset")))
     div(class = "gts-tsplit", pills)
+  }
+
+  # Seed the lock set to every split present in the pool -- the pill row starts
+  # with all combos selected. Called on each new set of optimal lineups and by
+  # the "reset" chip.
+  teamsplit_seed <- function(lp) {
+    rv[[paste0(lp, "_ts_excl")]] <- character(0)
+    ctx <- teamsplit_ctx(lp)
+    opt <- rv[[paste0(lp, "_optimal_lineups")]]
+    sh  <- if (!is.null(ctx) && !is.null(opt) && nrow(opt)) teamsplit_shares(opt, ctx) else NULL
+    rv[[paste0(lp, "_ts_lock")]] <- if (is.null(sh)) character(0) else sh$split
   }
 
   make_teamsplit_ui <- function(lp) {
@@ -3193,10 +3207,7 @@ server <- function(input, output, session) {
       rv[[paste0(lp, "_ts_lock")]] <- lk
       rv[[paste0(lp, "_ts_excl")]] <- ex
     }, ignoreInit = TRUE)
-    observeEvent(input[[paste0(lp, "_ts_clear")]], {
-      rv[[paste0(lp, "_ts_lock")]] <- character(0)
-      rv[[paste0(lp, "_ts_excl")]] <- character(0)
-    }, ignoreInit = TRUE)
+    observeEvent(input[[paste0(lp, "_ts_clear")]], teamsplit_seed(lp), ignoreInit = TRUE)
   }
   lapply(c("dk","fd","sd"), make_ts_click_observer)
 
