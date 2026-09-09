@@ -41,11 +41,15 @@ load_sport_input <- function(file_path, sport, config, slate = NULL, game = NULL
     NBA  = read_nba_input,
     SOCCER = read_soccer_input,
     CFB  = read_cfb_input,
-    CFB_CLASSIC = read_cfb_input
+    CFB_CLASSIC = read_cfb_input,
+    NFL  = read_nfl_input,
+    NFL_CLASSIC = read_nfl_input
   )
   if (sport %in% names(reader_map)) {
     # slate/game only mean anything to the CFB reader (a multi-slate
-    # workbook); every other reader ignores them.
+    # workbook); every other reader ignores them. NFL v1 has no multi-slate
+    # workbook (nfl_slate_menu is always NULL), so read_nfl_input takes only
+    # the path.
     if (sport %in% c("CFB", "CFB_CLASSIC"))
       return(reader_map[[sport]](file_path, slate = slate, game = game))
     return(reader_map[[sport]](file_path))
@@ -1216,6 +1220,7 @@ server <- function(input, output, session) {
     } else {
       d0 <- create_download_standard(optimal_lineups, metadata, platform)
       if (identical(sport, "NFL_PRESEASON_CLASSIC")) d0 <- ps_classic_headers(setDT(d0), platform)
+      if (identical(sport, "NFL_CLASSIC"))           d0 <- ps_classic_headers(setDT(d0), platform)
       if (identical(sport, "CFB_CLASSIC"))           d0 <- cfb_classic_headers(setDT(d0), platform)
       d0
     }
@@ -1642,6 +1647,48 @@ server <- function(input, output, session) {
           final_results[, (wc) := NULL]
         rv$dk_optimal_lineups <- final_results
 
+      } else if (rv$sport == "NFL_CLASSIC") {
+        # Classic NFL: nine position slots AND a binding salary cap ($50k DK).
+        # Same wiring as CFB_CLASSIC -- Pos is merged back onto the optimiser
+        # input (prepare_optimization_data keeps only Player/Salary), and the
+        # nfl_classic mode reads it to fill QB/RB/WR/TE/DST. StartOrder is
+        # already on sim_results (run_nfl_classic_simulation tags it) and routes
+        # the latest-kicking eligible player to FLEX for late swap.
+        progress$set(message="Finding optimal DraftKings lineups...", value=0)
+        opt_data <- prepare_optimization_data(rv$simulation_results, rv$sim_metadata, "DK")
+        opt_data <- merge(opt_data, rv$sim_metadata[, .(Player, Pos)],
+                          by="Player", all.x=TRUE)
+        dk_ok <- rv$sim_metadata[!is.na(DKID) & DKID != "" & DKID != "NA", Player]
+        opt_data <- opt_data[Player %in% dk_ok]
+        opt_config <- list(roster_size=rv$config$roster_sizes$DK, salary_cap=rv$config$salary_caps$DK,
+                           percentiles=c(0.01,0.05,0.10,0.20), platform_col="DKScore",
+                           position_slots=rv$config$position_slots,
+                           flex_eligible=rv$config$flex_eligible,
+                           max_lineups=rv$config$max_lineups %||% 5000L,
+                           use_parallel=TRUE,
+                           pool_spread=rv$config$pool_spread %||% 0)
+        progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
+        lineup_data <- find_optimal_lineups(opt_data, opt_config, mode="nfl_classic",
+                                            k=1, verbose=TRUE)
+        # DK classic rule: >= 2 teams and >= 2 games. Cheap to guarantee.
+        gtab <- as.data.table(rv$input_data$game)
+        lineup_data <- drop_invalid_classic(
+          lineup_data, rv$sim_metadata,
+          gtab[, .(AwayTeam=away, HomeTeam=home)])
+        progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
+                                    format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
+        score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
+        progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
+        own_data <- copy(rv$sim_metadata)
+        if ("DKOwn" %in% names(own_data)) { setnames(own_data, "DKOwn", "Own")
+          if (max(own_data$Own, na.rm=TRUE) > 1) own_data[, Own := Own / 100] }
+        final_results <- calculate_distribution_metrics(score_matrix, lineup_data, opt_config,
+                                                        ownership_data=own_data, verbose=TRUE)
+        final_results <- add_custom_metrics(final_results, rv$sim_metadata, rv$config)
+        for (wc in intersect(c("TotalEW","Win6Pct","Win5PlusPct"), names(final_results)))
+          final_results[, (wc) := NULL]
+        rv$dk_optimal_lineups <- final_results
+
       } else {
         dk_mode <- rv$config$optimization_modes$DK %||% "standard"
         progress$set(message="Finding optimal DraftKings lineups...", value=0)
@@ -1822,6 +1869,46 @@ server <- function(input, output, session) {
         if ("AvgOwn" %in% names(final_results)) final_results[, AvgOwn := NULL]
         rv$fd_optimal_lineups <- final_results
 
+      } else if (rv$sport == "NFL_CLASSIC") {
+        # Same nine slots as DK (FanDuel classic has no kicker), scored on
+        # FDScore against the $60k FD cap. Mirrors the DK NFL_CLASSIC branch.
+        if (!isTRUE(rv$has_fd)) {
+          showNotification("No FD salary data in this file.", type="warning"); return()
+        }
+        progress$set(message="Finding optimal FanDuel lineups...", value=0)
+        opt_data <- prepare_optimization_data(rv$simulation_results, rv$sim_metadata, "FD")
+        opt_data <- merge(opt_data, rv$sim_metadata[, .(Player, Pos)],
+                          by="Player", all.x=TRUE)
+        fd_ok <- rv$sim_metadata[!is.na(FDID) & FDID != "" & FDID != "NA", Player]
+        opt_data <- opt_data[Player %in% fd_ok]
+        opt_config <- list(roster_size=rv$config$roster_sizes$FD, salary_cap=rv$config$salary_caps$FD,
+                           percentiles=c(0.01,0.05,0.10,0.20), platform_col="FDScore",
+                           position_slots=rv$config$position_slots,
+                           flex_eligible=rv$config$flex_eligible,
+                           max_lineups=rv$config$max_lineups %||% 5000L,
+                           use_parallel=TRUE,
+                           pool_spread=rv$config$pool_spread %||% 0)
+        progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
+        lineup_data <- find_optimal_lineups(opt_data, opt_config, mode="nfl_classic",
+                                            k=1, verbose=TRUE)
+        gtab <- as.data.table(rv$input_data$game)
+        lineup_data <- drop_invalid_classic(
+          lineup_data, rv$sim_metadata,
+          gtab[, .(AwayTeam=away, HomeTeam=home)])
+        progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
+                                    format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
+        score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
+        progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
+        own_data <- copy(rv$sim_metadata)
+        if ("FDOwn" %in% names(own_data)) { setnames(own_data, "FDOwn", "Own")
+          if (max(own_data$Own, na.rm=TRUE) > 1) own_data[, Own := Own / 100] }
+        final_results <- calculate_distribution_metrics(score_matrix, lineup_data, opt_config,
+                                                        ownership_data=own_data, verbose=TRUE)
+        final_results <- add_custom_metrics(final_results, rv$sim_metadata, rv$config)
+        for (wc in intersect(c("TotalEW","Win6Pct","Win5PlusPct"), names(final_results)))
+          final_results[, (wc) := NULL]
+        rv$fd_optimal_lineups <- final_results
+
       } else {
         if (!isTRUE(rv$has_fd)) {
           showNotification("No FD salary data in this file.", type="warning"); return()
@@ -1831,7 +1918,12 @@ server <- function(input, output, session) {
         opt_data   <- prepare_optimization_data(rv$simulation_results, rv$sim_metadata, "FD")
         opt_config <- list(roster_size=rv$config$roster_sizes$FD, salary_cap=rv$config$salary_caps$FD,
                            percentiles=c(0.01,0.05,0.10,0.20), platform_col="FDScore",
-                           mvp_multiplier=1.5, progress_frequency=500, use_parallel=TRUE, max_lineups=5000)
+                           mvp_multiplier=1.5,
+                           # MVP salary multiplier: 1.5 for FD NFL 6-man single game
+                           # (MVP is priced at 1.5x), 1.0 for FD MMA. combinatorial_mvp
+                           # defaults it to 1.0, so it must be copied in here.
+                           mvp_salary_multiplier=rv$config$platform_columns$FD$mvp_salary_multiplier %||% 1.0,
+                           progress_frequency=500, use_parallel=TRUE, max_lineups=5000)
         progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
         lineup_data <- find_optimal_lineups(opt_data, opt_config, mode=fd_mode, k=1, verbose=TRUE)
         progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
@@ -3500,6 +3592,7 @@ server <- function(input, output, session) {
             dl[[col]] <- if(platform=="DK") paste0(dl[[col]]," (",ids,")") else paste0(ids,":",dl[[col]])
           }
           if (isTRUE(rv$sport == "NFL_PRESEASON_CLASSIC")) dl <- ps_classic_headers(dl, platform)
+          if (isTRUE(rv$sport == "NFL_CLASSIC"))           dl <- ps_classic_headers(dl, platform)
           if (isTRUE(rv$sport == "CFB_CLASSIC"))           dl <- cfb_classic_headers(dl, platform)
         }
         fwrite(dl, file)

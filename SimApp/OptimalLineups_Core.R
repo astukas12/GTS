@@ -31,6 +31,8 @@ find_optimal_lineups <- function(sim_results, config, mode = "standard", k = 3, 
     return(find_optimal_lineups_preseason_classic(sim_results, config, k, verbose))
   } else if (mode == "cfb_classic") {
     return(find_optimal_lineups_cfb_classic(sim_results, config, verbose))
+  } else if (mode == "nfl_classic") {
+    return(find_optimal_lineups_nfl_classic(sim_results, config, verbose))
   } else {
     stop(paste("Unknown mode:", mode,
                "- must be 'standard', 'mvp', 'captain', 'win_based',",
@@ -912,88 +914,138 @@ find_optimal_lineups_combinatorial_captain <- function(sim_results, config, verb
 }
 
 
+# =============================================================================
+# MODE 7: COMBINATORIAL MVP (FanDuel single-game / MVP format)
+# The MVP earns mvp_multiplier x score and costs mvp_salary_multiplier x salary;
+# the other (roster_size - 1) AnyFLEX slots are 1x / 1x.
+#
+#   * FD MMA sets mvp_salary_multiplier = 1.0 -- the top scorer is then always
+#     the optimal MVP, since making him MVP costs nothing extra.
+#   * FD NFL 6-man single game sets it to 1.5 -- MVPing an expensive top scorer
+#     can then bust the cap where MVPing the 2nd-best scorer would fit, so every
+#     player has to be tried as MVP. Same vectorised candidate loop as
+#     combinatorial_captain (the two formats are the same algorithm), with
+#     MVP / Player1..N column names.
+# =============================================================================
 find_optimal_lineups_combinatorial_mvp <- function(sim_results, config, verbose = TRUE) {
-  # FD MVP format: highest scorer per sim IS the MVP.
-  # Score is at 1.5x but salary counts at face value — same ID whether MVP or flex.
-  # So the optimal lineup is simply: pick the top scorer as MVP, then greedily
-  # fill 5 flex slots with the next-highest scorers under the remaining salary cap.
-  # No inner loop over candidates needed.
-  
   if (verbose) cat("\nPhase 1: Finding optimal lineup per sim (greedy MVP)...\n")
-  
+
   setDT(sim_results)
   roster_size    <- config$roster_size
   salary_cap     <- config$salary_cap
   mvp_multiplier <- if (!is.null(config$mvp_multiplier)) config$mvp_multiplier else 1.5
+  mvp_sal_mult   <- if (!is.null(config$mvp_salary_multiplier)) config$mvp_salary_multiplier else 1.0
   max_lineups    <- if (!is.null(config$max_lineups)) config$max_lineups else 5000L
   n_flex         <- roster_size - 1L
   start_time     <- Sys.time()
-  
-  players_dt <- unique(sim_results[, .(Player, Salary)])[Salary > 0 & !is.na(Salary)]
-  sim_ids    <- unique(sim_results$SimID)
-  n_sims     <- length(sim_ids)
-  
-  if (verbose) cat(sprintf("  %d players | %s sims | $%s cap | %.1fx MVP score\n",
-                           nrow(players_dt), format(n_sims, big.mark=","),
-                           format(salary_cap, big.mark=","), mvp_multiplier))
-  
-  setkey(sim_results, SimID)
-  prog_freq <- max(1L, n_sims %/% 10L)
-  lineup_list <- vector("list", n_sims)
-  
-  for (i in seq_along(sim_ids)) {
-    sid      <- sim_ids[i]
-    sim_data <- sim_results[.(sid)][Salary > 0 & !is.na(Salary) & !is.na(FantasyPoints)]
-    if (nrow(sim_data) < roster_size) next
-    
-    # Sort by score descending — highest scorer is always the MVP
-    setorder(sim_data, -FantasyPoints)
-    scores  <- sim_data$FantasyPoints
-    sals    <- sim_data$Salary
-    players <- sim_data$Player
-    n_p     <- nrow(sim_data)
-    
-    # Row 1 (highest scorer) is MVP; salary at face value toward cap
-    mvp_sal <- sals[1]
+
+  players_dt  <- unique(sim_results[Salary > 0 & !is.na(Salary), .(Player, Salary)])
+  all_players <- players_dt$Player
+  salaries    <- players_dt$Salary
+  n_players   <- nrow(players_dt)
+
+  sim_ids <- unique(sim_results$SimID)
+  n_sims  <- length(sim_ids)
+
+  if (verbose) cat(sprintf("  %d players | %s sims | $%s cap | %.1fx MVP score, %.2fx MVP salary\n",
+                           n_players, format(n_sims, big.mark=","),
+                           format(salary_cap, big.mark=","), mvp_multiplier, mvp_sal_mult))
+
+  # Score matrix: n_players x n_sims (collapse any duplicate player-sim rows first)
+  sim_results_clean <- sim_results[Salary > 0 & !is.na(Salary) & !is.na(FantasyPoints),
+                                   .(FantasyPoints = mean(FantasyPoints, na.rm = TRUE)),
+                                   by = .(Player, SimID)]
+  score_wide <- dcast(sim_results_clean, Player ~ SimID,
+                      value.var = "FantasyPoints", fun.aggregate = mean, fill = 0)
+  score_wide <- score_wide[match(all_players, Player)]
+  score_mat  <- as.matrix(score_wide[, -1L, with = FALSE])  # n_players x n_sims
+
+  best_score <- rep(-Inf, n_sims)
+  best_mvp   <- character(n_sims)
+  best_flex  <- matrix(NA_character_, nrow = n_flex, ncol = n_sims)
+  best_sal   <- numeric(n_sims)
+
+  # Outer loop: every player as MVP candidate. Inner work vectorised over sims.
+  for (ci in seq_len(n_players)) {
+    mvp_sal <- salaries[ci] * mvp_sal_mult
     if (mvp_sal > salary_cap) next
-    rem_cap <- salary_cap - mvp_sal
-    
-    # Greedy fill 5 flex from remaining players under remaining cap
-    picked_f   <- character(n_flex)
-    n_picked   <- 0L
-    sal_used   <- 0
-    flex_score <- 0
-    
-    for (j in 2:n_p) {
-      if (n_picked == n_flex) break
-      if (sal_used + sals[j] <= rem_cap) {
-        n_picked           <- n_picked + 1L
-        picked_f[n_picked] <- players[j]
-        sal_used           <- sal_used + sals[j]
-        flex_score         <- flex_score + scores[j]
+
+    rem_cap       <- salary_cap - mvp_sal
+    mvp_score_vec <- score_mat[ci, ] * mvp_multiplier  # n_sims vector
+
+    # FLEX pool = every player except this MVP candidate
+    fi    <- seq_len(n_players)[-ci]
+    f_sal <- salaries[fi]
+    f_mat <- score_mat[fi, , drop = FALSE]   # (n_players-1) x n_sims
+    n_f   <- length(fi)
+
+    # ord_mat[r, s] = index into fi of the r-th best FLEX in sim s
+    ord_mat <- apply(f_mat, 2L, function(x) order(x, decreasing = TRUE))
+
+    n_picked  <- integer(n_sims)
+    sal_used  <- numeric(n_sims)
+    score_acc <- numeric(n_sims)
+    pick_mat  <- matrix(NA_character_, nrow = n_flex, ncol = n_sims)
+
+    for (r in seq_len(n_f)) {
+      done <- (n_picked == n_flex)
+      if (all(done)) break
+      active <- which(!done)
+
+      j_vec <- ord_mat[r, active]          # FLEX index for each active sim
+      add   <- f_sal[j_vec] + sal_used[active] <= rem_cap
+      take  <- active[add]
+      jt    <- j_vec[add]
+
+      if (length(take)) {
+        n_picked[take]  <- n_picked[take] + 1L
+        sal_used[take]  <- sal_used[take] + f_sal[jt]
+        score_acc[take] <- score_acc[take] + f_mat[cbind(jt, take)]
+        for (ii in seq_along(take)) {
+          pick_mat[n_picked[take[ii]], take[ii]] <- all_players[fi[jt[ii]]]
+        }
       }
     }
-    
-    if (n_picked == n_flex) {
-      total_score <- scores[1] * mvp_multiplier + flex_score
-      sig <- paste(c(players[1], sort(picked_f)), collapse = "|")
-      row <- data.table(Lineup = sig, TotalSalary = mvp_sal + sal_used,
-                        TotalScore = total_score)
-      row[, MVP := players[1]]
-      for (k in seq_len(n_flex)) row[[paste0("Player", k)]] <- sort(picked_f)[k]
-      lineup_list[[i]] <- row
-    }
-    
-    if (verbose && i %% prog_freq == 0L) {
-      elapsed <- as.numeric(difftime(Sys.time(), start_time, units="secs"))
-      cat(sprintf("\r  Phase 1: %d%% | %.1fs", round(i/n_sims*100), elapsed))
-      flush.console()
-    }
+
+    complete <- which(n_picked == n_flex)
+    if (!length(complete)) next
+
+    total  <- mvp_score_vec[complete] + score_acc[complete]
+    better <- complete[total > best_score[complete]]
+    if (!length(better)) next
+
+    best_score[better]  <- total[match(better, complete)]
+    best_mvp[better]     <- all_players[ci]
+    best_sal[better]     <- mvp_sal + sal_used[better]
+    best_flex[, better]  <- pick_mat[, better]
   }
-  if (verbose) cat("\n")
-  
-  all_lineups <- rbindlist(lineup_list[!sapply(lineup_list, is.null)])
-  
+
+  has_lineup <- which(!is.na(best_mvp) & best_mvp != "")
+
+  # No feasible lineup in any sim -- almost always a sheet with no FD salaries or
+  # a cap smaller than the cheapest roster. Return an empty but well-formed
+  # result so the caller reports "0 lineups" instead of erroring on `by=Lineup`.
+  if (!length(has_lineup)) {
+    if (verbose) cat("  no feasible lineup (check FD salary data / cap)\n")
+    empty <- data.table(MVP = character(0))
+    for (k in seq_len(n_flex)) empty[[paste0("Player", k)]] <- character(0)
+    empty[, `:=`(TotalSalary = numeric(0), Top1Count = integer(0), AvgScore = numeric(0))]
+    return(list(unique_lineups = empty, n_sims = n_sims, config = config,
+                mode = "combinatorial_mvp"))
+  }
+
+  lineup_list <- lapply(has_lineup, function(s) {
+    flex_s <- sort(na.omit(best_flex[, s]))
+    sig <- paste(c(best_mvp[s], flex_s), collapse = "|")
+    row <- data.table(Lineup = sig, TotalSalary = best_sal[s],
+                      TotalScore = best_score[s])
+    row[, MVP := best_mvp[s]]
+    for (k in seq_len(n_flex)) row[[paste0("Player", k)]] <- flex_s[k]
+    row
+  })
+
+  all_lineups <- rbindlist(lineup_list)
+
   counts <- all_lineups[, .(Top1Count   = .N,
                             TotalSalary = TotalSalary[1],
                             AvgScore    = mean(TotalScore)),
@@ -2195,4 +2247,188 @@ find_optimal_lineups_cfb_classic <- function(sim_results, config, verbose = TRUE
                            format(nrow(uni), big.mark = ","),
                            as.numeric(difftime(Sys.time(), start_time, units = "secs"))))
   list(unique_lineups = uni, n_sims = n_sims_full, config = config, mode = "cfb_classic")
+}
+
+
+# =============================================================================
+# MODE: NFL CLASSIC  (QB / RB / RB / WR / WR / WR / TE / FLEX / DST, $50k/$60k)
+# -----------------------------------------------------------------------------
+# Same structure as cfb_classic -- a per-sim classic optimum under BOTH position
+# slots and a binding salary cap -- but five positions instead of three and a
+# fixed DST slot rather than a superflex. FLEX takes RB/WR/TE. NFL salaries run
+# ~$2,000-$9,000 so the cap binds like CFB's.
+#
+#     sum(x) == 9 ;  sum(salary * x) <= cap
+#     QB == 1 ;  RB in [2,3] ;  WR in [3,4] ;  TE in [1,2] ;  DST == 1
+# Those bounds are exactly the condition that the chosen 9 deal into
+# QB, RB, RB, WR, WR, WR, TE, FLEX(RB/WR/TE), DST.
+#
+# The 9 are then ASSIGNED to slots so FLEX holds the latest-kicking eligible
+# player (StartOrder, for late swap). Slot order out is the DK/FD upload order
+# QB/RB/RB/WR/WR/WR/TE/FLEX/DST -- FanDuel names the last slot DEF but the
+# roster shape is identical (FD classic has no kicker; kickers are showdown
+# only), so one path serves both platforms.
+#
+# Ranking mirrors cfb_classic: with a binding cap every sim's optimum is
+# effectively unique, so Top1Count carries little; the pool is ranked by lineup
+# mean, softened by config$pool_spread (Gumbel-top-k) for coverage.
+#
+# sim_results needs SimID, Player, FantasyPoints, Salary, Pos, StartOrder.
+# =============================================================================
+.NFL_CLASSIC_POS  <- c("QB", "RB", "WR", "TE", "DST")
+.NFL_CLASSIC_LO   <- c(QB = 1L, RB = 2L, WR = 3L, TE = 1L, DST = 1L)
+.NFL_CLASSIC_HI   <- c(QB = 1L, RB = 3L, WR = 4L, TE = 2L, DST = 1L)  # +1 per FLEX-eligible pos
+.NFL_CLASSIC_BASE <- c(RB = 2L, WR = 3L, TE = 1L)                     # non-FLEX minimums
+
+# Greedy pick over rows ALREADY sorted by descending points: take the best
+# player that fits the bucket cap (hi), the salary cap, and does not strand a
+# mandatory slot (lo). Mirrors .cfb_greedy over five buckets.
+.nfl_greedy <- function(pos, sal, cap, need) {
+  lo <- .NFL_CLASSIC_LO; hi <- .NFL_CLASSIC_HI
+  cnt <- c(QB = 0L, RB = 0L, WR = 0L, TE = 0L, DST = 0L); spent <- 0; pick <- integer(0)
+  for (i in seq_along(pos)) {
+    p <- pos[i]
+    if (is.na(match(p, names(cnt)))) next
+    if (cnt[[p]] >= hi[[p]]) next
+    if (spent + sal[i] > cap) next
+    slots_left <- need - length(pick)
+    mand <- sum(pmax(lo - cnt, 0L))
+    if (slots_left <= mand && cnt[[p]] >= lo[[p]]) next   # slot reserved for a min
+    pick <- c(pick, i); cnt[[p]] <- cnt[[p]] + 1L; spent <- spent + sal[i]
+    if (length(pick) == need) break
+  }
+  if (length(pick) == need) pick else NULL
+}
+
+# Assign every sim's chosen 9 to slots at once. `chosen` is long
+# (SimID, Player, Pos, StartOrder), 9 rows per sim, positionally valid
+# (QB 1, RB 2-3, WR 3-4, TE 1-2, DST 1). Returns long (SimID, Player, slot_i)
+# with slot_i 1..9 = QB, RB, RB, WR, WR, WR, TE, FLEX, DST.
+#
+# Rule: QB and DST are fixed; among RB/WR/TE the single extra beyond the base
+# minimum (2/3/1) is the FLEX, and it is the latest-kicking of its position for
+# late swap.
+.nfl_assign_slots_vec <- function(chosen) {
+  d <- as.data.table(chosen)[, .(SimID, Player, Pos, StartOrder)]
+  fixed <- d[Pos %chin% c("QB", "DST")][, slot := Pos]
+
+  rw <- d[Pos %chin% c("RB", "WR", "TE")]
+  rw[, npos  := .N, by = .(SimID, Pos)]
+  rw[, quota := pmax(npos - .NFL_CLASSIC_BASE[Pos], 0L)]   # 1 for the flex pos, else 0
+  setorder(rw, SimID, -StartOrder)                          # latest kickoff first
+  rw[, pr := rowid(SimID, Pos)]
+  rw[, slot := fifelse(pr <= quota, "FLEX", Pos)]
+
+  out <- rbind(fixed[, .(SimID, Player, slot)], rw[, .(SimID, Player, slot)])
+  ord <- c(QB = 1L, RB = 2L, WR = 3L, TE = 4L, FLEX = 5L, DST = 6L)
+  out[, so := ord[slot]]
+  setorder(out, SimID, so)
+  out[, slot_i := rowid(SimID)]
+  out[, .(SimID, Player, slot_i)]
+}
+
+find_optimal_lineups_nfl_classic <- function(sim_results, config, verbose = TRUE) {
+  setDT(sim_results)
+  if (!"Pos" %in% names(sim_results))
+    stop("nfl_classic optimiser needs a Pos column on sim_results")
+  if (!"StartOrder" %in% names(sim_results)) sim_results[, StartOrder := 1L]
+
+  POS  <- .NFL_CLASSIC_POS
+  need <- 9L
+  cap  <- config$salary_cap %||% 50000
+  max_lineups <- config$max_lineups %||% 5000L
+  start_time <- Sys.time()
+
+  SR <- sim_results[!is.na(FantasyPoints) & !is.na(Salary) & Salary > 0 &
+                    Pos %chin% POS,
+                    .(SimID, Player, FantasyPoints, Salary, Pos, StartOrder)]
+  if (!nrow(SR)) stop("nfl_classic optimiser: no priced players on sim_results")
+
+  # Global candidate cut: keep the top ~24 by mean points per position plus the
+  # cheapest few as cap-relievers. DST pools are tiny so this keeps them all.
+  pm <- SR[, .(mu = mean(FantasyPoints), sal = Salary[1]), by = .(Player, Pos)]
+  keep_pl <- pm[, .SD[union(head(order(-mu), 24L), head(order(sal), 6L)), Player],
+                by = Pos]$V1
+  SR <- SR[Player %chin% keep_pl]
+  all_ids <- unique(SR$SimID); n_sims_full <- length(all_ids)
+
+  if (verbose) cat(sprintf("\nPhase 1: NFL classic | %s sims | $%s cap | %d slots | %d candidates\n",
+                           format(n_sims_full, big.mark = ","),
+                           format(cap, big.mark = ","), need, length(keep_pl)))
+
+  # Point rank within (sim, position).
+  setorder(SR, SimID, -FantasyPoints)
+  SR[, pr := rowid(SimID, Pos)]
+
+  # ---- FAST PATH ---------------------------------------------------------
+  # The unconstrained best lineup: top QB, top 2 RB, top 3 WR, top TE, top DST,
+  # then the best of {RB3, WR4, TE2} for FLEX. When it is already under the cap
+  # it IS the optimum, and on an NFL classic slate it often is not -- the slow
+  # path below carries the rest.
+  base_c <- SR[(Pos == "QB"  & pr == 1L) | (Pos == "RB" & pr <= 2L) |
+               (Pos == "WR"  & pr <= 3L) | (Pos == "TE" & pr == 1L) |
+               (Pos == "DST" & pr == 1L)]
+  flex_c <- SR[(Pos == "RB" & pr == 3L) | (Pos == "WR" & pr == 4L) | (Pos == "TE" & pr == 2L)]
+  setorder(flex_c, SimID, -FantasyPoints)
+  flex_c <- flex_c[, head(.SD, 1L), by = SimID]
+  cand   <- rbindlist(list(base_c, flex_c), use.names = TRUE)
+  full9  <- cand[, .N, by = SimID][N == need, SimID]
+  cand   <- cand[SimID %chin% full9]
+  under  <- cand[, .(s = sum(Salary)), by = SimID][s <= cap, SimID]
+  fast   <- cand[SimID %chin% under]
+
+  # ---- SLOW PATH -------------------------------------------------------
+  # Sims where the unconstrained lineup breaks the cap (or the trimmed
+  # candidate set could not field 9): greedy pick under the cap.
+  slow_ids <- setdiff(unique(SR$SimID), under)
+  slow <- NULL
+  if (length(slow_ids)) {
+    SS <- SR[SimID %chin% slow_ids]                 # already point-sorted
+    slow <- SS[, {
+      pk <- .nfl_greedy(Pos, Salary, cap, need)
+      if (is.null(pk)) .SD[0L] else .SD[pk]
+    }, by = SimID, .SDcols = c("Player", "Pos", "StartOrder", "Salary")]
+  }
+  have_slow <- !is.null(slow) && nrow(slow) > 0L && "Player" %in% names(slow)
+  if (verbose)
+    cat(sprintf("  %s fast (under cap) + %s solved greedily\n",
+                format(length(under), big.mark = ","),
+                format(if (have_slow) uniqueN(slow$SimID) else 0L, big.mark = ",")))
+
+  chosen <- rbindlist(list(fast[, .(SimID, Player, Pos, StartOrder)],
+                           if (have_slow) slow[, .(SimID, Player, Pos, StartOrder)]),
+                      use.names = TRUE)
+  if (!nrow(chosen)) stop("nfl_classic optimiser: no feasible lineup in any sim")
+
+  # Assign each sim's 9 to QB/RB/RB/WR/WR/WR/TE/FLEX/DST (vectorised over sims).
+  full <- .nfl_assign_slots_vec(chosen)
+
+  wide <- dcast(full, SimID ~ slot_i, value.var = "Player")
+  pc <- paste0("Player", seq_len(need))
+  setnames(wide, as.character(seq_len(need)), pc)
+  key <- apply(as.matrix(wide[, ..pc]), 1L,
+               function(r) paste(sort(r), collapse = "|"))
+  wide[, lkey := key]
+  cnt <- wide[, .(Top1Count = .N), by = lkey]
+  uni <- merge(wide[!duplicated(lkey)], cnt, by = "lkey")
+
+  mu  <- setNames(pm$mu, pm$Player)
+  uni[, AvgScore := rowSums(matrix(mu[unlist(.SD)], nrow = nrow(uni))), .SDcols = pc]
+  sprd <- config$pool_spread %||% 0
+  if (sprd > 0) {
+    tT <- sprd * stats::sd(uni$AvgScore)
+    g  <- -log(-log(stats::runif(nrow(uni))))
+    uni[, rk := AvgScore / tT + g]
+  } else uni[, rk := AvgScore]
+  setorder(uni, -Top1Count, -rk)
+  if (nrow(uni) > max_lineups) uni <- head(uni, max_lineups)
+
+  sal <- setNames(pm$sal, pm$Player)
+  uni[, TotalSalary := rowSums(matrix(sal[unlist(.SD)], nrow = nrow(uni))), .SDcols = pc]
+  uni[, c("lkey", "rk") := NULL]
+
+  if (verbose) cat(sprintf("  %s distinct lineups | %.1fs\n",
+                           format(nrow(uni), big.mark = ","),
+                           as.numeric(difftime(Sys.time(), start_time, units = "secs"))))
+  list(unique_lineups = uni, n_sims = n_sims_full, config = config, mode = "nfl_classic")
 }
