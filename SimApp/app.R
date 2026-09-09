@@ -230,6 +230,26 @@ ui <- dashboardPage(
       .gts-grp-tile-v{font-size:13px;font-weight:700;color:#FFE500;line-height:1.2}
       .gts-grp-tile-k{font-size:9px;font-weight:700;letter-spacing:.05em;color:#888;line-height:1.3}
 
+      /* Team-split pills (NFL showdown) — one per roster split, click to LOCK,
+         click the x to EXCLUDE. */
+      .gts-tsplit{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+      .gts-tspill{display:inline-flex;align-items:center;gap:6px;height:26px;padding:0 6px 0 11px;
+        font-size:10px;font-weight:700;letter-spacing:.03em;background:#1a1a1a;color:#888;
+        border:1px solid #2a2a2a;border-radius:14px;cursor:pointer;white-space:nowrap;user-select:none;
+        transition:background .12s,color .12s,border-color .12s}
+      .gts-tspill:hover{background:#2a2a2a;color:#ccc;border-color:#444}
+      .gts-tspill .tsp-pct{color:#666;font-weight:700}
+      .gts-tspill.lock{background:rgba(76,175,80,0.16);color:#dff5df;border-color:#4caf50}
+      .gts-tspill.lock .tsp-pct{color:#a9d9ab}
+      .gts-tspill.excl{background:rgba(255,107,107,0.14);color:#ffdcdc;border-color:#ff6b6b;text-decoration:line-through}
+      .gts-tspill.excl .tsp-pct{color:#e0a5a5}
+      .gts-tspill .tsp-x{display:inline-flex;align-items:center;justify-content:center;width:15px;height:15px;
+        border-radius:50%;font-size:9px;color:#777;background:rgba(255,255,255,0.04);text-decoration:none}
+      .gts-tspill .tsp-x:hover{color:#ff6b6b;background:rgba(255,107,107,0.18)}
+      .gts-tspill.excl .tsp-x{color:#ffdcdc}
+      .gts-tspill-clear{color:#666;font-size:10px;font-weight:700;letter-spacing:.06em;cursor:pointer;padding:0 4px}
+      .gts-tspill-clear:hover{color:#ccc}
+
       /* Sim results control bar */
       .gts-sr-bar{display:flex;align-items:center;gap:0;background:#141414;border:1px solid #222;border-radius:6px;overflow:hidden;margin-bottom:16px}
       .gts-sr-seg{display:flex;align-items:center;padding:0 18px;height:42px;border-right:1px solid #222;flex-shrink:0}
@@ -605,7 +625,7 @@ server <- function(input, output, session) {
   # set of optimal lineups arrives, since a lock on a player who is no longer
   # in the pool would silently filter everything to zero.
   clear_lock_state <- function(lp) {
-    for (sfx in c("_lock_any","_excl_any","_lock_cpt","_excl_cpt"))
+    for (sfx in c("_lock_any","_excl_any","_lock_cpt","_excl_cpt","_ts_lock","_ts_excl"))
       rv[[paste0(lp, sfx)]] <- character(0)
   }
   
@@ -2707,37 +2727,17 @@ server <- function(input, output, session) {
           if (length(ec)) lineups <- lineups[!get(cap_cols[1]) %in% ec]
         }
 
-        # TEAM-SPLIT pre-filters (NFL showdown). Narrow the pool to a chosen
-        # split, a captain team, or a minimum count from one side.
+        # TEAM-SPLIT pill filter (NFL showdown). Locked splits keep only those
+        # rosters (OR across locks); excluded splits are dropped.
         ts <- teamsplit_ctx(lp)
-        if (!is.null(ts) && nrow(lineups)) {
-          sel_split <- input[[paste0(lp,"_ts_split")]]
-          sel_cptt  <- input[[paste0(lp,"_ts_cptteam")]]
-          min_n     <- suppressWarnings(as.numeric(input[[paste0(lp,"_ts_minn")]]))
-          min_team  <- input[[paste0(lp,"_ts_minteam")]]
-          need_split <- (!is.null(sel_split) && !identical(sel_split, "(any)")) ||
-                        (!is.null(sel_cptt)  && !identical(sel_cptt,  "(any)")) ||
-                        (!is.null(min_team)  && !identical(min_team,  "(any)") &&
-                         !is.na(min_n) && min_n > 0)
-          if (need_split) {
-            cap_tm <- ts$p2t[as.character(lineups[[ts$cap_col]])]
-            tmat   <- matrix(ts$p2t[as.character(unlist(lineups[, ts$slot_cols, with = FALSE]))],
-                             nrow = nrow(lineups))
-            n_a <- rowSums(tmat == ts$teams[1], na.rm = TRUE)
-            cnt_team <- function(tm) if (identical(tm, ts$teams[1])) n_a else ts$roster - n_a
-            keep <- rep(TRUE, nrow(lineups))
-            if (!is.null(sel_split) && !identical(sel_split, "(any)")) {
-              cpt_cnt <- ifelse(cap_tm == ts$teams[1], n_a, ts$roster - n_a)
-              lab <- sprintf("CPT %s · %d-%d", cap_tm, cpt_cnt, ts$roster - cpt_cnt)
-              keep <- keep & (lab == sel_split)
-            }
-            if (!is.null(sel_cptt) && !identical(sel_cptt, "(any)"))
-              keep <- keep & (cap_tm == sel_cptt)
-            if (!is.null(min_team) && !identical(min_team, "(any)") && !is.na(min_n) && min_n > 0)
-              keep <- keep & (cnt_team(min_team) >= min_n)
-            keep[is.na(keep)] <- FALSE
-            lineups <- lineups[keep]
-          }
+        ts_lock <- rv[[paste0(lp,"_ts_lock")]]; ts_excl <- rv[[paste0(lp,"_ts_excl")]]
+        if (!is.null(ts) && nrow(lineups) && (length(ts_lock) || length(ts_excl))) {
+          labs <- lineup_split_label(lineups, ts)
+          keep <- rep(TRUE, length(labs))
+          if (length(ts_lock)) keep <- keep & (labs %in% ts_lock)
+          if (length(ts_excl)) keep <- keep & !(labs %in% ts_excl)
+          keep[is.na(keep)] <- FALSE
+          lineups <- lineups[keep]
         }
       }
       lineups
@@ -3091,10 +3091,10 @@ server <- function(input, output, session) {
   # ==========================================================================
   # TEAM-SPLIT BREAKDOWN + FILTERS  (NFL showdown only)
   # ==========================================================================
-  # A single-game showdown roster is 6 players across exactly two teams. This
-  # shows the pool by roster split -- "CPT SEA · 4-2" is 4 SEA (incl. captain) +
-  # 2 NE -- and lets the pool be narrowed to a split, a captain team, or a
-  # minimum count from one side. Hidden on every non-showdown slate.
+  # A single-game showdown roster is 6 players across exactly two teams. One
+  # pill per roster split ("CPT SEA · 4-2" = 4 SEA incl. captain + 2 NE) with
+  # its share of the pool. Click a pill to LOCK the pool to that split (locks
+  # stack, OR); click the x to EXCLUDE it. Hidden on every non-showdown slate.
 
   teamsplit_ctx <- function(lp) {
     if (!isTRUE(rv$sport == "NFL")) return(NULL)
@@ -3126,54 +3126,79 @@ server <- function(input, output, session) {
     sprintf("CPT %s · %d-%d", cap_tm, cpt_cnt, oth_cnt)
   }
 
-  teamsplit_table <- function(dt, ctx) {
+  # Split -> % share of `dt`, ordered by the fixed domain (CPT <A> 5-1 .. 1-5,
+  # then CPT <B> 5-1 .. 1-5) so pill order never jumps as the pool changes.
+  teamsplit_shares <- function(dt, ctx) {
     labs <- lineup_split_label(dt, ctx)
     if (!length(labs)) return(NULL)
-    tb <- as.data.table(table(Split = labs))[order(-N)]
-    tb[, `%` := round(N / sum(N) * 100, 1)]
-    tags$table(class = "table table-condensed", style = "width:auto;font-size:11px;margin:0;",
-      tags$thead(tags$tr(tags$th("Split"), tags$th("N"), tags$th("%"))),
-      tags$tbody(lapply(seq_len(nrow(tb)), function(i)
-        tags$tr(tags$td(tb$Split[i]),
-                tags$td(format(tb$N[i], big.mark = ",")),
-                tags$td(sprintf("%.1f%%", tb$`%`[i]))))))
+    dom <- unlist(lapply(ctx$teams, function(tm) sprintf("CPT %s · %d-%d", tm, 5:1, 1:5)))
+    tb  <- table(factor(labs, levels = dom))
+    pct <- round(as.numeric(tb) / sum(tb) * 100, 1)
+    keep <- as.numeric(tb) > 0
+    data.table(split = dom[keep], pct = pct[keep])
   }
 
-  make_teamsplit_ui <- function(lp, filtered_reactive) {
-    output[[paste0(lp, "_teamsplit_tbl")]] <- renderUI({
-      ctx <- teamsplit_ctx(lp); if (is.null(ctx)) return(NULL)
-      teamsplit_table(filtered_reactive(), ctx)
+  # One pill row. `interactive` wires the LOCK / EXCLUDE click handlers; the
+  # portfolio copy is display-only.
+  teamsplit_pills <- function(dt, ctx, lp, interactive) {
+    sh <- teamsplit_shares(dt, ctx); if (is.null(sh) || !nrow(sh)) return(NULL)
+    lk <- rv[[paste0(lp, "_ts_lock")]]; ex <- rv[[paste0(lp, "_ts_excl")]]
+    js_body <- sprintf(
+      "Shiny.setInputValue('%s_ts_click',{split:this.getAttribute('data-s'),act:'lock',nonce:Math.random()},{priority:'event'});", lp)
+    js_x <- sprintf(
+      "event.stopPropagation();Shiny.setInputValue('%s_ts_click',{split:this.parentNode.getAttribute('data-s'),act:'excl',nonce:Math.random()},{priority:'event'});", lp)
+    pills <- lapply(seq_len(nrow(sh)), function(i) {
+      s <- sh$split[i]
+      st <- if (s %in% lk) "lock" else if (s %in% ex) "excl" else ""
+      tags$span(class = paste("gts-tspill", st), `data-s` = s,
+                onclick = if (interactive) js_body else NULL,
+                sub("^CPT ", "", s),
+                tags$span(class = "tsp-pct", sprintf("%.1f%%", sh$pct[i])),
+                if (interactive) tags$span(class = "tsp-x", onclick = js_x, HTML("&times;")))
     })
+    if (interactive && (length(lk) || length(ex)))
+      pills <- c(pills, list(tags$span(class = "gts-tspill-clear",
+        onclick = sprintf("Shiny.setInputValue('%s_ts_clear',Math.random(),{priority:'event'});", lp),
+        "clear")))
+    div(class = "gts-tsplit", pills)
+  }
+
+  make_teamsplit_ui <- function(lp) {
     renderUI({
       ctx <- teamsplit_ctx(lp); if (is.null(ctx)) return(NULL)
-      # 6 roster spots across 2 teams; the captain's team can hold anywhere from
-      # 1 (just the captain) to 5 -- a 6-0 is invalid and never in the pool.
-      splits <- c("(any)", unlist(lapply(c(ctx$teams[1], ctx$teams[2]), function(tm)
-        sprintf("CPT %s · %d-%d", tm, 5:1, 1:5))))
-      keep_sel <- function(id, choices) {
-        cur <- isolate(input[[paste0(lp, id)]])
-        if (!is.null(cur) && cur %in% choices) cur else choices[1]
-      }
+      opt <- rv[[paste0(lp, "_optimal_lineups")]]
+      if (is.null(opt) || !nrow(opt)) return(NULL)
       fluidRow(box(title = "Team Split", status = "warning", solidHeader = TRUE,
                    width = 12, collapsible = TRUE,
-        fluidRow(
-          column(3, selectInput(paste0(lp, "_ts_split"), "Split",
-                                choices = splits, selected = keep_sel("_ts_split", splits))),
-          column(3, selectInput(paste0(lp, "_ts_cptteam"), "CPT team",
-                                choices = c("(any)", ctx$teams),
-                                selected = keep_sel("_ts_cptteam", c("(any)", ctx$teams)))),
-          column(3, numericInput(paste0(lp, "_ts_minn"), "Min from team", value = 0, min = 0,
-                                 max = ctx$roster, step = 1)),
-          column(3, selectInput(paste0(lp, "_ts_minteam"), " ",
-                                choices = c("(any)", ctx$teams),
-                                selected = keep_sel("_ts_minteam", c("(any)", ctx$teams))))
-        ),
-        uiOutput(paste0(lp, "_teamsplit_tbl"))))
+                   teamsplit_pills(opt, ctx, lp, interactive = TRUE)))
     })
   }
-  output$dk_teamsplit_ui <- make_teamsplit_ui("dk", dk_filtered_lineups)
-  output$fd_teamsplit_ui <- make_teamsplit_ui("fd", fd_filtered_lineups)
-  output$sd_teamsplit_ui <- make_teamsplit_ui("sd", sd_filtered_lineups)
+  output$dk_teamsplit_ui <- make_teamsplit_ui("dk")
+  output$fd_teamsplit_ui <- make_teamsplit_ui("fd")
+  output$sd_teamsplit_ui <- make_teamsplit_ui("sd")
+
+  # Pill click -> toggle membership in the lock / exclude set. A split can be in
+  # at most one set: locking clears its exclude and vice versa.
+  make_ts_click_observer <- function(lp) {
+    observeEvent(input[[paste0(lp, "_ts_click")]], {
+      ev <- input[[paste0(lp, "_ts_click")]]
+      s <- ev$split; if (is.null(s) || !nzchar(s)) return()
+      lk <- rv[[paste0(lp, "_ts_lock")]] %||% character(0)
+      ex <- rv[[paste0(lp, "_ts_excl")]] %||% character(0)
+      if (identical(ev$act, "lock")) {
+        lk <- if (s %in% lk) setdiff(lk, s) else union(lk, s); ex <- setdiff(ex, s)
+      } else {
+        ex <- if (s %in% ex) setdiff(ex, s) else union(ex, s); lk <- setdiff(lk, s)
+      }
+      rv[[paste0(lp, "_ts_lock")]] <- lk
+      rv[[paste0(lp, "_ts_excl")]] <- ex
+    }, ignoreInit = TRUE)
+    observeEvent(input[[paste0(lp, "_ts_clear")]], {
+      rv[[paste0(lp, "_ts_lock")]] <- character(0)
+      rv[[paste0(lp, "_ts_excl")]] <- character(0)
+    }, ignoreInit = TRUE)
+  }
+  lapply(c("dk","fd","sd"), make_ts_click_observer)
 
   make_teamsplit_port_ui <- function(lp) {
     renderUI({
@@ -3182,7 +3207,7 @@ server <- function(input, output, session) {
       if (is.null(port) || !nrow(port)) return(NULL)
       fluidRow(box(title = "Portfolio Team Split", status = "info", solidHeader = TRUE,
                    width = 12, collapsible = TRUE,
-                   teamsplit_table(port, ctx)))
+                   teamsplit_pills(port, ctx, lp, interactive = FALSE)))
     })
   }
   output$dk_teamsplit_port_ui <- make_teamsplit_port_ui("dk")
