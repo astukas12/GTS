@@ -813,7 +813,7 @@ server <- function(input, output, session) {
     req(rv$sport)
     div(class = "gts-ctrl-seg gts-sims-seg",
         span(class = "gts-seg-label", "Sims to Run: "),
-        numericInput("n_sims", NULL, value = 50000,
+        numericInput("n_sims", NULL, value = rv$config$default_n_sims %||% 50000,
                      min = 1000, max = 150000, step = 1000, width = "80px")
     )
   })
@@ -1756,7 +1756,7 @@ server <- function(input, output, session) {
         # the same combinatorial_captain mode for CFB and NFL_PRESEASON and was
         # missing the same check. drop_single_team_sd() no-ops safely when
         # metadata has no Team column (F1), so gating on mode alone is safe.
-        if (identical(dk_mode, "combinatorial_captain"))
+        if (dk_mode %in% c("combinatorial_captain", "enum_captain"))
           lineup_data <- drop_single_team_sd(lineup_data, rv$sim_metadata)
         progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
                                     format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)

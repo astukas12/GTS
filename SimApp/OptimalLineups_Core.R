@@ -25,6 +25,8 @@ find_optimal_lineups <- function(sim_results, config, mode = "standard", k = 3, 
     return(find_optimal_lineups_combinatorial(sim_results, config, verbose))
   } else if (mode == "combinatorial_captain") {
     return(find_optimal_lineups_combinatorial_captain(sim_results, config, verbose))
+  } else if (mode == "enum_captain") {
+    return(find_optimal_lineups_enum_captain(sim_results, config, verbose))
   } else if (mode == "combinatorial_mvp") {
     return(find_optimal_lineups_combinatorial_mvp(sim_results, config, verbose))
   } else if (mode == "preseason_classic") {
@@ -35,8 +37,8 @@ find_optimal_lineups <- function(sim_results, config, mode = "standard", k = 3, 
     return(find_optimal_lineups_nfl_classic(sim_results, config, verbose))
   } else {
     stop(paste("Unknown mode:", mode,
-               "- must be 'standard', 'mvp', 'captain', 'win_based',",
-               "'combinatorial', 'combinatorial_captain', or 'combinatorial_mvp'"))
+               "- must be 'standard', 'mvp', 'captain', 'win_based', 'combinatorial',",
+               "'combinatorial_captain', 'enum_captain', or 'combinatorial_mvp'"))
   }
 }
 
@@ -931,6 +933,159 @@ find_optimal_lineups_combinatorial_captain <- function(sim_results, config, verb
   
   list(unique_lineups = unique_lineups, n_sims = n_sims, config = config,
        mode = "combinatorial_captain")
+}
+
+
+# =============================================================================
+# MODE 6b: ENUM CAPTAIN (DK Showdown, full enumeration + winning-script rank)
+# -----------------------------------------------------------------------------
+# The old per-sim path used sims for two jobs: generate the pool (each sim's
+# greedy argmax) and rank it. Generation was biased (greedy fill mis-crowns
+# cheap captains when the cap binds) and noisy (5000 hard cap). Here the pool is
+# every legal lineup -- deterministic, no sims needed to build it -- and sims do
+# only one job: rank by tournament-winning upside.
+#
+#   1. enumerate  every CPT + 5-flex from the slate (~1.7M on a 27-man slate)
+#   2. band       keep salary in [floor*cap, cap] AND >= 2 teams. Near-cap is
+#                 where the winners live; this is the one cheap structural cut
+#                 and it is what makes step 3 tractable (~1.7M -> ~150k).
+#   3. score      every band lineup against EVERY sim. For each sim, flag the
+#                 top enum_win_pct of lineups. hit_count = # sims flagged in.
+#                 Per-sim rank is self-normalising, so lineups built for
+#                 low-scoring games rack up hits in low-scoring sims -- the pool
+#                 ends up a mix across game scripts, not just shootout builds.
+#   4. keep       drop zero-hit lineups (never top-X% in any sim = not a GPP
+#                 lineup), rank the rest by hit_count, keep the top enum_keep.
+#
+# Emits hit_count into Top1Count (its natural analogue) and the weighted lineup
+# mean into AvgScore. Final exposure shaping is the selection layer's job, not
+# this function's.
+#
+# config knobs (all optional):
+#   enum_salary_floor_frac  0.83   lower edge of the salary band, as a cap frac
+#   enum_win_pct            0.01   per-sim "won this script" cutoff (top frac)
+#   enum_keep               10000  lineups kept, ranked by hit_count
+# =============================================================================
+find_optimal_lineups_enum_captain <- function(sim_results, config, verbose = TRUE) {
+  if (verbose) cat("\nPhase 1: Enumerating showdown lineups (salary band + winning-script rank)...\n")
+
+  setDT(sim_results)
+  roster_size    <- config$roster_size
+  salary_cap     <- config$salary_cap
+  cpt_multiplier <- if (!is.null(config$cpt_multiplier)) config$cpt_multiplier else 1.5
+  n_flex         <- roster_size - 1L
+  floor_frac     <- if (!is.null(config$enum_salary_floor_frac)) config$enum_salary_floor_frac else 0.88
+  enum_keep      <- if (!is.null(config$enum_keep)) config$enum_keep else 10000L
+  win_pct        <- if (!is.null(config$enum_win_pct)) config$enum_win_pct else 0.01
+  start_time     <- Sys.time()
+
+  players_dt  <- unique(sim_results[Salary > 0 & !is.na(Salary), .(Player, Salary)])
+  all_players <- players_dt$Player
+  salaries    <- players_dt$Salary
+  n_players   <- nrow(players_dt)
+  sim_ids     <- unique(sim_results$SimID)
+  n_sims      <- length(sim_ids)
+
+  # Player -> team id for the >= 2 teams rule (no-op if < 2 teams present)
+  team_id <- rep(1L, n_players)
+  if ("Team" %in% names(sim_results)) {
+    u <- unique(sim_results[!is.na(Team), .(Player, Team)])
+    tmap <- setNames(as.character(u$Team), u$Player)
+    tv <- tmap[all_players]
+    if (sum(!is.na(unique(tv))) >= 2) team_id <- as.integer(factor(tv))
+  }
+
+  # score matrix: n_players x n_sims (collapse dup player-sim rows first)
+  src <- sim_results[Salary > 0 & !is.na(Salary) & !is.na(FantasyPoints),
+                     .(FantasyPoints = mean(FantasyPoints, na.rm = TRUE)),
+                     by = .(Player, SimID)]
+  sw  <- dcast(src, Player ~ SimID, value.var = "FantasyPoints",
+               fun.aggregate = mean, fill = 0)
+  sw  <- sw[match(all_players, Player)]
+  score_mat <- as.matrix(sw[, -1L, with = FALSE])          # n_players x n_sims
+
+  mu <- rowMeans(score_mat)
+
+  sal_floor <- floor_frac * salary_cap
+
+  # ---- 1-2. enumerate CPT + 5-flex, keep salary-band & >=2-team survivors ----
+  cap_parts <- vector("list", n_players)
+  for (ci in seq_len(n_players)) {
+    cpt_sal <- salaries[ci] * cpt_multiplier
+    if (cpt_sal > salary_cap) next
+    others <- seq_len(n_players)[-ci]
+    fc     <- combn(others, n_flex)                        # n_flex x C  (real player idx)
+    fsal   <- colSums(matrix(salaries[fc], nrow = n_flex))
+    lsal   <- cpt_sal + fsal
+    same_t <- colSums(matrix(team_id[fc] == team_id[ci], nrow = n_flex)) == n_flex
+    keep   <- lsal >= sal_floor & lsal <= salary_cap & !same_t
+    if (!any(keep)) next
+    fk <- fc[, keep, drop = FALSE]
+    cap_parts[[ci]] <- rbind(matrix(ci, nrow = 1, ncol = ncol(fk)), fk,
+                             matrix(lsal[keep], nrow = 1))   # (1 cpt + n_flex + 1 sal) x m
+  }
+  cap_parts <- cap_parts[!vapply(cap_parts, is.null, logical(1))]
+  if (!length(cap_parts)) stop("enum_captain: no lineup in the salary band -- check salaries / cap")
+  E <- do.call(cbind, cap_parts)                            # (n_flex+2) x M
+  cpt_v  <- E[1L, ]
+  flex_m <- E[2:(n_flex + 1L), , drop = FALSE]              # n_flex x M  (ascending player idx)
+  lsal_v <- E[n_flex + 2L, ]
+  M <- length(cpt_v)
+
+  if (M < 2L * enum_keep && floor_frac > 0.75) {
+    if (verbose) cat(sprintf("  only %s lineups in band -- widening floor to 0.75*cap and re-enumerating\n",
+                             format(M, big.mark = ",")))
+    return(find_optimal_lineups_enum_captain(
+      sim_results, modifyList(config, list(enum_salary_floor_frac = 0.75)), verbose))
+  }
+  if (verbose) cat(sprintf("  %d players | %s sims | band [$%s, $%s] -> %s legal lineups\n",
+                           n_players, format(n_sims, big.mark = ","),
+                           format(round(sal_floor), big.mark = ","),
+                           format(salary_cap, big.mark = ","), format(M, big.mark = ",")))
+
+  # ---- 3. winning-script scoring: flag each sim's top enum_win_pct of lineups ----
+  # Per sim, build the M lineup scores by gathering the 6 slot scores from that
+  # sim's player-score vector (no M x n_players incidence matrix, no M x n_sims
+  # score matrix -- both would be tens of GB). A player is never captain and
+  # flex in the same lineup, so the gathers are disjoint by construction.
+  n_flag    <- max(1L, as.integer(round(M * win_pct)))
+  kth       <- M - n_flag + 1L
+  hit_count <- integer(M)
+  for (s in seq_len(n_sims)) {
+    sc <- score_mat[, s]
+    ls <- cpt_multiplier * sc[cpt_v]
+    for (r in seq_len(n_flex)) ls <- ls + sc[flex_m[r, ]]
+    thr <- sort(ls, partial = kth)[kth]
+    hit_count[ls >= thr] <- hit_count[ls >= thr] + 1L
+  }
+  idx6 <- rbind(matrix(cpt_v, nrow = 1L), flex_m)           # roster_size x M (for AvgScore)
+  wtv  <- c(cpt_multiplier, rep(1, n_flex))
+
+  # ---- 4. drop zero-hit, rank by hit_count, keep the top enum_keep ----
+  live <- which(hit_count > 0L)
+  ord  <- live[order(hit_count[live], decreasing = TRUE)]
+  sel  <- ord[seq_len(min(length(ord), enum_keep))]
+  if (verbose) cat(sprintf("  winning-script (top %.1f%%/sim): %s of %s lineups hit >=1 sim; kept top %s (hit_count %d..%d)\n",
+                           100 * win_pct, format(length(live), big.mark = ","),
+                           format(M, big.mark = ","), format(length(sel), big.mark = ","),
+                           hit_count[sel[length(sel)]], hit_count[sel[1]]))
+
+  # ---- assemble the candidate pool ----
+  wmean  <- as.numeric(wtv %*% matrix(mu[idx6[, sel, drop = FALSE]], nrow = roster_size))
+  cpt_s  <- all_players[cpt_v[sel]]
+  flex_s <- matrix(all_players[flex_m[, sel, drop = FALSE]], nrow = n_flex)
+  unique_lineups <- data.table(Captain = cpt_s)
+  for (k in seq_len(n_flex)) unique_lineups[[paste0("Util", k)]] <- flex_s[k, ]
+  unique_lineups[, TotalSalary := lsal_v[sel]]
+  unique_lineups[, Top1Count   := hit_count[sel]]   # winning-script hits, not per-sim argmax
+  unique_lineups[, AvgScore    := wmean]
+
+  if (verbose) cat(sprintf("  ✓ Phase 1: %s candidate lineups | %.1fs\n",
+                           format(nrow(unique_lineups), big.mark = ","),
+                           as.numeric(difftime(Sys.time(), start_time, units = "secs"))))
+
+  list(unique_lineups = unique_lineups, n_sims = n_sims, config = config,
+       mode = "enum_captain")
 }
 
 

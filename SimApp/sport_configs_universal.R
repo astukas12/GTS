@@ -361,8 +361,22 @@ SPORT_CONFIGS <- list(
     roster_sizes = list(DK = 6, FD = 6),
     salary_caps  = list(DK = 50000, FD = 60000),
 
-    optimization_modes = list(DK = "combinatorial_captain", FD = "combinatorial_mvp"),
+    optimization_modes = list(DK = "enum_captain", FD = "combinatorial_mvp"),
     max_lineups        = 5000,
+    # DK showdown uses enum_captain: enumerate every legal CPT+5, keep the
+    # near-cap salary band, then score EVERY band lineup against EVERY sim and
+    # rank by how many sims it finished in the top enum_win_pct (winning-script
+    # hit count). See find_optimal_lineups_enum_captain.
+    # floor 0.88 keeps the band at ~135k lineups (~5 min to score at 25k sims);
+    # only ~2.6% of true per-sim optima fall below it. Loosen toward 0.83 for
+    # more cheap-boom builds at the cost of runtime.
+    enum_salary_floor_frac = 0.88,
+    enum_win_pct           = 0.01,
+    enum_keep              = 10000L,
+    # Showdown scoring is per-sim ranking, not pool generation, so it needs far
+    # fewer sims -- 25k is plenty to rank the pool; the UI defaults there when an
+    # NFL showdown file loads. Bump to 50k for an occasional confirmation run.
+    default_n_sims         = 25000L,
 
     showdown_config = list(
       DK = list(enabled = TRUE, captain_multiplier = 1.5,
