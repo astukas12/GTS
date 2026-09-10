@@ -151,6 +151,12 @@ run("Soccer classic (UCL 9 Sep)",
     dims = c("Pos","Team","Opp","Game","SalaryTier"),
     expect_sport = "Soccer", expect_key = "Soccer", expect_conserve = 800)
 
+run("NFL Showdown (SEA@NE)",
+    "C:/Users/astuk/Downloads/contest-standings-193391013.csv",
+    "C:/Users/astuk/OneDrive/Documents/GTS/NFL/slates/2026-09-09_SEA_NE_SD.xlsx",
+    dims = c("Pos","Team","SalaryTier"),
+    expect_sport = "Showdown", expect_key = "NFL-SD", expect_conserve = 600)
+
 # ---- targeted assertions ----
 say("\n===== targeted checks =====")
 shiny::testServer(server, {
@@ -186,6 +192,27 @@ shiny::testServer(server, {
   flagged <- grepl("Check the file pairing", ms)
   say("  soccer NOT flagged wrong-slate:", !flagged)
   if (flagged) { FAILS <<- FAILS + 1; say("   FAIL") }
+})
+shiny::testServer(server, {
+  # NFL Showdown: workbook is the CFB-style game+team+projections layout, told
+  # apart from CFB by the NE/SEA team sheet names. Position comes off route_base
+  # (+ DST). Modelled players only, so it must not be flagged wrong-slate.
+  session$setInputs(file = list(datapath = "C:/Users/astuk/Downloads/contest-standings-193391013.csv", name = "c.csv"),
+                    input_file = list(datapath = "C:/Users/astuk/OneDrive/Documents/GTS/NFL/slates/2026-09-09_SEA_NE_SD.xlsx",
+                                      name = "n.xlsx"), sport_override = "Auto-detect")
+  say("  NFL-SD sport_key:", sport_key(), "(expect NFL-SD)")
+  if (!identical(sport_key(), "NFL-SD")) { FAILS <<- FAILS + 1; say("   FAIL") }
+  pl <- players()
+  poss <- sort(unique(pl$Pos[pl$Matched & !is.na(pl$Pos)]))
+  say("  NFL-SD matched:", sum(pl$Matched), "of", nrow(pl), "| positions:", paste(poss, collapse = ","))
+  if (!all(c("QB","RB","WR","TE","DST") %in% poss)) { FAILS <<- FAILS + 1; say("   FAIL: positions") }
+  ms <- paste(as.character(output$meta_status), collapse = " ")
+  say("  NFL-SD NOT flagged wrong-slate:", !grepl("Check the file pairing", ms))
+  if (grepl("Check the file pairing", ms)) { FAILS <<- FAILS + 1; say("   FAIL") }
+  session$setInputs(username = contest()$entries$Username[1])
+  ex <- exposure()
+  if (!all(c("CptUserExp","FlexUserExp") %in% names(ex$tbl))) { FAILS <<- FAILS + 1; say("   FAIL: no CPT/FLEX split") }
+  say("  NFL-SD CPT/FLEX split present:", all(c("CptUserExp","FlexUserExp") %in% names(ex$tbl)))
 })
 shiny::testServer(server, {
   session$setInputs(file = list(datapath = "C:/Users/astuk/Downloads/contest-standings-195045051.csv", name = "c.csv"),

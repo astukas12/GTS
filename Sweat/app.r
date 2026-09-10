@@ -486,6 +486,79 @@ read_input_soccer <- function(path, sheets) {
   unique(m, by = "Key")
 }
 
+# --- NFL Showdown -----------------------------------------------------------
+# The 2026 NFL pipeline emits CFB-template workbooks: a `game` sheet, one sheet
+# per team (usage vectors, with a trailing field/value block that names the
+# DST), and a `projections` sheet that is the DK pool - dksalary / dkproj /
+# dkown / cptown, plus salary_util (the showdown FLEX price) and salary_cpt.
+# Position comes off the team sheet's route_base (QB/RB/WR/TE/K); the DST is
+# added from the field=="dst" note row.
+read_input_nfl_sd <- function(path, sheets) {
+  rd  <- function(s) suppressMessages(as.data.table(readxl::read_excel(path, sheet = s)))
+  low <- tolower(sheets)
+  gsheet <- sheets[low == "game"][1]
+  psheet <- sheets[low == "projections"][1]
+  if (is.na(psheet)) stop("NFL Showdown input needs a 'projections' sheet.")
+  team_sheets <- sheets[!low %in% c("game", "projections", "etr")]
+
+  num <- function(x, cl) if (cl %in% names(x)) suppressWarnings(as.numeric(x[[cl]]))
+                         else rep(NA_real_, nrow(x))
+
+  p <- rd(psheet)
+  if (!"player" %in% names(p)) stop("'projections' sheet has no player column.")
+  m <- data.table(
+    Player  = trimws(as.character(p$player)),
+    Salary  = num(p, "salary_util"),
+    Proj    = num(p, "dkproj"),
+    ProjOwn = as_pct(num(p, "dkown")),
+    CptOwn  = as_pct(num(p, "cptown"))
+  )
+  if (all(is.na(m$Salary))) m[, Salary := num(p, "dksalary")]
+  m <- m[!is.na(Player) & nzchar(Player)]
+
+  # One sheet per team: route_base is the position, plus the DST from the notes.
+  pos <- rbindlist(lapply(team_sheets, function(tm) {
+    x <- tryCatch(rd(tm), error = function(e) NULL)
+    if (is.null(x) || !"player" %in% names(x)) return(NULL)
+    d <- data.table(Player = trimws(as.character(x$player)),
+                    Pos    = toupper(trimws(as.character(x$route_base))),
+                    Team   = toupper(tm))
+    d <- d[!is.na(Player) & nzchar(Player)]
+    if (all(c("field", "value") %in% names(x))) {
+      dn <- trimws(as.character(x$value[trimws(tolower(as.character(x$field))) == "dst"]))
+      dn <- dn[!is.na(dn) & nzchar(dn)]
+      if (length(dn)) d <- rbind(d, data.table(Player = dn[1], Pos = "DST", Team = toupper(tm)))
+    }
+    d
+  }), fill = TRUE)
+  if (!is.null(pos) && nrow(pos)) {
+    pos[, Key := norm_name(Player)]
+    pos <- unique(pos, by = "Key")
+    m[, Key := norm_name(Player)]
+    m <- merge(m, pos[, .(Key, Pos, Team)], by = "Key", all.x = TRUE)
+  } else {
+    m[, `:=`(Pos = NA_character_, Team = NA_character_)]
+  }
+
+  if (!is.na(gsheet)) {
+    g <- rd(gsheet)
+    if (all(c("away", "home") %in% names(g))) {
+      m[, Game := paste0(toupper(trimws(as.character(g$away[1]))), "@",
+                         toupper(trimws(as.character(g$home[1]))))]
+      m[, Total := num(g, "total")[1]]
+    }
+  }
+  if (!"Game" %in% names(m))  m[, Game := NA_character_]
+  if (!"Total" %in% names(m)) m[, Total := NA_real_]
+
+  m[, SalaryTier := bucket_quantile(
+      Salary, 5,
+      fmt = function(v) paste0("$", formatC(round(v), format = "d", big.mark = ",")))]
+  m <- m[!is.na(Player) & nzchar(Player)]
+  m[, Key := norm_name(Player)]
+  unique(m, by = "Key")
+}
+
 SPORTS <- list(
   NASCAR = list(
     label      = "NASCAR",
@@ -517,6 +590,18 @@ SPORTS <- list(
     extra_cols = c("Pos" = "Pos", "Team" = "Team", "Game" = "Game",
                    "Depth" = "DepthSlot", "Proj" = "Proj"),
     proj_own   = NULL
+  ),
+  `NFL-SD` = list(
+    label      = "NFL Showdown",
+    entity     = "Player",
+    slots      = c("CPT", "FLEX"),
+    read_input = read_input_nfl_sd,
+    input_hint = "single-game showdown workbook (game + team sheets + projections)",
+    group_dims = c("Position" = "Pos", "Team" = "Team", "Salary Tier" = "SalaryTier"),
+    extra_cols = c("Pos" = "Pos", "Team" = "Team", "Salary" = "Salary"),
+    # Proj / Proj Own % / Proj CPT % render in the projections section under
+    # the exposure table, not inline - same as CFB Showdown.
+    proj_own   = "ProjOwn"
   ),
   CFB = list(
     label      = "College Football",
@@ -649,7 +734,13 @@ detect_sport <- function(slot_tokens) {
 # is ambiguous. Each adapter's sim workbook has a distinctive sheet signature.
 identify_workbook_family <- function(sheets) {
   low <- tolower(sheets)
-  if ("game" %in% low && "projections" %in% low) return("CFB")
+  # The 2026 NFL pipeline and the CFB pipeline share the game+projections+team
+  # layout; they split on the team sheet names - NFL uses the 32 league codes.
+  if ("game" %in% low && "projections" %in% low) {
+    teams <- toupper(sheets[!low %in% c("game", "projections", "etr")])
+    if (length(teams) && all(teams %in% unname(NFL_NICKNAMES))) return("NFL")
+    return("CFB")
+  }
   if ("fights" %in% low)                         return("MMA")
   if ("ids" %in% low)                            return("NFL")
   if ("driver" %in% low)                         return("NASCAR")
@@ -663,6 +754,7 @@ family_to_key <- function(family, showdown) {
   if (is.na(family)) return(NA_character_)
   if (family == "CFB") return(if (showdown) "CFB-SD" else "CFB")
   if (family == "MMA") return(if (showdown) "MMA-SD" else "MMA")
+  if (family == "NFL") return(if (showdown) "NFL-SD" else "NFL")
   family
 }
 
