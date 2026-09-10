@@ -843,14 +843,22 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
     # these are present (see app.R make_filtered_exposure).
     if ("cptown" %in% names(prj)) meta[prj, CPTOwn := as.numeric(i.cptown), on = .(Player = player)]
     if ("mvpown" %in% names(prj)) meta[prj, MVPOwn := as.numeric(i.mvpown), on = .(Player = player)]
-    for (idc in intersect(c("dkid", "dk_id"), names(prj)))
+    # DK ids / salaries. FLEX slot: dkid | dk_id | dk_id_util. CAPTAIN slot is a
+    # DIFFERENT DK number (~1.5x salary): dkcid | dk_id_cpt. Showdown upload and
+    # the captain optimiser both need DKCID -- without it the portfolio export
+    # prints "Name (NA)" for every captain. Column names mirror cfb_engine.
+    for (idc in intersect(c("dkid", "dk_id", "dk_id_util"), names(prj)))
       meta[prj, DKID := suppressWarnings(as.integer(get(paste0("i.", idc)))), on = .(Player = player)]
-    for (sc in intersect(c("salary", "dksalary", "dk_salary"), names(prj)))
+    for (idc in intersect(c("dkcid", "dk_id_cpt"), names(prj)))
+      meta[prj, DKCID := suppressWarnings(as.integer(get(paste0("i.", idc)))), on = .(Player = player)]
+    for (sc in intersect(c("salary", "dksalary", "dk_salary", "salary_util"), names(prj)))
       meta[prj, DKSalary := suppressWarnings(as.integer(get(paste0("i.", sc)))), on = .(Player = player)]
-    # FanDuel ids / salaries -- needed for the FD classic optimiser + upload.
-    for (idc in intersect(c("fdid", "fd_id"), names(prj)))
+    for (sc in intersect(c("dkcsalary", "salary_cpt"), names(prj)))
+      meta[prj, DKCSalary := suppressWarnings(as.integer(get(paste0("i.", sc)))), on = .(Player = player)]
+    # FanDuel ids / salaries -- FD classic optimiser + upload, and FD MVP.
+    for (idc in intersect(c("fdid", "fd_id", "fd_id_util"), names(prj)))
       meta[prj, FDID := suppressWarnings(as.integer(get(paste0("i.", idc)))), on = .(Player = player)]
-    for (sc in intersect(c("fdsalary", "fd_salary"), names(prj)))
+    for (sc in intersect(c("fdsalary", "fd_salary", "fd_salary_util"), names(prj)))
       meta[prj, FDSalary := suppressWarnings(as.integer(get(paste0("i.", sc)))), on = .(Player = player)]
   }
   meta[is.na(DKOwn), DKOwn := 0][is.na(CPTOwn), CPTOwn := 0]
