@@ -1324,8 +1324,15 @@ SPORT_CONFIGS <- list(
     roster_sizes = list(DK = 6),
     salary_caps  = list(DK = 50000),
 
-    optimization_modes = list(DK = "combinatorial_captain"),
+    optimization_modes = list(DK = "enum_captain"),
     max_lineups        = 5000,
+    # Same switch as NFL showdown -- see find_optimal_lineups_enum_captain.
+    # Measured on the FSU@SMU showdown (27 players): ~61k legal lineups at
+    # floor 0.88, smaller than NFL's ~135k, so Phase 1 should run faster there.
+    enum_salary_floor_frac = 0.88,
+    enum_win_pct           = 0.01,
+    enum_keep              = 10000L,
+    default_n_sims         = 25000L,
 
     showdown_config = list(
       DK = list(enabled = TRUE, captain_multiplier = 1.5,
