@@ -1423,7 +1423,11 @@ gts_dom_bond <- function(tau = NULL, start_weight = NULL) {
     options(gts.dom.start_weight = start_weight)
   }
   out <- list(tau = getOption("gts.dom.tau", 0),
-              start_weight = getOption("gts.dom.start_weight", 0.45))
+              start_weight = getOption("gts.dom.start_weight", 0.45),
+              start_prog_floor = getOption("gts.dom.start_prog_floor", 0),
+              tau_big = getOption("gts.dom.tau_big", 0),
+              start_weight_big = getOption("gts.dom.start_weight_big",
+                                          getOption("gts.dom.start_weight", 0.45)))
   if (is.null(tau) && is.null(start_weight)) out else invisible(out)
 }
 
@@ -1576,9 +1580,39 @@ assign_dominator_points_from_profiles_optimized <- function(race_result, race_we
   # now does more of the front-starter work, so the queue-jump is dialed back.
   start_boost <- getOption("gts.dom.start_boost", 0.35)
   start_reach <- getOption("gts.dom.start_reach", 6)
+  # The queue-jump used to ramp from zero on the biggest line (prog = 0 at
+  # pass 1) to full strength on the smallest. That is backwards: of the 49
+  # 30+-point dominator days in Xfinity intermediates since 2022, 49% started
+  # P1-P3 and 86% started top-10, so the front row's points ARE the big lines.
+  # With no boost there the sim blanked the pole 38.5% of the time against a
+  # real 7.7%. This floor applies the boost from the first line onward.
+  start_prog_floor <- getOption("gts.dom.start_prog_floor", 0)
+  # Slot predictiveness collapses on the biggest lines -- start+finish explains
+  # R2 .037 inside the 30+ bucket against .44 across all lines -- so the
+  # largest profiles are matched probabilistically and the small ones stay
+  # near-deterministic. tau for a line scales with its size relative to the
+  # biggest line in the race.
+  tau_big <- getOption("gts.dom.tau_big", 0)
+  # DEFAULT OFF (= bond_startw). Tested 12 Sep 2026 and NOT adopted: because
+  # Starting is a fixed input, identical in every sim, weighting it harder makes
+  # the big lines land on the same 2-3 drivers deterministically. Top-3
+  # dominator share went 44% -> 57% on our grid and 49% -> 65% on a realistic
+  # one, and tau from 0.5 to 2.0 moved it under a point. The pole's real floor
+  # (7.7% zero vs our 38%) comes from leading EARLY laps, which profile
+  # matching on start+finish cannot express. Knobs left in for experiments.
+  # Start weight for the BIGGEST line in the race, tapering to bond_startw for
+  # the smallest. Of the 49 30+-point dominator days in Xfinity intermediates
+  # since 2022, 86% started top-10 but only 49% finished P1 -- so on a big line
+  # the grid slot identifies the driver better than the finish does, and a flat
+  # 0.45 weight has it backwards. "Led early, faded" (Love P1->P16, 46.7 pts;
+  # Berry P1->P24, 46.2) is only reachable when start outweighs finish.
+  startw_big <- getOption("gts.dom.start_weight_big", bond_startw)
   finish_diff_matrix <- outer(driver_finishes, profile_finishes, function(x, y) abs(x - y))
   start_diff_matrix <- outer(driver_starts, profile_starts, function(x, y) abs(x - y))
   distance_matrix <- sqrt(finish_diff_matrix^2 + bond_startw * start_diff_matrix^2)
+  # squared parts kept so each line can be re-weighted by its own size below
+  fin_sq <- finish_diff_matrix^2
+  st_sq  <- start_diff_matrix^2
 
   # =========================================================================
   # GREEDY ASSIGNMENT: Prioritize high-value profiles + DKMax eligibility
@@ -1592,6 +1626,7 @@ assign_dominator_points_from_profiles_optimized <- function(race_result, race_we
   
   # Sort profiles by dominator points (highest first)
   profile_order <- order(-profile_dom_values)
+  max_dom_value <- max(profile_dom_values, na.rm = TRUE)
   
   # Track which drivers have been assigned
   available_drivers <- 1:n_drivers
@@ -1631,7 +1666,12 @@ assign_dominator_points_from_profiles_optimized <- function(race_result, race_we
     
     # Find the best eligible driver for this profile (minimum distance)
     # Get distances only for eligible drivers
-    distances_to_profile <- distance_matrix[eligible_driver_indices, profile_idx]
+    # line-size-scaled metric: rel = 1 on the race's biggest line, ~0 on the
+    # smallest. Big lines lean on the grid slot, small ones on the finish.
+    rel <- if (max_dom_value > 0) profile_dom_points / max_dom_value else 0
+    w_st <- bond_startw + (startw_big - bond_startw) * rel
+    distances_to_profile <- sqrt(fin_sq[eligible_driver_indices, profile_idx] +
+                                 w_st * st_sq[eligible_driver_indices, profile_idx])
 
     # A front-row starter leads the opening stint whether or not the race goes
     # his way, but profiles are matched on FINISHING position — so a pole sitter
@@ -1648,7 +1688,8 @@ assign_dominator_points_from_profiles_optimized <- function(race_result, race_we
     # profile is still assigned exactly once, so the pot is untouched.
     if (start_boost > 0 && length(distances_to_profile) > 1L) {
       prio <- pmax(0, 1 - (driver_starts[eligible_driver_indices] - 1) / start_reach)
-      distances_to_profile <- distances_to_profile * (1 - start_boost * prio * prog)
+      prog_eff <- start_prog_floor + (1 - start_prog_floor) * prog
+      distances_to_profile <- distances_to_profile * (1 - start_boost * prio * prog_eff)
     }
 
     # tau = 0 keeps the original hard nearest-neighbour pick. Above 0, draw from
@@ -1656,10 +1697,13 @@ assign_dominator_points_from_profiles_optimized <- function(race_result, race_we
     # from its historical slot — this is the only source of dominator variance
     # that is not just "which race got sampled". Distances are shifted by their
     # minimum first so exp() cannot underflow to an all-zero weight vector.
-    if (bond_tau <= 0 || length(distances_to_profile) == 1L) {
+    # tau for THIS line: the global tau, or a size-scaled one for the big
+    # profiles, whichever is larger. rel = 1 on the race's biggest line.
+    tau_here <- max(bond_tau, tau_big * rel)
+    if (tau_here <= 0 || length(distances_to_profile) == 1L) {
       best_idx_in_eligible <- which.min(distances_to_profile)
     } else {
-      w <- exp(-(distances_to_profile - min(distances_to_profile)) / bond_tau)
+      w <- exp(-(distances_to_profile - min(distances_to_profile)) / tau_here)
       best_idx_in_eligible <- sample.int(length(w), size = 1L, prob = w)
     }
     driver_idx <- eligible_driver_indices[best_idx_in_eligible]
