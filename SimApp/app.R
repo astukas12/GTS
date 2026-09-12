@@ -2100,8 +2100,8 @@ server <- function(input, output, session) {
 
       } else if (rv$sport == "SOCCER") {
         sd_meta <- copy(rv$sim_metadata); setDT(sd_meta)
-        if (!all(c("CPTSalary","SDSalary") %in% names(sd_meta)))
-          stop("Missing CPTSalary/SDSalary. Ensure SD files were included in the input.")
+        if (!"SDSalary" %in% names(sd_meta) || all(is.na(sd_meta$SDSalary)))
+          stop("Missing SDSalary. Ensure SD files were included in the input.")
         selected_sd <- if (!is.null(input$sd_game_select)) input$sd_game_select else {
           sdf <- unique(sd_meta[!is.na(ShowdownFile) & ShowdownFile != "", ShowdownFile])
           if (length(sdf)) sdf[1] else stop("No ShowdownFile found in metadata.")
@@ -2109,24 +2109,32 @@ server <- function(input, output, session) {
         sd_meta_filt <- sd_meta[ShowdownFile == selected_sd]
         if (nrow(sd_meta_filt) == 0) stop(sprintf("No players for showdown: %s", selected_sd))
         sd_sim <- rv$simulation_results[Player %in% sd_meta_filt$Player]
-        soccer_sd_config <- list(salary_cap     = rv$config$salary_caps$SD,
+        # Full-enumeration + winning-script rank -- same approach NFL/CFB
+        # showdown already use (find_optimal_lineups_enum_captain). Soccer SD
+        # is only ~22 players, so exhaustively enumerating every legal
+        # captain+5-flex lineup is cheap and exact, unlike the old per-sim
+        # greedy fill (find_optimal_lineups_soccer_sd) it replaces, which could
+        # miss the true best lineup for a given sim.
+        soccer_sd_config <- list(roster_size    = rv$config$roster_sizes$SD %||% 6L,
+                                 salary_cap     = rv$config$salary_caps$SD,
                                  max_lineups   = 5000,
                                  percentiles   = c(0.01, 0.05, 0.10, 0.20),
                                  platform_col  = "DKScore",
                                  cpt_multiplier = 1.5)
         progress$set(message=sprintf("Finding optimal Soccer Showdown lineups (%s)...", selected_sd),
                      detail="Phase 1: Building lineup pool...", value=0.05)
-        lineup_data <- find_optimal_lineups_soccer_sd(sd_sim, sd_meta_filt, soccer_sd_config, verbose=TRUE)
+        opt_data_sd <- prepare_optimization_data(sd_sim, sd_meta_filt, "SD")
+        lineup_data <- find_optimal_lineups(opt_data_sd, soccer_sd_config, mode="enum_captain", k=1, verbose=TRUE)
+        lineup_data <- drop_single_team_sd(lineup_data, sd_meta_filt)
         progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
                                     format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
-        soccer_sd_sim <- copy(sd_sim); setDT(soccer_sd_sim)
-        score_matrix  <- score_all_lineups(lineup_data, soccer_sd_sim, verbose=TRUE)
+        score_matrix  <- score_all_lineups(lineup_data, opt_data_sd, verbose=TRUE)
         progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
         final_results <- calculate_distribution_metrics(score_matrix, lineup_data, soccer_sd_config,
                                                         ownership_data=NULL, verbose=TRUE)
         if ("AvgOwn" %in% names(final_results)) final_results[, AvgOwn := NULL]
         rv$sd_optimal_lineups <- final_results
-        
+
       } else {
         sd_mode    <- rv$config$optimization_modes$SD %||% "captain"
         opt_data   <- prepare_optimization_data(rv$simulation_results, rv$sim_metadata, "SD")
@@ -2451,7 +2459,7 @@ server <- function(input, output, session) {
                                     fluidRow(box(title="Player Exposure in Filtered Pool",status="info",solidHeader=TRUE,width=12,
                                                  div(style="margin-bottom:6px;",
                                                      uiOutput(paste0(lp,"_lock_summary"), inline=TRUE)),
-                                                 tags$details(style="margin-bottom:6px;",
+                                                 tags$details(open="open", style="margin-bottom:6px;",
                                                    tags$summary("Filters & group totals",
                                                                 style="cursor:pointer;font-size:11px;color:#FFE500;"),
                                                    uiOutput(paste0(lp,"_expfilter_ui")),
@@ -2468,7 +2476,7 @@ server <- function(input, output, session) {
                                                  DTOutput(paste0(lp,"_builds_summary")))),
                                     uiOutput(paste0(lp,"_teamsplit_port_ui")),
                                     fluidRow(box(title="Portfolio Player Exposure",status="info",solidHeader=TRUE,width=12,
-                                                 tags$details(style="margin-bottom:6px;",
+                                                 tags$details(open="open", style="margin-bottom:6px;",
                                                    tags$summary("Filters & group totals",
                                                                 style="cursor:pointer;font-size:11px;color:#FFE500;"),
                                                    uiOutput(paste0(lp,"_portfilter_ui")),
@@ -4034,6 +4042,19 @@ server <- function(input, output, session) {
     else if (length(avail) > 0) avail[1] else "DK"
   })
 
+  # A DK position string can list more than one eligible slot for one player
+  # (soccer's "M/F" dual eligibility). These treat "M/F" as belonging to BOTH
+  # buckets, not a third combined one, everywhere Pos feeds a filter pill, a
+  # filter match, or a group-by tile.
+  pos_parts      <- function(x) strsplit(as.character(x), "/", fixed = TRUE)
+  pos_matches_any <- function(x, vals) vapply(pos_parts(x), function(v) any(v %in% vals), logical(1))
+  explode_by_pos <- function(dt, pos_col) {
+    parts <- pos_parts(dt[[pos_col]])
+    out <- dt[rep(seq_len(.N), lengths(parts))]
+    out[[pos_col]] <- unlist(parts)
+    out
+  }
+
   # ── Reusable filter-pill pair: position / team / game ─────────────────────
   # One row of pills per dimension that `meta` actually carries. Multi-select
   # within a row (OR); rows AND together. Inputs are namespaced by `prefix`
@@ -4049,7 +4070,7 @@ server <- function(input, output, session) {
     }
     pos_col <- intersect(c("Pos", "PosGroup", "DKPos", "FDPos"), names(meta))[1]
     pos_vals <- if (!is.na(pos_col)) {
-      v <- uniq_chr(meta[[pos_col]])
+      v <- uniq_chr(unlist(pos_parts(meta[[pos_col]])))
       ord <- c("QB","RB","WR","TE","K","DST","D","G","F","C","P")
       c(intersect(ord, v), setdiff(v, ord))
     } else character(0)
@@ -4099,7 +4120,7 @@ server <- function(input, output, session) {
     ps <- input[[paste0(prefix, "_pos")]]
     if (length(ps)) {
       pos_col <- intersect(c("Pos", "PosGroup", "DKPos", "FDPos"), names(dt))[1]
-      if (!is.na(pos_col)) dt <- dt[get(pos_col) %in% ps]
+      if (!is.na(pos_col)) dt <- dt[pos_matches_any(dt[[pos_col]], ps)]
     }
     ts <- input[[paste0(prefix, "_team")]]
     if (length(ts) && "Team" %in% names(dt)) dt <- dt[Team %in% ts]
@@ -4119,7 +4140,7 @@ server <- function(input, output, session) {
     meta <- as.data.table(meta)
     keep <- rep(TRUE, nrow(meta))
     pos_col <- intersect(c("Pos", "PosGroup", "DKPos", "FDPos"), names(meta))[1]
-    if (length(ps) && !is.na(pos_col)) keep <- keep & (as.character(meta[[pos_col]]) %in% ps)
+    if (length(ps) && !is.na(pos_col)) keep <- keep & pos_matches_any(meta[[pos_col]], ps)
     if (length(ts) && "Team" %in% names(meta)) keep <- keep & (as.character(meta$Team) %in% ts)
     if (length(gs) && "GameKey" %in% names(meta)) keep <- keep & (as.character(meta$GameKey) %in% gs)
     unique(as.character(meta$Player[keep]))
@@ -4145,7 +4166,7 @@ server <- function(input, output, session) {
     }
     pos_col <- intersect(c("Pos", "PosGroup", "DKPos", "FDPos"), names(dt))[1]
     pos_tbl <- if (!is.na(pos_col)) {
-      t <- dt[, .(val = sum(get(value_col), na.rm = TRUE)), by = c(pos_col)]
+      t <- explode_by_pos(dt, pos_col)[, .(val = sum(get(value_col), na.rm = TRUE)), by = c(pos_col)]
       setnames(t, pos_col, "key")[order(-val)]
     } else NULL
     team_tbl <- if ("Team" %in% names(dt)) {

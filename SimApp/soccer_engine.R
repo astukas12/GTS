@@ -1096,6 +1096,11 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
   setnames(metadata, c("DK_Salary","DK_ID"), c("DKSalary","DKID"), skip_absent=TRUE)
   metadata[, DKOwn := 0]; metadata[, PosGroup := DK_RosterPos]
   metadata[, DKPos := if("DK_RosterPos" %in% names(.SD)) DK_RosterPos else Pos, .SDcols=names(metadata)]
+  # app.R's shared position pills/exposure breakdowns read "Pos" before
+  # PosGroup/DKPos -- overwrite it with the DK roster slot (not our own
+  # granular research tag) so a dual-eligible player ("M/F") is treated as
+  # DK treats them, not split into some third research-only bucket.
+  metadata[, Pos := DKPos]
   metadata[, GameKey := { r<-games[Home==Team|Away==Team]; if(nrow(r)) r$Game[1] else paste0(Team," vs ",Opp) }, by=Player]
   grm <- data.table(Th=games$Home, Ta=games$Away, rk=seq_len(nrow(games)))
   metadata[, GameRank := { r<-grm[Th==Team|Ta==Team, rk]; if(length(r)) r[1] else 1L }, by=Player]
@@ -1133,6 +1138,7 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
       metadata[!is.na(ClassicID), DKID := ClassicID]
       metadata[!is.na(ClassicSalary), DKSalary := ClassicSalary]
       metadata[!is.na(ClassicPos), DKPos := ClassicPos]
+      metadata[!is.na(ClassicPos), Pos := ClassicPos]
       cat(sprintf("  Classic merged: %d/%d players have Classic salary\n", n_clas, nrow(metadata)))
     } else {
       cat("  WARNING: Classic_IDs missing expected columns — skipping merge\n")
@@ -1462,40 +1468,9 @@ find_optimal_lineups_soccer <- function(sim_results, metadata, config, verbose=T
   list(unique_lineups=ul, n_sims=ns, config=config, mode="soccer_dk")
 }
 
-find_optimal_lineups_soccer_sd <- function(sim_results, metadata, config, verbose=TRUE) {
-  if(verbose) cat("\nPhase 1: Soccer SD lineups...\n")
-  setDT(sim_results); setDT(metadata)
-  sc<-config$salary_cap; ml<-config$max_lineups%||%5000L; cm<-1.5
-  meta<-unique(metadata[!is.na(CPTSalary)&CPTSalary>0&!is.na(SDSalary)&SDSalary>0,.(Player,Team,CPTSalary,SDSalary,GameKey)],by="Player")
-  if(!nrow(meta)) stop("No SD players.")
-  np<-nrow(meta); pl<-meta$Player; cs<-as.numeric(meta$CPTSalary); ss<-as.numeric(meta$SDSalary); tid<-as.integer(factor(meta$Team))
-  opt<-merge(sim_results[,.(SimID,Player,DKScore)],meta[,.(Player)],by="Player"); opt<-opt[!is.na(DKScore)]
-  sids<-sort(unique(opt$SimID)); ns<-length(sids)
-  sm<-matrix(0,np,ns); sm[cbind(match(opt$Player,pl),match(opt$SimID,sids))]<-opt$DKScore
-  if(verbose) cat(sprintf("  %d players | %s sims\n",np,format(ns,big.mark=",")))
-  st<-Sys.time(); ro<-apply(sm,2,order,decreasing=TRUE)
-  bs<-rep(-Inf,ns); bc<-integer(ns); bf<-matrix(0L,5,ns); bsal<-numeric(ns)
-  co<-order(-rowMeans(sm))
-  for(ci in seq_len(min(np,12L))) {
-    cx<-co[ci]; if(cs[cx]>sc) next; rc<-sc-cs[cx]; ctid<-tid[cx]; csc<-sm[cx,]*cm
-    for(s in seq_len(ns)) {
-      rk<-ro[,s]; fsal<-0;fsc<-0;npk<-0L;fi<-integer(5);ho<-FALSE
-      for(ri in seq_len(np)) { if(npk==5L) break; pi<-rk[ri]; if(pi==cx) next; if(fsal+ss[pi]>rc) next
-      npk<-npk+1L; fi[npk]<-pi; fsal<-fsal+ss[pi]; fsc<-fsc+sm[pi,s]; if(tid[pi]!=ctid) ho<-TRUE }
-      if(npk<5L||!ho) next; tot<-csc[s]+fsc
-      if(tot>bs[s]) { bs[s]<-tot; bc[s]<-cx; bf[,s]<-fi; bsal[s]<-cs[cx]+fsal }
-    }
-  }
-  valid<-which(bc>0); if(!length(valid)) stop("No valid SD lineups.")
-  lu<-cn<-u1<-u2<-u3<-u4<-u5<-character(length(valid))
-  for(vi in seq_along(valid)) { s<-valid[vi]; fp<-sort(pl[bf[,s]]); cn[vi]<-pl[bc[s]]
-  lu[vi]<-paste(c(cn[vi],fp),collapse="|"); u1[vi]<-fp[1];u2[vi]<-fp[2];u3[vi]<-fp[3];u4[vi]<-fp[4];u5[vi]<-fp[5] }
-  ad<-data.table(Lineup=lu,TotalSalary=bsal[valid],TotalScore=bs[valid],Captain=cn,Util1=u1,Util2=u2,Util3=u3,Util4=u4,Util5=u5)
-  ct<-ad[,.(Top1Count=.N,TotalSalary=TotalSalary[1],AvgScore=mean(TotalScore),Captain=Captain[1],Util1=Util1[1],Util2=Util2[1],Util3=Util3[1],Util4=Util4[1],Util5=Util5[1]),by=Lineup]
-  ct[,rand:=runif(.N)]; setorder(ct,-Top1Count,rand); ct[,rand:=NULL]
-  if(nrow(ct)>ml) ct<-ct[1:ml]
-  ul<-ct[,.(TotalSalary,Top1Count,AvgScore,Captain,Util1,Util2,Util3,Util4,Util5)]
-  el<-as.numeric(difftime(Sys.time(),st,units="secs"))
-  if(verbose) cat(sprintf("  Done: %s SD lineups | %.1fs\n",format(nrow(ul),big.mark=","),el))
-  list(unique_lineups=ul, n_sims=ns, config=config, mode="captain")
-}
+# Soccer SD lineups now go through the generic find_optimal_lineups(mode=
+# "enum_captain") in OptimalLineups_Core.R (same full-enumeration approach as
+# NFL/CFB showdown) -- see the SOCCER branch of the SD build handler in app.R.
+# The old per-sim greedy fill (find_optimal_lineups_soccer_sd) that lived here
+# is gone; it approximated the best captain+flex per sim by descending-score
+# order under the salary cap, which could miss the true optimum for a sim.
