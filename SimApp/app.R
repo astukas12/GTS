@@ -2149,7 +2149,11 @@ server <- function(input, output, session) {
         opt_config <- list(roster_size=rv$config$roster_sizes$SD, salary_cap=rv$config$salary_caps$SD,
                            percentiles=c(0.01,0.05,0.10,0.20), platform_col="DKScore",
                            cpt_multiplier=1.5, progress_frequency=500,
-                           use_parallel=FALSE, max_lineups=sd_max_lineups)
+                           use_parallel=FALSE, max_lineups=sd_max_lineups,
+                           # enum_captain reads enum_keep, not max_lineups, for its pool
+                           # cutoff -- wire it through so sports on this path keep their
+                           # own validated cap instead of the function's 10000L default.
+                           enum_keep=sd_max_lineups)
         progress$set(message="Finding optimal Showdown lineups...",
                      detail="Phase 1: Building lineup pool...", value=0.05)
         lineup_data  <- find_optimal_lineups(opt_data, opt_config, mode=sd_mode, k=1, verbose=TRUE)

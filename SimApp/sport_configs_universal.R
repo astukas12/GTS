@@ -118,10 +118,14 @@ SPORT_CONFIGS <- list(
     roster_sizes = list(DK = 6, FD = 6, SD = 6),
     salary_caps  = list(DK = 50000, FD = 100, SD = 50000),
     # Small player pool: greedy optimal per sim, dedupe → ranked by Top1Count
-    optimization_modes = list(DK = "combinatorial", FD = "combinatorial_mvp", SD = "combinatorial_captain"),
+    # SD: full enumeration + winning-script rank, same switch as NFL/CFB/soccer
+    # showdown (find_optimal_lineups_enum_captain) -- MMA SD is ~26 fighters,
+    # cheap and exact to enumerate exhaustively vs. the old per-sim greedy fill.
+    optimization_modes = list(DK = "combinatorial", FD = "combinatorial_mvp", SD = "enum_captain"),
     # Pool cutoff validated at ~3,000 (cov80) via contest-portfolio backtest:
     # random-draw finish degrades monotonically as the pool grows past ~3,000
-    # on both DK Classic and SD. Down from 5,000.
+    # on both DK Classic and SD. Down from 5,000. (SD's enum_keep is wired to
+    # this same max_lineups value in app.R's showdown branch.)
     max_lineups        = 3000,
     
     standard_metrics = c(
