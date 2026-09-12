@@ -252,11 +252,48 @@ process_lap_data <- function(race_season, race_id, series_id) {
   }))
 }
 
-process_weekend_data <- function(race_season, race_id, series_id) {
+# The weekend feed carries both the per-driver results and the race-level
+# summary (cautions, leaders, average speed). Both callers want it, so fetch
+# once per race and cache — otherwise a backfill run doubles every HTTP call.
+.weekend_feed_cache <- new.env(parent = emptyenv())
+
+fetch_weekend_feed <- function(race_season, race_id, series_id) {
+  key <- sprintf("%d_%d_%d", race_season, series_id, race_id)
+  if (!is.null(.weekend_feed_cache[[key]])) return(.weekend_feed_cache[[key]])
   url <- sprintf("https://cf.nascar.com/cacher/%d/%d/%d/weekend-feed.json",
                  race_season, series_id, race_id)
-  with_retry(tryCatch({
-    json_data <- fromJSON(url)
+  feed <- with_retry(tryCatch(fromJSON(url), error = function(e) NULL))
+  .weekend_feed_cache[[key]] <- feed
+  feed
+}
+
+# Race-level summary columns. race_list_basic.json — the schedule feed the
+# Races sheet is built from — carries these as zeros before the race and NASCAR
+# never backfills them there, so they have to come from the weekend feed after
+# the race is run.
+WEEKEND_META_COLS <- c(
+  "actual_laps", "actual_distance", "number_of_cars_in_field",
+  "number_of_lead_changes", "number_of_leaders",
+  "number_of_cautions", "number_of_caution_laps",
+  "average_speed", "total_race_time", "margin_of_victory",
+  "pole_winner_driver_id", "pole_winner_speed"
+)
+
+extract_race_meta <- function(race_season, race_id, series_id) {
+  feed <- fetch_weekend_feed(race_season, race_id, series_id)
+  wr <- feed$weekend_race
+  if (is.null(wr) || nrow(wr) == 0) return(NULL)
+  out <- tibble(race_id = as.numeric(race_id))
+  for (col in WEEKEND_META_COLS) {
+    v <- if (col %in% names(wr)) wr[[col]][1] else NA
+    out[[col]] <- if (is.null(v)) NA else v
+  }
+  out
+}
+
+process_weekend_data <- function(race_season, race_id, series_id) {
+  json_data <- fetch_weekend_feed(race_season, race_id, series_id)
+  tryCatch({
     if (is.null(json_data$weekend_race)) return(NULL)
     json_data$weekend_race %>%
       unnest(results, names_sep = "_") %>%
@@ -275,7 +312,7 @@ process_weekend_data <- function(race_season, race_id, series_id) {
         points_position = as.numeric(points_position)
       ) %>%
       select(-driver_fullname)
-  }, error = function(e) NULL))
+  }, error = function(e) NULL)
 }
 
 calculate_fantasy_points <- function(data, scoring_table) {
@@ -447,6 +484,70 @@ if (nrow(new_race_rows) > 0) {
 }
 
 # -----------------------------------------------------------------------------
+# 3c. Backfill race-level metadata from the weekend feed
+# The Races sheet is built from race_list_basic.json, which reports cautions,
+# leaders, lead changes, average speed and margin of victory as 0 until the
+# race is run — and never fills them in afterwards. Left alone, 59 of this
+# season's 74 run races carry number_of_cautions = 0 and 58 carry
+# number_of_leaders = 0, which is not a quiet season, it is missing data.
+#
+# Fix every run race in the current season whose summary still reads as unset,
+# pulling the real values from the weekend feed. A completed race always has at
+# least one leader, so number_of_leaders == 0 is a reliable sentinel. Idempotent
+# — a race already filled in is skipped, so reruns cost nothing.
+# -----------------------------------------------------------------------------
+log_msg("Backfilling race-level metadata from weekend feeds...")
+meta_filled <- 0L
+
+needs_meta <- races_updated %>%
+  mutate(race_date_parsed = as.Date(substr(race_date, 1, 10))) %>%
+  filter(race_season == CURRENT_YEAR,
+         Historical == "Y",
+         !is.na(race_date_parsed), race_date_parsed < TODAY,
+         is.na(number_of_leaders) | number_of_leaders == 0)
+
+if (nrow(needs_meta) == 0) {
+  log_msg("  All current-season race metadata already populated")
+} else {
+  log_msg(sprintf("  %d race(s) missing metadata", nrow(needs_meta)))
+  meta_rows <- list()
+  for (i in seq_len(nrow(needs_meta))) {
+    mr <- needs_meta[i, ]
+    m <- extract_race_meta(mr$race_season, mr$race_id, mr$series_id)
+    if (is.null(m) || is.na(m$number_of_leaders) || m$number_of_leaders == 0) {
+      log_msg(sprintf("    %s — feed not ready, will retry next run", mr$race_name))
+      next
+    }
+    meta_rows[[length(meta_rows) + 1]] <- m
+  }
+
+  if (length(meta_rows) == 0) {
+    log_msg("  No metadata available from the feeds this run")
+  } else {
+    meta <- bind_rows(meta_rows)
+    # Patch by position rather than a join: only the rows we fetched change, and
+    # each value is coerced to the column's existing type first. The feed hands
+    # back total_race_time as "1:58:04" where the sheet may hold it as a number,
+    # and a type clash inside a join would take the whole run down.
+    idx <- match(meta$race_id, races_updated$race_id)
+    ok  <- !is.na(idx)
+    for (col in WEEKEND_META_COLS) {
+      if (!col %in% names(races_updated)) next
+      v <- meta[[col]][ok]
+      v <- switch(class(races_updated[[col]])[1],
+                  numeric   = suppressWarnings(as.numeric(v)),
+                  integer   = suppressWarnings(as.integer(v)),
+                  character = as.character(v),
+                  v)
+      keep <- !is.na(v)
+      races_updated[[col]][idx[ok][keep]] <- v[keep]
+    }
+    log_msg(sprintf("  Filled metadata for %d race(s)", sum(ok)))
+    meta_filled <- sum(ok)
+  }
+}
+
+# -----------------------------------------------------------------------------
 # 4. DETERMINE WHICH RACES NEED RESULTS PROCESSING
 # A race needs processing if:
 #   - It is marked Historical = Y in the updated Races sheet (date has passed)
@@ -462,7 +563,7 @@ if (nrow(races_needing_results) == 0) {
   log_msg("Results are up to date. Saving any Races sheet changes and exiting.")
   
   # Still need to save if Historical flags changed or new races were added
-  if (n_flipped > 0 || nrow(new_race_rows) > 0) {
+  if (n_flipped > 0 || nrow(new_race_rows) > 0 || meta_filled > 0) {
     log_msg(sprintf("Writing updated %s...", DATA_FILE))
     wb <- loadWorkbook(DATA_FILE)
     removeWorksheet(wb, "Races")
