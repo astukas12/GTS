@@ -986,13 +986,19 @@ find_optimal_lineups_enum_captain <- function(sim_results, config, verbose = TRU
   sim_ids     <- unique(sim_results$SimID)
   n_sims      <- length(sim_ids)
 
-  # Player -> team id for the >= 2 teams rule (no-op if < 2 teams present)
-  team_id <- rep(1L, n_players)
+  # Player -> team id for the >= 2 teams rule. No-op (never filters a lineup
+  # out) when the engine carries no Team column or the slate is one team --
+  # same convention as find_optimal_lineups_combinatorial_captain's p2t <- NULL.
+  has_teams <- FALSE
+  team_id   <- rep(1L, n_players)
   if ("Team" %in% names(sim_results)) {
     u <- unique(sim_results[!is.na(Team), .(Player, Team)])
     tmap <- setNames(as.character(u$Team), u$Player)
     tv <- tmap[all_players]
-    if (sum(!is.na(unique(tv))) >= 2) team_id <- as.integer(factor(tv))
+    if (sum(!is.na(unique(tv))) >= 2) {
+      team_id   <- as.integer(factor(tv))
+      has_teams <- TRUE
+    }
   }
 
   # score matrix: n_players x n_sims (collapse dup player-sim rows first)
@@ -1017,7 +1023,8 @@ find_optimal_lineups_enum_captain <- function(sim_results, config, verbose = TRU
     fc     <- combn(others, n_flex)                        # n_flex x C  (real player idx)
     fsal   <- colSums(matrix(salaries[fc], nrow = n_flex))
     lsal   <- cpt_sal + fsal
-    same_t <- colSums(matrix(team_id[fc] == team_id[ci], nrow = n_flex)) == n_flex
+    same_t <- if (has_teams) colSums(matrix(team_id[fc] == team_id[ci], nrow = n_flex)) == n_flex
+              else rep(FALSE, ncol(fc))
     keep   <- lsal >= sal_floor & lsal <= salary_cap & !same_t
     if (!any(keep)) next
     fk <- fc[, keep, drop = FALSE]
