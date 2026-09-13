@@ -1693,7 +1693,9 @@ server <- function(input, output, session) {
                            pool_spread=rv$config$pool_spread %||% 0)
         progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
         lineup_data <- find_optimal_lineups(opt_data, opt_config, mode="cfb_classic",
-                                            k=1, verbose=TRUE)
+                                            k=1, verbose=TRUE,
+                                            progress_callback=function(frac, detail)
+                                              progress$set(value=0.05 + frac*0.30, detail=detail))
         # DK classic rule: >= 2 teams and >= 2 games. Never binds on a 7-game
         # slate, cheap to guarantee anyway.
         gtab <- as.data.table(rv$input_data$game)
@@ -1702,13 +1704,17 @@ server <- function(input, output, session) {
           gtab[, .(AwayTeam=away, HomeTeam=home)])
         progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
                                     format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
-        score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
+        score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE,
+                                          progress_callback=function(frac, detail)
+                                            progress$set(value=0.35 + frac*0.35, detail=detail))
         progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
         own_data <- copy(rv$sim_metadata)
         if ("DKOwn" %in% names(own_data)) { setnames(own_data, "DKOwn", "Own")
           if (max(own_data$Own, na.rm=TRUE) > 1) own_data[, Own := Own / 100] }
         final_results <- calculate_distribution_metrics(score_matrix, lineup_data, opt_config,
-                                                        ownership_data=own_data, verbose=TRUE)
+                                                        ownership_data=own_data, verbose=TRUE,
+                                                        progress_callback=function(frac, detail)
+                                                          progress$set(value=0.70 + frac*0.30, detail=detail))
         final_results <- add_custom_metrics(final_results, rv$sim_metadata, rv$config)
         for (wc in intersect(c("TotalEW","Win6Pct","Win5PlusPct"), names(final_results)))
           final_results[, (wc) := NULL]
@@ -1779,7 +1785,9 @@ server <- function(input, output, session) {
                            phase1_metric=rv$config$phase1_metric %||% "mean",
                            phase1_sims=rv$config$phase1_sims %||% 5000L)
         progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
-        lineup_data <- find_optimal_lineups(opt_data, opt_config, mode=dk_mode, k=1, verbose=TRUE)
+        lineup_data <- find_optimal_lineups(opt_data, opt_config, mode=dk_mode, k=1, verbose=TRUE,
+                                            progress_callback=function(frac, detail)
+                                              progress$set(value=0.05 + frac*0.30, detail=detail))
         # DK showdown rule: a captain-mode lineup needs players from BOTH
         # teams -- all 6 from one side is not a legal DK entry. NFL_PRESEASON's
         # SD button already dropped these (line ~2013); this DK button reaches
@@ -1790,12 +1798,16 @@ server <- function(input, output, session) {
           lineup_data <- drop_single_team_sd(lineup_data, rv$sim_metadata)
         progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
                                     format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
-        score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
+        score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE,
+                                          progress_callback=function(frac, detail)
+                                            progress$set(value=0.35 + frac*0.35, detail=detail))
         progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
         own_data <- copy(rv$sim_metadata)
         if ("DKOwn" %in% names(own_data)) { setnames(own_data, "DKOwn", "Own"); if (max(own_data$Own, na.rm=TRUE) > 1) own_data[, Own := Own / 100] }
         final_results <- calculate_distribution_metrics(score_matrix, lineup_data, opt_config,
-                                                        ownership_data=own_data, verbose=TRUE)
+                                                        ownership_data=own_data, verbose=TRUE,
+                                                        progress_callback=function(frac, detail)
+                                                          progress$set(value=0.70 + frac*0.30, detail=detail))
         progress$set(detail="Phase 3: Adding custom metrics...", value=0.90)
         final_results <- add_custom_metrics(final_results, rv$sim_metadata, rv$config)
         # Strip MMA win-count metrics (not needed for lineup building)
