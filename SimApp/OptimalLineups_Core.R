@@ -142,20 +142,20 @@ find_optimal_lineups_standard <- function(sim_results, config, k = 3, verbose = 
     if (verbose) cat(sprintf("  Using %d cores\n", n_cores))
     
     cl <- makeCluster(n_cores, type = "PSOCK")
+    on.exit(stopCluster(cl), add = TRUE)          # else a worker error leaks the cluster
     clusterEvalQ(cl, {
       library(data.table)
       library(lpSolve)
     })
-    clusterExport(cl, c("find_top_k_for_sim", "roster_size", "salary_cap", "k"), 
+    clusterExport(cl, c("find_top_k_for_sim", "roster_size", "salary_cap", "k"),
                   envir = environment())
     clusterExport(cl, "sim_results", envir = environment())
-    
+
     all_lineups <- parLapply(cl, sim_ids, function(sid) {
       sim_data <- sim_results[SimID == sid]
       find_top_k_for_sim(sim_data, roster_size, salary_cap, k)
     })
-    
-    stopCluster(cl)
+
     all_lineups <- all_lineups[!sapply(all_lineups, is.null)]
     
   } else {
@@ -384,20 +384,20 @@ find_optimal_lineups_mvp <- function(sim_results, config, k = 3, verbose = TRUE)
     if (verbose) cat(sprintf("  Using %d cores\n", n_cores))
     
     cl <- makeCluster(n_cores, type = "PSOCK")
+    on.exit(stopCluster(cl), add = TRUE)          # else a worker error leaks the cluster
     clusterEvalQ(cl, {
       library(data.table)
       library(lpSolve)
     })
-    clusterExport(cl, c("find_top_k_mvp_for_sim", "roster_size", "salary_cap", "mvp_multiplier", "k"), 
+    clusterExport(cl, c("find_top_k_mvp_for_sim", "roster_size", "salary_cap", "mvp_multiplier", "k"),
                   envir = environment())
     clusterExport(cl, "sim_results", envir = environment())
-    
+
     all_lineups <- parLapply(cl, sim_ids, function(sid) {
       sim_data <- sim_results[SimID == sid]
       find_top_k_mvp_for_sim(sim_data, roster_size, salary_cap, mvp_multiplier, k)
     })
-    
-    stopCluster(cl)
+
     all_lineups <- all_lineups[!sapply(all_lineups, is.null)]
     
   } else {
@@ -587,20 +587,20 @@ find_optimal_lineups_captain <- function(sim_results, config, k = 3, verbose = T
     if (verbose) cat(sprintf("  Using %d cores\n", n_cores))
     
     cl <- makeCluster(n_cores, type = "PSOCK")
+    on.exit(stopCluster(cl), add = TRUE)          # else a worker error leaks the cluster
     clusterEvalQ(cl, {
       library(data.table)
       library(lpSolve)
     })
-    clusterExport(cl, c("find_top_k_captain_for_sim", "roster_size", "salary_cap", "cpt_multiplier", "k"), 
+    clusterExport(cl, c("find_top_k_captain_for_sim", "roster_size", "salary_cap", "cpt_multiplier", "k"),
                   envir = environment())
     clusterExport(cl, "sim_results", envir = environment())
-    
+
     all_lineups <- parLapply(cl, sim_ids, function(sid) {
       sim_data <- sim_results[SimID == sid]
       find_top_k_captain_for_sim(sim_data, roster_size, salary_cap, cpt_multiplier, k)
     })
-    
-    stopCluster(cl)
+
     all_lineups <- all_lineups[!sapply(all_lineups, is.null)]
     
   } else {
