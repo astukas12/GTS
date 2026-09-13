@@ -3920,20 +3920,40 @@ server <- function(input, output, session) {
   # set from inside the table renderers themselves, next to the exp_tbl they
   # describe -- see make_filtered_exposure / make_portfolio_exposure /
   # make_portfolio_lineups.
-  make_group_filter_ui <- function(prefix) {
-    force(prefix)   # prefix is a promise over `paste0(..., lp_)` from the loop
-                    # below -- without forcing it here, all three renderUI
-                    # closures would read `lp_` lazily and see its FINAL loop
-                    # value ("sd") instead of the one each was built with.
+  make_group_filter_ui <- function(prefix, exclude_lp = NULL) {
+    force(prefix); force(exclude_lp)   # prefix/exclude_lp are promises over
+                    # `paste0(..., lp_)` from the loop below -- without
+                    # forcing them here, all three renderUI closures would
+                    # read `lp_` lazily and see its FINAL loop value ("sd")
+                    # instead of the one each was built with.
     renderUI({
       req(rv$sim_metadata)
-      filter_pills_ui(prefix, rv$sim_metadata)
+      filter_pills_ui(prefix, rv$sim_metadata, exclude_lp = exclude_lp)
     })
   }
+  # EXCLUDE SELECTED: push every player the pill row currently matches (team,
+  # game, pos, any combination) into the SAME _excl_any set the per-row EXCL
+  # button writes to -- one click for "every Bills player" instead of 6.
+  make_bulk_excl_observer <- function(prefix, lp) {
+    force(prefix); force(lp)
+    observeEvent(input[[paste0(prefix, "_bulk_excl")]], {
+      players <- pill_allowed_players(input, prefix, rv$sim_metadata)
+      if (is.null(players) || !length(players)) {
+        showNotification("Select a team, game or position pill first.", type = "warning")
+        return()
+      }
+      xk <- paste0(lp, "_excl_any")
+      rv[[xk]] <- union(rv[[xk]], players)
+      rv[[paste0(lp, "_lock_any")]] <- setdiff(rv[[paste0(lp, "_lock_any")]], players)
+      showNotification(sprintf("Excluded %d player(s).", length(players)), type = "message", duration = 3)
+    }, ignoreInit = TRUE)
+  }
   for (lp_ in c("dk", "fd", "sd")) {
-    output[[paste0(lp_, "_expfilter_ui")]]  <- make_group_filter_ui(paste0("expfilter_",  lp_))
-    output[[paste0(lp_, "_portfilter_ui")]] <- make_group_filter_ui(paste0("portfilter_", lp_))
+    output[[paste0(lp_, "_expfilter_ui")]]  <- make_group_filter_ui(paste0("expfilter_",  lp_), lp_)
+    output[[paste0(lp_, "_portfilter_ui")]] <- make_group_filter_ui(paste0("portfilter_", lp_), lp_)
     output[[paste0(lp_, "_plnfilter_ui")]]  <- make_group_filter_ui(paste0("plnfilter_",  lp_))
+    make_bulk_excl_observer(paste0("expfilter_",  lp_), lp_)
+    make_bulk_excl_observer(paste0("portfilter_", lp_), lp_)
   }
 
 
@@ -4159,7 +4179,16 @@ server <- function(input, output, session) {
   # its own independent selection. Originated as the Fantasy Projections
   # table's filter row; generalized so the exposure/portfolio tables can each
   # get their own copy without re-deriving the pill idiom.
-  filter_pills_ui <- function(prefix, meta) {
+  # `exclude_lp`, when supplied, is the LOCK/EXCL platform key ("dk"/"fd"/
+  # "sd") this pill row's selection should bulk-exclude into -- adds an
+  # EXCLUDE SELECTED button that pushes every player matching the CURRENT
+  # pill selection (pos/team/game, whatever's active) into
+  # rv[[paste0(exclude_lp,"_excl_any")]], the same set the per-row EXCL
+  # button writes to. One click excludes a whole team or game (or both, or a
+  # position) instead of clicking EXCL down a 20-player roster. NULL (the
+  # projections-table filter row, which has no lock/excl concept) renders
+  # the pill row exactly as before.
+  filter_pills_ui <- function(prefix, meta, exclude_lp = NULL) {
     if (is.null(meta) || !nrow(meta)) return(NULL)
     meta <- as.data.table(meta)
     uniq_chr <- function(x) {
@@ -4191,13 +4220,18 @@ server <- function(input, output, session) {
       "var pf=this.closest('.gts-pf');pf.querySelectorAll('.gts-pill.active').forEach(function(b){b.classList.remove('active')});['pos','team','game'].forEach(function(k){Shiny.setInputValue('%s_'+k,[],{priority:'event'});});",
       prefix)
 
+    excl_btn <- if (!is.null(exclude_lp))
+      actionButton(paste0(prefix, "_bulk_excl"), "✕ EXCLUDE SELECTED",
+                  class = "btn-sm btn-danger", style = "margin-left:10px;padding:2px 8px;font-size:11px;")
+
     div(class = "gts-pf",
         pill_row("pos",  "POS",  pos_vals),
         pill_row("team", "TEAM", team_vals),
         pill_row("game", "GAME", game_vals,
                  show = function(v) sub("\\s+", " @ ", v)),
         div(class = "gts-pf-row",
-            span(class = "gts-pf-clear", onclick = clear_js, "✕ CLEAR")),
+            span(class = "gts-pf-clear", onclick = clear_js, "✕ CLEAR"),
+            excl_btn),
         tags$script(HTML(sprintf(
           "Shiny.setInputValue('%s_pos',[],{priority:'event'});Shiny.setInputValue('%s_team',[],{priority:'event'});Shiny.setInputValue('%s_game',[],{priority:'event'});",
           prefix, prefix, prefix))))

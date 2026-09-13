@@ -2545,10 +2545,15 @@ find_optimal_lineups_nfl_classic <- function(sim_results, config, verbose = TRUE
                     .(SimID, Player, FantasyPoints, Salary, Pos, StartOrder)]
   if (!nrow(SR)) stop("nfl_classic optimiser: no priced players on sim_results")
 
-  # Global candidate cut: keep the top ~24 by mean points per position plus the
+  # Global candidate cut: keep the top-N by mean points per position plus the
   # cheapest few as cap-relievers. DST pools are tiny so this keeps them all.
+  # config$candidate_top_n/candidate_cheap_n (SPORT_CONFIGS$NFL_CLASSIC) --
+  # default 40/10, widened from the original 24/6 once a real 12-game Sunday
+  # slate (270 players) showed the narrower cut kept only ~half the pool.
+  top_n   <- config$candidate_top_n   %||% 40L
+  cheap_n <- config$candidate_cheap_n %||% 10L
   pm <- SR[, .(mu = mean(FantasyPoints), sal = Salary[1]), by = .(Player, Pos)]
-  keep_pl <- pm[, .SD[union(head(order(-mu), 24L), head(order(sal), 6L)), Player],
+  keep_pl <- pm[, .SD[union(head(order(-mu), top_n), head(order(sal), cheap_n)), Player],
                 by = Pos]$V1
   SR <- SR[Player %chin% keep_pl]
   all_ids <- unique(SR$SimID); n_sims_full <- length(all_ids)
@@ -2562,26 +2567,43 @@ find_optimal_lineups_nfl_classic <- function(sim_results, config, verbose = TRUE
   SR[, pr := rowid(SimID, Pos)]
 
   # ---- FAST PATH ---------------------------------------------------------
-  # The unconstrained best lineup: top QB, top 2 RB, top 3 WR, top TE, top DST,
-  # then the best of {RB3, WR4, TE2} for FLEX. When it is already under the cap
-  # it IS the optimum, and on an NFL classic slate it often is not -- the slow
-  # path below carries the rest.
+  # The unconstrained best lineup(s): top QB, top 2 RB, top 3 WR, top TE, top
+  # DST, then EACH of {RB3, WR4, TE2} as its OWN FLEX variant -- not just the
+  # single best of the three. Collapsing FLEX to one winner threw away real
+  # structural diversity for free: measured on the real W1 Sunday sheet (12
+  # games, 20k sims), keeping all three variants took the fast path from
+  # 4,720 to 19,589 distinct lineups -- zero extra duplication (every one
+  # distinct), because it stops discarding information the sim already
+  # computed rather than approximating anything new. A lineup's Top1Count now
+  # means "one of the (up to) 3 strongest FLEX arrangements for that sim's
+  # draw", not strictly the argmax -- the same relaxation
+  # find_optimal_lineups_enum_captain's winning-script rank already uses for
+  # showdown, not a new kind of approximation for this codebase.
   base_c <- SR[(Pos == "QB"  & pr == 1L) | (Pos == "RB" & pr <= 2L) |
                (Pos == "WR"  & pr <= 3L) | (Pos == "TE" & pr == 1L) |
                (Pos == "DST" & pr == 1L)]
   flex_c <- SR[(Pos == "RB" & pr == 3L) | (Pos == "WR" & pr == 4L) | (Pos == "TE" & pr == 2L)]
   setorder(flex_c, SimID, -FantasyPoints)
-  flex_c <- flex_c[, head(.SD, 1L), by = SimID]
-  cand   <- rbindlist(list(base_c, flex_c), use.names = TRUE)
+  flex_c[, variant := rowid(SimID)]                 # up to 3 FLEX options per sim
+  # A composite "SimID_vN" id carries each variant through the rest of Phase 1
+  # as its own independent candidate lineup; n_sims_full (WinRate's
+  # denominator) was captured above from the TRUE sim count and is untouched.
+  cand <- rbindlist(lapply(sort(unique(flex_c$variant)), function(v)
+    rbindlist(list(base_c[,  .(SimID = paste0(SimID, "_v", v), Player, Pos, StartOrder, Salary)],
+                   flex_c[variant == v, .(SimID = paste0(SimID, "_v", v), Player, Pos, StartOrder, Salary)]),
+              use.names = TRUE)), use.names = TRUE)
   full9  <- cand[, .N, by = SimID][N == need, SimID]
   cand   <- cand[SimID %chin% full9]
   under  <- cand[, .(s = sum(Salary)), by = SimID][s <= cap, SimID]
   fast   <- cand[SimID %chin% under]
 
   # ---- SLOW PATH -------------------------------------------------------
-  # Sims where the unconstrained lineup breaks the cap (or the trimmed
-  # candidate set could not field 9): greedy pick under the cap.
-  slow_ids <- setdiff(unique(SR$SimID), under)
+  # Sims where EVERY fast-path variant breaks the cap (or the trimmed
+  # candidate set could not field 9): greedy pick under the cap. A sim needs
+  # the slow path only if NONE of its 1-3 fast variants landed under cap --
+  # strip the "_vN" suffix before comparing against the original sim ids.
+  under_orig <- unique(sub("_v[0-9]+$", "", under))
+  slow_ids <- setdiff(unique(SR$SimID), under_orig)
   slow <- NULL
   if (length(slow_ids)) {
     SS <- SR[SimID %chin% slow_ids]                 # already point-sorted
