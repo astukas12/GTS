@@ -516,8 +516,8 @@ SPORT_CONFIGS <- list(
     # Phase 2/3 (~2.5 -> ~5 min at 50k sims) and a live 5k run already showed
     # good diversity -- the FLEX-variant fix carries the gain, not the count.
     max_lineups          = 5000,
-    candidate_top_n      = 40,   # nfl_classic only -- see find_optimal_lineups_nfl_classic
-    candidate_cheap_n    = 10,
+    candidate_top_n      = 999,  # no cut (13 Sep 2026): mean-based cut dropped ceiling plays; per-sim ranking already filters. 20k sims: Phase 1 12s -> 20s, players used 184 -> 237
+    candidate_cheap_n    = 999,
 
     # QB / RB / RB / WR / WR / WR / TE / FLEX / DST -- DK and FD, same shape.
     # The optimiser derives the LP position bounds from these counts plus the
