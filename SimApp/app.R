@@ -2763,15 +2763,32 @@ server <- function(input, output, session) {
           lineups <- lineups[get(rp[1]) >= v]
       }
       slider_ver <- rv[[paste0(lp,"_slider_v")]]
+      # Only filter on a column make_range_sliders would actually draw a slider
+      # for. Every optimiser run resets the slider version to 0 and bumps it to
+      # 1, so slider ids repeat across runs, and Shiny keeps an input's last
+      # value after its slider is gone. A showdown slate has no ownership
+      # (AvgOwn is 0 on every lineup), so no Avg Own slider is drawn -- but the
+      # classic run's "dk_filter_AvgOwn_v1" range was still sitting in `input`
+      # and filtered AvgOwn >= 2.x, emptying the Portfolio Builder.
+      has_range <- function(col) {
+        x <- optimal[[col]]
+        mn <- suppressWarnings(min(x, na.rm=TRUE)); mx <- suppressWarnings(max(x, na.rm=TRUE))
+        is.finite(mn) && is.finite(mx) && mn != mx
+      }
       sv <- input[[paste0(lp,"_filter_TotalSalary_v",slider_ver)]]
-      if (!is.null(sv) && "TotalSalary" %in% names(lineups))
+      if (!is.null(sv) && "TotalSalary" %in% names(lineups) && has_range("TotalSalary"))
         lineups <- lineups[TotalSalary >= sv[1]*1000 & TotalSalary <= sv[2]*1000]
       num_cols   <- names(lineups)[sapply(lineups, is.numeric)]
       num_cols   <- setdiff(num_cols, grep("^Player|^Captain|^MVP",names(lineups),value=TRUE))
       range_cols <- setdiff(num_cols, c("WinRate","Top1Pct","Top5Pct","Top10Pct","Top20Pct","TotalSalary"))
       for (col in range_cols) {
         fv <- input[[paste0(lp,"_filter_",col,"_v",slider_ver)]]
-        if (!is.null(fv)) lineups <- lineups[get(col) >= fv[1] & get(col) <= fv[2]]
+        if (is.null(fv) || !has_range(col)) next
+        # AvgOwn is a geometric mean, so ONE unowned player zeroes the whole
+        # lineup. 0 means "no ownership data", not "contrarian" -- always keep it.
+        lineups <- if (col == "AvgOwn")
+          lineups[AvgOwn == 0 | (AvgOwn >= fv[1] & AvgOwn <= fv[2])]
+        else lineups[get(col) >= fv[1] & get(col) <= fv[2]]
       }
       
       if (isTRUE(rv$sport == "F1")) {
