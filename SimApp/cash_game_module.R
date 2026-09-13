@@ -57,6 +57,8 @@ get_slot_labels <- function(config, n_slots) {
            "6" = c("CPT","UTIL1","UTIL2","UTIL3","UTIL4","UTIL5"),
            paste0("P", seq_len(n_slots))
     )
+  } else if (sport == "NFL_CLASSIC" && n_slots == 9L) {
+    c("QB","RB1","RB2","WR1","WR2","WR3","TE","FLEX","DST")
   } else NULL  # NULL = keep Player1..N
 }
 
@@ -735,6 +737,103 @@ build_field_tiers_nba <- function(metadata, specs, salary_cap, platform = "DK",
 
 
 # ============================================================================
+# NFL CLASSIC FIELD LINEUP GENERATION — ownership-weighted positional sampling
+#
+# combn is useless at 9 slots over ~270 players with position rules, and a
+# repeated LP is O(n) solves with a growing exclusion matrix.  Instead draw a
+# large block of LEGAL QB/RB/RB/WR/WR/WR/TE/FLEX/DST rosters at once, each slot
+# sampled with probability ~ own^alpha, filter to the salary band and >= 2
+# games, dedup, and rank by geometric-mean ownership.  The head of that list is
+# the chalk the field mass-enters; derive_tier_field widens from there.  All
+# vectorised — cost is a few matrix ops on n_draw rows, independent of sims.
+# ============================================================================
+
+generate_field_lineups_nfl_classic <- function(metadata,
+                                               n            = 1500L,
+                                               salary_cap   = 50000,
+                                               salary_floor = 49000,
+                                               platform     = "DK",
+                                               n_draw       = 60000L,
+                                               alpha        = 1.5,
+                                               seed         = 42L) {
+  meta    <- copy(as.data.table(metadata))
+  sal_col <- if (platform == "FD") "FDSalary" else "DKSalary"
+  own_col <- if (platform == "FD") "FDOwn"    else "DKOwn"
+  missing <- setdiff(c("Player", "Pos", sal_col, own_col), names(meta))
+  if (length(missing) > 0)
+    stop("NFL field gen — metadata missing: ", paste(missing, collapse = ", "))
+
+  meta[, Sal := as.numeric(get(sal_col))]
+  meta[, Own := as.numeric(get(own_col))]
+  if (max(meta$Own, na.rm = TRUE) <= 1) meta[, Own := Own * 100]
+  if (!"GameKey" %in% names(meta)) meta[, GameKey := if ("Team" %in% names(meta)) Team else Player]
+  meta <- unique(meta[Pos %chin% c("QB", "RB", "WR", "TE", "DST") &
+                        !is.na(Sal) & Sal > 0 & !is.na(Own) & Own > 0], by = "Player")
+
+  set.seed(seed)
+  draw <- function(pos, k) {
+    ix <- which(meta$Pos %chin% pos)
+    if (length(ix) < 1L) stop("NFL field gen — no owned ", paste(pos, collapse = "/"))
+    w  <- meta$Own[ix] ^ alpha
+    matrix(ix[sample.int(length(ix), n_draw * k, replace = TRUE, prob = w)], nrow = n_draw)
+  }
+  m <- cbind(draw("QB", 1L), draw("RB", 2L), draw("WR", 3L), draw("TE", 1L),
+             draw(c("RB", "WR", "TE"), 1L), draw("DST", 1L))
+
+  # Reject repeated players (same RB twice, FLEX = an already-rostered WR, ...)
+  srt  <- t(apply(m, 1L, sort))
+  ok   <- rowSums(srt[, -1L, drop = FALSE] == srt[, -ncol(srt), drop = FALSE]) == 0L
+  tot  <- rowSums(matrix(meta$Sal[m], nrow = n_draw))
+  gm   <- matrix(meta$GameKey[m], nrow = n_draw)
+  ok   <- ok & rowSums(gm != gm[, 1L]) > 0L          # DK/FD classic: >= 2 games
+  band <- ok & tot <= salary_cap & tot >= salary_floor
+  ef   <- salary_floor
+  while (sum(band) < n && ef > salary_cap * 0.9) {    # thin slate: relax the floor
+    ef   <- ef - 500
+    band <- ok & tot <= salary_cap & tot >= ef
+  }
+  keep <- which(band)
+  keep <- keep[!duplicated(srt[keep, , drop = FALSE])]
+  if (length(keep) == 0L) stop("NFL field generation produced no legal lineups.")
+
+  m    <- m[keep, , drop = FALSE]
+  lown <- matrix(log(meta$Own[m]), nrow = nrow(m))
+  aown <- exp(rowMeans(lown))
+  ord  <- head(order(-aown), n)
+
+  std_cols <- paste0("Player", 1:9)
+  dt <- as.data.table(matrix(meta$Player[m[ord, , drop = FALSE]], ncol = 9L))
+  setnames(dt, std_cols)
+  dt[, TotalSalary := tot[keep][ord]]
+  dt[, AvgOwn      := round(aown[ord], 2)]
+  dt[, LineupID    := paste0("F", seq_len(.N))]
+  setcolorder(dt, c("LineupID", std_cols, "TotalSalary", "AvgOwn"))
+
+  cat(sprintf("  [Field-NFL] %s draws -> %s legal unique -> %d kept (%s, floor $%s)\n",
+              format(n_draw, big.mark = ","), format(length(keep), big.mark = ","),
+              nrow(dt), platform, format(ef, big.mark = ",")))
+  dt[]
+}
+
+#' Build NFL classic field tiers: one sampled master, then derive per contest.
+build_field_tiers_nfl_classic <- function(metadata, specs, salary_cap, salary_floor,
+                                          platform = "DK", seed = 42L) {
+  n_master <- max(sapply(specs, `[[`, "n_field")) * 3L
+  cat(sprintf("\n  [Field-NFL] Master build: n=%d\n", n_master))
+  master <- generate_field_lineups_nfl_classic(metadata, n = n_master,
+                                               salary_cap = salary_cap,
+                                               salary_floor = salary_floor,
+                                               platform = platform, seed = seed)
+  tiers <- lapply(specs, function(s) derive_tier_field(master, s, seed = seed))
+  names(tiers) <- names(specs)
+  for (k in names(tiers))
+    cat(sprintf("  [Field-NFL] %-14s %4d lineups\n", specs[[k]]$label, nrow(tiers[[k]])))
+  cat("\n")
+  list(master = master, tiers = tiers)
+}
+
+
+# ============================================================================
 # PLATFORM RESOLUTION
 # ============================================================================
 
@@ -1229,6 +1328,8 @@ register_cash_game_observers <- function(input, output, session, rv) {
     sizes  <- paste(sapply(keys, function(k) specs[[k]]$n_field), collapse = "/")
     desc   <- if (du_platform() == "SD") paste0("Tournament pool subsets (", sizes, ")")
     else if (is_nba)          paste0("LP-optimized master, tiers ", sizes)
+    else if (isTRUE(rv$config$sport_name == "NFL_CLASSIC"))
+                              paste0("Own-weighted legal rosters, tiers ", sizes)
     else                      paste0("Chalk core + fill, tiers ", sizes)
     span(style = "color:#aaa;font-size:12px;", desc)
   })
@@ -1286,6 +1387,7 @@ register_cash_game_observers <- function(input, output, session, rv) {
       t_total <- Sys.time()
       cash_p  <- get_cash_params(rv$config)
       is_nba  <- isTRUE(rv$config$sport_name == "NBA")
+      is_nfl_classic <- isTRUE(rv$config$sport_name == "NFL_CLASSIC")
       
       all_specs <- scale_contest_specs(rv$config)
       specs     <- all_specs[du_contests()]
@@ -1360,6 +1462,15 @@ register_cash_game_observers <- function(input, output, session, rv) {
         tiers  <- lapply(specs, function(s) head(master, min(s$n_field, nrow(master))))
         names(tiers) <- names(specs)
         
+      } else if (is_nfl_classic) {
+        if (!own_col %in% names(meta_raw))
+          stop(own_col, " not found in metadata.")
+        ft     <- build_field_tiers_nfl_classic(meta_raw, specs, sal_cap,
+                                                salary_floor = sal_cap - 1000,
+                                                platform = plat)
+        master <- ft$master
+        tiers  <- ft$tiers
+
       } else if (is_nba) {
         if (!proj_col %in% names(meta_raw))
           stop(proj_col, " not found in metadata — NBA field requires ETR projections.")
