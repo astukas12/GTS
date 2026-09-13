@@ -11,8 +11,9 @@ library(parallel)
 # MAIN ENTRY POINT - MODE ROUTER
 # =============================================================================
 
-find_optimal_lineups <- function(sim_results, config, mode = "standard", k = 3, verbose = TRUE) {
-  
+find_optimal_lineups <- function(sim_results, config, mode = "standard", k = 3, verbose = TRUE,
+                                 progress_callback = NULL) {
+
   if (mode == "standard") {
     return(find_optimal_lineups_standard(sim_results, config, k, verbose))
   } else if (mode == "mvp") {
@@ -22,7 +23,7 @@ find_optimal_lineups <- function(sim_results, config, mode = "standard", k = 3, 
   } else if (mode == "win_based") {
     return(find_optimal_lineups_winbased(sim_results, config, verbose))
   } else if (mode == "combinatorial") {
-    return(find_optimal_lineups_combinatorial(sim_results, config, verbose))
+    return(find_optimal_lineups_combinatorial(sim_results, config, verbose, progress_callback))
   } else if (mode == "combinatorial_captain") {
     return(find_optimal_lineups_combinatorial_captain(sim_results, config, verbose))
   } else if (mode == "enum_captain") {
@@ -32,7 +33,7 @@ find_optimal_lineups <- function(sim_results, config, mode = "standard", k = 3, 
   } else if (mode == "preseason_classic") {
     return(find_optimal_lineups_preseason_classic(sim_results, config, k, verbose))
   } else if (mode == "cfb_classic") {
-    return(find_optimal_lineups_cfb_classic(sim_results, config, verbose))
+    return(find_optimal_lineups_cfb_classic(sim_results, config, verbose, progress_callback))
   } else if (mode == "nfl_classic") {
     return(find_optimal_lineups_nfl_classic(sim_results, config, verbose))
   } else {
@@ -665,7 +666,8 @@ find_optimal_lineups_captain <- function(sim_results, config, k = 3, verbose = T
 # instead of only per-sim winners. Phase 2 handles all scoring via matrix multiply.
 # =============================================================================
 
-find_optimal_lineups_combinatorial <- function(sim_results, config, verbose = TRUE) {
+find_optimal_lineups_combinatorial <- function(sim_results, config, verbose = TRUE,
+                                               progress_callback = NULL) {
   # Per-sim greedy optimal: for each sim, sort players by score and greedily
   # pick the best roster_size players that fit under salary cap.
   # Greedy IS optimal here — simple knapsack with only count + salary constraints.
@@ -727,10 +729,14 @@ find_optimal_lineups_combinatorial <- function(sim_results, config, verbose = TR
       for (k in seq_len(roster_size)) lineup_list[[i]][[paste0("Player", k)]] <- picked_sorted[k]
     }
     
-    if (verbose && i %% prog_freq == 0L) {
+    if ((verbose || !is.null(progress_callback)) && i %% prog_freq == 0L) {
       elapsed <- as.numeric(difftime(Sys.time(), start_time, units="secs"))
-      cat(sprintf("\r  Phase 1: %d%% | %.1fs", round(i/n_sims*100), elapsed))
-      flush.console()
+      if (verbose) {
+        cat(sprintf("\r  Phase 1: %d%% | %.1fs", round(i/n_sims*100), elapsed))
+        flush.console()
+      }
+      if (!is.null(progress_callback))
+        progress_callback(i/n_sims, sprintf("Phase 1: building lineup pool (%d%%)", round(i/n_sims*100)))
     }
   }
   if (verbose) cat("\n")
@@ -1277,7 +1283,8 @@ find_optimal_lineups_combinatorial_mvp <- function(sim_results, config, verbose 
 # PHASE 2: SCORE ALL LINEUPS (MODE-AGNOSTIC)
 # =============================================================================
 
-score_all_lineups <- function(lineup_data, sim_results, verbose = TRUE, sims_per_batch = 5000) {
+score_all_lineups <- function(lineup_data, sim_results, verbose = TRUE, sims_per_batch = 5000,
+                              progress_callback = NULL) {
   
   if (verbose) cat("\nPhase 2: Scoring lineups (matrix method)...\n")
   
@@ -1461,11 +1468,15 @@ score_all_lineups <- function(lineup_data, sim_results, verbose = TRUE, sims_per
         }
         flush.console()
       }
-      
+      if (!is.null(progress_callback)) {
+        pct <- 30 + ((sims_processed / n_sims) * 60)
+        progress_callback(pct / 100, sprintf("Phase 2: scoring lineups (%.0f%%)", pct))
+      }
+
       rm(batch_lineup_scores)
       gc(verbose = FALSE)
     }
-    
+
     if (verbose) {
       cat("\n")
       elapsed_time <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
@@ -1509,20 +1520,24 @@ score_all_lineups <- function(lineup_data, sim_results, verbose = TRUE, sims_per
       } else {
         cat(sprintf("\r  Phase 2: 90%% | %.1fs | Finalizing...", elapsed))
       }
-      
+
       flush.console()
     }
-    
+    if (!is.null(progress_callback)) {
+      pct <- 30 + ((batch_idx / n_batches) * 60)
+      progress_callback(pct / 100, sprintf("Phase 2: scoring lineups (%.0f%%)", pct))
+    }
+
     rm(batch_lineup_scores)
     gc(verbose = FALSE)
   }
-  
+
   if (verbose) {
     cat("\n")
     elapsed_time <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
     cat(sprintf("  ✓ Phase 2: %.1fs\n", elapsed_time))
   }
-  
+
   return(score_matrix)
 }
 
@@ -1531,8 +1546,9 @@ score_all_lineups <- function(lineup_data, sim_results, verbose = TRUE, sims_per
 # PHASE 3: CALCULATE DISTRIBUTION METRICS (MODE-AGNOSTIC)
 # =============================================================================
 
-calculate_distribution_metrics <- function(score_matrix, lineup_data, config, 
-                                           ownership_data = NULL, verbose = TRUE) {
+calculate_distribution_metrics <- function(score_matrix, lineup_data, config,
+                                           ownership_data = NULL, verbose = TRUE,
+                                           progress_callback = NULL) {
   
   if (verbose) cat("\nPhase 3: Calculating metrics...\n")
   
@@ -1613,11 +1629,15 @@ calculate_distribution_metrics <- function(score_matrix, lineup_data, config,
         }
       }
       
-      if (verbose && chunk_idx %% max(1L, n_chunks %/% 5L) == 0L) {
+      if ((verbose || !is.null(progress_callback)) && chunk_idx %% max(1L, n_chunks %/% 5L) == 0L) {
         elapsed  <- as.numeric(difftime(Sys.time(), phase3_start, units = "secs"))
         pct_done <- round(chunk_end / n_sims * 40 + 20)
-        cat(sprintf("\r  Phase 3: %d%% | %.1fs", pct_done, elapsed))
-        flush.console()
+        if (verbose) {
+          cat(sprintf("\r  Phase 3: %d%% | %.1fs", pct_done, elapsed))
+          flush.console()
+        }
+        if (!is.null(progress_callback))
+          progress_callback(pct_done / 100, sprintf("Phase 3: calculating metrics (%d%%)", pct_done))
       }
     }
     
@@ -1640,6 +1660,7 @@ calculate_distribution_metrics <- function(score_matrix, lineup_data, config,
     cat(sprintf("  Phase 3: 70%% | %.1fs | Calculating ownership...\n", elapsed))
     flush.console()
   }
+  if (!is.null(progress_callback)) progress_callback(0.70, "Phase 3: calculating ownership...")
   
   # Ownership
   total_salary <- unique_lineups$TotalSalary
@@ -1753,6 +1774,7 @@ calculate_distribution_metrics <- function(score_matrix, lineup_data, config,
     cat(sprintf("  Phase 3: 90%% | %.1fs | Assembling results...\n", elapsed))
     flush.console()
   }
+  if (!is.null(progress_callback)) progress_callback(0.90, "Phase 3: assembling results...")
   
   # Combine results
   results <- data.table(
@@ -2335,7 +2357,8 @@ Phase 1: optimal classic lineup for %s sims
   out[, .(SimID, Player, slot_i)]
 }
 
-find_optimal_lineups_cfb_classic <- function(sim_results, config, verbose = TRUE) {
+find_optimal_lineups_cfb_classic <- function(sim_results, config, verbose = TRUE,
+                                             progress_callback = NULL) {
   setDT(sim_results)
   if (!all(c("Pos", "StartOrder") %in% names(sim_results)))
     stop("cfb_classic optimiser needs Pos and StartOrder on sim_results")
@@ -2400,6 +2423,10 @@ find_optimal_lineups_cfb_classic <- function(sim_results, config, verbose = TRUE
   slow_ids <- setdiff(unique(SR$SimID), under)
   slow <- NULL
   if (length(slow_ids)) {
+    if (!is.null(progress_callback))
+      progress_callback(0.3, sprintf("Phase 1: %s under cap, solving %s via fallback...",
+                                     format(length(under), big.mark = ","),
+                                     format(length(slow_ids), big.mark = ",")))
     SS <- SR[SimID %chin% slow_ids]                 # already point-sorted
     slow <- SS[, {
       pk <- .cfb_greedy(Pos, Salary, cap, b, need)
