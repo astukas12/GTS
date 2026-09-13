@@ -683,7 +683,16 @@ server <- function(input, output, session) {
     cfb_slate_key      = NULL,
     cfb_slate_path     = NULL,
     cfb_full_sim_results  = NULL,
-    cfb_full_sim_metadata = NULL
+    cfb_full_sim_metadata = NULL,
+    # NFL multi-slate workbook: same mechanism as the CFB block above --
+    # nfl_slate_menu() (nfl_engine.R) mirrors cfb_slate_menu() exactly (same
+    # `in_classics` / `showdown_slice` game-tab convention), so this is a
+    # straight copy of the CFB reactive state, not a new design.
+    nfl_slate_menu     = NULL,
+    nfl_slate_key      = NULL,
+    nfl_slate_path     = NULL,
+    nfl_full_sim_results  = NULL,
+    nfl_full_sim_metadata = NULL
   )
   
   
@@ -777,6 +786,15 @@ server <- function(input, output, session) {
       rv$cfb_full_sim_results  <- NULL
       rv$cfb_full_sim_metadata <- NULL
 
+      # NFL multi-slate workbook -- same pattern as CFB above.
+      rv$nfl_slate_menu <- if (rv$sport %in% c("NFL", "NFL_CLASSIC"))
+        nfl_slate_menu(input$input_file$datapath) else NULL
+      rv$nfl_slate_key    <- if (!is.null(rv$nfl_slate_menu) && nrow(rv$nfl_slate_menu))
+        rv$nfl_slate_menu$key[1] else NULL
+      rv$nfl_slate_path   <- input$input_file$datapath
+      rv$nfl_full_sim_results  <- NULL
+      rv$nfl_full_sim_metadata <- NULL
+
       rv$input_data <- load_sport_input(input$input_file$datapath, rv$sport, rv$config)
 
     }, error = function(e) {
@@ -787,6 +805,10 @@ server <- function(input, output, session) {
       rv$cfb_slate_key  <- NULL
       rv$cfb_full_sim_results  <- NULL
       rv$cfb_full_sim_metadata <- NULL
+      rv$nfl_slate_menu <- NULL
+      rv$nfl_slate_key  <- NULL
+      rv$nfl_full_sim_results  <- NULL
+      rv$nfl_full_sim_metadata <- NULL
       showNotification(paste("Upload error:", e$message), type = "error", duration = 8)
     })
   })
@@ -964,6 +986,14 @@ server <- function(input, output, session) {
           rv$cfb_full_sim_results  <- result$sim_results
           rv$cfb_full_sim_metadata <- result$metadata
           rv$cfb_slate_key         <- rv$cfb_slate_menu$key[1]
+        }
+
+        # NFL multi-slate workbook -- same stash, same trigger shape as CFB.
+        if (isTRUE(rv$sport == "NFL_CLASSIC") && !is.null(rv$nfl_slate_menu) &&
+            nrow(rv$nfl_slate_menu) > 1) {
+          rv$nfl_full_sim_results  <- result$sim_results
+          rv$nfl_full_sim_metadata <- result$metadata
+          rv$nfl_slate_key         <- rv$nfl_slate_menu$key[1]
         }
 
 
@@ -2261,6 +2291,28 @@ server <- function(input, output, session) {
           })
       )
     }
+    # NFL multi-slate workbook: same picker, same re-slice-not-re-sim
+    # mechanism as cfb_slate_selector above (nfl_slate_menu() mirrors
+    # cfb_slate_menu() exactly).
+    nfl_slate_selector <- if (!is.null(rv$nfl_slate_menu) && nrow(rv$nfl_slate_menu) > 1 &&
+                              !is.null(rv$nfl_full_sim_results)) {
+      menu <- rv$nfl_slate_menu
+      div(id = "nfl_lineup_slate_pills", style = "margin-bottom:14px;",
+          span(class = "gts-sr-label",
+               style = "margin-right:10px;color:#FFE500;font-size:11px;font-weight:700;letter-spacing:.06em;",
+               "SLATE:"),
+          lapply(seq_len(nrow(menu)), function(i) {
+            tags$button(
+              class = paste("gts-pill", if (identical(menu$key[i], rv$nfl_slate_key)) "active" else ""),
+              onclick = sprintf(
+                "document.querySelectorAll('#nfl_lineup_slate_pills .gts-pill').forEach(function(b){b.classList.remove('active')});
+                 this.classList.add('active');
+                 Shiny.setInputValue('nfl_lineup_slate_select','%s',{priority:'event'});",
+                menu$key[i]),
+              menu$label[i])
+          })
+      )
+    }
     # Gate the picker on available_platforms(), NOT config$platforms: the two
     # disagreeing is exactly what put a game picker on screen with no Score
     # Showdown button beside it.
@@ -2291,6 +2343,7 @@ server <- function(input, output, session) {
     fluidRow(box(title="Lineup Scoring", status="warning", solidHeader=TRUE, width=12,
                  p("Find and score optimal lineups across all platforms:"),
                  cfb_slate_selector,
+                 nfl_slate_selector,
                  sd_game_selector,
                  fluidRow(lapply(active_plats, function(platform) {
                    pname <- switch(platform,"DK"="DraftKings","FD"="FanDuel","SD"="Showdown")
@@ -2326,6 +2379,32 @@ server <- function(input, output, session) {
                                         rv$cfb_slate_path, row)
       reset_all_state()   # different contest -- old lineups/portfolio don't apply
       rv$cfb_slate_key <- row$key
+      rv$sport         <- row$sport
+      rv$config        <- get_sport_config(rv$sport)
+      decl <- rv$config$platforms %||% c("DK")
+      rv$has_dk <- "DK" %in% decl
+      rv$has_fd <- "FD" %in% decl
+      rv$has_sd <- "SD" %in% decl
+      rv$simulation_results <- sliced$sim_results
+      rv$sim_metadata       <- sliced$metadata
+    }, error = function(e) {
+      showNotification(paste("Slate switch error:", e$message), type = "error", duration = 8)
+    })
+  })
+
+  # NFL equivalent of the CFB slate-switch observer directly above -- same
+  # re-slice-from-the-pristine-full-card logic, nfl_reslice_for_lineups()
+  # instead of cfb_reslice_for_lineups().
+  observeEvent(input$nfl_lineup_slate_select, {
+    req(rv$nfl_slate_menu, rv$nfl_slate_path, rv$nfl_full_sim_results, rv$nfl_full_sim_metadata)
+    row <- rv$nfl_slate_menu[key == input$nfl_lineup_slate_select]
+    req(nrow(row))
+    row <- row[1]
+    tryCatch({
+      sliced <- nfl_reslice_for_lineups(rv$nfl_full_sim_results, rv$nfl_full_sim_metadata,
+                                        rv$nfl_slate_path, row)
+      reset_all_state()
+      rv$nfl_slate_key <- row$key
       rv$sport         <- row$sport
       rv$config        <- get_sport_config(rv$sport)
       decl <- rv$config$platforms %||% c("DK")
@@ -2971,7 +3050,13 @@ server <- function(input, output, session) {
         # salary columns at all, so the engine fills a flat default and the
         # column is the same number on every row. Leverage is then just a copy
         # of Exposure. Drop them rather than show three dead columns.
-        if (isTRUE(rv$sport %in% c("NFL_PRESEASON","NFL_PRESEASON_CLASSIC"))) {
+        # NFL/NFL_CLASSIC joins preseason here: a multi-slate NFL card is
+        # commonly built ETR-first with only classic_main priced, so Early /
+        # Afternoon / a showdown subset can carry all-zero DKOwn/CPTOwn until
+        # ownership posts. Leverage = Exposure - OwnProj is then a verbatim
+        # (and misleading) copy of Exposure -- drop it with OwnProj rather
+        # than show a leverage number that isn't measuring anything.
+        if (isTRUE(rv$sport %in% c("NFL_PRESEASON","NFL_PRESEASON_CLASSIC","NFL","NFL_CLASSIC"))) {
           dead <- intersect(c("Salary","Sal"), names(exp_tbl))
           dead <- dead[vapply(dead, function(c_) uniqueN(exp_tbl[[c_]]) <= 1L, logical(1))]
           # Leverage goes with OwnProj: it is Exposure - OwnProj, so a zero
@@ -3555,7 +3640,11 @@ server <- function(input, output, session) {
           base_meta  <- c("Player", "Pos", if (is_f1) "PlayerType" else NULL,
                           "PosGroup","Salary","RGProj","RGMin","SimProj","GameTime","Starting","Team","Car",
                           "Position","Match","Opponent","Surface","Tour","TeeTimeGroup","CutProb")
-          if (isTRUE(rv$sport %in% c("NFL_PRESEASON","NFL_PRESEASON_CLASSIC"))) {
+          # NFL/NFL_CLASSIC joins preseason here -- see the matching comment
+          # in make_filtered_exposure above (all-zero ownership before ETR
+          # posts on a multi-slate card; drop OwnProj/Leverage rather than
+          # show a Leverage that is just a copy of Exposure).
+          if (isTRUE(rv$sport %in% c("NFL_PRESEASON","NFL_PRESEASON_CLASSIC","NFL","NFL_CLASSIC"))) {
             dead <- intersect(c("Salary","Sal"), names(exp_tbl))
             dead <- dead[vapply(dead, function(c_) uniqueN(exp_tbl[[c_]]) <= 1L, logical(1))]
             if ("OwnProj" %in% names(exp_tbl) &&
@@ -3708,7 +3797,11 @@ server <- function(input, output, session) {
           base_meta  <- c("Player", "Pos", if (is_f1) "PlayerType" else NULL,
                           "PosGroup","Salary","RGProj","RGMin","SimProj","GameTime","Starting","Team","Car",
                           "Position","Match","Opponent","Surface","Tour","TeeTimeGroup","CutProb")
-          if (isTRUE(rv$sport %in% c("NFL_PRESEASON","NFL_PRESEASON_CLASSIC"))) {
+          # NFL/NFL_CLASSIC joins preseason here -- see the matching comment
+          # in make_filtered_exposure above (all-zero ownership before ETR
+          # posts on a multi-slate card; drop OwnProj/Leverage rather than
+          # show a Leverage that is just a copy of Exposure).
+          if (isTRUE(rv$sport %in% c("NFL_PRESEASON","NFL_PRESEASON_CLASSIC","NFL","NFL_CLASSIC"))) {
             dead <- intersect(c("Salary","Sal"), names(exp_tbl))
             dead <- dead[vapply(dead, function(c_) uniqueN(exp_tbl[[c_]]) <= 1L, logical(1))]
             if ("OwnProj" %in% names(exp_tbl) &&

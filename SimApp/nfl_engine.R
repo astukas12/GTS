@@ -526,7 +526,69 @@ read_nfl_input <- function(file_path, slate = NULL, game = NULL) {
   }), fill = TRUE)
   tt[is.na(dst) | !nzchar(trimws(dst)), dst := team]
 
-  # melt pys_target + derive the DST opponent from the game tab
+  prj <- NULL
+  hit <- sh[tolower(sh) == "projections"]
+  if (length(hit)) {
+    prj <- as.data.table(readxl::read_excel(file_path, sheet = hit[1]))
+    setnames(prj, tolower(names(prj)))
+    if (!"player" %in% names(prj) && "name" %in% names(prj)) setnames(prj, "name", "player")
+  }
+
+  # ---- MULTI-SLATE SELECTION -- mirrors cfb_engine.R's read_cfb_input -------
+  # `in_classics` on the game tab: a `;`-separated list of contest tags each
+  # game row belongs to (e.g. "classic_main;classic_2"). `showdown_slice`:
+  # one game tagged as a standalone showdown subset of a classic card. Either
+  # column absent -- this is a legacy single-slate sheet, behaviour unchanged.
+  multi <- ("in_classics" %in% names(g)) ||
+           (!is.null(prj) && "slate" %in% names(prj))
+  if (multi) {
+    if (is.null(slate)) {
+      slate <- "classic_main"
+      message("[nfl] multi-slate workbook, no slate given -- defaulting to classic_main")
+    }
+    if (identical(tolower(slate), "sd")) {
+      if (is.null(game) || !nzchar(game))
+        stop("slate = \"SD\" needs game = <showdown_slice label>, e.g. \"SEA_NE\"")
+      sel <- g[!is.na(showdown_slice) &
+               toupper(trimws(as.character(showdown_slice))) == toupper(trimws(game))]
+      if (!nrow(sel)) stop("no game has showdown_slice == \"", game, "\" on this sheet")
+      g <- sel
+      prj_slate <- "SD"
+    } else {
+      tok <- strsplit(ifelse(is.na(g$in_classics), "", as.character(g$in_classics)),
+                      "\\s*;\\s*")
+      inrow <- vapply(tok, function(v) slate %in% v, logical(1))
+      if (!any(inrow))
+        stop("no game is in classic slate \"", slate, "\" -- check the game tab's in_classics")
+      g <- g[inrow]
+      # DK/FD classic both require >=2 games (drop_invalid_classic enforces it
+      # downstream in app.R) -- a single-game subset crashes the optimiser's
+      # scoring step with an opaque "subscript out of bounds" once every
+      # lineup gets dropped as invalid. Fail here instead, at read time, with
+      # an actionable message: a single game belongs in `showdown_slice`
+      # (routes to the NFL/showdown optimiser), not a 1-game `in_classics` tag.
+      if (nrow(g) < 2L)
+        stop("classic slate \"", slate, "\" has only 1 game -- DK/FD classic needs ",
+             ">=2 games. Tag a single-game subset with showdown_slice instead ",
+             "of in_classics.")
+      prj_slate <- slate
+    }
+    # kickoff order re-ranks WITHIN the chosen subset (the sheet column is the
+    # full-card rank); the classic optimiser's FLEX late-swap pick keys off it.
+    if ("start_order" %in% names(g))
+      g[, start_order := frank(as.numeric(start_order), ties.method = "first")]
+    sel_teams <- unique(c(as.character(g$away), as.character(g$home)))
+    pl <- pl[team %in% sel_teams]
+    tt <- tt[team %in% sel_teams]
+    if (!is.null(prj) && "slate" %in% names(prj))
+      # DST identity lives on the team block (tt$dst), not as a player row in
+      # pl -- filtering to player %in% pl$player alone drops every DST's
+      # projections row, so no DST gets a DKID and classic can never fill the
+      # DST slot.
+      prj <- prj[as.character(slate) == prj_slate & player %in% c(pl$player, tt$dst)]
+  }
+
+  # melt pys_target + derive the DST opponent from the (now possibly sliced) game tab
   tt[, `:=`(pys_target = NA_real_, dst_opp = NA_character_)]
   for (i in seq_len(nrow(tt))) {
     tm <- tt$team[i]; row <- g[away == tm | home == tm][1]
@@ -555,20 +617,154 @@ read_nfl_input <- function(file_path, slate = NULL, game = NULL) {
       pl[availability == "out", (cl) := 0]
   }
 
-  prj <- NULL
-  hit <- sh[tolower(sh) == "projections"]
-  if (length(hit)) {
-    prj <- as.data.table(readxl::read_excel(file_path, sheet = hit[1]))
-    setnames(prj, tolower(names(prj)))
-    if (!"player" %in% names(prj) && "name" %in% names(prj)) setnames(prj, "name", "player")
-  }
-
   list(game = g, team = tt, players = pl, projections = prj)
 }
 
-# a lightweight menu for a slate picker. NFL v1 has no multi-slate workbook, so
-# this is always NULL (the caller shows no picker). Mirrors cfb_slate_menu.
-nfl_slate_menu <- function(file_path) NULL
+# One row per contest on a multi-slate workbook, for a slate-picker UI. A
+# legacy single-slate sheet (no `in_classics` on the game tab) has nothing to
+# pick -- returns NULL, and the caller shows no picker. Mirrors
+# cfb_slate_menu() exactly (same `in_classics` / `showdown_slice` convention,
+# same column names) so a workbook builder written for one sport works for
+# the other with no per-sport branching.
+#   key       stable id for the UI (a select input's value)
+#   label     what the picker shows
+#   sport     NFL_CLASSIC (classic contests) or NFL (showdowns)
+#   slate_arg / game_arg -- pass straight through to read_nfl_input()
+nfl_slate_menu <- function(file_path) {
+  sh <- readxl::excel_sheets(file_path)
+  gtab <- sh[tolower(sh) == "game"]
+  if (!length(gtab)) return(NULL)
+  g <- as.data.table(readxl::read_excel(file_path, sheet = gtab[1]))
+  if (!"in_classics" %in% names(g)) return(NULL)
+
+  tok <- strsplit(ifelse(is.na(g$in_classics), "", as.character(g$in_classics)), "\\s*;\\s*")
+  classics <- setdiff(unique(unlist(tok)), "")
+  classics <- c(intersect("classic_main", classics), setdiff(classics, "classic_main"))
+
+  classic_rows <- rbindlist(lapply(classics, function(cl) {
+    inrow <- vapply(tok, function(v) cl %in% v, logical(1))
+    gg <- g[inrow]
+    n  <- nrow(gg)
+    label <- if (identical(cl, "classic_main")) {
+      sprintf("Main - %d game", n)
+    } else {
+      matchups <- paste(sprintf("%s@%s", gg$away, gg$home), collapse = " + ")
+      sprintf("%d-game - %s", n, matchups)
+    }
+    data.table(menu_key = cl, label = label, sport = "NFL_CLASSIC",
+               slate_arg = cl, game_arg = NA_character_)
+  }))
+
+  sd_rows <- if ("showdown_slice" %in% names(g)) {
+    slices <- unique(g[!is.na(showdown_slice) & showdown_slice != "", showdown_slice])
+    rbindlist(lapply(slices, function(sl) {
+      gg <- g[showdown_slice == sl][1]
+      data.table(menu_key = paste0("SD_", sl),
+                 label = sprintf("Showdown - %s @ %s", gg$away, gg$home),
+                 sport = "NFL", slate_arg = "SD", game_arg = sl)
+    }))
+  } else NULL
+
+  out <- rbind(classic_rows, sd_rows, fill = TRUE)
+  setnames(out, "menu_key", "key")
+  out
+}
+
+# The Player/Team/Pos/DKID/.../FDOwn/MVPOwn table the app contract expects,
+# built from a player pool (`PL`) + team block (`TT`, for the DST identity)
+# plus a contest's `projections` rows, restricted to `valid_players` (the
+# players a simulation actually has draws for). Split out of
+# run_nfl_simulation so nfl_reslice_for_lineups() can rebuild pricing for a
+# different contest WITHOUT re-simulating. Mirrors cfb_build_meta() exactly.
+nfl_build_meta <- function(PL, TT, prj, valid_players) {
+  # `pos` is computed inside run_nfl_simulation from route_base; a fresh
+  # read_nfl_input() (the reslice path) never runs that step, so derive it
+  # here too if it is missing -- same rule, so both callers agree.
+  if (!"pos" %in% names(PL))
+    PL <- copy(PL)[, pos := fifelse(route_base %in% c("WR", "TE", "RB", "QB", "K", "DST"),
+                                    route_base, "WR")]
+  posmap <- unique(PL[, .(player, Pos = pos)])
+  posmap <- rbind(posmap, TT[, .(player = dst, Pos = "DST")], fill = TRUE)
+  posmap <- unique(posmap, by = "player")
+  meta <- unique(rbind(PL[, .(Player = player, Team = team)],
+                       TT[, .(Player = dst, Team = team)], fill = TRUE), by = "Player")
+  meta <- merge(meta, posmap, by.x = "Player", by.y = "player", all.x = TRUE)
+  meta[is.na(Pos), Pos := "WR"]
+  meta <- meta[Player %in% valid_players]
+  meta[, `:=`(DKID = NA_character_, DKCID = NA_character_,
+              DKSalary = NA_integer_, DKCSalary = NA_integer_,
+              FDID = NA_character_, FDSalary = NA_integer_,
+              DKProj = NA_real_, DKOwn = 0, CPTOwn = 0,
+              FDProj = NA_real_, FDOwn = 0, MVPOwn = 0)]
+  if (!is.null(prj) && nrow(as.data.table(prj))) {
+    prj <- as.data.table(prj)
+    if ("dkproj" %in% names(prj)) meta[prj, DKProj := as.numeric(i.dkproj), on = .(Player = player)]
+    if ("dkown"  %in% names(prj)) meta[prj, DKOwn  := as.numeric(i.dkown),  on = .(Player = player)]
+    if ("fdproj" %in% names(prj)) meta[prj, FDProj := as.numeric(i.fdproj), on = .(Player = player)]
+    if ("fdown"  %in% names(prj)) meta[prj, FDOwn  := as.numeric(i.fdown),  on = .(Player = player)]
+    if ("cptown" %in% names(prj)) meta[prj, CPTOwn := as.numeric(i.cptown), on = .(Player = player)]
+    if ("mvpown" %in% names(prj)) meta[prj, MVPOwn := as.numeric(i.mvpown), on = .(Player = player)]
+
+    # First non-NA alias wins, never a later blank one. A long multi-slate
+    # projections tab carries columns for BOTH shapes on the same wide row
+    # (dkid/dksalary for a classic row, dk_id_util/salary_util for a
+    # showdown row) -- looping the aliases and overwriting unconditionally
+    # meant whichever alias was checked LAST clobbered a real id with NA
+    # whenever that alias was blank for this row. FDID also stays character
+    # end to end: real FanDuel ids look like "133104-129368", and casting to
+    # integer silently turned every one of them into NA.
+    coalesce_chr <- function(cols) {
+      cols <- intersect(cols, names(prj))
+      if (!length(cols)) return(NULL)
+      v <- trimws(as.character(prj[[cols[1]]])); v[!nzchar(v)] <- NA_character_
+      for (extra in cols[-1]) {
+        w <- trimws(as.character(prj[[extra]])); w[!nzchar(w)] <- NA_character_
+        v <- fifelse(is.na(v), w, v)
+      }
+      v
+    }
+    assign_meta <- function(target, values, as_fun = identity) {
+      if (is.null(values)) return(invisible())
+      jd <- unique(data.table(player = prj$player, .v = as_fun(values))[!is.na(.v)], by = "player")
+      if (nrow(jd)) meta[jd, (target) := i..v, on = .(Player = player)]
+    }
+    to_int <- function(x) suppressWarnings(as.integer(x))
+
+    assign_meta("DKID",      coalesce_chr(c("dkid", "dk_id", "dk_id_util")))
+    assign_meta("DKCID",     coalesce_chr(c("dkcid", "dk_id_cpt")))
+    assign_meta("FDID",      coalesce_chr(c("fdid", "fd_id", "fd_id_util")))
+    assign_meta("DKSalary",  coalesce_chr(c("salary", "dksalary", "dk_salary", "salary_util")), to_int)
+    assign_meta("DKCSalary", coalesce_chr(c("dkcsalary", "salary_cpt")), to_int)
+    assign_meta("FDSalary",  coalesce_chr(c("fdsalary", "fd_salary", "fd_salary_util")), to_int)
+  }
+  meta[is.na(DKOwn), DKOwn := 0][is.na(CPTOwn), CPTOwn := 0]
+  meta[is.na(FDOwn), FDOwn := 0][is.na(MVPOwn), MVPOwn := 0]
+  meta[]
+}
+
+# Re-slice an already-simulated multi-slate CARD down to one contest, WITHOUT
+# re-running the dealer. `sim_results`/`sim_metadata` are the classic_main
+# outputs -- every game on the card, drawn once. `menu_row` is one row from
+# nfl_slate_menu(). The workbook re-read here is cheap (no simulation): it
+# exists only to get that contest's own player set and pricing off the
+# `projections` tab. StartOrder/GameKey/Pos need no adjustment -- the classic
+# optimiser sorts them WITHIN each sim, so filtering to a subset of games
+# leaves them correct as-is. Mirrors cfb_reslice_for_lineups() exactly.
+nfl_reslice_for_lineups <- function(sim_results, sim_metadata, file_path, menu_row) {
+  sl <- read_nfl_input(file_path, slate = menu_row$slate_arg,
+                       game = if (is.na(menu_row$game_arg)) NULL else menu_row$game_arg)
+  teams <- unique(sl$players$team)
+  sr <- as.data.table(sim_results)[Team %in% teams]
+  md <- as.data.table(sim_metadata)[Team %in% teams]
+
+  fresh <- nfl_build_meta(sl$players, sl$team, sl$projections, unique(sr$Player))
+  pcols <- intersect(c("Pos","DKID","DKCID","DKSalary","DKCSalary","DKProj","DKOwn","CPTOwn",
+                       "FDID","FDSalary","FDProj","FDOwn","MVPOwn"), names(md))
+  md[, (pcols) := NULL]
+  md <- merge(md, fresh, by = c("Player","Team"), all.x = TRUE)
+
+  list(sim_results = sr, metadata = md)
+}
 
 # =============================================================================
 # SCORING  -- platform-neutral stat lines in, DK / FD fantasy points out.
@@ -819,50 +1015,14 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
   A[, FDScore := round(nfl_score_lines(A, "FD"), 3)]
 
   # ---- position + metadata --------------------------------------------------
-  posmap <- unique(PL[, .(player, Pos = pos)])
-  posmap <- rbind(posmap, TT[, .(player = dst, Pos = "DST")], fill = TRUE)
-  posmap <- unique(posmap, by = "player")
-  meta <- unique(A[, .(Player = player, Team = team)])
-  meta <- merge(meta, posmap, by.x = "Player", by.y = "player", all.x = TRUE)
-  meta[is.na(Pos), Pos := "WR"]
-  meta[, `:=`(DKID = NA_integer_, DKCID = NA_integer_,
-              DKSalary = NA_integer_, DKCSalary = NA_integer_,
-              FDID = NA_integer_, FDSalary = NA_integer_,
-              DKProj = NA_real_, DKOwn = 0, CPTOwn = 0,
-              FDProj = NA_real_, FDOwn = 0, MVPOwn = 0)]
-  prj <- input_data$projections
-  if (!is.null(prj) && nrow(as.data.table(prj))) {
-    prj <- as.data.table(prj)
-    if ("dkproj" %in% names(prj)) meta[prj, DKProj := as.numeric(i.dkproj), on = .(Player = player)]
-    if ("dkown"  %in% names(prj)) meta[prj, DKOwn  := as.numeric(i.dkown),  on = .(Player = player)]
-    if ("fdproj" %in% names(prj)) meta[prj, FDProj := as.numeric(i.fdproj), on = .(Player = player)]
-    if ("fdown"  %in% names(prj)) meta[prj, FDOwn  := as.numeric(i.fdown),  on = .(Player = player)]
-    # Showdown captain-slot ownership: `cptown` (DK Captain) / `mvpown` (FD MVP),
-    # read straight off the projections tab like the flat own columns above. The
-    # Portfolio Builder splits ownership/leverage by premium vs flex slot when
-    # these are present (see app.R make_filtered_exposure).
-    if ("cptown" %in% names(prj)) meta[prj, CPTOwn := as.numeric(i.cptown), on = .(Player = player)]
-    if ("mvpown" %in% names(prj)) meta[prj, MVPOwn := as.numeric(i.mvpown), on = .(Player = player)]
-    # DK ids / salaries. FLEX slot: dkid | dk_id | dk_id_util. CAPTAIN slot is a
-    # DIFFERENT DK number (~1.5x salary): dkcid | dk_id_cpt. Showdown upload and
-    # the captain optimiser both need DKCID -- without it the portfolio export
-    # prints "Name (NA)" for every captain. Column names mirror cfb_engine.
-    for (idc in intersect(c("dkid", "dk_id", "dk_id_util"), names(prj)))
-      meta[prj, DKID := suppressWarnings(as.integer(get(paste0("i.", idc)))), on = .(Player = player)]
-    for (idc in intersect(c("dkcid", "dk_id_cpt"), names(prj)))
-      meta[prj, DKCID := suppressWarnings(as.integer(get(paste0("i.", idc)))), on = .(Player = player)]
-    for (sc in intersect(c("salary", "dksalary", "dk_salary", "salary_util"), names(prj)))
-      meta[prj, DKSalary := suppressWarnings(as.integer(get(paste0("i.", sc)))), on = .(Player = player)]
-    for (sc in intersect(c("dkcsalary", "salary_cpt"), names(prj)))
-      meta[prj, DKCSalary := suppressWarnings(as.integer(get(paste0("i.", sc)))), on = .(Player = player)]
-    # FanDuel ids / salaries -- FD classic optimiser + upload, and FD MVP.
-    for (idc in intersect(c("fdid", "fd_id", "fd_id_util"), names(prj)))
-      meta[prj, FDID := suppressWarnings(as.integer(get(paste0("i.", idc)))), on = .(Player = player)]
-    for (sc in intersect(c("fdsalary", "fd_salary", "fd_salary_util"), names(prj)))
-      meta[prj, FDSalary := suppressWarnings(as.integer(get(paste0("i.", sc)))), on = .(Player = player)]
-  }
-  meta[is.na(DKOwn), DKOwn := 0][is.na(CPTOwn), CPTOwn := 0]
-  meta[is.na(FDOwn), FDOwn := 0][is.na(MVPOwn), MVPOwn := 0]
+  # DK ids / salaries: FLEX slot dkid|dk_id|dk_id_util, CAPTAIN slot (a
+  # DIFFERENT DK number, ~1.5x salary) dkcid|dk_id_cpt. FanDuel mirrors it for
+  # classic + FD MVP. `cptown`/`mvpown` are captain/MVP-slot ownership -- the
+  # Portfolio Builder splits ownership/leverage by premium vs flex slot when
+  # present (see app.R make_filtered_exposure). Factored into nfl_build_meta()
+  # so nfl_reslice_for_lineups() can rebuild pricing for a different
+  # multi-slate contest without re-simulating.
+  meta <- nfl_build_meta(PL, TT, input_data$projections, valid_players = unique(A$player))
 
   sim_results <- A[, .(SimID, Player = player, Team = team,
                        DKScore, FDScore)]
