@@ -79,6 +79,8 @@ CFB_EVT_SACK <- 1L; CFB_EVT_FG <- 2L; CFB_EVT_RUN <- 3L; CFB_EVT_CMP <- 4L
 CFB_POOL_DIMS <- c("total", "absp", "fO_pr", "fO_pys", "dO_pr", "dO_pys")
 CFB_POOL_W    <- c(1.4, 1.4, 1.0, 1.0, 1.0, 1.0)
 CFB_BW        <- 0.9
+# pool team names (CFBD spelling) that game-tab pool_filter = "option" keeps
+CFB_OPTION_TEAMS <- c("Air Force", "Army", "Navy")
 
 # Reception yardage buckets and the league's own mix across them. THE LEAGUE MIX
 # IS THE DENOMINATOR of the likelihood ratio -- not the player's own position.
@@ -643,7 +645,27 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
   target <- list(total = G$total[1], absp = G$spread[1],
                  fO_pr = 0.52, fO_pys = pys[[fav]],
                  dO_pr = 0.52, dO_pys = pys[[dog]])
-  cal <- cfb_calibrate(P, target, list(total = G$total[1], margin = G$spread[1]))
+
+  # OPTIONAL POOL FILTER (game tab `pool_filter`). A triple-option service
+  # academy is a different game type: its pool games pass for ~0.25 of their
+  # yards against a pool centre of ~0.60, so the soft kernel alone keeps drawing
+  # ordinary offenses and the style guard freezes (see WHEN THE POOL CANNOT
+  # DELIVER). "option" restricts this game's draws to pool games featuring
+  # Army, Navy or Air Force (~220 rows, 2019-25). The kernel still weights
+  # within them, so rows with the academy on the wrong side of the spread
+  # fall away on the style dims. Blank / absent = the full pool, as before.
+  pf <- if ("pool_filter" %in% names(G)) tolower(trimws(as.character(G$pool_filter[1]))) else NA_character_
+  floors <- list()
+  if (identical(pf, "option")) {
+    P <- P[fteam %in% CFB_OPTION_TEAMS | dteam %in% CFB_OPTION_TEAMS]
+    setkey(P, game_id)
+    # the ESS floors are sized for a 4,966-game pool; scale them to this one
+    floors <- list(ess_floor = 0.25 * nrow(P), mkt_floor = 0.12 * nrow(P))
+    say(sprintf("pool filter: option -- %d service-academy games", nrow(P)), 0.03)
+  } else if (!is.na(pf) && nzchar(pf)) {
+    stop("unknown pool_filter \"", pf, "\" on the game tab (known: option)")
+  }
+  cal <- do.call(cfb_calibrate, c(list(P, target, list(total = G$total[1], margin = G$spread[1])), floors))
   say(sprintf("pool calibrated: ESS %.0f, total %.1f, margin %.1f, pys f %.2f/%.2f d %.2f/%.2f%s",
               cal$ess, cal$total, cal$margin,
               cal$style_got[["fO_pys"]], cal$style_ask[["fO_pys"]],
@@ -652,7 +674,7 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
   # Style calibration deliberately spends effective sample to hold the pass/run
   # read, so an ESS of 90-150 is now the working range, not an alarm. Warn only
   # when the pool is genuinely too thin to simulate from.
-  if (cal$ess < 60)
+  if (cal$ess < (if (length(floors)) 25 else 60))
     warning("CFB pool is thin: ESS ", round(cal$ess),
             ". Widen the bandwidth or accept a wider output.")
 
