@@ -501,7 +501,20 @@ SPORT_CONFIGS <- list(
     salary_caps  = list(DK = 50000, FD = 60000),
 
     optimization_modes = list(DK = "nfl_classic", FD = "nfl_classic"),
-    max_lineups        = 5000,
+    # A 12-game Sunday window is a much bigger player pool than anything this
+    # optimiser was tuned against before (270 players vs. CFB classic's ~140
+    # or a 4-team fixture's ~35) -- both knobs below were still at the generic
+    # default. Measured on the real W1 Sunday sheet: the candidate cut alone
+    # (default 24+6/position) kept only 137 of 293 rosterable players, and
+    # even AT that narrow cut the optimiser already finds 6,000+ distinct
+    # lineups per platform -- max_lineups=5000 was the binding constraint,
+    # not sim count. Widening the cut is cheap (measured 5.7s -> 6.7s greedy
+    # time at 20k sims going from 24+6 to 60+15); this settled on 40+10 as a
+    # first real-slate value -- revisit with the full scoring-time cost once
+    # felt in practice (Phase 2/3 scale with max_lineups x sims).
+    max_lineups          = 10000,
+    candidate_top_n      = 40,   # nfl_classic only -- see find_optimal_lineups_nfl_classic
+    candidate_cheap_n    = 10,
 
     # QB / RB / RB / WR / WR / WR / TE / FLEX / DST -- DK and FD, same shape.
     # The optimiser derives the LP position bounds from these counts plus the
