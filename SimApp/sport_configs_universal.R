@@ -512,7 +512,10 @@ SPORT_CONFIGS <- list(
     # time at 20k sims going from 24+6 to 60+15); this settled on 40+10 as a
     # first real-slate value -- revisit with the full scoring-time cost once
     # felt in practice (Phase 2/3 scale with max_lineups x sims).
-    max_lineups          = 10000,
+    # max_lineups went to 10,000 and back to 5,000 (13 Sep 2026): 10k doubled
+    # Phase 2/3 (~2.5 -> ~5 min at 50k sims) and a live 5k run already showed
+    # good diversity -- the FLEX-variant fix carries the gain, not the count.
+    max_lineups          = 5000,
     candidate_top_n      = 40,   # nfl_classic only -- see find_optimal_lineups_nfl_classic
     candidate_cheap_n    = 10,
 
