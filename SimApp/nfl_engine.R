@@ -64,6 +64,7 @@
 
 suppressPackageStartupMessages({
   library(data.table)
+  library(curl); library(jsonlite)   # real QB passing-yard props, see nfl_pass_yard_props()
 })
 
 # ---- where the pool lives ---------------------------------------------------
@@ -102,6 +103,15 @@ NFL_EVT_SACK <- 1L; NFL_EVT_FG <- 2L; NFL_EVT_RUN <- 3L; NFL_EVT_CMP <- 4L
 NFL_POOL_DIMS      <- c("total", "absp", "fO_pr", "fO_pys", "dO_pr", "dO_pys")
 NFL_POOL_W         <- c(1.5, 1.5, 0.7, 0.7, 0.7, 0.7)
 NFL_POOL_BW        <- 0.9
+
+# The two REAL pass-yard dims (nfl_pass_yard_props()), appended when at least
+# one side of a game has a posted line -- see run_nfl_simulation. Weighted
+# like total/absp (real market data), not like the 0.7 style dims. Measured
+# on the W1 Sunday 24-QB check: delivers the ask within ~1-2 yards on normal
+# games with NO extra ESS relaxation (rung stays 0), and still converges
+# close on the hard-total games that already relaxed before this existed.
+NFL_POOL_DIMS_PYDS <- c(NFL_POOL_DIMS, "fpass_yds", "dpass_yds")
+NFL_POOL_W_PYDS    <- c(NFL_POOL_W, 1.2, 1.2)
 NFL_ESS_FLOOR      <- 150
 NFL_ESS_HARDFLOOR  <- 60
 
@@ -223,6 +233,78 @@ nfl_dirichlet_winners <- function(sim_idx, base_p, a0, n_sims) {
 }
 
 # =============================================================================
+# REAL QB PASSING-YARD PROPS  (inlined from GTS/NFL/R/fetch_props_pinnacle.R)
+# -----------------------------------------------------------------------------
+# The pool target for team pass-yard LEVEL (fpass_yds/dpass_yds, see
+# nfl_calibrate_target) is sourced from Pinnacle's real no-vig prop board, not
+# an estimate -- "real lines always" (README/BUILD_QUEUE). One GET for the
+# board + one for prices, ~750 Week-1 player props across every game. Wrapped
+# in try/catch throughout: a network failure, a 401 (Pinnacle's public site
+# key rotated), or a missing line for one QB must degrade to "no yards-level
+# delivery for that side" -- never abort the sim.
+# =============================================================================
+PINN_NFL_BASE   <- "https://guest.api.arcadia.pinnacle.com/0.1"
+PINN_NFL_LEAGUE <- 889L
+PINN_NFL_HEADERS <- c(
+  "user-agent" = paste("Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                       "AppleWebKit/537.36 (KHTML, like Gecko)",
+                       "Chrome/128.0.0.0 Safari/537.36"),
+  "accept"    = "application/json",
+  "referer"   = "https://www.pinnacle.com/",
+  "x-api-key" = "CmX2KcMrXuFmNg6YFbmTxE0y9CIrOi0R")
+
+nfl_pinn_get <- function(path, tries = 3) {
+  for (i in seq_len(tries)) {
+    h <- curl::new_handle(); curl::handle_setheaders(h, .list = as.list(PINN_NFL_HEADERS))
+    r <- tryCatch(curl::curl_fetch_memory(paste0(PINN_NFL_BASE, path), handle = h),
+                  error = function(e) NULL)
+    if (!is.null(r) && r$status_code == 200)
+      return(jsonlite::fromJSON(rawToChar(r$content), simplifyVector = FALSE))
+    Sys.sleep(1.5 * i)
+  }
+  NULL   # caller degrades gracefully -- never stop() on a fetch failure
+}
+
+# One row per player passing-yard prop: player, line. NULL (not an error) if
+# Pinnacle is unreachable or the board carries no passing-yard props right now.
+nfl_pass_yard_props <- function() {
+  tryCatch({
+    m  <- nfl_pinn_get(sprintf("/leagues/%d/matchups", PINN_NFL_LEAGUE))
+    mk <- nfl_pinn_get(sprintf("/leagues/%d/markets/straight", PINN_NFL_LEAGUE))
+    if (is.null(m) || is.null(mk)) return(NULL)
+    sp <- Filter(function(x) identical(x$type, "special") &&
+                   identical(x$special$category, "Player Props"), m)
+    props <- rbindlist(lapply(sp, function(x) {
+      ids <- sapply(x$participants, `[[`, "id"); nms <- sapply(x$participants, `[[`, "name")
+      data.table(matchup = x$id, desc = x$special$description,
+                 over_id = ids[nms == "Over"][1])
+    }))
+    props <- props[grepl(" Total Passing Yards$", desc)]
+    if (!nrow(props)) return(NULL)
+    props[, player := sub(" Total .*$", "", desc)]
+    px <- rbindlist(lapply(Filter(function(x) x$period == 0 && x$key == "s;0;ou", mk), function(x)
+      rbindlist(lapply(x$prices, function(p)
+        data.table(matchup = x$matchupId, pid = p$participantId, points = p$points %||% NA_real_)))))
+    props <- merge(props, px[, .(matchup, over_id = pid, line = points)],
+                   by = c("matchup", "over_id"))
+    props <- unique(props[!is.na(line), .(player, line)], by = "player")
+    if (!nrow(props)) NULL else props
+  }, error = function(e) NULL)
+}
+
+# Exact match first (Pinnacle spells all 24 W1 Sunday starters verbatim as of
+# 13 Sep 2026), then an accent/punctuation-insensitive fallback for whatever
+# doesn't match cleanly in a later week.
+nfl_qb_pass_line <- function(qb, props) {
+  if (is.null(props) || is.na(qb) || !nzchar(qb)) return(NA_real_)
+  hit <- props[player == qb, line]
+  if (length(hit)) return(hit[1])
+  norm <- function(x) tolower(trimws(gsub("[^A-Za-z]", "", x)))
+  hit <- props[norm(player) == norm(qb), line]
+  if (length(hit)) hit[1] else NA_real_
+}
+
+# =============================================================================
 # POOL MATCHING  (inlined from GTS/NFL/R/build_pool.R -- CFB's mechanism)
 # =============================================================================
 
@@ -254,65 +336,145 @@ nfl_wmean <- function(v, w) { ok <- is.finite(v)
   if (!any(ok)) return(NA_real_); sum(v[ok] * w[ok]) / sum(w[ok]) }
 
 # Raw kernel weights over the pool. Soft weights only -- no hard filters.
-nfl_pool_weights <- function(G, target, bw = NFL_POOL_BW, weights = NFL_POOL_W) {
-  tgt <- unlist(target)[NFL_POOL_DIMS]
+# `dims` defaults to the base 6-dim set -- passing a longer `dims` (with a
+# matching-length `weights`) is how a caller opts into extra kernel inputs
+# (see nfl_calibrate_target below) without changing anyone else's behaviour.
+nfl_pool_weights <- function(G, target, bw = NFL_POOL_BW, weights = NFL_POOL_W,
+                             dims = NFL_POOL_DIMS) {
+  tgt <- unlist(target)[dims]
   if (anyNA(tgt)) stop("pool target missing: ",
-                       paste(NFL_POOL_DIMS[is.na(tgt)], collapse = ", "))
-  M  <- as.matrix(G[, ..NFL_POOL_DIMS])
+                       paste(dims[is.na(tgt)], collapse = ", "))
+  M  <- as.matrix(G[, ..dims])
   mu <- colMeans(M); sg <- apply(M, 2, sd)
   Mz <- sweep(sweep(M, 2, mu, "-"), 2, sg, "/")
   tz <- (tgt - mu) / sg
   d2 <- rowSums(sweep((sweep(Mz, 2, tz, "-"))^2, 2, weights, "*"))
   w  <- exp(-d2 / (2 * bw^2)); w[!is.finite(w)] <- 0; w <- w / sum(w)
-  list(w = w, ess = nfl_ess(w), n = nrow(G), bw = bw, weights = weights)
+  list(w = w, ess = nfl_ess(w), n = nrow(G), bw = bw, weights = weights, dims = dims)
 }
 
-# Damped fixed point on the two MARKET dims only. Style targets are your read
-# on the teams, not something to solve for. Ported verbatim from CFB.
+# Damped fixed point delivering a market quantity as the POOL'S OWN WEIGHTED
+# MEAN, not just a fixed kernel-centre guess. Originally total/absp only;
+# style targets were "your read on the teams, not something to solve for."
+# That was wrong for pys specifically -- fO_pr/dO_pr sit at the pool median
+# (fixed, a composition-matching dim, not delivered) and are correlated with
+# fO_pys/dO_pys, so pinning pr drags every pys ask back toward the middle:
+# asked range 0.56-0.72, realised 0.62-0.69 (ISSUES #10, the 24-QB passing
+# check). fO_pys/dO_pys correct the SAME way total/margin do.
+#
+# That alone did not close the gap: pys is a RATIO (pass/(pass+rush)), and
+# its weighted mean landing on the ask does not constrain the weighted mean
+# of the LEVEL (pass yards) to move with it -- different games hit the same
+# ratio at very different yardage totals. Measured on the real 24-QB check:
+# fixing the ratio moved Love's game pys from 0.655 to 0.641 (right on the
+# 0.64 ask) while the pool's weighted-mean pass YARDS for that side moved
+# only 226->224 against a -23 line gap. So fpass_yds/dpass_yds (the pool's
+# own real yardage columns, already present -- no new columns needed) are a
+# SECOND delivered quantity, targeted off the real Pinnacle prop line, not
+# an estimate. Real lines always.
+#
+# ADDITIVE: each block below only activates when the caller supplies the
+# matching market/target/dims entries. Omit them all (as every call site
+# did before this) and behaviour is byte-identical to before. Ported
+# verbatim from CFB, extended for NFL.
 nfl_calibrate_target <- function(G, target, market, bw = NFL_POOL_BW,
-                                 weights = NFL_POOL_W, iters = 12, damp = 0.8,
-                                 tol = 0.05) {
+                                 weights = NFL_POOL_W, dims = NFL_POOL_DIMS,
+                                 iters = 12, damp = 0.8) {
   tg <- target
-  tlo <- min(G$total); thi <- max(G$total); shi <- max(G$absp)
-  for (k in seq_len(iters)) {
-    w  <- nfl_pool_weights(G, tg, bw = bw, weights = weights)$w
-    et <- nfl_wmean(G$pts_sum, w); em <- nfl_wmean(G$margin, w)
-    if (!is.finite(et) || !is.finite(em)) break
-    dt <- market$total - et; dm <- market$margin - em
-    if (max(abs(c(dt, dm))) < tol) break
-    tg$total <- min(max(tg$total + damp * dt, tlo), thi)
-    tg$absp  <- min(max(tg$absp  + damp * dm, 0),   shi)
+
+  # Each deliverable: the name in `target`/`dims` (`nm`), the matching key in
+  # `market` (`mkt` -- total/absp's real-world names don't match their
+  # target names: "absp" targets the kernel, "margin" is the market's name
+  # for the same quantity), the pool column whose weighted mean must land on
+  # market[[mkt]], and a tolerance on that quantity's OWN scale (points, a
+  # 0-1 share, or yards -- not one constant).
+  deliver <- list(list(nm = "total", mkt = "total",  col = "pts_sum", tol = 0.05),
+                  list(nm = "absp",  mkt = "margin", col = "margin",  tol = 0.05))
+  have_pys <- !is.null(market$fO_pys) && !is.null(market$dO_pys)
+  if (have_pys)
+    deliver <- c(deliver, list(list(nm = "fO_pys", mkt = "fO_pys", col = "fO_pys", tol = 0.005),
+                               list(nm = "dO_pys", mkt = "dO_pys", col = "dO_pys", tol = 0.005)))
+  # Independent per side: a backup QB with no posted line yet is common and
+  # should not block delivering the OTHER side's real line.
+  if (!is.null(market$fpass_yds))
+    deliver <- c(deliver, list(list(nm = "fpass_yds", mkt = "fpass_yds", col = "fpass_yds", tol = 1)))
+  if (!is.null(market$dpass_yds))
+    deliver <- c(deliver, list(list(nm = "dpass_yds", mkt = "dpass_yds", col = "dpass_yds", tol = 1)))
+  bounds <- lapply(deliver, function(d) range(G[[d$col]], na.rm = TRUE))
+
+  # fO_pr/dO_pr TRACK the pys kernel-centre via the pool's own pr~pys fit,
+  # rather than sitting frozen at the slate-wide median. Walking pys to an
+  # extreme while pr stays at the median asks the pool for a (extreme pys,
+  # median pr) combination that barely exists (the two are correlated in
+  # real games), which cost ESS for no accuracy benefit -- measured on the
+  # W1 Sunday asks, forcing that combination relaxed the ESS ladder 2-4
+  # rungs on ordinary games. Letting pr move WITH pys asks for the
+  # combination the pool actually has plenty of.
+  pr_of <- function(pys, side) {
+    py <- G[[paste0(side, "_pys")]]; pr <- G[[paste0(side, "_pr")]]
+    b  <- stats::cov(pr, py) / stats::var(py); a <- mean(pr) - b * mean(py)
+    a + b * pys
   }
-  r <- nfl_pool_weights(G, tg, bw = bw, weights = weights)
-  list(target = tg, ess = r$ess, iters = k,
-       total = nfl_wmean(G$pts_sum, r$w), margin = nfl_wmean(G$margin, r$w))
+  if (have_pys) { tg$fO_pr <- pr_of(tg$fO_pys, "fO"); tg$dO_pr <- pr_of(tg$dO_pys, "dO") }
+
+  for (k in seq_len(iters)) {
+    w <- nfl_pool_weights(G, tg, bw = bw, weights = weights, dims = dims)$w
+    diffs <- vapply(deliver, function(d) market[[d$mkt]] - nfl_wmean(G[[d$col]], w), 0)
+    if (anyNA(diffs)) break
+    if (all(abs(diffs) < vapply(deliver, `[[`, 0, "tol"))) break
+    for (i in seq_along(deliver)) {
+      d <- deliver[[i]]
+      tg[[d$nm]] <- min(max(tg[[d$nm]] + damp * diffs[i], bounds[[i]][1]), bounds[[i]][2])
+    }
+    if (have_pys) { tg$fO_pr <- pr_of(tg$fO_pys, "fO"); tg$dO_pr <- pr_of(tg$dO_pys, "dO") }
+  }
+  r <- nfl_pool_weights(G, tg, bw = bw, weights = weights, dims = dims)
+  out <- list(target = tg, ess = r$ess, iters = k,
+             total = nfl_wmean(G$pts_sum, r$w), margin = nfl_wmean(G$margin, r$w))
+  for (d in deliver) out[[d$nm]] <- nfl_wmean(G[[d$col]], r$w)
+  out
 }
 
 # THE ESS GUARD -- relax or refuse, never warn-and-proceed. Ladder: composition
 # widens first, bandwidth next, market last; re-calibrate at every rung; stop at
 # the first rung >= floor; refuse (stop()) if the ladder is spent below the hard
 # floor. Ported from GTS/NFL/R/build_pool.R.
+#
+# Rungs are built BY NAME off `dims`, not fixed-length numeric vectors -- a
+# name absent from `dims` (e.g. fpass_yds/dpass_yds when the caller didn't
+# ask for yardage delivery) is a no-op, so the ladder is byte-identical to
+# the original 6-dim version whenever the caller doesn't opt into the extra
+# dims. fpass_yds/dpass_yds relax alongside total/absp (the "mkt" tier) --
+# they are real market data too, not a composition read, so they get the
+# same late-relax protection.
 nfl_pool_weights_guarded <- function(G, target, market,
                                      floor_ess = NFL_ESS_FLOOR,
                                      hard_ess  = NFL_ESS_HARDFLOOR,
-                                     bw = NFL_POOL_BW, verbose = TRUE) {
-  w0 <- NFL_POOL_W
+                                     bw = NFL_POOL_BW, dims = NFL_POOL_DIMS,
+                                     weights = NFL_POOL_W, verbose = TRUE) {
+  w0 <- weights
+  set1 <- function(base, nms, factor) {
+    for (nm in nms) { i <- match(nm, dims); if (!is.na(i)) base[i] <- w0[i] * factor }
+    base
+  }
+  style <- c("fO_pr", "fO_pys", "dO_pr", "dO_pys")
+  mkt   <- c("total", "absp", "fpass_yds", "dpass_yds")
   rungs <- list(
-    list(lab = "as asked",               w = w0,                          bw = bw),
-    list(lab = "dO weight x0.55",         w = w0 * c(1,1,1,1,.55,.55),      bw = bw),
-    list(lab = "fO+dO weight x0.55",      w = w0 * c(1,1,.55,.55,.55,.55),  bw = bw),
-    list(lab = "fO+dO weight x0.30",      w = w0 * c(1,1,.30,.30,.30,.30),  bw = bw),
-    list(lab = "style x0.30, bw x1.3",    w = w0 * c(1,1,.30,.30,.30,.30),  bw = bw * 1.3),
-    list(lab = "style x0.30, bw x1.7",    w = w0 * c(1,1,.30,.30,.30,.30),  bw = bw * 1.7),
+    list(lab = "as asked",               w = w0,                                       bw = bw),
+    list(lab = "dO weight x0.55",         w = set1(w0, c("dO_pr","dO_pys"), .55),        bw = bw),
+    list(lab = "fO+dO weight x0.55",      w = set1(w0, style, .55),                      bw = bw),
+    list(lab = "fO+dO weight x0.30",      w = set1(w0, style, .30),                      bw = bw),
+    list(lab = "style x0.30, bw x1.3",    w = set1(w0, style, .30),                      bw = bw * 1.3),
+    list(lab = "style x0.30, bw x1.7",    w = set1(w0, style, .30),                      bw = bw * 1.7),
     list(lab = "style x0.30, bw x1.7, mkt x0.75",
-         w = w0 * c(.75,.75,.30,.30,.30,.30), bw = bw * 1.7),
+         w = set1(set1(w0, style, .30), mkt, .75), bw = bw * 1.7),
     list(lab = "style x0.30, bw x1.7, mkt x0.55",
-         w = w0 * c(.55,.55,.30,.30,.30,.30), bw = bw * 1.7))
+         w = set1(set1(w0, style, .30), mkt, .55), bw = bw * 1.7))
   tried <- list()
   for (i in seq_along(rungs)) {
     rg  <- rungs[[i]]
-    cal <- nfl_calibrate_target(G, target, market, bw = rg$bw, weights = rg$w)
-    r   <- nfl_pool_weights(G, cal$target, bw = rg$bw, weights = rg$w)
+    cal <- nfl_calibrate_target(G, target, market, bw = rg$bw, weights = rg$w, dims = dims)
+    r   <- nfl_pool_weights(G, cal$target, bw = rg$bw, weights = rg$w, dims = dims)
     tried[[i]] <- data.table(rung = i - 1L, move = rg$lab, ess = r$ess,
                              total = cal$total, margin = cal$margin)
     if (r$ess >= floor_ess) {
@@ -333,8 +495,8 @@ nfl_pool_weights_guarded <- function(G, target, market,
          "no comparable game in the pool. Widen the output by hand or add the ",
          "2019-2020 low-weight tail (BUILD QUEUE part 4).")
   i <- which.max(best$ess); rg <- rungs[[i]]
-  cal <- nfl_calibrate_target(G, target, market, bw = rg$bw, weights = rg$w)
-  r   <- nfl_pool_weights(G, cal$target, bw = rg$bw, weights = rg$w)
+  cal <- nfl_calibrate_target(G, target, market, bw = rg$bw, weights = rg$w, dims = dims)
+  r   <- nfl_pool_weights(G, cal$target, bw = rg$bw, weights = rg$w, dims = dims)
   list(w = r$w, ess = r$ess, n = r$n, bw = rg$bw, target = cal$target,
        total = cal$total, margin = cal$margin, relaxed = TRUE, rung = i - 1L, ladder = best)
 }
@@ -794,7 +956,7 @@ nfl_score_lines <- function(A, platform = c("DK", "FD")) {
 # =============================================================================
 run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
                                progress_callback = NULL, keep_components = FALSE,
-                               seed = NULL, .slate_type = NULL) {
+                               seed = NULL, .slate_type = NULL, .props = NULL) {
   say <- function(msg, frac = NULL) {
     if (is.function(progress_callback)) try(progress_callback(msg, frac), silent = TRUE)
     message("[nfl] ", msg)
@@ -837,11 +999,41 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
   target <- list(total = total, absp = abs(spread),
                  fO_pr = med_pr, fO_pys = pys_f,
                  dO_pr = med_pr, dO_pys = pys_d)
-  r <- nfl_pool_weights_guarded(Gp, target, market = list(total = total, margin = abs(spread)),
+  market <- list(total = total, margin = abs(spread))
+
+  # Real pass-yard LEVEL delivery (see nfl_calibrate_target) -- fetch once per
+  # sim call unless the caller (run_nfl_classic_simulation, one fetch for the
+  # whole card) already supplied .props. Per side independently: a QB with no
+  # posted line yet (backup, bye-adjacent, book hasn't hung it) just falls
+  # back to the pool median on that side, same as pys does above -- never
+  # blocks the OTHER side's real delivery and never blocks the sim.
+  # A classic-mode caller (run_nfl_classic_simulation) always supplies .props
+  # -- possibly NULL, if the one whole-card fetch failed -- and that NULL is
+  # authoritative: retrying per-game would mean up to 12 redundant round-trips
+  # to a board that's already down. Only fetch here for a standalone
+  # (showdown) call, where .slate_type is unset and nobody fetched yet.
+  props <- if (is.null(.props) && is.null(.slate_type)) nfl_pass_yard_props() else .props
+  qb_of <- function(tm) { P <- PL[team == tm & pass_share > 0]
+    if (nrow(P)) P$player[which.max(P$pass_share)] else NA_character_ }
+  pyds_f <- nfl_qb_pass_line(qb_of(fav), props)
+  pyds_d <- nfl_qb_pass_line(qb_of(dog), props)
+  dims <- NFL_POOL_DIMS; weights <- NFL_POOL_W
+  if (is.finite(pyds_f) || is.finite(pyds_d)) {
+    dims <- NFL_POOL_DIMS_PYDS; weights <- NFL_POOL_W_PYDS
+    target$fpass_yds <- if (is.finite(pyds_f)) pyds_f else stats::median(Gp$fpass_yds)
+    target$dpass_yds <- if (is.finite(pyds_d)) pyds_d else stats::median(Gp$dpass_yds)
+    if (is.finite(pyds_f)) market$fpass_yds <- pyds_f
+    if (is.finite(pyds_d)) market$dpass_yds <- pyds_d
+  }
+
+  r <- nfl_pool_weights_guarded(Gp, target, market = market, dims = dims, weights = weights,
                                 verbose = FALSE)
-  say(sprintf("pool calibrated: ESS %.0f%s, total %.1f, margin %.1f, pys f %.2f d %.2f",
+  say(sprintf("pool calibrated: ESS %.0f%s, total %.1f, margin %.1f, pys f %.2f d %.2f%s",
               r$ess, if (r$relaxed) sprintf(" [relaxed to rung %d]", r$rung) else "",
-              r$total, r$margin, pys_f, pys_d), 0.08)
+              r$total, r$margin, pys_f, pys_d,
+              if (is.finite(pyds_f) || is.finite(pyds_d))
+                sprintf(", pyds f %s d %s", format(round(pyds_f,1)), format(round(pyds_d,1)))
+              else ""), 0.08)
 
   set.seed(if (is.null(seed) || is.na(seed))
              as.integer(Sys.time()) %% .Machine$integer.max else as.integer(seed))
@@ -1184,6 +1376,11 @@ run_nfl_classic_simulation <- function(input_data, n_sims = 10000, config = NULL
   sr <- vector("list", ng); md <- vector("list", ng)
   pj <- vector("list", ng); vis <- vector("list", ng); cp <- vector("list", ng)
 
+  # One fetch for the whole card, not one per game -- Pinnacle's board covers
+  # every game at once, so 12 calls would be 11 wasted round-trips.
+  say("fetching passing-yard props", 0.01)
+  props <- nfl_pass_yard_props()
+
   for (i in seq_len(ng)) {
     gi  <- G[i]; tms <- c(gi$away, gi$home); gkey <- paste(gi$away, gi$home)
     say(sprintf("game %d/%d  %s", i, ng, gkey), (i - 1) / ng)
@@ -1194,6 +1391,7 @@ run_nfl_classic_simulation <- function(input_data, n_sims = 10000, config = NULL
                                                  (i - 1 + (f %||% 0)) / ng), silent = TRUE) else NULL
     res <- run_nfl_simulation(sub, n_sims = n_sims, config = config, progress_callback = gp,
                               keep_components = keep_components, .slate_type = "classic",
+                              .props = props,
                               seed = if (is.null(seed)) NULL else as.integer(seed) + i)
     so <- as.integer(gi$start_order)
     sr[[i]] <- as.data.table(res$sim_results)[, `:=`(GameKey = gkey, StartOrder = so)]
