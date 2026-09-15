@@ -98,7 +98,9 @@ run_tennis_engine <- function(input_data, n_sims, config, progress_callback = NU
   # rates are now player-specific -- ATP top-ace-tercile 10+ ace rate 21% ->
   # 34% of sims (41% real), heavy WTA double-faulters' no-DF 7% -> 2.6% (2.9%).
   # No profile (or < 5 matches): the sampled match's own counts, unchanged.
-  SERVE_RESCORE_POWER <- data.table(Tour = c("ATP", "WTA"), b_ace = c(0.8, 1.0), b_df = c(0.8, 1.0))
+  # WTA DF power 1.0 -> 0.8 (15 Sep): clean servers' no-DF rate 15% -> 13% of
+  # sims (11% real); backtest/wta_df_power_check.R.
+  SERVE_RESCORE_POWER <- data.table(Tour = c("ATP", "WTA"), b_ace = c(0.8, 1.0), b_df = c(0.8, 0.8))
   serve_rates <- historical_data[!is.na(w_ace) & !is.na(l_ace) & !is.na(w_df) & !is.na(l_df) &
                                    (w_games_won + l_games_won) > 0,
     .(rate_ace = sum(w_ace + l_ace) / (2 * sum(w_games_won + l_games_won)),
