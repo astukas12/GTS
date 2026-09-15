@@ -279,8 +279,9 @@ run_golf_simulation <- function(input_data, n_sims = 10000,
   cat(sprintf("Golf sim | %d players | %d sims | cut_line=%d | no_cut=%s\n",
               n_p, n_sims, cut_line, no_cut))
   
-  progress_callback %||% (function(...) NULL)
-  cb <- progress_callback %||% function(v, m) invisible()
+  # Explicit is.null, not %||%: engines share one environment and a later
+  # engine's %||% (cfb_engine.R) calls is.na(a[1]), which errors on a function.
+  cb <- if (is.null(progress_callback)) function(v, m) invisible() else progress_callback
   
   cb(0.05, "Pre-computing distributions...")
   dist <- precompute_golf_distributions(players_dt, cut_line, no_cut)
