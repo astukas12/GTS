@@ -426,6 +426,19 @@ run_tennis_engine <- function(input_data, n_sims, config, progress_callback = NU
     Surface  = Surface,
     Tour     = Tour
   )])
+
+  # Tennis showdown (TENNIS_SHOWDOWN) sheets carry two extra draftableIds per
+  # player -- DK prices the CPT and A-CPT slots separately from the base P
+  # slot rather than as a clean multiple of it. Plain passthrough, no
+  # simulation-affecting change: absent on a Classic sheet, so this is a no-op
+  # there.
+  if (all(c("CPTID", "CPTSalary", "ACPTID", "ACPTSalary") %in% names(player_data))) {
+    showdown_cols <- unique(player_data[, .(
+      Player = Name, CPTID, CPTSalary, ACPTID, ACPTSalary
+    )])
+    metadata <- merge(metadata, showdown_cols, by = "Player")
+  }
+
   # Players in dropped matches have no sims -- keep them out of the optimizer
   if (length(dropped_matches)) {
     metadata <- metadata[!Match %in% dropped_matches]
