@@ -1067,7 +1067,9 @@ server <- function(input, output, session) {
   }
   
   create_display_table <- function(optimal_lineups, metadata, platform) {
-    if ("Captain" %in% names(optimal_lineups)) {
+    if ("Captain" %in% names(optimal_lineups) && "ACaptain" %in% names(optimal_lineups)) {
+      player_cols <- c("Captain", "ACaptain", grep("^Util", names(optimal_lineups), value=TRUE))
+    } else if ("Captain" %in% names(optimal_lineups)) {
       player_cols <- c("Captain", grep("^Util", names(optimal_lineups), value=TRUE))
     } else if ("MVP" %in% names(optimal_lineups)) {
       player_cols <- c("MVP", grep("^Player", names(optimal_lineups), value=TRUE))
@@ -1238,7 +1240,24 @@ server <- function(input, output, session) {
       dl[[col]] <- lookup(dl[[col]], "flex")
     dl
   }
-  
+
+  # Tennis showdown (CPT / A-CPT / P): unlike every other showdown sport, DK
+  # gives each player THREE distinct draftableIds -- one per slot, not one CPT
+  # id derived from a single flex id. metadata carries them as CPTID/ACPTID/ID
+  # straight from the sheet (see TENNIS_SHOWDOWN's required_columns).
+  create_download_tennis_showdown <- function(optimal_lineups, metadata) {
+    dl <- copy(optimal_lineups); setDT(metadata)
+    lookup <- function(players, id_col) {
+      if (!id_col %in% names(metadata)) return(players)
+      ids <- metadata[[id_col]][match(players, metadata$Player)]
+      paste0(players, " (", ids, ")")
+    }
+    if ("Captain"  %in% names(dl)) dl$Captain  <- lookup(dl$Captain,  "CPTID")
+    if ("ACaptain" %in% names(dl)) dl$ACaptain <- lookup(dl$ACaptain, "ACPTID")
+    if ("Util1"    %in% names(dl)) dl$Util1    <- lookup(dl$Util1,    "DKID")
+    dl
+  }
+
   create_download_f1 <- function(optimal_lineups, metadata) {
     dl <- copy(optimal_lineups); setDT(metadata)
     fmt <- function(name, id) paste0(name, " (", id, ")")
@@ -1281,6 +1300,7 @@ server <- function(input, output, session) {
   create_download_table <- function(optimal_lineups, metadata, platform, sport = NULL) {
     dl <- if ("Captain" %in% names(optimal_lineups)) {
       if (identical(sport, "F1")) create_download_f1(optimal_lineups, metadata)
+      else if (identical(sport, "TENNIS_SHOWDOWN")) create_download_tennis_showdown(optimal_lineups, metadata)
       else create_download_showdown(optimal_lineups, metadata)
     } else if ("MVP" %in% names(optimal_lineups)) {
       create_download_mvp(optimal_lineups, metadata)
@@ -1765,7 +1785,21 @@ server <- function(input, output, session) {
       } else {
         dk_mode <- rv$config$optimization_modes$DK %||% "standard"
         progress$set(message="Finding optimal DraftKings lineups...", value=0)
-        opt_data   <- prepare_optimization_data(rv$simulation_results, rv$sim_metadata, "DK")
+        # Tennis showdown carries THREE distinct salaries per player (CPT/A-CPT/P
+        # draftableIds), not one -- prepare_optimization_data's generic single
+        # Salary=DKSalary merge would lose the CPT/A-CPT columns the enumerator
+        # needs to price each slot at DK's own real salary (see
+        # find_optimal_lineups_enum_tennis_captain).
+        opt_data <- if (identical(dk_mode, "enum_tennis_captain")) {
+          setDT(rv$simulation_results); setDT(rv$sim_metadata)
+          od <- merge(rv$simulation_results,
+                     rv$sim_metadata[, .(Player, Salary=DKSalary, CPTSalary, ACPTSalary)],
+                     by="Player")
+          od[, FantasyPoints := DKScore]
+          od[Salary > 0 & !is.na(Salary) & CPTSalary > 0 & ACPTSalary > 0]
+        } else {
+          prepare_optimization_data(rv$simulation_results, rv$sim_metadata, "DK")
+        }
         # cpt_multiplier is REQUIRED whenever dk_mode is a captain mode. Without
         # it, calculate_distribution_metrics builds
         # multipliers <- c(config$cpt_multiplier, rep(1, n - 1)) where the first
@@ -1775,8 +1809,10 @@ server <- function(input, output, session) {
         opt_config <- list(roster_size=rv$config$roster_sizes$DK, salary_cap=rv$config$salary_caps$DK,
                            percentiles=c(0.01,0.05,0.10,0.20), platform_col="DKScore",
                            cpt_multiplier=rv$config$showdown_config$DK$captain_multiplier %||% 1.5,
+                           acpt_multiplier=rv$config$showdown_config$DK$acpt_multiplier %||% 1.25,
                            progress_frequency=500, use_parallel=TRUE,
                            max_lineups=rv$config$max_lineups %||% 5000L,
+                           enum_keep=rv$config$enum_keep %||% 50000L,
                            # opt_config is a FRESH list, not rv$config, so
                            # anything the optimiser reads has to be copied in
                            # explicitly -- pool_spread was set in the sport
@@ -3999,6 +4035,8 @@ server <- function(input, output, session) {
         id_col <- paste0(platform,"ID")
         if ("Captain" %in% names(dl) && isTRUE(rv$sport == "F1")) {
           dl <- create_download_f1(dl, rv$sim_metadata)
+        } else if ("Captain" %in% names(dl) && isTRUE(rv$sport == "TENNIS_SHOWDOWN")) {
+          dl <- create_download_tennis_showdown(dl, rv$sim_metadata)
         } else if ("Captain" %in% names(dl)) {
           dl <- create_download_showdown(dl, rv$sim_metadata)
         } else if ("MVP" %in% names(dl)) {

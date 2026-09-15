@@ -214,8 +214,134 @@ SPORT_CONFIGS <- list(
       roster_structure  = list(captain_slots = 1, utility_slots = 5)
     )
   ),
-  
-  
+
+
+  # ==========================================================================
+  # TENNIS SHOWDOWN (DK "Short Slate": CPT / A-CPT / P, 3 players)
+  # --------------------------------------------------------------------------
+  # NOT a platform on TENNIS -- the roster shape is fundamentally different
+  # (3 slots, 2 distinct captain tiers) from Classic's 6 flat "P" slots, so
+  # folding it into TENNIS would mean branching on structure everywhere
+  # downstream. Must be listed BEFORE plain TENNIS: detect_sport()'s
+  # column-only fallback returns the first sport whose required_columns match,
+  # and a showdown sheet satisfies both this entry's 4-column check and
+  # TENNIS's 3-column one.
+  #
+  # DK prices each slot with its OWN draftableId salary (not a clean multiple
+  # of the base one -- confirmed off a live pull, ratios cluster near
+  # 1.50x/1.25x but drift a few dollars per player from DK's rounding), so the
+  # sheet carries three salary/ID pairs per player instead of one. Engine
+  # (tennis_engine.R) is UNCHANGED -- same per-player simulated DK-score
+  # distributions as Classic; the multipliers apply only when scoring a
+  # lineup, in find_optimal_lineups_enum_tennis_captain.
+  # ==========================================================================
+  TENNIS_SHOWDOWN = list(
+    sport_name         = "TENNIS_SHOWDOWN",
+    sport_display_name = "Tennis Showdown",
+    player_label       = "Player",
+    player_label_plural = "Players",
+
+    detection = list(
+      required_sheets   = NULL,
+      required_columns  = c("Surface", "Tour", "BO", "ACPTID"),
+      min_sheet_matches = 0,
+      min_column_matches = 4
+    ),
+
+    platforms    = c("DK"),
+    roster_sizes = list(DK = 3),
+    salary_caps  = list(DK = 50000),
+
+    optimization_modes = list(DK = "enum_tennis_captain"),
+    # Short slate pools are small (one day's contests, ~10-30 players) --
+    # enumerate every legal lineup exactly rather than sampling, per the W4
+    # design. enum_keep is generous headroom, not a real cutoff at this pool
+    # size (see find_optimal_lineups_enum_tennis_captain).
+    max_lineups  = 50000,
+    enum_win_pct = 0.01,
+    enum_keep    = 50000L,
+    default_n_sims = 25000L,
+
+    showdown_config = list(
+      DK = list(enabled = TRUE, mode = "tennis_captain",
+                captain_multiplier = 1.5, acpt_multiplier = 1.25,
+                # Salary multipliers are NOT used to derive CPT/A-CPT salary --
+                # the sheet's own CPTSalary/ACPTSalary columns are DK's real
+                # per-slot prices. Kept here only for display/reference.
+                captain_salary_multiplier = 1.5, acpt_salary_multiplier = 1.25)
+    ),
+
+    standard_metrics = c(
+      "WinRate", "Top1Rate", "Top5Rate", "Top10Rate", "Top20Rate",
+      "TotalSalary", "AvgOwn"
+    ),
+
+    custom_metrics = list(),
+
+    metadata_columns = list(
+      list(name = "Match",    label = "Match",    type = "text", display = TRUE, filter = FALSE),
+      list(name = "Opponent", label = "Opponent", type = "text", display = TRUE, filter = FALSE),
+      list(name = "Surface",  label = "Surface",  type = "text", display = TRUE, filter = TRUE),
+      list(name = "Tour",     label = "Tour",     type = "text", display = TRUE, filter = TRUE)
+    ),
+
+    portfolio_filters = list(
+      rate_minimums = list(
+        list(name = "Win",   label = "Win",    step = 0.1),
+        list(name = "Top1",  label = "Top 1",  step = 0.1),
+        list(name = "Top5",  label = "Top 5",  step = 0.1),
+        list(name = "Top10", label = "Top 10", step = 0.1),
+        list(name = "Top20", label = "Top 20", step = 0.1)
+      ),
+      range_filters = list(
+        list(name = "Salary", label = "Salary (K)", column = "TotalSalary", step = 0.1, format = "salary_k"),
+        list(name = "AvgOwn", label = "Avg Own",    column = "AvgOwn",      step = 0.1, format = "decimal")
+      )
+    ),
+
+    platform_columns = list(
+      DK = list(salary = "DKSalary", id = "DKID", ownership = "DKOwn", score = "DKScore",
+                cpt_id = "CPTID", cpt_salary = "CPTSalary", cpt_multiplier = 1.5,
+                acpt_id = "ACPTID", acpt_salary = "ACPTSalary", acpt_multiplier = 1.25,
+                platform_label = "DK Tennis Showdown")
+    ),
+
+    download_formats = list(DK = "{Name} ({DKID})"),
+
+    input_file = list(
+      type            = "excel",
+      required_sheets = NULL,
+      player_sheet    = NULL,
+      required_columns = list(
+        base = c("Name", "CPTSalary", "CPTID", "ACPTSalary", "ACPTID",
+                "Salary", "ID", "Own", "Game Info", "ML", "SS", "Surface", "Tour", "BO"),
+        DK   = c("CPTSalary", "CPTID", "ACPTSalary", "ACPTID", "Salary", "ID", "Own")
+      )
+    ),
+
+    simulation = list(
+      function_name          = "run_tennis_engine",
+      requires_historical_data = TRUE,
+      historical_data_file   = "tennis_clean_database.xlsx",
+      output_format = list(
+        sim_results = c("SimID", "Player", "DKScore"),
+        metadata    = c("Player", "DKSalary", "DKID", "DKOwn", "Match", "Opponent",
+                        "CPTID", "CPTSalary", "ACPTID", "ACPTSalary")
+      )
+    ),
+
+    # No lineup_metrics_function: calculate_tennis_lineup_metrics keys off
+    # Player[0-9] columns Classic's 6-flat-slot lineups have; showdown's
+    # Captain/ACaptain/Util1 shape doesn't match, and TotalEW/Win6/Win5+ are
+    # excluded from standard_metrics/custom_metrics above anyway.
+
+    # DK bulk upload column headers (in player slot order: CPT, A-CPT, P)
+    dk_export_slots = list(
+      DK = c("CPT", "A-CPT", "P")
+    )
+  ),
+
+
   # ==========================================================================
   # TENNIS
   # ==========================================================================

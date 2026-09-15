@@ -28,6 +28,8 @@ find_optimal_lineups <- function(sim_results, config, mode = "standard", k = 3, 
     return(find_optimal_lineups_combinatorial_captain(sim_results, config, verbose))
   } else if (mode == "enum_captain") {
     return(find_optimal_lineups_enum_captain(sim_results, config, verbose))
+  } else if (mode == "enum_tennis_captain") {
+    return(find_optimal_lineups_enum_tennis_captain(sim_results, config, verbose))
   } else if (mode == "combinatorial_mvp") {
     return(find_optimal_lineups_combinatorial_mvp(sim_results, config, verbose))
   } else if (mode == "preseason_classic") {
@@ -39,7 +41,8 @@ find_optimal_lineups <- function(sim_results, config, mode = "standard", k = 3, 
   } else {
     stop(paste("Unknown mode:", mode,
                "- must be 'standard', 'mvp', 'captain', 'win_based', 'combinatorial',",
-               "'combinatorial_captain', 'enum_captain', or 'combinatorial_mvp'"))
+               "'combinatorial_captain', 'enum_captain', 'enum_tennis_captain',",
+               "or 'combinatorial_mvp'"))
   }
 }
 
@@ -1103,6 +1106,104 @@ find_optimal_lineups_enum_captain <- function(sim_results, config, verbose = TRU
 
 
 # =============================================================================
+# MODE 6b: ENUM TENNIS CAPTAIN (DK Tennis Short Slate: CPT / A-CPT / P)
+# Three DISTINCT roles, not one CPT + N identical flex -- CPT scores at
+# cpt_multiplier (1.5x), A-CPT at acpt_multiplier (1.25x), P at 1x, and DK
+# prices each role with its own real draftableId salary rather than a clean
+# multiple of the base one (measured off a live pull: ratios cluster near
+# 1.50/1.25 but drift a few dollars per player from DK's own rounding). So,
+# unlike find_optimal_lineups_captain, this reads CPTSalary/ACPTSalary/Salary
+# straight off the sheet instead of deriving captain salary from the base one.
+# Pools are small (one day's short slate, ~10-30 players), so this enumerates
+# every legal ordered (CPT, A-CPT, P) triple exactly -- no salary-band
+# pre-filter like enum_captain needs for NFL/CFB's 40+ player pools -- then
+# ranks by the same winning-script hit-count convention as enum_captain.
+# =============================================================================
+find_optimal_lineups_enum_tennis_captain <- function(sim_results, config, verbose = TRUE) {
+  if (verbose) cat("\nPhase 1: Enumerating tennis showdown lineups (CPT / A-CPT / P)...\n")
+
+  setDT(sim_results)
+  salary_cap <- config$salary_cap
+  cpt_mult   <- if (!is.null(config$cpt_multiplier))  config$cpt_multiplier  else 1.5
+  acpt_mult  <- if (!is.null(config$acpt_multiplier)) config$acpt_multiplier else 1.25
+  win_pct    <- config$enum_win_pct %||% 0.01
+  enum_keep  <- config$enum_keep    %||% 50000L
+  start_time <- Sys.time()
+
+  players_dt <- unique(sim_results[!is.na(CPTSalary) & !is.na(ACPTSalary) & !is.na(Salary) &
+                                     CPTSalary > 0 & ACPTSalary > 0 & Salary > 0,
+                                   .(Player, CPTSalary, ACPTSalary, Salary)])
+  all_players <- players_dt$Player
+  n_players   <- nrow(players_dt)
+  sim_ids     <- unique(sim_results$SimID)
+  n_sims      <- length(sim_ids)
+
+  if (n_players < 3) stop("enum_tennis_captain: need at least 3 players, got ", n_players)
+
+  # score matrix: n_players x n_sims (collapse dup player-sim rows first)
+  src <- sim_results[!is.na(FantasyPoints), .(FantasyPoints = mean(FantasyPoints, na.rm = TRUE)),
+                     by = .(Player, SimID)]
+  sw  <- dcast(src, Player ~ SimID, value.var = "FantasyPoints", fun.aggregate = mean, fill = 0)
+  sw  <- sw[match(all_players, Player)]
+  score_mat <- as.matrix(sw[, -1L, with = FALSE])
+  mu <- rowMeans(score_mat)
+
+  # ---- enumerate every ordered (CPT, A-CPT, P) triple of distinct players ----
+  idx  <- seq_len(n_players)
+  trip <- as.matrix(expand.grid(cpt = idx, acpt = idx, p = idx, KEEP.OUT.ATTRS = FALSE))
+  trip <- trip[trip[, 1] != trip[, 2] & trip[, 1] != trip[, 3] & trip[, 2] != trip[, 3], , drop = FALSE]
+
+  lsal <- players_dt$CPTSalary[trip[, 1]] + players_dt$ACPTSalary[trip[, 2]] + players_dt$Salary[trip[, 3]]
+  keep <- lsal <= salary_cap
+  trip <- trip[keep, , drop = FALSE]
+  lsal <- lsal[keep]
+  M    <- nrow(trip)
+  if (!M) stop("enum_tennis_captain: no lineup fits under the $", format(salary_cap, big.mark = ","), " cap")
+
+  if (verbose) cat(sprintf("  %d players | %s sims | cap $%s -> %s legal lineups\n",
+                           n_players, format(n_sims, big.mark = ","),
+                           format(salary_cap, big.mark = ","), format(M, big.mark = ",")))
+
+  # ---- winning-script scoring: flag each sim's top enum_win_pct of lineups ----
+  n_flag    <- max(1L, as.integer(round(M * win_pct)))
+  kth       <- M - n_flag + 1L
+  hit_count <- integer(M)
+  for (s in seq_len(n_sims)) {
+    sc  <- score_mat[, s]
+    ls  <- cpt_mult * sc[trip[, 1]] + acpt_mult * sc[trip[, 2]] + sc[trip[, 3]]
+    thr <- sort(ls, partial = kth)[kth]
+    hit_count[ls >= thr] <- hit_count[ls >= thr] + 1L
+  }
+
+  live <- which(hit_count > 0L)
+  ord  <- live[order(hit_count[live], decreasing = TRUE)]
+  sel  <- ord[seq_len(min(length(ord), enum_keep))]
+  if (verbose) cat(sprintf("  winning-script (top %.1f%%/sim): %s of %s lineups hit >=1 sim; kept top %s (hit_count %d..%d)\n",
+                           100 * win_pct, format(length(live), big.mark = ","),
+                           format(M, big.mark = ","), format(length(sel), big.mark = ","),
+                           hit_count[sel[length(sel)]], hit_count[sel[1]]))
+
+  wmean <- cpt_mult * mu[trip[sel, 1]] + acpt_mult * mu[trip[sel, 2]] + mu[trip[sel, 3]]
+
+  unique_lineups <- data.table(
+    Captain     = all_players[trip[sel, 1]],
+    ACaptain    = all_players[trip[sel, 2]],
+    Util1       = all_players[trip[sel, 3]],
+    TotalSalary = lsal[sel],
+    Top1Count   = hit_count[sel],
+    AvgScore    = wmean
+  )
+
+  if (verbose) cat(sprintf("  ✓ Phase 1: %s candidate lineups | %.1fs\n",
+                           format(nrow(unique_lineups), big.mark = ","),
+                           as.numeric(difftime(Sys.time(), start_time, units = "secs"))))
+
+  list(unique_lineups = unique_lineups, n_sims = n_sims, config = config,
+       mode = "enum_tennis_captain")
+}
+
+
+# =============================================================================
 # MODE 7: COMBINATORIAL MVP (FanDuel single-game / MVP format)
 # The MVP earns mvp_multiplier x score and costs mvp_salary_multiplier x salary;
 # the other (roster_size - 1) AnyFLEX slots are 1x / 1x.
@@ -1315,7 +1416,13 @@ score_all_lineups <- function(lineup_data, sim_results, verbose = TRUE, sims_per
   start_time <- Sys.time()
   
   # Detect player columns based on what exists in data
-  if ("Captain" %in% names(unique_lineups)) {
+  if ("Captain" %in% names(unique_lineups) && "ACaptain" %in% names(unique_lineups)) {
+    # Tennis showdown: two distinct captain tiers (CPT 1.5x, A-CPT 1.25x), not
+    # one CPT + N identical flex -- see find_optimal_lineups_enum_tennis_captain.
+    player_cols <- c("Captain", "ACaptain", grep("^Util", names(unique_lineups), value = TRUE))
+    multipliers <- c(config$cpt_multiplier %||% 1.5, config$acpt_multiplier %||% 1.25,
+                     rep(1, length(player_cols) - 2))
+  } else if ("Captain" %in% names(unique_lineups)) {
     player_cols <- c("Captain", grep("^Util", names(unique_lineups), value = TRUE))
     multipliers <- c(config$cpt_multiplier, rep(1, length(player_cols) - 1))
   } else if ("MVP" %in% names(unique_lineups)) {
@@ -1666,7 +1773,11 @@ calculate_distribution_metrics <- function(score_matrix, lineup_data, config,
   total_salary <- unique_lineups$TotalSalary
   
   # Detect player columns
-  if ("Captain" %in% names(unique_lineups)) {
+  if ("Captain" %in% names(unique_lineups) && "ACaptain" %in% names(unique_lineups)) {
+    player_cols <- c("Captain", "ACaptain", grep("^Util", names(unique_lineups), value = TRUE))
+    multipliers <- c(config$cpt_multiplier %||% 1.5, config$acpt_multiplier %||% 1.25,
+                     rep(1, length(player_cols) - 2))
+  } else if ("Captain" %in% names(unique_lineups)) {
     player_cols <- c("Captain", grep("^Util", names(unique_lineups), value = TRUE))
     multipliers <- c(config$cpt_multiplier, rep(1, length(player_cols) - 1))
   } else if ("MVP" %in% names(unique_lineups)) {
