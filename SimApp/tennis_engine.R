@@ -20,8 +20,7 @@ odds_to_probability <- function(odds) {
 # HELPER: serve / return profiles
 # The database's Player_Profiles sheet (built by GTS/Tennis/tennis_db_lib.R,
 # build_player_profiles) holds each player's last-12-month ace, double-fault
-# and break indices (1 = tour average); Serve_Coef holds the per-tour DK-point
-# coefficients from the W3 backtest. Sheet names are matched to profile names
+# and break indices (1 = tour average). Sheet names are matched to profile names
 # with the same normalisation the database pipeline uses (name_key), then by
 # unique token containment ("Felix Auger Aliassime" vs "Felix Auger-Aliassime").
 # ============================================================================
@@ -87,8 +86,24 @@ run_tennis_engine <- function(input_data, n_sims, config, progress_callback = NU
   db_sheets <- excel_sheets(hist_file)
   player_profiles <- if ("Player_Profiles" %in% db_sheets)
     as.data.table(read_excel(hist_file, sheet = "Player_Profiles")) else NULL
-  serve_coef <- if ("Serve_Coef" %in% db_sheets)
-    as.data.table(read_excel(hist_file, sheet = "Serve_Coef")) else NULL
+
+  # Serve rescore (15 Sep 2026; replaces the flat per-player shift). Each sim
+  # keeps its sampled match's scoreline and breaks; the player's own aces and
+  # DFs in that match are rebuilt from their profile, then rescored with DK's
+  # ace, DF, 10+/15+ ace and no-DF rules. Index above 1: add extra, in
+  # proportion to games played in that match (games x tour rate x (idx - 1));
+  # below 1: keep each of the match's own with probability idx. Powers soften
+  # the index, per tour, picked on 2025 slates. Backtest (GTS/Tennis/backtest/
+  # serve_tails.R): means and lineup ranks match the flat shift, but bonus
+  # rates are now player-specific -- ATP top-ace-tercile 10+ ace rate 21% ->
+  # 34% of sims (41% real), heavy WTA double-faulters' no-DF 7% -> 2.6% (2.9%).
+  # No profile (or < 5 matches): the sampled match's own counts, unchanged.
+  SERVE_RESCORE_POWER <- data.table(Tour = c("ATP", "WTA"), b_ace = c(0.8, 1.0), b_df = c(0.8, 1.0))
+  serve_rates <- historical_data[!is.na(w_ace) & !is.na(l_ace) & !is.na(w_df) & !is.na(l_df) &
+                                   (w_games_won + l_games_won) > 0,
+    .(rate_ace = sum(w_ace + l_ace) / (2 * sum(w_games_won + l_games_won)),
+      rate_df  = sum(w_df + l_df)   / (2 * sum(w_games_won + l_games_won))),
+    by = .(tour, surface, best_of)]
 
   # --------------------------------------------------------------------------
   # PARSE INPUT
@@ -266,6 +281,7 @@ run_tennis_engine <- function(input_data, n_sims, config, progress_callback = NU
 
     match_cache[[match_name]] <- list(
       type      = "normal",
+      tour      = p1$Tour, surface = p1$Surface, bo = as.numeric(p1$BO),
       p1_name   = p1$Name,  p2_name   = p2$Name,
       p1_is_fav = p1_is_fav,
       cum_probs = cum_probs,
@@ -288,6 +304,35 @@ run_tennis_engine <- function(input_data, n_sims, config, progress_callback = NU
   cb(0.15, "Running simulations...")
   
   pool_keys  <- c("p1_ss", "p1_nss", "p2_ss", "p2_nss")
+
+  # Serve rescore setup (see SERVE_RESCORE_POWER above)
+  serve_prof <- data.table(Name = character(0), ace_m = numeric(0), df_m = numeric(0))
+  if (!is.null(player_profiles)) {
+    mp <- match_player_profiles(player_data$Name, player_data$Tour, player_profiles)
+    mp <- mp[!is.na(prof_row)]
+    mp <- cbind(mp, player_profiles[mp$prof_row, .(n_matches, ace_idx, df_idx)])
+    mp <- merge(mp[n_matches >= 5], SERVE_RESCORE_POWER, by = "Tour")
+    serve_prof <- mp[, .(Name, ace_m = ace_idx^b_ace, df_m = df_idx^b_df)]
+  }
+  serve_redraw <- function(cnt, G, rate, m) {
+    ok <- !is.na(cnt) & !is.na(G)
+    out <- cnt
+    if (m > 1)      out[ok] <- cnt[ok] + rpois(sum(ok), G[ok] * rate * (m - 1))
+    else if (m < 1) out[ok] <- rbinom(sum(ok), cnt[ok], m)
+    out
+  }
+  # DK points change for one player's sims from rebuilding their aces / DFs
+  serve_delta <- function(name, ace, df, G, rt, bo5) {
+    p <- serve_prof[Name == name]
+    if (!nrow(p) || nrow(rt) != 1 || !length(ace)) return(0)
+    a2 <- serve_redraw(ace, G, rt$rate_ace, p$ace_m[1])
+    d2 <- serve_redraw(df,  G, rt$rate_df,  p$df_m[1])
+    v_ace <- if (bo5) 0.25 else 0.4; thr <- if (bo5) 15 else 10; nodf <- if (bo5) 5 else 2.5
+    out <- v_ace * (a2 - ace) - (d2 - df) + 2 * ((a2 >= thr) - (ace >= thr)) + nodf * ((d2 == 0) - (df == 0))
+    out[is.na(out)] <- 0
+    out
+  }
+  serve_acc <- list()
   all_results <- vector("list", length(match_cache))
   result_idx  <- 0L
   
@@ -318,6 +363,7 @@ run_tennis_engine <- function(input_data, n_sims, config, progress_callback = NU
     
     winner_scores <- numeric(n_sims)
     loser_scores  <- numeric(n_sims)
+    w_ace_s <- w_df_s <- l_ace_s <- l_df_s <- g_s <- rep(NA_real_, n_sims)
     
     for (bucket in 1:4) {
       idx  <- which(outcome_idx == bucket)
@@ -335,6 +381,23 @@ run_tennis_engine <- function(input_data, n_sims, config, progress_callback = NU
         # l_dk_score is always the loser's — no swap needed regardless of who was favourite
         winner_scores[idx] <- pool$w_dk_score[drawn]
         loser_scores[idx]  <- pool$l_dk_score[drawn]
+        w_ace_s[idx] <- pool$w_ace[drawn]; w_df_s[idx] <- pool$w_df[drawn]
+        l_ace_s[idx] <- pool$l_ace[drawn]; l_df_s[idx] <- pool$l_df[drawn]
+        g_s[idx]     <- pool$w_games_won[drawn] + pool$l_games_won[drawn]
+      }
+    }
+
+    # ---- Serve rescore: rebuild each profiled player's aces / DFs per sim ----
+    if (nrow(serve_prof)) {
+      rt  <- serve_rates[tour == info$tour & surface == info$surface & best_of == info$bo]
+      bo5 <- isTRUE(info$bo == 5)
+      for (pn in intersect(c(info$p1_name, info$p2_name), serve_prof$Name)) {
+        iw <- which(winner_vec == pn); il <- which(loser_vec == pn)
+        dw <- serve_delta(pn, w_ace_s[iw], w_df_s[iw], g_s[iw], rt, bo5)
+        dl <- serve_delta(pn, l_ace_s[il], l_df_s[il], g_s[il], rt, bo5)
+        winner_scores[iw] <- winner_scores[iw] + dw
+        loser_scores[il]  <- loser_scores[il]  + dl
+        serve_acc[[pn]] <- (sum(dw) + sum(dl)) / n_sims
       }
     }
     
@@ -350,32 +413,12 @@ run_tennis_engine <- function(input_data, n_sims, config, progress_callback = NU
   
   sim_results   <- rbindlist(all_results)
 
-  # --------------------------------------------------------------------------
-  # SERVE / RETURN SHIFT
-  # Given the outcome, a player's DK points track their recent ace, DF and
-  # break rates, which the price-matched pools can't see (W3 backtest: big
-  # ATP servers under-projected ~1.8 pts, heavy WTA double-faulters over-
-  # projected ~1.9). Each matched player's sims move by
-  #   ace * log(ace_idx) + df * log(df_idx) + brk * log(brk_idx)
-  # Walkovers and players with < 5 profile matches are left unshifted.
-  # --------------------------------------------------------------------------
-  serve_shift <- data.table(Player = character(0), ServeShift = numeric(0))
-  if (!is.null(player_profiles) && !is.null(serve_coef) && nrow(sim_results)) {
-    simmed <- unique(player_data[Name %in% sim_results[Outcome != "WO", unique(Player)], .(Name, Tour)])
-    mp <- match_player_profiles(simmed$Name, simmed$Tour, player_profiles)
-    mp <- mp[!is.na(prof_row)]
-    mp <- cbind(mp, player_profiles[mp$prof_row, .(n_matches, ace_idx, df_idx, brk_idx)])
-    mp <- merge(mp[n_matches >= 5], serve_coef[, .(Tour = tour, ace, df, brk)], by = "Tour")
-    if (nrow(mp)) {
-      mp[, ServeShift := ace * log(ace_idx) + df * log(df_idx) + brk * log(brk_idx)]
-      serve_shift <- mp[, .(Player = Name, ServeShift)]
-      sim_results[serve_shift, on = "Player", DKScore := DKScore + i.ServeShift]
-    }
-    cat(sprintf("Serve profiles: %d of %d simmed players shifted (range %+.1f to %+.1f pts)\n",
-                nrow(serve_shift), nrow(simmed),
-                if (nrow(serve_shift)) min(serve_shift$ServeShift) else 0,
-                if (nrow(serve_shift)) max(serve_shift$ServeShift) else 0))
-  }
+  # Serve rescore summary: mean DK change per rescored player (applied per sim above)
+  serve_shift <- data.table(Player = names(serve_acc), ServeShift = unlist(serve_acc, use.names = FALSE))
+  cat(sprintf("Serve profiles: %d of %d players rescored (mean change %+.1f to %+.1f pts)\n",
+              nrow(serve_shift), uniqueN(sim_results[Outcome != "WO", Player]),
+              if (nrow(serve_shift)) min(serve_shift$ServeShift) else 0,
+              if (nrow(serve_shift)) max(serve_shift$ServeShift) else 0))
   sim_elapsed   <- as.numeric(difftime(Sys.time(), sim_start,   units = "secs"))
   total_elapsed <- as.numeric(difftime(Sys.time(), overall_start, units = "mins"))
   
