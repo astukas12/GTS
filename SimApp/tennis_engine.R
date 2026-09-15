@@ -17,6 +17,40 @@ odds_to_probability <- function(odds) {
 }
 
 # ============================================================================
+# HELPER: serve / return profiles
+# The database's Player_Profiles sheet (built by GTS/Tennis/tennis_db_lib.R,
+# build_player_profiles) holds each player's last-12-month ace, double-fault
+# and break indices (1 = tour average); Serve_Coef holds the per-tour DK-point
+# coefficients from the W3 backtest. Sheet names are matched to profile names
+# with the same normalisation the database pipeline uses (name_key), then by
+# unique token containment ("Felix Auger Aliassime" vs "Felix Auger-Aliassime").
+# ============================================================================
+
+tennis_name_key <- function(x) {
+  x <- iconv(as.character(x), to = "ASCII//TRANSLIT")
+  x <- tolower(ifelse(is.na(x), "", x))
+  x <- gsub("[^a-z ]", " ", x)
+  x <- gsub("\\b(jr|sr|ii|iii)\\b", " ", x)
+  trimws(gsub(" +", " ", x))
+}
+
+match_player_profiles <- function(names, tours, profiles) {
+  keys <- tennis_name_key(names)
+  out <- data.table(Name = names, Tour = tours, name_key = keys, prof_row = NA_integer_)
+  for (i in seq_along(names)) {
+    cand <- which(profiles$Tour == tours[i])
+    hit <- cand[profiles$name_key[cand] == keys[i]]
+    if (length(hit) != 1) {
+      tk <- strsplit(keys[i], " ")[[1]]
+      hit <- cand[vapply(strsplit(profiles$name_key[cand], " "), function(pk)
+        all(tk %in% pk) || all(pk %in% tk), logical(1))]
+    }
+    if (length(hit) == 1) out$prof_row[i] <- hit
+  }
+  out
+}
+
+# ============================================================================
 # MAIN ENGINE
 # ============================================================================
 
@@ -47,7 +81,15 @@ run_tennis_engine <- function(input_data, n_sims, config, progress_callback = NU
   }
   
   setkey(historical_data, tour, surface, best_of, w_favorite, w_straight_sets)
-  
+
+  # Serve / return profiles (absent from databases built before 15 Sep 2026 --
+  # then no player gets a shift and the engine runs as before)
+  db_sheets <- excel_sheets(hist_file)
+  player_profiles <- if ("Player_Profiles" %in% db_sheets)
+    as.data.table(read_excel(hist_file, sheet = "Player_Profiles")) else NULL
+  serve_coef <- if ("Serve_Coef" %in% db_sheets)
+    as.data.table(read_excel(hist_file, sheet = "Serve_Coef")) else NULL
+
   # --------------------------------------------------------------------------
   # PARSE INPUT
   # --------------------------------------------------------------------------
@@ -307,6 +349,33 @@ run_tennis_engine <- function(input_data, n_sims, config, progress_callback = NU
   }
   
   sim_results   <- rbindlist(all_results)
+
+  # --------------------------------------------------------------------------
+  # SERVE / RETURN SHIFT
+  # Given the outcome, a player's DK points track their recent ace, DF and
+  # break rates, which the price-matched pools can't see (W3 backtest: big
+  # ATP servers under-projected ~1.8 pts, heavy WTA double-faulters over-
+  # projected ~1.9). Each matched player's sims move by
+  #   ace * log(ace_idx) + df * log(df_idx) + brk * log(brk_idx)
+  # Walkovers and players with < 5 profile matches are left unshifted.
+  # --------------------------------------------------------------------------
+  serve_shift <- data.table(Player = character(0), ServeShift = numeric(0))
+  if (!is.null(player_profiles) && !is.null(serve_coef) && nrow(sim_results)) {
+    simmed <- unique(player_data[Name %in% sim_results[Outcome != "WO", unique(Player)], .(Name, Tour)])
+    mp <- match_player_profiles(simmed$Name, simmed$Tour, player_profiles)
+    mp <- mp[!is.na(prof_row)]
+    mp <- cbind(mp, player_profiles[mp$prof_row, .(n_matches, ace_idx, df_idx, brk_idx)])
+    mp <- merge(mp[n_matches >= 5], serve_coef[, .(Tour = tour, ace, df, brk)], by = "Tour")
+    if (nrow(mp)) {
+      mp[, ServeShift := ace * log(ace_idx) + df * log(df_idx) + brk * log(brk_idx)]
+      serve_shift <- mp[, .(Player = Name, ServeShift)]
+      sim_results[serve_shift, on = "Player", DKScore := DKScore + i.ServeShift]
+    }
+    cat(sprintf("Serve profiles: %d of %d simmed players shifted (range %+.1f to %+.1f pts)\n",
+                nrow(serve_shift), nrow(simmed),
+                if (nrow(serve_shift)) min(serve_shift$ServeShift) else 0,
+                if (nrow(serve_shift)) max(serve_shift$ServeShift) else 0))
+  }
   sim_elapsed   <- as.numeric(difftime(Sys.time(), sim_start,   units = "secs"))
   total_elapsed <- as.numeric(difftime(Sys.time(), overall_start, units = "mins"))
   
@@ -410,6 +479,7 @@ run_tennis_engine <- function(input_data, n_sims, config, progress_callback = NU
   
   list(
     dropped_matches = dropped_matches,
+    serve_shift  = serve_shift,
     sim_results  = sim_results,
     metadata     = metadata,
     projections  = projections,
