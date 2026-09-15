@@ -17,6 +17,40 @@ odds_to_probability <- function(odds) {
 }
 
 # ============================================================================
+# HELPER: serve / return profiles
+# The database's Player_Profiles sheet (built by GTS/Tennis/tennis_db_lib.R,
+# build_player_profiles) holds each player's last-12-month ace, double-fault
+# and break indices (1 = tour average); Serve_Coef holds the per-tour DK-point
+# coefficients from the W3 backtest. Sheet names are matched to profile names
+# with the same normalisation the database pipeline uses (name_key), then by
+# unique token containment ("Felix Auger Aliassime" vs "Felix Auger-Aliassime").
+# ============================================================================
+
+tennis_name_key <- function(x) {
+  x <- iconv(as.character(x), to = "ASCII//TRANSLIT")
+  x <- tolower(ifelse(is.na(x), "", x))
+  x <- gsub("[^a-z ]", " ", x)
+  x <- gsub("\\b(jr|sr|ii|iii)\\b", " ", x)
+  trimws(gsub(" +", " ", x))
+}
+
+match_player_profiles <- function(names, tours, profiles) {
+  keys <- tennis_name_key(names)
+  out <- data.table(Name = names, Tour = tours, name_key = keys, prof_row = NA_integer_)
+  for (i in seq_along(names)) {
+    cand <- which(profiles$Tour == tours[i])
+    hit <- cand[profiles$name_key[cand] == keys[i]]
+    if (length(hit) != 1) {
+      tk <- strsplit(keys[i], " ")[[1]]
+      hit <- cand[vapply(strsplit(profiles$name_key[cand], " "), function(pk)
+        all(tk %in% pk) || all(pk %in% tk), logical(1))]
+    }
+    if (length(hit) == 1) out$prof_row[i] <- hit
+  }
+  out
+}
+
+# ============================================================================
 # MAIN ENGINE
 # ============================================================================
 
@@ -47,7 +81,15 @@ run_tennis_engine <- function(input_data, n_sims, config, progress_callback = NU
   }
   
   setkey(historical_data, tour, surface, best_of, w_favorite, w_straight_sets)
-  
+
+  # Serve / return profiles (absent from databases built before 15 Sep 2026 --
+  # then no player gets a shift and the engine runs as before)
+  db_sheets <- excel_sheets(hist_file)
+  player_profiles <- if ("Player_Profiles" %in% db_sheets)
+    as.data.table(read_excel(hist_file, sheet = "Player_Profiles")) else NULL
+  serve_coef <- if ("Serve_Coef" %in% db_sheets)
+    as.data.table(read_excel(hist_file, sheet = "Serve_Coef")) else NULL
+
   # --------------------------------------------------------------------------
   # PARSE INPUT
   # --------------------------------------------------------------------------
@@ -86,7 +128,10 @@ run_tennis_engine <- function(input_data, n_sims, config, progress_callback = NU
   POOL_FLOOR     <- 10   # minimum pool size; expand beyond threshold if needed
   
   match_cache <- list()
-  
+  # Matches left out of the sim: no ML on the sheet, or no historical pool.
+  # Their players get no sim rows and are removed from metadata below.
+  dropped_matches <- character(0)
+
   for (match_idx in seq_along(matches)) {
     match_name    <- matches[match_idx]
     match_players <- player_data[`Game Info` == match_name]
@@ -101,15 +146,24 @@ run_tennis_engine <- function(input_data, n_sims, config, progress_callback = NU
     p2 <- match_players[2]
     cat(sprintf(" (%s vs %s)", p1$Name, p2$Name))
     
-    # ---- WALKOVER: missing ML or explicit WD/WO tour flag ----
-    is_walkover <- any(c(p1$Tour, p2$Tour) %in% c("WD", "WO")) ||
-      is.na(suppressWarnings(as.numeric(p1$ML))) ||
-      is.na(suppressWarnings(as.numeric(p2$ML)))
-    
+    # ---- WALKOVER: explicit WD/WO tour flag only ----
+    is_walkover <- any(c(p1$Tour, p2$Tour) %in% c("WD", "WO"))
+
+    # ---- MISSING ML: leave the match out ----
+    # A blank ML used to be read as a walkover (flat 30 / 0 in every sim). The
+    # W3 backtest found 144 played matches simmed that way, real winners off by
+    # 47 DK points each. No price, no sim, until the sheet has one.
+    if (!is_walkover && (is.na(suppressWarnings(as.numeric(p1$ML))) ||
+                         is.na(suppressWarnings(as.numeric(p2$ML))))) {
+      cat(" - DROPPED (missing ML)\n")
+      warning(sprintf("Match '%s' left out of the sim: missing ML on the sheet", match_name))
+      dropped_matches <- c(dropped_matches, match_name)
+      next
+    }
+
     if (is_walkover) {
       cat(" - WALKOVER\n")
-      winner_name <- if (p1$Tour %in% c("WD", "WO") ||
-                         is.na(suppressWarnings(as.numeric(p1$ML)))) p2$Name else p1$Name
+      winner_name <- if (p1$Tour %in% c("WD", "WO")) p2$Name else p1$Name
       loser_name  <- if (winner_name == p1$Name) p2$Name else p1$Name
       match_cache[[match_name]] <- list(
         type         = "walkover",
@@ -179,8 +233,11 @@ run_tennis_engine <- function(input_data, n_sims, config, progress_callback = NU
       in_range <- pool[odds_diff <= (ODDS_THRESHOLD * 2)]
       pool     <- if (nrow(in_range) >= POOL_FLOOR) in_range else pool[1:min(POOL_FLOOR, .N)]
       
-      # Inverse-rank weights: closest match sampled most often
-      pool[, sample_weight := 1 / seq_len(.N)]
+      # Uniform weights inside the window. The old 1/rank weights left ~55
+      # effective historical matches per player and, since prices tie at 0.1,
+      # favoured older rows by file order. Uniform was better on every held-out
+      # measure in the W3 backtest (GTS/Tennis/backtest/FINDINGS.md).
+      pool[, sample_weight := 1]
       pool
     }
     
@@ -195,7 +252,18 @@ run_tennis_engine <- function(input_data, n_sims, config, progress_callback = NU
       p2_ss  = get_pool(winner_is_fav = !p1_is_fav, straight_sets = TRUE),
       p2_nss = get_pool(winner_is_fav = !p1_is_fav, straight_sets = FALSE)
     )
-    
+
+    # ---- NO HISTORY: leave the match out rather than invent scores ----
+    # (was runif(50,70) / runif(20,40) with only a warning). An empty pool means
+    # the sheet's Tour/Surface/BO combination isn't in the database.
+    if (any(vapply(pools, is.null, logical(1)))) {
+      cat(" - DROPPED (no historical pool: check Tour/Surface/BO)\n")
+      warning(sprintf("Match '%s' left out of the sim: no historical matches for %s / %s / BO%s",
+                      match_name, p1$Tour, p1$Surface, p1$BO))
+      dropped_matches <- c(dropped_matches, match_name)
+      next
+    }
+
     match_cache[[match_name]] <- list(
       type      = "normal",
       p1_name   = p1$Name,  p2_name   = p2$Name,
@@ -267,13 +335,6 @@ run_tennis_engine <- function(input_data, n_sims, config, progress_callback = NU
         # l_dk_score is always the loser's — no swap needed regardless of who was favourite
         winner_scores[idx] <- pool$w_dk_score[drawn]
         loser_scores[idx]  <- pool$l_dk_score[drawn]
-      } else {
-        warning(sprintf(
-          "No historical pool: match='%s' bucket='%s' — using fallback scores",
-          match_name, pool_keys[bucket]
-        ))
-        winner_scores[idx] <- runif(length(idx), 50, 70)
-        loser_scores[idx]  <- runif(length(idx), 20, 40)
       }
     }
     
@@ -288,6 +349,33 @@ run_tennis_engine <- function(input_data, n_sims, config, progress_callback = NU
   }
   
   sim_results   <- rbindlist(all_results)
+
+  # --------------------------------------------------------------------------
+  # SERVE / RETURN SHIFT
+  # Given the outcome, a player's DK points track their recent ace, DF and
+  # break rates, which the price-matched pools can't see (W3 backtest: big
+  # ATP servers under-projected ~1.8 pts, heavy WTA double-faulters over-
+  # projected ~1.9). Each matched player's sims move by
+  #   ace * log(ace_idx) + df * log(df_idx) + brk * log(brk_idx)
+  # Walkovers and players with < 5 profile matches are left unshifted.
+  # --------------------------------------------------------------------------
+  serve_shift <- data.table(Player = character(0), ServeShift = numeric(0))
+  if (!is.null(player_profiles) && !is.null(serve_coef) && nrow(sim_results)) {
+    simmed <- unique(player_data[Name %in% sim_results[Outcome != "WO", unique(Player)], .(Name, Tour)])
+    mp <- match_player_profiles(simmed$Name, simmed$Tour, player_profiles)
+    mp <- mp[!is.na(prof_row)]
+    mp <- cbind(mp, player_profiles[mp$prof_row, .(n_matches, ace_idx, df_idx, brk_idx)])
+    mp <- merge(mp[n_matches >= 5], serve_coef[, .(Tour = tour, ace, df, brk)], by = "Tour")
+    if (nrow(mp)) {
+      mp[, ServeShift := ace * log(ace_idx) + df * log(df_idx) + brk * log(brk_idx)]
+      serve_shift <- mp[, .(Player = Name, ServeShift)]
+      sim_results[serve_shift, on = "Player", DKScore := DKScore + i.ServeShift]
+    }
+    cat(sprintf("Serve profiles: %d of %d simmed players shifted (range %+.1f to %+.1f pts)\n",
+                nrow(serve_shift), nrow(simmed),
+                if (nrow(serve_shift)) min(serve_shift$ServeShift) else 0,
+                if (nrow(serve_shift)) max(serve_shift$ServeShift) else 0))
+  }
   sim_elapsed   <- as.numeric(difftime(Sys.time(), sim_start,   units = "secs"))
   total_elapsed <- as.numeric(difftime(Sys.time(), overall_start, units = "mins"))
   
@@ -350,14 +438,22 @@ run_tennis_engine <- function(input_data, n_sims, config, progress_callback = NU
     )])
     metadata <- merge(metadata, showdown_cols, by = "Player")
   }
-  
+
+  # Players in dropped matches have no sims -- keep them out of the optimizer
+  if (length(dropped_matches)) {
+    metadata <- metadata[!Match %in% dropped_matches]
+    cat(sprintf("Left out of the sim (%d): %s\n", length(dropped_matches),
+                paste(dropped_matches, collapse = "; ")))
+  }
+
   # --------------------------------------------------------------------------
   # MATCH ANALYSIS VISUALS
   # --------------------------------------------------------------------------
   cb(0.90, "Building match analysis...")
   match_analysis_data <- list()
-  
+
   for (match_name in unique(player_data$Match)) {
+    if (match_name %in% dropped_matches) next
     mp <- player_data[Match == match_name]
     if (nrow(mp) != 2) next
     p1 <- mp[1]; p2 <- mp[2]
@@ -395,6 +491,8 @@ run_tennis_engine <- function(input_data, n_sims, config, progress_callback = NU
   cb(1.0, "Tennis simulation complete!")
   
   list(
+    dropped_matches = dropped_matches,
+    serve_shift  = serve_shift,
     sim_results  = sim_results,
     metadata     = metadata,
     projections  = projections,
