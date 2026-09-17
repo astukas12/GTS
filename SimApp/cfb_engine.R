@@ -491,6 +491,19 @@ read_cfb_input <- function(file_path, slate = NULL, game = NULL) {
                              by = "player"), by = "player", all.x = TRUE)
     else po[, own := NA_real_]
     prj <- po
+  } else if (!is.null(etr_raw) && "etr" %in% names(etr_raw)) {
+    # SINGLE-SLATE SHEETS NEED THE SAME JOIN (fixed 17 Sep 2026). A standalone
+    # showdown workbook has no `in_classics` and no `slate` column, so `multi`
+    # is FALSE and `prj` stayed as the raw projections tab -- which carries
+    # ownership but NOT etr. cfb_build_meta() then left DKProj NA for every
+    # player and the app's ETR column came up blank, while ownership (on the
+    # projections tab) looked fine. That is why it read as "half the data is
+    # missing". Multi-slate cards were unaffected, which is why it survived
+    # 28 Aug and 12 Sep.
+    et <- unique(etr_raw[, .(player, etr = suppressWarnings(as.numeric(etr)))], by = "player")
+    prj <- if (is.null(prj) || !nrow(prj)) et
+           else if ("etr" %in% names(prj)) prj          # sheet already carries it
+           else merge(as.data.table(prj), et, by = "player", all.x = TRUE, sort = FALSE)
   }
 
   if (!"dk_pos" %in% names(pl)) pl[, dk_pos := NA_character_]
