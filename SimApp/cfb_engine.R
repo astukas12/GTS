@@ -79,6 +79,11 @@ CFB_EVT_SACK <- 1L; CFB_EVT_FG <- 2L; CFB_EVT_RUN <- 3L; CFB_EVT_CMP <- 4L
 CFB_POOL_DIMS <- c("total", "absp", "fO_pr", "fO_pys", "dO_pr", "dO_pys")
 CFB_POOL_W    <- c(1.4, 1.4, 1.0, 1.0, 1.0, 1.0)
 CFB_BW        <- 0.9
+# Pass-yard LEVEL delivery (optional, see cfb_calibrate): the weight the two
+# yardage dims carry and the widened bandwidth that pays for them. Grid-tested
+# on SYR@PITT 17 Sep against Pinnacle's lines -- see the note in cfb_calibrate.
+CFB_LVL_W     <- 0.6
+CFB_LVL_BW    <- 1.6
 # pool team names (CFBD spelling) that game-tab pool_filter = "option" keeps
 CFB_OPTION_TEAMS <- c("Air Force", "Army", "Navy")
 
@@ -179,12 +184,13 @@ cfb_lr <- function(pos, target_ypc) {
 
 # Kernel weights over the pool. Everything is a soft weight -- no hard filters,
 # so a slightly-off game contributes a little rather than nothing.
-cfb_pool_weights <- function(P, target, bw = CFB_BW) {
-  M  <- as.matrix(P[, ..CFB_POOL_DIMS])
+cfb_pool_weights <- function(P, target, bw = CFB_BW,
+                             dims = CFB_POOL_DIMS, wts = CFB_POOL_W) {
+  M  <- as.matrix(P[, ..dims])
   mu <- colMeans(M); sg <- apply(M, 2, stats::sd)
-  tz <- (unlist(target)[CFB_POOL_DIMS] - mu) / sg
+  tz <- (unlist(target)[dims] - mu) / sg
   Mz <- sweep(sweep(M, 2, mu, "-"), 2, sg, "/")
-  d2 <- rowSums(sweep((sweep(Mz, 2, tz, "-"))^2, 2, CFB_POOL_W, "*"))
+  d2 <- rowSums(sweep((sweep(Mz, 2, tz, "-"))^2, 2, wts, "*"))
   w  <- exp(-d2 / (2 * bw^2)); w[!is.finite(w)] <- 0
   w / sum(w)
 }
@@ -239,24 +245,77 @@ cfb_calibrate <- function(P, target, market, iters = 24, damp = 0.8, tol = 0.05,
   clip    <- function(x, m) max(-m, min(m, x))
   s_got <- function(w) { g <- vapply(scols, function(cn) wm(P[[cn]], w), numeric(1))
                          names(g) <- sdims; g }
-  ess_of <- function(t) cfb_ess(cfb_pool_weights(P, t))
 
-  tg <- target; ess_limited <- FALSE
+  # ---- OPTIONAL: deliver the PASS-YARD LEVEL off real prop lines -----------
+  # pys is a RATIO, and its weighted mean landing on the ask does not pin the
+  # weighted mean of the LEVEL -- different games hit .66 at very different
+  # yardage. Measured on SYR@PITT (17 Sep) against Pinnacle's own lines: the
+  # ratio-only calibration returned PITT 295 pass yards against a 274.5 line
+  # and SYR 222 against 250.5. Second half of the nfl_engine.R ISSUES #10 fix,
+  # ported back with CFB's own pool columns (fpyds/dpyds, already present).
+  #
+  # ONLY fires when the caller supplies market$fpass_yds / market$dpass_yds
+  # (game tab columns, filled from a real book -- see fetch_market()'s rule:
+  # a line, never an estimate). Absent, `dims`/`wts`/`bw` stay the settled
+  # six-dimension kernel and this function is byte-identical to before.
+  #
+  # The two extra dims cost effective sample, so they come with the widening
+  # that buys it back: weight 0.6 (vs 1.0 for the style dims) and bandwidth
+  # 1.6. Measured grid on this game -- 0.6/1.6 lands PITT 274.7 / SYR 246.5 at
+  # ESS 63; the default 0.9 bandwidth delivers both lines exactly but at ESS 9,
+  # which is too few real games to deal an afternoon from.
+  have_lvl <- is.finite(market$fpass_yds %||% NA_real_) &&
+              is.finite(market$dpass_yds %||% NA_real_)
+  ldims <- c("fpyds", "dpyds")
+  dims <- CFB_POOL_DIMS; wts <- CFB_POOL_W; bw <- CFB_BW
+  if (have_lvl) {
+    # 1 row of 4,966 lacks the yardage columns. Fill it with the column median
+    # rather than dropping it -- the caller deals from THIS pool by row index
+    # (sample.int(nrow(P), prob = cal$w)), so the weights must stay aligned.
+    P <- data.table::copy(P)
+    P[!is.finite(fpyds), fpyds := stats::median(P$fpyds, na.rm = TRUE)]
+    P[!is.finite(dpyds), dpyds := stats::median(P$dpyds, na.rm = TRUE)]
+    dims <- c(dims, ldims); wts <- c(wts, CFB_LVL_W, CFB_LVL_W); bw <- CFB_LVL_BW
+    target$fpyds <- market$fpass_yds; target$dpyds <- market$dpass_yds
+  }
+  ess_of <- function(t) cfb_ess(cfb_pool_weights(P, t, bw = bw, dims = dims, wts = wts))
+
+  # fO_pr/dO_pr TRACK the pys target through the pool's own pr~pys fit instead
+  # of sitting frozen at the 0.52 placeholder. Ported back from nfl_engine.R
+  # (ISSUES #10), where the same pin was measured compressing every pys ask
+  # toward the middle: pr and pys are correlated in real games, so walking pys
+  # out while pr stays at the median asks for a combination that barely exists,
+  # and the ESS guard then freezes style short of the ask.
+  # Measured here on SYR@PITT (17 Sep, ask f .73 / d .70): delivered pys d .654
+  # -> .669, dog pass yards 219 -> 223, favourite 272 -> 280, ESS 93 -> 95.
+  # Same guard, same market delivery -- this only changes WHICH games the
+  # kernel reaches for.
+  pr_of <- function(pys, side) {
+    py <- P[[paste0(side, "_pys")]]; pr <- P[[paste0(side, "_pr")]]
+    b  <- stats::cov(pr, py) / stats::var(py)
+    mean(pr) - b * mean(py) + b * pys
+  }
+  track_pr <- function(t) { t$fO_pr <- pr_of(t$fO_pys, "fO")
+                            t$dO_pr <- pr_of(t$dO_pys, "dO"); t }
+
+  tg <- track_pr(target); ess_limited <- FALSE
   for (k in seq_len(iters)) {
-    w  <- cfb_pool_weights(P, tg)
+    w  <- cfb_pool_weights(P, tg, bw = bw, dims = dims, wts = wts)
     et <- sum(P$pts_sum * w); em <- sum(P$margin * w)
     dt <- market$total - et;  dm <- market$margin - em
     ds <- ask - s_got(w); ds[!is.finite(ds)] <- 0
-    prev <- unlist(tg[c("total", "absp", sdims)])
+    prev <- unlist(tg[c("total", "absp", sdims, if (have_lvl) ldims)])
 
     # style: take the largest ESS-safe fraction of the step toward the ask
     step <- style_damp * ds
     for (f in c(1, .5, .25, .125, .0625, 0)) {
       cand <- tg; cand[sdims] <- as.list(clamp01(unlist(tg[sdims]) + f * step))
+      cand <- track_pr(cand)
       if (f == 0 || ess_of(cand) >= ess_floor) break
     }
     if (f < 1 && max(abs(ds)) > style_tol) ess_limited <- TRUE
     tg[sdims] <- as.list(clamp01(unlist(tg[sdims]) + f * step))
+    tg <- track_pr(tg)
 
     # market: chase total/margin freely while the pool is deep enough; once ESS
     # is under the floor, stop pulling the target past mkt_slack of the line
@@ -267,16 +326,25 @@ cfb_calibrate <- function(P, target, market, iters = 24, damp = 0.8, tol = 0.05,
     tg$total <- market$total  + st
     tg$absp  <- max(0, market$margin + sm)
 
-    now <- unlist(tg[c("total", "absp", sdims)])
+    # pass-yard LEVEL: same damped fixed point as total/margin, on the pool's
+    # own yardage columns. Market data, so it chases freely like the line does.
+    if (have_lvl) {
+      tg$fpyds <- tg$fpyds + damp * (market$fpass_yds - wm(P$fpyds, w))
+      tg$dpyds <- tg$dpyds + damp * (market$dpass_yds - wm(P$dpyds, w))
+    }
+
+    now <- unlist(tg[c("total", "absp", sdims, if (have_lvl) ldims)])
     if (max(abs(now - prev)) < 1e-3) break
   }
 
-  w <- cfb_pool_weights(P, tg)
+  w <- cfb_pool_weights(P, tg, bw = bw, dims = dims, wts = wts)
   got <- s_got(w)
   list(target = tg, w = w, ess = cfb_ess(w),
        total = sum(P$pts_sum * w), margin = sum(P$margin * w),
        style_ask = ask, style_got = got, style_gap = ask - got,
-       style_frozen = isTRUE(ess_limited))
+       style_frozen = isTRUE(ess_limited),
+       lvl_ask = if (have_lvl) c(f = market$fpass_yds, d = market$dpass_yds),
+       lvl_got = if (have_lvl) c(f = wm(P$fpyds, w), d = wm(P$dpyds, w)))
 }
 
 # ---- reading the sheet -------------------------------------------------------
@@ -665,12 +733,21 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
   } else if (!is.na(pf) && nzchar(pf)) {
     stop("unknown pool_filter \"", pf, "\" on the game tab (known: option)")
   }
-  cal <- do.call(cfb_calibrate, c(list(P, target, list(total = G$total[1], margin = G$spread[1])), floors))
-  say(sprintf("pool calibrated: ESS %.0f, total %.1f, margin %.1f, pys f %.2f/%.2f d %.2f/%.2f%s",
+  # OPTIONAL pass-yard lines off the game tab, FAVOURITE- and DOG-relative
+  # (`fav_pass_yds` / `dog_pass_yds`) so the columns don't have to know which
+  # side is home. Absent columns leave the six-dim kernel exactly as before.
+  gnum <- function(nm) if (nm %in% names(G)) suppressWarnings(as.numeric(G[[nm]][1])) else NA_real_
+  mkt <- list(total = G$total[1], margin = G$spread[1],
+              fpass_yds = gnum("fav_pass_yds"), dpass_yds = gnum("dog_pass_yds"))
+  cal <- do.call(cfb_calibrate, c(list(P, target, mkt), floors))
+  say(sprintf("pool calibrated: ESS %.0f, total %.1f, margin %.1f, pys f %.2f/%.2f d %.2f/%.2f%s%s",
               cal$ess, cal$total, cal$margin,
               cal$style_got[["fO_pys"]], cal$style_ask[["fO_pys"]],
               cal$style_got[["dO_pys"]], cal$style_ask[["dO_pys"]],
-              if (isTRUE(cal$style_frozen)) " [style capped by ESS floor]" else ""), 0.08)
+              if (isTRUE(cal$style_frozen)) " [style capped by ESS floor]" else "",
+              if (!is.null(cal$lvl_got))
+                sprintf(", pass yds f %.0f/%.0f d %.0f/%.0f", cal$lvl_got[["f"]], cal$lvl_ask[["f"]],
+                        cal$lvl_got[["d"]], cal$lvl_ask[["d"]]) else ""), 0.08)
   # Style calibration deliberately spends effective sample to hold the pass/run
   # read, so an ESS of 90-150 is now the working range, not an alarm. Warn only
   # when the pool is genuinely too thin to simulate from.
