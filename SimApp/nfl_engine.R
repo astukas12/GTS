@@ -447,6 +447,29 @@ nfl_calibrate_target <- function(G, target, market, bw = NFL_POOL_BW,
 # dims. fpass_yds/dpass_yds relax alongside total/absp (the "mkt" tier) --
 # they are real market data too, not a composition read, so they get the
 # same late-relax protection.
+#
+# TAIL-ASK REORDER (17 Sep 2026, DET@BUF 54.5-total TNF showdown). Diagnosed
+# live: the guard refused at ESS 36-40 (hard floor 60) even with fully
+# neutral composition -- the total itself (54.5, ~2.3 pool-SD out, the 99th
+# pctile) was the whole distance driver, and the DEFAULT ladder wastes its
+# first three rungs discounting composition, which measurably does nothing
+# when composition isn't the problem (rungs 1-3 moved ESS 1.2 -> 2.7; only bw
+# widening + a market-weight discount -- rungs 4-7 -- reached rung-max ESS
+# 36). Real comparables exist (80-93 pool games within a reasonable window of
+# this total+spread) -- the default order just reaches them too late.
+#
+# So: detect whether THIS ask is itself tail on total/absp (a z-score check
+# against the pool's own total/absp mean+sd, independent of style) BEFORE
+# building the ladder, and if so, skip straight to bandwidth widening + a
+# market-weight discount, deferring composition discount to the end instead
+# of the start. This does not invent a new relaxation -- rungs 6-7 of the
+# default ladder already discount market weight; calibrate_target()'s damped
+# fixed-point still re-centres the delivered weighted-mean total/margin on
+# the real market number regardless of which rung gets there, so widening
+# reaches the SAME endpoint faster for a tail ask, it does not change what
+# gets delivered. An ordinary slate's total/absp sit near the pool mean, so
+# `is_tail` stays FALSE and the ladder is byte-identical to before -- this
+# is additive, not a change to normal-slate behaviour.
 nfl_pool_weights_guarded <- function(G, target, market,
                                      floor_ess = NFL_ESS_FLOOR,
                                      hard_ess  = NFL_ESS_HARDFLOOR,
@@ -459,7 +482,19 @@ nfl_pool_weights_guarded <- function(G, target, market,
   }
   style <- c("fO_pr", "fO_pys", "dO_pr", "dO_pys")
   mkt   <- c("total", "absp", "fpass_yds", "dpass_yds")
-  rungs <- list(
+
+  # is_tail: is the ASK itself far in the pool's own total/absp distribution,
+  # independent of style? z-score against the pool's real mean/sd on each dim
+  # present in `dims`; > 1.75 SD (roughly the top/bottom ~8%) trips it.
+  mkt_z <- vapply(c("total", "absp"), function(nm) {
+    if (!nm %in% dims || is.null(target[[nm]])) return(0)
+    v <- G[[nm]]; sg <- stats::sd(v, na.rm = TRUE)
+    if (!is.finite(sg) || sg <= 0) return(0)
+    abs((target[[nm]] - mean(v, na.rm = TRUE)) / sg)
+  }, 0)
+  is_tail <- any(mkt_z > 1.75, na.rm = TRUE)
+
+  rungs <- if (!is_tail) list(
     list(lab = "as asked",               w = w0,                                       bw = bw),
     list(lab = "dO weight x0.55",         w = set1(w0, c("dO_pr","dO_pys"), .55),        bw = bw),
     list(lab = "fO+dO weight x0.55",      w = set1(w0, style, .55),                      bw = bw),
@@ -469,7 +504,22 @@ nfl_pool_weights_guarded <- function(G, target, market,
     list(lab = "style x0.30, bw x1.7, mkt x0.75",
          w = set1(set1(w0, style, .30), mkt, .75), bw = bw * 1.7),
     list(lab = "style x0.30, bw x1.7, mkt x0.55",
-         w = set1(set1(w0, style, .30), mkt, .55), bw = bw * 1.7))
+         w = set1(set1(w0, style, .30), mkt, .55), bw = bw * 1.7)
+  ) else list(
+    # TAIL ORDER -- widen bandwidth and discount market weight FIRST (the
+    # dims actually driving the distance), defer composition discount to the
+    # last two rungs instead of the first three. Same end-states as the
+    # default ladder (bw x1.7, mkt x0.55, style x0.30 all appear, just
+    # reordered), so this never reaches a wider relaxation than the default
+    # ladder already permitted -- it just gets there in fewer wasted rungs.
+    list(lab = "as asked",                          w = w0,                     bw = bw),
+    list(lab = "bw x1.3",                           w = w0,                     bw = bw * 1.3),
+    list(lab = "bw x1.7",                           w = w0,                     bw = bw * 1.7),
+    list(lab = "bw x1.7, mkt x0.75",                w = set1(w0, mkt, .75),     bw = bw * 1.7),
+    list(lab = "bw x1.7, mkt x0.55",                w = set1(w0, mkt, .55),     bw = bw * 1.7),
+    list(lab = "bw x1.7, mkt x0.55, style x0.55",   w = set1(set1(w0, mkt, .55), style, .55), bw = bw * 1.7),
+    list(lab = "bw x1.7, mkt x0.55, style x0.30",   w = set1(set1(w0, mkt, .55), style, .30), bw = bw * 1.7),
+    list(lab = "bw x1.7, mkt x0.30, style x0.30",   w = set1(set1(w0, mkt, .30), style, .30), bw = bw * 1.7))
   tried <- list()
   for (i in seq_along(rungs)) {
     rg  <- rungs[[i]]
