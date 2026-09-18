@@ -1824,6 +1824,14 @@ for (v in c("Races", "Stage", "Theta", "Kappa"))
 
 NASCAR_STAGE1_METRIC_THETA  <- 0.95         # stage-1 grid weight on a metric-grid night (see prepare_stage_dominator_data)
 NASCAR_STAGE23_METRIC_THETA <- c(0.1, 0.0)  # stage-2 and stage-3 grid weight on a metric-grid night
+# Metric-grid nights, stages 2-3 (Andrew, 18 Sep 2026, ORLY Bristol -- a JUDGEMENT, not a fit: the metric-
+# night history is flat on both). Carry-over weakened to .25: the stage split exists to break a real
+# driver's day up, and on a metric night the stage-1 holder got his line from a grid set by owner points.
+# And the biggest late lines go to the best car running up front: closeness blends the finish gap with
+# (car's quality rank - the line's size rank in that stage) at NASCAR_METRIC_LATE_QUALITY. On the 5660
+# sheet: Love (metric pole) 31.4 -> 29.8 dominator pts (stage 1 kept), Allgaier (fastest, 9th) 11.8 -> 20.6.
+NASCAR_METRIC_KAPPA23       <- c(0.25, 0.25)
+NASCAR_METRIC_LATE_QUALITY  <- 0.30
 
 nascar_stage_dom_params <- function(series, track_type) {
   key_s <- tolower(series); key_t <- tolower(track_type)
@@ -1885,6 +1893,8 @@ prepare_stage_dominator_data <- function(race_profiles, driver_data = NULL) {
   metric_grid <- "MetricGrid" %in% names(rp) && isTRUE(as.logical(rp$MetricGrid[1]))
   if (q_on && metric_grid) params$theta[1] <- min(params$theta[1], NASCAR_STAGE1_METRIC_THETA)
   if (metric_grid) params$theta[2:3] <- pmin(params$theta[2:3], NASCAR_STAGE23_METRIC_THETA)
+  if (metric_grid) params$kappa[2:3] <- pmin(params$kappa[2:3], NASCAR_METRIC_KAPPA23)
+  late_q <- if (metric_grid && q_on) NASCAR_METRIC_LATE_QUALITY else 0
   # No car's race total may beat the biggest single-car day in the pool. Stages
   # are dealt separately, so without this a car can stack one driver's stage 1
   # and 3 on another driver's big stage 2 (Bristol Trucks: 3% of sims, up to 88
@@ -1892,7 +1902,7 @@ prepare_stage_dominator_data <- function(race_profiles, driver_data = NULL) {
   cap <- list(DK = max(vapply(races, function(r) max(rowSums(r$DK)), 0)),
               FD = max(vapply(races, function(r) max(rowSums(r$FD)), 0)))
   list(races = races, theta = params$theta, kappa = params$kappa, cap = cap, q_on = q_on, f_q = f_q,
-       metric_grid = metric_grid)
+       metric_grid = metric_grid, late_q = late_q)
 }
 
 # One drawn race's stage lines dealt to one field. Pure: no data.table, no
@@ -1920,7 +1930,7 @@ prepare_stage_dominator_data <- function(race_profiles, driver_data = NULL) {
 # ~2% of points). Tried and rejected the same day: sharing in proportion to
 # each leader's own line (piles it on the #2 car).
 nascar_stage_deal <- function(f_start, f_fin, room, l_start, l_fin, val, theta, kappa,
-                              f_q = NULL, l_q = NULL) {
+                              f_q = NULL, l_q = NULL, late_q = 0) {
   n <- length(f_start)
   pts <- numeric(n)
   owner <- matrix(NA_integer_, nrow(val), 3)
@@ -1932,7 +1942,9 @@ nascar_stage_deal <- function(f_start, f_fin, room, l_start, l_fin, val, theta, 
     spill <- list()                              # (points left, cars nearest-first) per capped line
     for (j in lines) {
       if (!any(free)) break
-      second <- if (s == 1 && use_q) (f_q - l_q[j]) else (f_fin - l_fin[j])
+      second <- if (s == 1 && use_q) (f_q - l_q[j])
+                else if (use_q && late_q > 0) sqrt((1 - late_q) * (f_fin - l_fin[j])^2 + late_q * (f_q - match(j, lines))^2)
+                else (f_fin - l_fin[j])
       d <- sqrt(theta[s] * (f_start - l_start[j])^2 + (1 - theta[s]) * second^2)
       if (s > 1 && kappa[s] > 0) {
         held <- seq_len(n) %in% owner[j, seq_len(s - 1)]
@@ -1983,7 +1995,8 @@ assign_dominator_points_stagewise <- function(race_result, race_weights, stage_d
   deal <- nascar_stage_deal(race_result$Starting, race_result$FinishPosition, room,
                             rd$start, rd$fin, rd[[platform]], stage_data$theta, stage_data$kappa,
                             f_q = if (isTRUE(stage_data$q_on)) stage_data$f_q else NULL,
-                            l_q = if (isTRUE(stage_data$q_on)) rd$q else NULL)
+                            l_q = if (isTRUE(stage_data$q_on)) rd$q else NULL,
+                            late_q = if (is.null(stage_data$late_q)) 0 else stage_data$late_q)
   set(race_result, j = col_name, value = deal$pts)
   race_result
 }
