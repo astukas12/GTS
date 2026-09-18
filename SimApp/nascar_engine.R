@@ -1822,6 +1822,9 @@ NASCAR_STAGE_DOM_FIT <- data.frame(matrix(c(
 for (v in c("Races", "Stage", "Theta", "Kappa"))
   NASCAR_STAGE_DOM_FIT[[v]] <- as.numeric(NASCAR_STAGE_DOM_FIT[[v]])
 
+NASCAR_STAGE1_METRIC_THETA  <- 0.95         # stage-1 grid weight on a metric-grid night (see prepare_stage_dominator_data)
+NASCAR_STAGE23_METRIC_THETA <- c(0.1, 0.0)  # stage-2 and stage-3 grid weight on a metric-grid night
+
 nascar_stage_dom_params <- function(series, track_type) {
   key_s <- tolower(series); key_t <- tolower(track_type)
   key_s <- if (grepl("cup", key_s)) "cup series" else if (grepl("truck", key_s)) "truck series" else "oreilly series"
@@ -1870,13 +1873,26 @@ prepare_stage_dominator_data <- function(race_profiles, driver_data = NULL) {
     fill <- max(f_q)                 # a line with no pre-race rank ranks with the back of the field
     for (k in names(races)) races[[k]]$q[is.na(races[[k]]$q)] <- fill
   } else params$theta[1] <- 1
+  # Metric grid (qualifying cancelled; lineup set by owner points). The pool's lines come from races
+  # with real qualifying, where the pole sitter was fast; tonight's pole may not be. 18 Sep 2026: dealing
+  # real-qualifying lines onto 39 metric-grid fields and scoring against those nights, stage 1 fits best
+  # at .95 (pole's stage-1 share .252 vs real .219; pure grid .302, .98 .278). The sheet marks it with
+  # Race_Profiles$MetricGrid; it only applies with quality ranks on both sides.
+  # Stages 2-3 on a metric night: cars work their way to their true spot, so the late lines follow
+  # the FINISH, not the grid. Same test: stage-2/3 grid weight .1 / 0 fits best (.056) against the
+  # engine's .2 / .6 (.079); stage 3's share to starters 1-5 .234 vs real .275 (was .395), to
+  # finishers 1-5 .589 vs real .541 (was .462). Needs only the flag, not quality ranks.
+  metric_grid <- "MetricGrid" %in% names(rp) && isTRUE(as.logical(rp$MetricGrid[1]))
+  if (q_on && metric_grid) params$theta[1] <- min(params$theta[1], NASCAR_STAGE1_METRIC_THETA)
+  if (metric_grid) params$theta[2:3] <- pmin(params$theta[2:3], NASCAR_STAGE23_METRIC_THETA)
   # No car's race total may beat the biggest single-car day in the pool. Stages
   # are dealt separately, so without this a car can stack one driver's stage 1
   # and 3 on another driver's big stage 2 (Bristol Trucks: 3% of sims, up to 88
   # against a real best of 76.75). The excess passes down like a DKMax excess.
   cap <- list(DK = max(vapply(races, function(r) max(rowSums(r$DK)), 0)),
               FD = max(vapply(races, function(r) max(rowSums(r$FD)), 0)))
-  list(races = races, theta = params$theta, kappa = params$kappa, cap = cap, q_on = q_on, f_q = f_q)
+  list(races = races, theta = params$theta, kappa = params$kappa, cap = cap, q_on = q_on, f_q = f_q,
+       metric_grid = metric_grid)
 }
 
 # One drawn race's stage lines dealt to one field. Pure: no data.table, no
