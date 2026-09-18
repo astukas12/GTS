@@ -1893,11 +1893,16 @@ prepare_stage_dominator_data <- function(race_profiles, driver_data = NULL) {
 # 9th-15th car in the same slots. Without the ranks (older sheets) stage 1 is
 # pure grid, exactly as before.
 #
-# Overflow is unchanged: a line over a car's ceiling passes down to the next-
-# nearest car with room. Tried 18 Sep and reverted: sharing the excess among the
-# stage's other leaders in proportion to what they held piled it on the biggest
-# remaining holder (ORLY Bristol: 2nd-biggest total over 40 in 18% of sims vs 7%).
-# With DKMax loose at the top, overflow is ~0.5% of points; keep the top loose.
+# Overflow (18 Sep 2026). What a car's ceiling will not take is split EVENLY
+# across the four nearest cars with room (repeating while any is left), after
+# the stage's lines are all dealt. It used to pass whole to the single next-
+# nearest car, which let the 3rd starter inherit both front-row cars' capped
+# stage-1 lines on top of his own day: ORLY Bristol with two DKMax-20 cars on
+# the front row, the worst 1% of sims gave one car 86 points of overflow; now
+# 26. Biggest day 60.8 -> 56.2 (33 real ORLY short tracks: 55.0), 2nd-biggest
+# over 40 8% -> 4% (real 6%). With a normal grid nothing changes (overflow is
+# ~2% of points). Tried and rejected the same day: sharing in proportion to
+# each leader's own line (piles it on the #2 car).
 nascar_stage_deal <- function(f_start, f_fin, room, l_start, l_fin, val, theta, kappa,
                               f_q = NULL, l_q = NULL) {
   n <- length(f_start)
@@ -1908,6 +1913,7 @@ nascar_stage_deal <- function(f_start, f_fin, room, l_start, l_fin, val, theta, 
     lines <- which(val[, s] > 0)
     lines <- lines[order(-val[lines, s])]
     free <- rep(TRUE, n)
+    spill <- list()                              # (points left, cars nearest-first) per capped line
     for (j in lines) {
       if (!any(free)) break
       second <- if (s == 1 && use_q) (f_q - l_q[j]) else (f_fin - l_fin[j])
@@ -1921,13 +1927,20 @@ nascar_stage_deal <- function(f_start, f_fin, room, l_start, l_fin, val, theta, 
       i <- cand[which.min(d[cand])]
       free[i] <- FALSE
       # the owner (for carry-through) is the car the line was dealt to, even if
-      # its ceiling sends part of the line down the queue
+      # its ceiling sends part of the line elsewhere
       owner[j, s] <- i
-      left <- val[j, s]
-      for (k in c(i, setdiff(order(d), i))) {
-        if (left <= 0) break
-        g <- min(left, room[k])
-        if (g > 0) { pts[k] <- pts[k] + g; room[k] <- room[k] - g; left <- left - g }
+      g <- min(val[j, s], room[i])
+      pts[i] <- pts[i] + g; room[i] <- room[i] - g
+      if (val[j, s] - g > 1e-9) spill[[length(spill) + 1]] <- list(left = val[j, s] - g, ord = setdiff(order(d), i))
+    }
+    for (sp in spill) {                          # evenly over the four nearest cars with room
+      left <- sp$left
+      for (it in 1:50) {
+        if (left <= 1e-9) break
+        ks <- head(sp$ord[room[sp$ord] > 1e-9], 4)
+        if (!length(ks)) break
+        g <- pmin(left / length(ks), room[ks])
+        pts[ks] <- pts[ks] + g; room[ks] <- room[ks] - g; left <- left - sum(g)
       }
     }
   }
