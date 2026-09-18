@@ -117,7 +117,7 @@ run_nascar_simulation <- function(input_data, n_sims, config, progress_callback 
   
   
   # Dominator lines per race, split by stage (stops if the sheet has no stages)
-  stage_data <- prepare_stage_dominator_data(race_profiles)
+  stage_data <- prepare_stage_dominator_data(race_profiles, driver_data)
   
   
   # Split profiles by race for fast lookup (kept for compatibility)
@@ -1761,7 +1761,14 @@ assign_dominator_points_from_profiles_optimized <- function(race_result, race_we
 # and theta / kappa chosen to reproduce the real stage shares by start slot, zero
 # rates, carry-through and top-1/top-3 share, blended with the series-wide fit
 # as (n * group + 20 * series) / (n + 20). Refit there and paste the new table here.
-# Stage 1 is pure grid in every group. Atlanta stage 3 also follows the grid in
+# Stage 1 is pure grid in every group but one. O'Reilly short track, 18 Sep 2026
+# (GTS/Nascar/nascar_dom_stage_fit_q.R): stage 1 blends grid with pre-race QUALITY
+# at theta1 .98 (quality ranks are wide numbers, so .98 is already a real tilt).
+# Pure grid got the pole's stage-1 share right (.346) but gave the front five's
+# top-8 cars .61 of their stage 1 against a real .76; .98 gives .275 / .70. The
+# nearest-car rule cannot get both, so it is a compromise until stage 1 is dealt
+# by probability (board item). Without PreRank on the sheet it stays pure grid.
+# Atlanta stage 3 also follows the grid in
 # O'Reilly and Trucks: the front starters keep collecting fastest laps in the
 # draft however the race finishes (real P2 zero-in-S3 rate 0/10).
 NASCAR_STAGE_DOM_FIT <- data.frame(matrix(c(
@@ -1789,7 +1796,7 @@ NASCAR_STAGE_DOM_FIT <- data.frame(matrix(c(
   "oreilly series", "road_course", 29, 1, 1.00, 0.00,
   "oreilly series", "road_course", 29, 2, 0.70, 0.90,
   "oreilly series", "road_course", 29, 3, 0.00, 1.00,
-  "oreilly series", "short_track", 33, 1, 1.00, 0.00,
+  "oreilly series", "short_track", 33, 1, 0.98, 0.00,   # 18 Sep: grid + quality (PreRank), see below
   "oreilly series", "short_track", 33, 2, 0.20, 0.75,
   "oreilly series", "short_track", 33, 3, 0.60, 0.97,
   "oreilly series", "superspeedway", 18, 1, 1.00, 0.00,
@@ -1827,7 +1834,7 @@ nascar_stage_dom_params <- function(series, track_type) {
   list(theta = p$Theta, kappa = p$Kappa)
 }
 
-prepare_stage_dominator_data <- function(race_profiles) {
+prepare_stage_dominator_data <- function(race_profiles, driver_data = NULL) {
   need <- c("RaceID", "StartPos", "FinPos", "S1_Lead", "S1_Fast", "S2_Lead", "S2_Fast",
             "S3_Lead", "S3_Fast", "Series", "TrackType")
   miss <- setdiff(need, names(race_profiles))
@@ -1846,34 +1853,65 @@ prepare_stage_dominator_data <- function(race_profiles) {
     F <- as.matrix(p[, .(S1_Fast, S2_Fast, S3_Fast)])
     races[[as.character(rid)]] <- list(
       start = p$StartPos, fin = p$FinPos,
+      q = if ("PreRank" %in% names(p)) as.numeric(p$PreRank) else NULL,
       DK = 0.25 * L + 0.45 * F,      # DK: 0.25 per lead lap, 0.45 per fastest lap
       FD = 0.10 * L                  # FD: 0.10 per lead lap, no fastest-lap points
     )
   }
+  # Stage 1 by grid AND quality needs both sides ranked: the lines (PreRank in
+  # Race_Profiles, written by the sheet builders from 18 Sep 2026) and the field
+  # (the sheet's own finish rates: more expected thresholds = better car). A
+  # sheet missing either keeps stage 1 as pure grid, as before.
+  lv <- c("W", "T3", "T5", "T10", "T15", "T20", "T25", "T30")
+  q_on <- "PreRank" %in% names(rp) && !is.null(driver_data) && all(lv %in% names(driver_data))
+  f_q <- NULL
+  if (q_on) {
+    f_q <- frank(-rowSums(as.data.frame(driver_data)[, lv]), ties.method = "average")
+    fill <- max(f_q)                 # a line with no pre-race rank ranks with the back of the field
+    for (k in names(races)) races[[k]]$q[is.na(races[[k]]$q)] <- fill
+  } else params$theta[1] <- 1
   # No car's race total may beat the biggest single-car day in the pool. Stages
   # are dealt separately, so without this a car can stack one driver's stage 1
   # and 3 on another driver's big stage 2 (Bristol Trucks: 3% of sims, up to 88
   # against a real best of 76.75). The excess passes down like a DKMax excess.
   cap <- list(DK = max(vapply(races, function(r) max(rowSums(r$DK)), 0)),
               FD = max(vapply(races, function(r) max(rowSums(r$FD)), 0)))
-  list(races = races, theta = params$theta, kappa = params$kappa, cap = cap)
+  list(races = races, theta = params$theta, kappa = params$kappa, cap = cap, q_on = q_on, f_q = f_q)
 }
 
 # One drawn race's stage lines dealt to one field. Pure: no data.table, no
 # sheet columns, so the fitting and acceptance harness in GTS/Nascar calls this
 # exact function. val is lines x 3 platform points; room is each car's ceiling.
 # Returns the field's points and, per line and stage, the car it was dealt to.
-nascar_stage_deal <- function(f_start, f_fin, room, l_start, l_fin, val, theta, kappa) {
+#
+# Stage 1 and car quality (18 Sep 2026). With f_q / l_q (pre-race quality
+# ranks: the field's from the sheet, the line's from Race_Profiles$PreRank),
+# stage-1 closeness is start blended with QUALITY instead of finish:
+#   d1 = sqrt(theta1 * (start gap)^2 + (1 - theta1) * (quality gap)^2)
+# so the best car starting 3rd can take a pole sitter's stage-1 line. Across
+# 459 races a top-3 car starting 2nd-3rd took .18 of stage 1 against .08 for a
+# 9th-15th car in the same slots. Without the ranks (older sheets) stage 1 is
+# pure grid, exactly as before.
+#
+# Overflow is unchanged: a line over a car's ceiling passes down to the next-
+# nearest car with room. Tried 18 Sep and reverted: sharing the excess among the
+# stage's other leaders in proportion to what they held piled it on the biggest
+# remaining holder (ORLY Bristol: 2nd-biggest total over 40 in 18% of sims vs 7%).
+# With DKMax loose at the top, overflow is ~0.5% of points; keep the top loose.
+nascar_stage_deal <- function(f_start, f_fin, room, l_start, l_fin, val, theta, kappa,
+                              f_q = NULL, l_q = NULL) {
   n <- length(f_start)
   pts <- numeric(n)
   owner <- matrix(NA_integer_, nrow(val), 3)
+  use_q <- !is.null(f_q) && !is.null(l_q)
   for (s in 1:3) {
     lines <- which(val[, s] > 0)
     lines <- lines[order(-val[lines, s])]
     free <- rep(TRUE, n)
     for (j in lines) {
       if (!any(free)) break
-      d <- sqrt(theta[s] * (f_start - l_start[j])^2 + (1 - theta[s]) * (f_fin - l_fin[j])^2)
+      second <- if (s == 1 && use_q) (f_q - l_q[j]) else (f_fin - l_fin[j])
+      d <- sqrt(theta[s] * (f_start - l_start[j])^2 + (1 - theta[s]) * second^2)
       if (s > 1 && kappa[s] > 0) {
         held <- seq_len(n) %in% owner[j, seq_len(s - 1)]
         d <- d * (1 - kappa[s] * held)
@@ -1912,8 +1950,11 @@ assign_dominator_points_stagewise <- function(race_result, race_weights, stage_d
   room <- as.numeric(race_result[[paste0(platform, "Max")]])
   room[is.na(room)] <- Inf
   room <- pmin(room, stage_data$cap[[platform]])
+  # race_result rows are in driver_data order, the order f_q was ranked in
   deal <- nascar_stage_deal(race_result$Starting, race_result$FinishPosition, room,
-                            rd$start, rd$fin, rd[[platform]], stage_data$theta, stage_data$kappa)
+                            rd$start, rd$fin, rd[[platform]], stage_data$theta, stage_data$kappa,
+                            f_q = if (isTRUE(stage_data$q_on)) stage_data$f_q else NULL,
+                            l_q = if (isTRUE(stage_data$q_on)) rd$q else NULL)
   set(race_result, j = col_name, value = deal$pts)
   race_result
 }
@@ -2040,7 +2081,7 @@ get_full_nascar_simulation_data <- function(input_data, n_sims, config) {
   
   # Pre-compute distance data (OPTIMIZED)
   # Dominator lines per race, split by stage (stops if the sheet has no stages)
-  stage_data <- prepare_stage_dominator_data(race_profiles)
+  stage_data <- prepare_stage_dominator_data(race_profiles, driver_data)
   
   # Run simulations - same as main function but return ALL columns
   all_results <- list()
