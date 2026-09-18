@@ -2405,25 +2405,44 @@ Phase 1: optimal classic lineup for %s sims
        size = sum(lo) + nflex + nsflex)
 }
 
-# Greedy pick over rows ALREADY sorted by descending points: take the best
-# player that fits the bucket cap (hi), the salary cap, and does not strand a
-# mandatory slot (lo). Near-optimal, and on a CFB classic slate the cap
-# carries several thousand dollars of slack in a typical lineup so it is only
-# reached in a minority of sims -- the caller solves the rest exactly.
-.cfb_greedy <- function(pos, sal, cap, b, need) {
-  lo <- b$lo; hi <- b$hi
-  cnt <- c(QB = 0L, RB = 0L, WR = 0L); spent <- 0; pick <- integer(0)
-  for (i in seq_along(pos)) {
-    p <- pos[i]
-    if (cnt[[p]] >= hi[[p]]) next
-    if (spent + sal[i] > cap) next
-    slots_left <- need - length(pick)
-    mand <- sum(pmax(lo[c("QB", "RB", "WR")] - cnt[c("QB", "RB", "WR")], 0L))
-    if (slots_left <= mand && cnt[[p]] >= lo[[p]]) next   # slot reserved for a min
-    pick <- c(pick, i); cnt[[p]] <- cnt[[p]] + 1L; spent <- spent + sal[i]
-    if (length(pick) == need) break
-  }
-  if (length(pick) == need) pick else NULL
+# EXACT solve for the cap-binding sims (18 Sep 2026). This replaced a
+# single-pass greedy that had no backtracking: on the 18 Sep MIA/WAKE +
+# UH/TTU card it returned NO lineup for 45% of cap-binding sims (2,534 of
+# 5,683 in a 10k run) and was short of the optimum in 42% of the rest (mean
+# 1.9 pts, max 17). Those sims silently added nothing to Phase 1's pool.
+#
+# Per sim:
+#  1. Dominance prune -- exact, not a heuristic. At position P, a player that
+#     at least hi[P] same-position players beat on points at <= salary can
+#     never be needed: one of them is always free to swap in. Points get a
+#     tiny per-row jitter so ties (many 0.0s) order strictly.
+#  2. Binary ILP (lpSolve) on the survivors: `need` players, salary <= cap,
+#     QB/RB/WR counts within [lo, hi]. Always feasible when any lineup is.
+# Self-contained (data.table + lpSolve only) so it runs on PSOCK workers.
+.cfb_exact_chunk <- function(SS, cap, lo, hi, need) {
+  library(data.table)
+  SS <- as.data.table(SS)
+  SS[, fpj := FantasyPoints + rowid(SimID) * 1e-7]
+  SS[, h := hi[Pos]]
+  setorder(SS, SimID, Pos, Salary, -fpj)
+  SS[, keep := {
+    hh <- h[1]; k <- logical(.N); top <- rep(-Inf, hh)
+    for (i in seq_len(.N)) {
+      k[i] <- fpj[i] > top[hh]
+      if (k[i]) { top[hh] <- fpj[i]; top <- sort(top, decreasing = TRUE) }
+    }
+    k
+  }, by = .(SimID, Pos)]
+  SS <- SS[keep == TRUE]
+  dirs <- c("==", "<=", ">=", "<=", ">=", "<=", ">=", "<=")
+  rhs  <- c(need, cap, lo[["QB"]], hi[["QB"]], lo[["RB"]], hi[["RB"]], lo[["WR"]], hi[["WR"]])
+  SS[, {
+    A <- rbind(rep(1, .N), Salary, Pos == "QB", Pos == "QB", Pos == "RB", Pos == "RB",
+               Pos == "WR", Pos == "WR")
+    r <- lpSolve::lp("max", fpj, A, dirs, rhs, all.bin = TRUE)
+    pk <- if (r$status == 0) which(r$solution > 0.5) else integer(0)
+    .(Player = Player[pk], Pos = Pos[pk], StartOrder = StartOrder[pk], Salary = Salary[pk])
+  }, by = SimID]
 }
 
 # Assign every sim's chosen 8 to slots at once. `chosen` is long
@@ -2530,25 +2549,35 @@ find_optimal_lineups_cfb_classic <- function(sim_results, config, verbose = TRUE
 
   # ---- SLOW PATH ---------------------------------------------------------
   # Sims where the unconstrained lineup breaks the cap (or the trimmed
-  # candidate set could not field 8): greedy pick under the cap.
+  # candidate set could not field 8): exact solve under the cap
+  # (.cfb_exact_chunk), split across cores when there are enough of them.
   slow_ids <- setdiff(unique(SR$SimID), under)
   slow <- NULL
   if (length(slow_ids)) {
     if (!is.null(progress_callback))
-      progress_callback(0.3, sprintf("Phase 1: %s under cap, solving %s via fallback...",
+      progress_callback(0.3, sprintf("Phase 1: %s under cap, solving %s exactly...",
                                      format(length(under), big.mark = ","),
                                      format(length(slow_ids), big.mark = ",")))
-    SS <- SR[SimID %chin% slow_ids]                 # already point-sorted
-    slow <- SS[, {
-      pk <- .cfb_greedy(Pos, Salary, cap, b, need)
-      if (is.null(pk)) .SD[0L] else .SD[pk]
-    }, by = SimID, .SDcols = c("Player", "Pos", "StartOrder", "Salary")]
+    SS <- SR[SimID %chin% slow_ids, .(SimID, Player, Pos, StartOrder, Salary, FantasyPoints)]
+    use_par <- isTRUE(config$use_parallel %||% TRUE) && length(slow_ids) > 500L
+    if (use_par) {
+      n_cores <- min(parallel::detectCores() - 1L, 7L)
+      grp <- split(slow_ids, cut(seq_along(slow_ids), n_cores, labels = FALSE))
+      cl <- parallel::makeCluster(n_cores, type = "PSOCK")
+      on.exit(parallel::stopCluster(cl), add = TRUE)
+      slow <- rbindlist(parallel::parLapply(cl, lapply(grp, function(g) SS[SimID %in% g]),
+                                            .cfb_exact_chunk, cap = cap, lo = b$lo,
+                                            hi = b$hi, need = need))
+    } else {
+      slow <- .cfb_exact_chunk(SS, cap, b$lo, b$hi, need)
+    }
   }
   have_slow <- !is.null(slow) && nrow(slow) > 0L && "Player" %in% names(slow)
   if (verbose)
-    cat(sprintf("  %s fast (under cap) + %s solved greedily\n",
+    cat(sprintf("  %s fast (under cap) + %s of %s cap-binding solved exactly\n",
                 format(length(under), big.mark = ","),
-                format(if (have_slow) uniqueN(slow$SimID) else 0L, big.mark = ",")))
+                format(if (have_slow) uniqueN(slow$SimID) else 0L, big.mark = ","),
+                format(length(slow_ids), big.mark = ",")))
 
   chosen <- rbindlist(list(fast[, .(SimID, Player, Pos, StartOrder)],
                            if (have_slow) slow[, .(SimID, Player, Pos, StartOrder)]),
