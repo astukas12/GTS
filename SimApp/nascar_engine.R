@@ -116,22 +116,8 @@ run_nascar_simulation <- function(input_data, n_sims, config, progress_callback 
   # Massive speedup: reduces 800M calculations to ~40K
   
   
-  race_distance_data <- list()
-  
-  for (race_id in unique(race_profiles$RaceID)) {
-    # Use data.table syntax for filtering
-    profiles <- race_profiles[RaceID == race_id]
-    
-    if (nrow(profiles) > 0) {
-      # Store all the data needed for fast lookup during simulation
-      race_distance_data[[as.character(race_id)]] <- list(
-        profiles = profiles,
-        profile_finishes = profiles$FinPos,
-        profile_starts = profiles$StartPos,
-        n_profiles = nrow(profiles)
-      )
-    }
-  }
+  # Dominator lines per race, split by stage (stops if the sheet has no stages)
+  stage_data <- prepare_stage_dominator_data(race_profiles)
   
   
   # Split profiles by race for fast lookup (kept for compatibility)
@@ -184,14 +170,14 @@ run_nascar_simulation <- function(input_data, n_sims, config, progress_callback 
     setalloccol(race_result)
     
     # Assign dominator points from race profiles (using pre-computed data)
-    race_result <- assign_dominator_points_from_profiles_optimized(
-      race_result, race_weights, race_distance_data, "DK"
+    race_result <- assign_dominator_points_stagewise(
+      race_result, race_weights, stage_data, "DK"
     )
     
     # Only calculate FD dominator points if FD data is present
     if (has_fd) {
-      race_result <- assign_dominator_points_from_profiles_optimized(
-        race_result, race_weights, race_distance_data, "FD"
+      race_result <- assign_dominator_points_stagewise(
+        race_result, race_weights, stage_data, "FD"
       )
     }
     
@@ -1739,6 +1725,199 @@ assign_dominator_points_from_profiles_optimized <- function(race_result, race_we
 }
 
 
+# ============================================================================
+# STAGE-BY-STAGE DOMINATOR ASSIGNMENT (GTS/Nascar/DOMINATOR_DESIGN.md, Part 2)
+# ============================================================================
+# One real race is drawn per sim, as before, but its lines are handed out one
+# stage at a time instead of as whole-race lines. A pole sitter who finishes
+# 20th used to look like any other 20th-place car and was blanked 28-38% of the
+# time (real: 0-8%), because the whole-race matcher only saw start and finish
+# together. Stage 1 follows the grid in every series; stage 2 mostly follows
+# whoever had stage 1; stage 3 follows the finish. Dealing each stage on its own
+# key gives the pole his stage-1 floor while stages 2-3 still float with the
+# sim's finish, so the big days do not pile onto the same two cars.
+#
+# Within a stage, lines go biggest first, each to the nearest car with no line
+# yet in that stage:
+#   d = sqrt(theta * (start gap)^2 + (1 - theta) * (finish gap)^2) * (1 - kappa * held)
+# held = 1 when that car got the same source driver's line in an earlier stage.
+# theta = 1 is pure grid, 0 pure finish; kappa = 1 keeps a real driver's day on
+# one car, 0 re-deals every stage. Both are FITTED per series x track type (see
+# NASCAR_STAGE_DOM_FIT below), not chosen.
+#
+# DKMax / FDMax is a ceiling on a driver's race total, and so is the pool's
+# biggest real single-car day. Whatever a line would put over either passes
+# down to the next nearest car with room, so every sim pays exactly the drawn
+# race's dominator points.
+#
+# Race_Profiles must carry per-stage laps (S1_Lead, S1_Fast, ... S3_Fast) and
+# the race's Series and TrackType. There is no fallback to whole-race matching:
+# a sheet without them is a stop, not a silent return to the old engine.
+
+# Fitted 17 Sep 2026 by GTS/Nascar/nascar_dom_stage_fit.R (dsf_fit_all) from
+# 426 real races 2022-2026 (NASCAR lap feed, stage split anchored to official
+# totals; exhibitions and rain-shortened races excluded). Each race was re-dealt
+# with lines from the other races in its group onto its own real grid and finish,
+# and theta / kappa chosen to reproduce the real stage shares by start slot, zero
+# rates, carry-through and top-1/top-3 share, blended with the series-wide fit
+# as (n * group + 20 * series) / (n + 20). Refit there and paste the new table here.
+# Stage 1 is pure grid in every group. Atlanta stage 3 also follows the grid in
+# O'Reilly and Trucks: the front starters keep collecting fastest laps in the
+# draft however the race finishes (real P2 zero-in-S3 rate 0/10).
+NASCAR_STAGE_DOM_FIT <- data.frame(matrix(c(
+  "cup series", "atlanta", 9, 1, 1.00, 0.00,
+  "cup series", "atlanta", 9, 2, 0.10, 0.90,
+  "cup series", "atlanta", 9, 3, 0.00, 0.97,
+  "cup series", "intermediate", 73, 1, 1.00, 0.00,
+  "cup series", "intermediate", 73, 2, 0.10, 0.90,
+  "cup series", "intermediate", 73, 3, 0.10, 0.75,
+  "cup series", "road_course", 25, 1, 1.00, 0.00,
+  "cup series", "road_course", 25, 2, 0.10, 0.90,
+  "cup series", "road_course", 25, 3, 0.00, 0.75,
+  "cup series", "short_track", 42, 1, 1.00, 0.00,
+  "cup series", "short_track", 42, 2, 0.60, 0.75,
+  "cup series", "short_track", 42, 3, 0.00, 0.97,
+  "cup series", "superspeedway", 19, 1, 1.00, 0.00,
+  "cup series", "superspeedway", 19, 2, 0.10, 0.90,
+  "cup series", "superspeedway", 19, 3, 0.00, 0.97,
+  "oreilly series", "atlanta", 10, 1, 1.00, 0.00,
+  "oreilly series", "atlanta", 10, 2, 0.10, 0.90,
+  "oreilly series", "atlanta", 10, 3, 1.00, 0.00,
+  "oreilly series", "intermediate", 63, 1, 1.00, 0.00,
+  "oreilly series", "intermediate", 63, 2, 0.10, 0.90,
+  "oreilly series", "intermediate", 63, 3, 0.10, 0.75,
+  "oreilly series", "road_course", 29, 1, 1.00, 0.00,
+  "oreilly series", "road_course", 29, 2, 0.70, 0.90,
+  "oreilly series", "road_course", 29, 3, 0.00, 1.00,
+  "oreilly series", "short_track", 33, 1, 1.00, 0.00,
+  "oreilly series", "short_track", 33, 2, 0.20, 0.75,
+  "oreilly series", "short_track", 33, 3, 0.60, 0.97,
+  "oreilly series", "superspeedway", 18, 1, 1.00, 0.00,
+  "oreilly series", "superspeedway", 18, 2, 0.10, 0.97,
+  "oreilly series", "superspeedway", 18, 3, 0.00, 1.00,
+  "truck series", "atlanta", 5, 1, 1.00, 0.00,
+  "truck series", "atlanta", 5, 2, 0.10, 0.90,
+  "truck series", "atlanta", 5, 3, 1.00, 0.97,
+  "truck series", "intermediate", 46, 1, 1.00, 0.00,
+  "truck series", "intermediate", 46, 2, 0.10, 0.90,
+  "truck series", "intermediate", 46, 3, 0.10, 0.90,
+  "truck series", "road_course", 13, 1, 1.00, 0.00,
+  "truck series", "road_course", 13, 2, 0.20, 0.90,
+  "truck series", "road_course", 13, 3, 0.10, 0.75,
+  "truck series", "short_track", 33, 1, 1.00, 0.00,
+  "truck series", "short_track", 33, 2, 0.10, 0.90,
+  "truck series", "short_track", 33, 3, 0.00, 1.00,
+  "truck series", "superspeedway", 8, 1, 1.00, 0.00,
+  "truck series", "superspeedway", 8, 2, 1.00, 0.00,
+  "truck series", "superspeedway", 8, 3, 0.70, 0.75
+), ncol = 6, byrow = TRUE, dimnames = list(NULL, c("Series", "TrackType", "Races", "Stage", "Theta", "Kappa"))),
+  stringsAsFactors = FALSE)
+for (v in c("Races", "Stage", "Theta", "Kappa"))
+  NASCAR_STAGE_DOM_FIT[[v]] <- as.numeric(NASCAR_STAGE_DOM_FIT[[v]])
+
+nascar_stage_dom_params <- function(series, track_type) {
+  key_s <- tolower(series); key_t <- tolower(track_type)
+  key_s <- if (grepl("cup", key_s)) "cup series" else if (grepl("truck", key_s)) "truck series" else "oreilly series"
+  p <- NASCAR_STAGE_DOM_FIT[NASCAR_STAGE_DOM_FIT$Series == key_s &
+                            NASCAR_STAGE_DOM_FIT$TrackType == key_t, ]
+  if (nrow(p) != 3)
+    stop("No fitted stage dominator parameters for ", series, " / ", track_type,
+         ". Known track types: ", paste(unique(NASCAR_STAGE_DOM_FIT$TrackType), collapse = ", "))
+  p <- p[order(p$Stage), ]
+  list(theta = p$Theta, kappa = p$Kappa)
+}
+
+prepare_stage_dominator_data <- function(race_profiles) {
+  need <- c("RaceID", "StartPos", "FinPos", "S1_Lead", "S1_Fast", "S2_Lead", "S2_Fast",
+            "S3_Lead", "S3_Fast", "Series", "TrackType")
+  miss <- setdiff(need, names(race_profiles))
+  if (length(miss))
+    stop("Race_Profiles is missing ", paste(miss, collapse = ", "),
+         ". The NASCAR engine deals dominator points stage by stage and needs the ",
+         "per-stage profile columns - rebuild the sheet with the current sheet builder.")
+  rp <- as.data.table(race_profiles)
+  for (v in need[-c(10, 11)]) set(rp, j = v, value = as.numeric(rp[[v]]))
+  for (v in need[4:9]) set(rp, j = v, value = fifelse(is.na(rp[[v]]), 0, rp[[v]]))
+  params <- nascar_stage_dom_params(rp$Series[1], rp$TrackType[1])
+  races <- list()
+  for (rid in unique(rp$RaceID)) {
+    p <- rp[RaceID == rid]
+    L <- as.matrix(p[, .(S1_Lead, S2_Lead, S3_Lead)])
+    F <- as.matrix(p[, .(S1_Fast, S2_Fast, S3_Fast)])
+    races[[as.character(rid)]] <- list(
+      start = p$StartPos, fin = p$FinPos,
+      DK = 0.25 * L + 0.45 * F,      # DK: 0.25 per lead lap, 0.45 per fastest lap
+      FD = 0.10 * L                  # FD: 0.10 per lead lap, no fastest-lap points
+    )
+  }
+  # No car's race total may beat the biggest single-car day in the pool. Stages
+  # are dealt separately, so without this a car can stack one driver's stage 1
+  # and 3 on another driver's big stage 2 (Bristol Trucks: 3% of sims, up to 88
+  # against a real best of 76.75). The excess passes down like a DKMax excess.
+  cap <- list(DK = max(vapply(races, function(r) max(rowSums(r$DK)), 0)),
+              FD = max(vapply(races, function(r) max(rowSums(r$FD)), 0)))
+  list(races = races, theta = params$theta, kappa = params$kappa, cap = cap)
+}
+
+# One drawn race's stage lines dealt to one field. Pure: no data.table, no
+# sheet columns, so the fitting and acceptance harness in GTS/Nascar calls this
+# exact function. val is lines x 3 platform points; room is each car's ceiling.
+# Returns the field's points and, per line and stage, the car it was dealt to.
+nascar_stage_deal <- function(f_start, f_fin, room, l_start, l_fin, val, theta, kappa) {
+  n <- length(f_start)
+  pts <- numeric(n)
+  owner <- matrix(NA_integer_, nrow(val), 3)
+  for (s in 1:3) {
+    lines <- which(val[, s] > 0)
+    lines <- lines[order(-val[lines, s])]
+    free <- rep(TRUE, n)
+    for (j in lines) {
+      if (!any(free)) break
+      d <- sqrt(theta[s] * (f_start - l_start[j])^2 + (1 - theta[s]) * (f_fin - l_fin[j])^2)
+      if (s > 1 && kappa[s] > 0) {
+        held <- seq_len(n) %in% owner[j, seq_len(s - 1)]
+        d <- d * (1 - kappa[s] * held)
+      }
+      d <- d + runif(n, 0, 1e-6)                 # break exact ties at random
+      cand <- which(free)
+      i <- cand[which.min(d[cand])]
+      free[i] <- FALSE
+      # the owner (for carry-through) is the car the line was dealt to, even if
+      # its ceiling sends part of the line down the queue
+      owner[j, s] <- i
+      left <- val[j, s]
+      for (k in c(i, setdiff(order(d), i))) {
+        if (left <= 0) break
+        g <- min(left, room[k])
+        if (g > 0) { pts[k] <- pts[k] + g; room[k] <- room[k] - g; left <- left - g }
+      }
+    }
+  }
+  list(pts = pts, owner = owner)
+}
+
+assign_dominator_points_stagewise <- function(race_result, race_weights, stage_data, platform) {
+  setalloccol(race_result)
+  if (nrow(race_weights) == 0) stop("race_weights is empty")
+  if (sum(race_weights$Weight) == 0) stop("All race weights are 0")
+  race_id <- if (nrow(race_weights) == 1) race_weights$RaceID[1] else
+    sample(race_weights$RaceID, size = 1, prob = race_weights$Weight)
+
+  col_name <- paste0(platform, "DominatorPoints")
+  rd <- stage_data$races[[as.character(race_id)]]
+  if (is.null(rd)) {
+    set(race_result, j = col_name, value = numeric(nrow(race_result)))
+    return(race_result)
+  }
+  room <- as.numeric(race_result[[paste0(platform, "Max")]])
+  room[is.na(room)] <- Inf
+  room <- pmin(room, stage_data$cap[[platform]])
+  deal <- nascar_stage_deal(race_result$Starting, race_result$FinishPosition, room,
+                            rd$start, rd$fin, rd[[platform]], stage_data$theta, stage_data$kappa)
+  set(race_result, j = col_name, value = deal$pts)
+  race_result
+}
+
 #' Assign dominator points from profiles (CACHED VERSION - LEGACY)
 #' Kept for compatibility with visualization functions
 #' Uses pre-cached race profiles split by RaceID for faster lookup
@@ -1860,18 +2039,8 @@ get_full_nascar_simulation_data <- function(input_data, n_sims, config) {
   scoring_systems <- create_scoring_system()
   
   # Pre-compute distance data (OPTIMIZED)
-  race_distance_data <- list()
-  for (race_id in unique(race_profiles$RaceID)) {
-    profiles <- race_profiles[race_profiles$RaceID == race_id, ]
-    if (nrow(profiles) > 0) {
-      race_distance_data[[as.character(race_id)]] <- list(
-        profiles = profiles,
-        profile_finishes = profiles$FinPos,
-        profile_starts = profiles$StartPos,
-        n_profiles = nrow(profiles)
-      )
-    }
-  }
+  # Dominator lines per race, split by stage (stops if the sheet has no stages)
+  stage_data <- prepare_stage_dominator_data(race_profiles)
   
   # Run simulations - same as main function but return ALL columns
   all_results <- list()
@@ -1903,12 +2072,12 @@ get_full_nascar_simulation_data <- function(input_data, n_sims, config) {
     setalloccol(race_result)
     
     # Assign dominator points using optimized function
-    race_result <- assign_dominator_points_from_profiles_optimized(
-      race_result, race_weights, race_distance_data, "DK"
+    race_result <- assign_dominator_points_stagewise(
+      race_result, race_weights, stage_data, "DK"
     )
     if (has_fd) {
-      race_result <- assign_dominator_points_from_profiles_optimized(
-        race_result, race_weights, race_distance_data, "FD"
+      race_result <- assign_dominator_points_stagewise(
+        race_result, race_weights, stage_data, "FD"
       )
     }
     
