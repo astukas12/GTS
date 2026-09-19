@@ -711,6 +711,14 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
 
   say("loading pool", 0.02)
   P   <- readRDS(file.path(CFB_DATA_DIR, "cfb_pool.rds"));   setDT(P)
+  # BROKEN POOL GAMES, never dealt (audit 19 Sep 2026): recorded 0-0 finals,
+  # a missing or negative passing line, or play-by-play under 50 events
+  # (median 113) that would under-deal every player.
+  CFB_POOL_BROKEN <- c(401207158, 401282226, 401282237, 401282249, 401309574, 401769076,  # 0-0
+                       401310752,                                                         # no pass line
+                       401760392,                                                         # -29 pass yds
+                       401282612, 401416627, 401426609, 401426615, 401643737)             # <50 events
+  P <- P[!game_id %in% CFB_POOL_BROKEN]
   EV  <- readRDS(file.path(CFB_DATA_DIR, "cfb_events.rds")); setDT(EV)
   FUM <- readRDS(file.path(CFB_DATA_DIR, "cfb_fumbles.rds")); setDT(FUM)
   setkey(EV, game_id, pos_team); setkey(FUM, game_id, team); setkey(P, game_id)
@@ -771,7 +779,14 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
   set.seed(if (is.null(seed) || is.na(seed))
              as.integer(Sys.time()) %% .Machine$integer.max
            else as.integer(seed))
-  idx <- sample.int(nrow(P), n_sims, TRUE, prob = cal$w)
+  # A pool row with no passing line (1 of ~4,966) must never be DEALT: its NA
+  # pyds/ptd/pint land on the QB and NaN the whole slate's score summary
+  # (19 Sep 2026: Walker Eget, 1 sim in 300). The matcher fills it for
+  # weighting only; here it gets zero weight.
+  wdeal <- cal$w
+  for (cl in c("fpyds", "dpyds", "fptd", "dptd", "fpint", "dpint"))
+    if (cl %in% names(P)) wdeal[!is.finite(P[[cl]])] <- 0
+  idx <- sample.int(nrow(P), n_sims, TRUE, prob = wdeal)
   draw <- P[idx]
 
   # ---- per-team setup --------------------------------------------------------
