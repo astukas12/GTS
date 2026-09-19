@@ -753,6 +753,12 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
     say(sprintf("pool filter: option -- %d service-academy games", nrow(P)), 0.03)
   } else if (!is.na(pf) && nzchar(pf)) {
     stop("unknown pool_filter \"", pf, "\" on the game tab (known: option)")
+  } else {
+    # The reverse (Andrew, 19 Sep 2026): an ordinary game never draws an option
+    # game either. The academies are their own category -- only a game tagged
+    # pool_filter = "option" deals from them.
+    P <- P[!(fteam %in% CFB_OPTION_TEAMS | dteam %in% CFB_OPTION_TEAMS)]
+    setkey(P, game_id)
   }
   # OPTIONAL pass-yard lines off the game tab, FAVOURITE- and DOG-relative
   # (`fav_pass_yds` / `dog_pass_yds`) so the columns don't have to know which
