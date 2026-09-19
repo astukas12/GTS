@@ -706,66 +706,73 @@ find_optimal_lineups_combinatorial <- function(sim_results, config, verbose = TR
   unit <- Reduce(gcd2, as.integer(round(c(players_dt$Salary, salary_cap))))
   cap_u <- as.integer(salary_cap %/% unit)
 
-  # setkey for fast per-sim lookup
-  setkey(sim_results, SimID)
-  prog_freq <- max(1L, n_sims %/% 10L)
-
-  lineup_list <- vector("list", n_sims)
-  NEG <- -1e12
-
-  for (i in seq_along(sim_ids)) {
-    sid      <- sim_ids[i]
-    sim_data <- sim_results[.(sid)][Salary > 0 & !is.na(Salary) & !is.na(FantasyPoints)]
-    np  <- nrow(sim_data)
-    pts <- sim_data$FantasyPoints
-    w   <- as.integer(round(sim_data$Salary / unit))
-
-    # dp[k + 1, s + 1] = best score with k players using exactly s salary units
-    dp   <- matrix(NEG, roster_size + 1L, cap_u + 1L); dp[1L, 1L] <- 0
-    keep <- array(FALSE, c(np, roster_size + 1L, cap_u + 1L))
-    for (j in seq_len(np)) {
-      wj <- w[j]
-      if (wj > cap_u) next
-      for (k in roster_size:1L) {                       # descending k: each player used once
-        cand <- dp[k, 1L:(cap_u + 1L - wj)] + pts[j]
-        tgt  <- (1L + wj):(cap_u + 1L)
-        better <- cand > dp[k + 1L, tgt]
-        if (any(better)) {
-          idx <- tgt[better]
-          dp[k + 1L, idx]       <- cand[better]
-          keep[j, k + 1L, idx]  <- TRUE
+  # Exact solve for every sim in a chunk (one data.table of SimID/Player/Salary/
+  # FantasyPoints rows).
+  solve_chunk <- function(dt, roster_size, cap_u, unit) {
+    NEG <- -1e12
+    out <- lapply(split(dt, by = "SimID", keep.by = FALSE), function(sim_data) {
+      # Exact pruning: a player with >= roster_size others at no higher salary and no lower
+      # score can never be needed -- one of those others not already picked can replace him.
+      # Cuts ~37 NASCAR drivers to ~10-15, which is where the time goes (the keep array).
+      sl <- sim_data$Salary; fp <- sim_data$FantasyPoints
+      dom <- rowSums(outer(sl, sl, ">=") & outer(fp, fp, "<=")) - 1L   # minus himself
+      sim_data <- sim_data[dom < roster_size]
+      np  <- nrow(sim_data)
+      pts <- sim_data$FantasyPoints
+      w   <- as.integer(round(sim_data$Salary / unit))
+      # dp[k + 1, s + 1] = best score with k players using exactly s salary units
+      dp   <- matrix(NEG, roster_size + 1L, cap_u + 1L); dp[1L, 1L] <- 0
+      keep <- array(FALSE, c(np, roster_size + 1L, cap_u + 1L))
+      for (j in seq_len(np)) {
+        wj <- w[j]
+        if (wj > cap_u) next
+        src <- 1L:(cap_u + 1L - wj); tgt <- (1L + wj):(cap_u + 1L)
+        for (k in roster_size:1L) {                     # descending k: each player used once
+          cand   <- dp[k, src] + pts[j]
+          better <- cand > dp[k + 1L, tgt]
+          if (any(better)) {
+            idx <- tgt[better]
+            dp[k + 1L, idx]      <- cand[better]
+            keep[j, k + 1L, idx] <- TRUE
+          }
         }
       }
-    }
-    best_s <- which.max(dp[roster_size + 1L, ])
-
-    if (dp[roster_size + 1L, best_s] > NEG / 2) {
+      best_s <- which.max(dp[roster_size + 1L, ])
+      if (dp[roster_size + 1L, best_s] <= NEG / 2) return(NULL)
       picked_idx <- integer(0); k <- roster_size + 1L; s <- best_s
       for (j in np:1L) if (k > 1L && keep[j, k, s]) { picked_idx <- c(picked_idx, j); s <- s - w[j]; k <- k - 1L }
-      picked        <- sim_data$Player[picked_idx]
-      picked_sorted <- sort(picked)   # canonical order for dedup
-      lineup_list[[i]] <- data.table(
-        Lineup      = paste(picked_sorted, collapse = "|"),
-        TotalSalary = sum(sim_data$Salary[picked_idx]),
-        TotalScore  = sum(pts[picked_idx])
-      )
-      # Store player columns in sorted order
-      for (k in seq_len(roster_size)) lineup_list[[i]][[paste0("Player", k)]] <- picked_sorted[k]
-    }
-    
-    if ((verbose || !is.null(progress_callback)) && i %% prog_freq == 0L) {
+      list(paste(sort(sim_data$Player[picked_idx]), collapse = "|"),   # canonical order for dedup
+           sum(sim_data$Salary[picked_idx]), sum(pts[picked_idx]))
+    })
+    out <- out[!vapply(out, is.null, logical(1))]
+    data.table(Lineup      = vapply(out, `[[`, "", 1L),
+               TotalSalary = vapply(out, `[[`, 0, 2L),
+               TotalScore  = vapply(out, `[[`, 0, 3L))
+  }
+
+  sd_all <- sim_results[Salary > 0 & !is.na(Salary) & !is.na(FantasyPoints),
+                        .(SimID, Player, Salary, FantasyPoints)]
+  # Ten progress steps. Single-threaded on purpose: PSOCK workers were SLOWER here (147s vs
+  # 99s for 50k NASCAR sims) -- the per-sim work is small and memory-bound, not CPU-bound.
+  steps    <- split(sim_ids, cut(seq_along(sim_ids), min(10L, n_sims), labels = FALSE))
+  lineup_list <- vector("list", length(steps))
+  done <- 0L
+  for (b in seq_along(steps)) {
+    lineup_list[[b]] <- solve_chunk(sd_all[SimID %in% steps[[b]]], roster_size, cap_u, unit)
+    done <- done + length(steps[[b]])
+    if (verbose || !is.null(progress_callback)) {
       elapsed <- as.numeric(difftime(Sys.time(), start_time, units="secs"))
       if (verbose) {
-        cat(sprintf("\r  Phase 1: %d%% | %.1fs", round(i/n_sims*100), elapsed))
+        cat(sprintf("\r  Phase 1: %d%% | %.1fs", round(done/n_sims*100), elapsed))
         flush.console()
       }
       if (!is.null(progress_callback))
-        progress_callback(i/n_sims, sprintf("Phase 1: building lineup pool (%d%%)", round(i/n_sims*100)))
+        progress_callback(done/n_sims, sprintf("Phase 1: building lineup pool (%d%%)", round(done/n_sims*100)))
     }
   }
   if (verbose) cat("\n")
-  
-  all_lineups <- rbindlist(lineup_list[!sapply(lineup_list, is.null)])
+
+  all_lineups <- rbindlist(lineup_list)
   
   # Count how often each unique lineup was #1 optimal
   counts <- all_lineups[, .(Top1Count = .N,
