@@ -671,13 +671,19 @@ find_optimal_lineups_captain <- function(sim_results, config, k = 3, verbose = T
 
 find_optimal_lineups_combinatorial <- function(sim_results, config, verbose = TRUE,
                                                progress_callback = NULL) {
-  # Per-sim greedy optimal: for each sim, sort players by score and greedily
-  # pick the best roster_size players that fit under salary cap.
-  # Greedy IS optimal here — simple knapsack with only count + salary constraints.
-  # Dedupe across all sims → unique lineups ranked by how often each was #1.
-  # Far fewer unique lineups than combinatorial explosion (~100-2000 for MMA).
-  
-  if (verbose) cat("\nPhase 1: Finding optimal lineup per sim (greedy)...\n")
+  # Per-sim EXACT optimal: the best roster_size players under the salary cap,
+  # solved as a 0/1 knapsack with a count constraint (dynamic program over
+  # (players picked, salary used), then backtrack). Dedupe across all sims ->
+  # unique lineups ranked by how often each was #1.
+  #
+  # 19 Sep 2026: this used to be a greedy fill (take the top scorers until the
+  # cap binds, then whatever still fits), under the comment "greedy IS optimal
+  # here". It is not: on Cup Bristol 5626, 2,000 sims, greedy missed the true
+  # optimal in 87% of sims by 19.5 DK pts on average (max 62), over-stacked the
+  # top salaries and produced 1,074 unique lineups where the exact solve gives
+  # 1,896. Same defect already fixed for CFB/NFL classic (c7b7ef8, cd9c0c2).
+
+  if (verbose) cat("\nPhase 1: Finding optimal lineup per sim (exact)...\n")
   
   setDT(sim_results)
   roster_size <- config$roster_size
@@ -694,39 +700,54 @@ find_optimal_lineups_combinatorial <- function(sim_results, config, verbose = TR
                            nrow(players_dt), format(n_sims, big.mark=","),
                            format(salary_cap, big.mark=",")))
   
+  # Salaries in units of their greatest common divisor (DK/FD: $100), so the
+  # DP table is (roster_size + 1) x (cap / unit + 1) -- 7 x 501 for DK NASCAR.
+  gcd2 <- function(a, b) { while (b > 0) { t <- b; b <- a %% b; a <- t }; a }
+  unit <- Reduce(gcd2, as.integer(round(c(players_dt$Salary, salary_cap))))
+  cap_u <- as.integer(salary_cap %/% unit)
+
   # setkey for fast per-sim lookup
   setkey(sim_results, SimID)
   prog_freq <- max(1L, n_sims %/% 10L)
-  
+
   lineup_list <- vector("list", n_sims)
-  
+  NEG <- -1e12
+
   for (i in seq_along(sim_ids)) {
     sid      <- sim_ids[i]
     sim_data <- sim_results[.(sid)][Salary > 0 & !is.na(Salary) & !is.na(FantasyPoints)]
-    setorder(sim_data, -FantasyPoints)
-    
-    # Greedy: pick highest-scoring players that fit under cap
-    picked   <- character(roster_size)
-    n_picked <- 0L
-    sal_used <- 0
-    
-    for (j in seq_len(nrow(sim_data))) {
-      if (n_picked == roster_size) break
-      p   <- sim_data$Player[j]
-      sal <- sim_data$Salary[j]
-      if (sal_used + sal <= salary_cap) {
-        n_picked          <- n_picked + 1L
-        picked[n_picked]  <- p
-        sal_used          <- sal_used + sal
+    np  <- nrow(sim_data)
+    pts <- sim_data$FantasyPoints
+    w   <- as.integer(round(sim_data$Salary / unit))
+
+    # dp[k + 1, s + 1] = best score with k players using exactly s salary units
+    dp   <- matrix(NEG, roster_size + 1L, cap_u + 1L); dp[1L, 1L] <- 0
+    keep <- array(FALSE, c(np, roster_size + 1L, cap_u + 1L))
+    for (j in seq_len(np)) {
+      wj <- w[j]
+      if (wj > cap_u) next
+      for (k in roster_size:1L) {                       # descending k: each player used once
+        cand <- dp[k, 1L:(cap_u + 1L - wj)] + pts[j]
+        tgt  <- (1L + wj):(cap_u + 1L)
+        better <- cand > dp[k + 1L, tgt]
+        if (any(better)) {
+          idx <- tgt[better]
+          dp[k + 1L, idx]       <- cand[better]
+          keep[j, k + 1L, idx]  <- TRUE
+        }
       }
     }
-    
-    if (n_picked == roster_size) {
+    best_s <- which.max(dp[roster_size + 1L, ])
+
+    if (dp[roster_size + 1L, best_s] > NEG / 2) {
+      picked_idx <- integer(0); k <- roster_size + 1L; s <- best_s
+      for (j in np:1L) if (k > 1L && keep[j, k, s]) { picked_idx <- c(picked_idx, j); s <- s - w[j]; k <- k - 1L }
+      picked        <- sim_data$Player[picked_idx]
       picked_sorted <- sort(picked)   # canonical order for dedup
       lineup_list[[i]] <- data.table(
         Lineup      = paste(picked_sorted, collapse = "|"),
-        TotalSalary = sal_used,
-        TotalScore  = sum(sim_data$FantasyPoints[sim_data$Player %in% picked])
+        TotalSalary = sum(sim_data$Salary[picked_idx]),
+        TotalScore  = sum(pts[picked_idx])
       )
       # Store player columns in sorted order
       for (k in seq_len(roster_size)) lineup_list[[i]][[paste0("Player", k)]] <- picked_sorted[k]
