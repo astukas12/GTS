@@ -543,6 +543,8 @@ build_field_tiers <- function(metadata, specs, salary_cap, salary_floor,
 }
 
 
+
+
 # ============================================================================
 # FIELD VALUE SOURCE — ownership, else projections, else our own sim medians
 #
@@ -833,6 +835,280 @@ build_field_tiers_showdown <- function(own_dt, specs, salary_cap, n_flex,
     cat(sprintf("  [Field-SD] %-14s %4d lineups\n", specs[[k]]$label, nrow(tiers[[k]])))
   cat("\n")
   list(master = master, tiers = tiers)
+}
+
+# ============================================================================
+# CASH LADDER FIELD  —  the opponent a cash lineup is actually measured against
+#
+# A cash lineup's job is not to beat every roster that could legally be built.
+# It is to beat the chalk that other people actually enter. Those are different
+# questions and the second one is the only one a double-up pays on: the
+# enumerated universe contains ~93,000 rosters nobody will ever submit, and a
+# lineup's rank inside THAT is not information.
+#
+# So the cash measure is field-relative. This builds the field once, up front,
+# and hands find_optimal_lineups_enum_captain() everything it needs to ask, per
+# sim, "did this lineup clear the field's cut line" -- for twenty cut lines at
+# once. See the ladder block in that function.
+#
+# One field, built chalky, serves 2x/3x/5x: the public field for a double-up
+# and a triple-up is very nearly the same field. A 10x field is genuinely wider
+# and this one is too concentrated for it -- the tab says so rather than
+# pretending otherwise. Four tier-specific fields would mean four sweeps, since
+# a percentile is only meaningful against the field it was measured on, and
+# that is the whole thing the ladder exists to avoid.
+#
+# CASH_LADDER_PCT is dense where contests actually cut. The standard cash lines
+# land exactly on rungs -- a double-up pays the top 45%, so it reads the 55th
+# percentile; 3x reads the 70th, 5x the 80th, 10x the 90th -- and the top end is
+# dense enough that a small winner-take-all field can be integrated off the
+# same twenty numbers.
+# ============================================================================
+
+CASH_LADDER_PCT <- c(0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.55, 0.60, 0.65,
+                     0.70, 0.75, 0.80, 0.85, 0.90, 0.93, 0.95, 0.97, 0.98,
+                     0.99, 0.995)
+
+# Ownership is raised to this power before sampling. The sampler's own default
+# is 1.0 -- draw players in proportion to projected ownership -- which builds a
+# field wider than a double-up field really is. Real cash entries concentrate
+# harder than the ownership projection implies, because the people entering them
+# are all reading the same value plays.
+CASH_FIELD_ALPHA <- 1.35
+
+# Size of the sampled field the ladder measures against. It is read 20 ways per
+# sim rather than once, so a bigger field buys smoother cut lines for almost
+# nothing -- the field pass benchmarked at 0.05s per 300 sims against 1.47s for
+# the sweep it rides along with.
+CASH_FIELD_N <- 1000L
+
+#' Cheap deterministic fold of a character vector to one integer.
+#'
+#' Only ever used to notice that a stored cash curve was built against a
+#' different field or a different sim count, so it does not have to be a real
+#' hash -- and a real one would mean adding `digest` to a file that has no
+#' dependencies of its own.
+.cash_sig <- function(x) {
+  v <- vapply(as.character(x), function(s)
+    sum(utf8ToInt(s) * seq_along(utf8ToInt(s))), numeric(1), USE.NAMES = FALSE)
+  as.integer(sum(v) %% .Machine$integer.max)
+}
+
+#' Build the chalk field the cash ladder is measured against.
+#'
+#' @param meta      sim_metadata (needs a salary column; ownership if the sheet
+#'                  has it, projections otherwise, sim medians as last resort)
+#' @param sim_res   simulation_results, for the median fallback
+#' @param config    sport config
+#' @param n_flex    non-captain slots (5 on DK NFL showdown)
+#' @return list ready to drop into opt_config$cash_field, or NULL if the slate
+#'         cannot support a field (caller then runs exactly as it does today)
+cash_ladder_field <- function(meta, sim_res, config, platform = "SD",
+                              n_flex = 5L, salary_cap = 50000,
+                              n_field = CASH_FIELD_N,
+                              alpha = CASH_FIELD_ALPHA,
+                              score_col = "DKScore", verbose = TRUE) {
+  out <- tryCatch({
+    cols <- cash_sd_cols(config, meta, platform)
+    fo   <- cash_field_ownership(meta, sim_res, cols, score_col,
+                                 n_flex_slots = n_flex)
+
+    fld <- generate_field_lineups_showdown(
+      fo$own, n = n_field, n_flex = n_flex,
+      salary_cap   = salary_cap,
+      salary_floor = salary_cap * 0.90,
+      alpha        = alpha)
+
+    slot_cols <- c("Captain", paste0("Util", seq_len(n_flex)))
+
+    # Entry duplication. generate_field_lineups_showdown() returns the field
+    # already sorted by ownership, so the decay lines up with it: the chalkiest
+    # roster is entered max_weight times, the least chalky once. This is the
+    # double_up spec's decay -- the chalky end, deliberately.
+    w <- build_weights(paste0("F", seq_len(nrow(fld))),
+                       max_weight = CONTEST_TYPES$double_up$max_weight,
+                       min_weight = CONTEST_TYPES$double_up$min_weight)
+
+    list(
+      cpt        = as.character(fld$Captain),
+      flex       = t(as.matrix(fld[, paste0("Util", seq_len(n_flex)), with = FALSE])),
+      weights    = as.numeric(w),
+      pct        = CASH_LADDER_PCT,
+      cpt_mult   = cols$cpt_mult,
+      label      = fo$label,
+      n_field    = nrow(fld),
+      max_weight = CONTEST_TYPES$double_up$max_weight,
+      alpha      = alpha,
+      sig        = .cash_sig(c(unlist(fld[, slot_cols, with = FALSE]),
+                               as.character(w))))
+  }, error = function(e) {
+    # A field we cannot build is not a reason to fail a tournament run. The
+    # sweep drops back to exactly what it does today and the Cash tab falls
+    # back to its own scoring path.
+    cat(sprintf("  [Cash-ladder] no field (%s) -- cash curve skipped\n", e$message))
+    NULL
+  })
+
+  if (!is.null(out) && verbose)
+    cat(sprintf("  [Cash-ladder] field: %d lineups, alpha %.2f, dup 1-%dx | %s\n",
+                out$n_field, out$alpha, out$max_weight, out$label))
+  out
+}
+
+
+# ============================================================================
+# CASH FROM THE LADDER  —  a lookup, not a scoring run
+#
+# When the tournament sweep built a cash curve (showdown; see
+# find_optimal_lineups_enum_captain), the Cash tab does no work at all: no
+# field build, no scoring pass, no contest evaluation. Every contest shape is a
+# read off the curve at 1 - cash_pct.
+#
+# The curve's rungs are percentiles of the FIELD. A contest paying the top 45%
+# is asking "did you beat the 55th percentile of the people you are playing
+# against", so cash_pct 0.45 reads the 0.55 rung -- and the standard lines all
+# land on a rung exactly. Anything else interpolates linearly between the two
+# rungs either side, which is well behaved because the curve is monotone in p
+# by construction.
+#
+# Two honest differences from the scoring path this replaces:
+#
+#  * The cut line is set by the FIELD alone. The old path put your own 50
+#    lineups into the contest and let them push each other down the standings;
+#    in a real double-up your one entry does not move the cut. Cash rates read
+#    slightly higher here for that reason alone, independent of selection.
+#  * There is no MedianScore. The ladder never holds a lineup's scores -- that
+#    is the entire point, the raw matrix is 18 GB -- so the table carries
+#    MeanScore, the weighted mean of player means, and says so.
+# ============================================================================
+
+#' Read a contest's cash rate for every lineup off the ladder.
+#'
+#' @param curve  n x K matrix of rates, columns at `pct`
+#' @param pct    ladder rungs, ascending
+#' @param cash_pct  fraction of the field that gets paid
+cash_rate_at <- function(curve, pct, cash_pct) {
+  p <- 1 - cash_pct
+  if (p <= pct[1])            return(curve[, 1])
+  if (p >= pct[length(pct)])  return(curve[, ncol(curve)])
+  j <- findInterval(p, pct)
+  if (isTRUE(all.equal(p, pct[j]))) return(curve[, j])
+  w <- (p - pct[j]) / (pct[j + 1L] - pct[j])
+  curve[, j] * (1 - w) + curve[, j + 1L] * w
+}
+
+#' Build the Cash tab's whole result set from a stored curve.
+#'
+#' Returns exactly the shapes the scoring path returns — long / wide /
+#' combined / tiers / exposure — so every output on the tab is untouched.
+cash_from_curve <- function(cc, specs, n_yours, meta, sim_res, config,
+                            platform = "SD", sal_col = "SDSalary",
+                            own_col = "DKOwn", score_col = "DKScore") {
+
+  n_flex    <- ncol(cc$lineups) - 2L          # Captain + Util1..N + TotalSalary + MeanScore
+  std_cols  <- c("Captain", grep("^Util", names(cc$lineups), value = TRUE))
+  n_flex    <- length(std_cols) - 1L
+
+  yl <- copy(cc$lineups)
+  fl <- copy(cc$field$lineups)
+
+  # Ownership, for AvgOwn and for the exposure table. Cheap — this is the
+  # ownership resolve, not a field build and not a scoring pass.
+  fo <- tryCatch(cash_field_ownership(meta, sim_res,
+                                      cash_sd_cols(config, meta, platform),
+                                      score_col, n_flex_slots = n_flex),
+                 error = function(e) NULL)
+  avg_own <- function(dt) {
+    if (is.null(fo)) return(rep(NA_real_, nrow(dt)))
+    co <- setNames(fo$own$CptOwn,  fo$own$Player)
+    fw <- setNames(fo$own$FlexOwn, fo$own$Player)
+    lo <- log(pmax(cbind(co[dt$Captain],
+                         sapply(std_cols[-1], function(cl) fw[dt[[cl]]])), 1e-9))
+    round(exp(rowMeans(lo)), 2)
+  }
+  sal_of <- function(dt) {
+    if (is.null(fo)) return(rep(NA_real_, nrow(dt)))
+    cs <- setNames(fo$own$CptSal,  fo$own$Player)
+    fs <- setNames(fo$own$FlexSal, fo$own$Player)
+    as.numeric(cs[dt$Captain] + rowSums(sapply(std_cols[-1], function(cl) fs[dt[[cl]]])))
+  }
+
+  fl[, AvgOwn := avg_own(fl)]
+  fl[, TotalSalary := sal_of(fl)]
+  yl[, AvgOwn := avg_own(yl)]
+  # The field arrives ownership-ordered from the sampler, so a tier is a head().
+  fl[, .rank := seq_len(.N)]
+
+  # Your pool: the best lineups across the contests actually selected, not the
+  # best on one of them. A lineup that tops the double-up and dies at 10x still
+  # belongs on the tab when the double-up is one of the boxes ticked.
+  ymax <- do.call(pmax, lapply(specs, function(s)
+    cash_rate_at(cc$curve, cc$pct, s$cash_pct)))
+  ysel <- order(ymax, decreasing = TRUE)[seq_len(min(n_yours, nrow(yl)))]
+  yl   <- yl[ysel]
+  yl[, LineupID := paste0("Y", seq_len(.N))]
+
+  n_fmax <- min(max(sapply(specs, `[[`, "n_field")), nrow(fl))
+  fu     <- fl[seq_len(n_fmax)]
+  fu[, LineupID := paste0("F", seq_len(.N))]
+
+  keep <- c("LineupID", std_cols, "TotalSalary", "AvgOwn", "MeanScore")
+  combined <- rbindlist(list(yl[, keep, with = FALSE], fu[, keep, with = FALSE]),
+                        use.names = TRUE)
+
+  tiers <- lapply(specs, function(s) fu[seq_len(min(s$n_field, nrow(fu)))])
+  names(tiers) <- names(specs)
+
+  long <- rbindlist(lapply(names(specs), function(k) {
+    s  <- specs[[k]]
+    ry <- cash_rate_at(cc$curve,       cc$pct, s$cash_pct)[ysel]
+    rf <- cash_rate_at(cc$field$curve, cc$pct, s$cash_pct)[seq_len(nrow(tiers[[k]]))]
+    data.table(
+      LineupID    = c(yl$LineupID, tiers[[k]]$LineupID),
+      Source      = c(rep("Yours", nrow(yl)), rep("Field", nrow(tiers[[k]]))),
+      MeanScore   = round(c(yl$MeanScore, tiers[[k]]$MeanScore), 2),
+      CashRate    = round(100 * c(ry, rf), 1),
+      Contest     = s$label,
+      ContestKey  = k)
+  }), use.names = TRUE)
+
+  wide <- NULL
+  yours <- long[Source == "Yours"]
+  if (nrow(yours)) {
+    wide <- dcast(yours, LineupID ~ Contest, value.var = "CashRate")
+    ct   <- sapply(specs, `[[`, "label")
+    ct   <- ct[ct %in% names(wide)]
+    if (length(ct)) {
+      cm <- as.matrix(wide[, ct, with = FALSE]); cm[is.na(cm)] <- -Inf
+      wide[, BestContest := ct[max.col(cm, ties.method = "first")]]
+      wide[, BestCash := apply(cm, 1L, function(r) { m <- max(r); if (is.finite(m)) m else NA_real_ })]
+      setcolorder(wide, c("LineupID", ct, "BestContest", "BestCash"))
+      setorder(wide, -BestCash)
+    }
+  }
+
+  widest   <- names(specs)[which.max(sapply(specs, `[[`, "n_field"))]
+  exp_meta <- copy(as.data.table(meta))
+  if (sal_col %in% names(exp_meta) && sal_col != "DKSalary")
+    setnames(exp_meta, sal_col, "DKSalary")
+  if (own_col %in% names(exp_meta) && own_col != "DKOwn")
+    setnames(exp_meta, own_col, "DKOwn")
+  exposure <- tryCatch(
+    build_combined_exposure(tiers[[widest]], yl, exp_meta, std_cols),
+    error = function(e) NULL)
+
+  # One field serves every tier, and it is built at the chalky end because that
+  # is what a double-up field is. A 10x field is genuinely wider than this, so
+  # that row is read off a tighter field than the real one and the tab says so
+  # rather than quietly presenting it as the same kind of number.
+  lbl <- sprintf("%s — cut line from the field alone, %d lineups, 1-%dx duplication",
+                 cc$field$label, cc$field$n_field, cc$field$max_weight)
+  if ("ten_x" %in% names(specs))
+    lbl <- paste0(lbl, " · 10x is read off this same chalk field, which is ",
+                  "tighter than a real 10x field — treat that row as approximate")
+
+  list(long = long, wide = wide, combined = combined, tiers = tiers,
+       exposure = exposure, std_cols = std_cols, field_label = lbl)
 }
 
 
@@ -1720,6 +1996,49 @@ register_cash_game_observers <- function(input, output, session, rv) {
       
       dk_opt  <- copy(as.data.table(opt_lus))
       sim_res <- copy(as.data.table(rv$simulation_results))
+
+      # ── Ladder short-circuit ─────────────────────────────────────────────
+      # If the tournament sweep left a cash curve behind, everything below is
+      # already done: the field was built and every lineup in the band was
+      # measured against it, twenty cut lines at a time, while the sweep was
+      # running. So this is a lookup and a sort. Falls through to the scoring
+      # path below for every other roster shape, and whenever the curve does
+      # not belong to the sim currently loaded.
+      cc <- if (identical(plat, "DK")) rv$dk_cash_curve else NULL
+      if (!is.null(cc) && !is.null(cc$curve) &&
+          isTRUE(cc$n_sims == length(unique(sim_res$SimID)))) {
+        cat(sprintf("
+  [Contests] %s | cash ladder | %s lineups x %d cut lines | no scoring pass
+",
+                    plat, format(nrow(cc$lineups), big.mark = ","), length(cc$pct)))
+        flush.console()
+        progress$set(detail = "Reading the cash ladder...", value = 0.4)
+
+        res <- cash_from_curve(cc, specs, cash_p$n_yours, meta_raw, sim_res,
+                               rv$config, platform = plat,
+                               sal_col = sal_col, own_col = own_col,
+                               score_col = score_col)
+
+        du_rv$long <- res$long;         du_rv$wide     <- res$wide
+        du_rv$tiers <- res$tiers;       du_rv$combined <- res$combined
+        du_rv$exposure <- res$exposure; du_rv$std_cols <- res$std_cols
+        du_rv$platform <- plat;         du_rv$id_col   <- id_col
+        du_rv$specs <- specs;           du_rv$view     <- names(specs)[1]
+        du_rv$field_label <- res$field_label
+        du_rv$has_results <- TRUE
+
+        elapsed <- as.numeric(difftime(Sys.time(), t_total, units = "secs"))
+        du_rv$status <- sprintf(
+          "Contests complete — %s | cash ladder | %d tiers | %s sims | %.1fs",
+          plat, length(specs), format(cc$n_sims, big.mark = ","), elapsed)
+        cat(sprintf("  [Contests] Complete in %.1fs (lookup)
+
+", elapsed))
+        flush.console()
+        progress$set(detail = "Done!", value = 1)
+        showNotification("Contest read from the cash ladder.", type = "message")
+        return(invisible(NULL))
+      }
       
       player_cols <- get_player_cols(dk_opt)
       r_size      <- length(player_cols)
@@ -2149,11 +2468,15 @@ register_cash_game_observers <- function(input, output, session, rv) {
     std_cols <- du_rv$std_cols
     base     <- du_rv$combined[, c("LineupID", std_cols, "TotalSalary", "AvgOwn"),
                                with = FALSE]
-    dt <- merge(sub[, .(LineupID, Source, MedianScore, AvgFinish, CashRate)],
+    # The ladder path carries MeanScore and has no AvgFinish -- it never holds
+    # a lineup's per-sim scores, which is exactly what makes it cheap. Take
+    # whichever score columns the active path actually produced.
+    mcols <- intersect(c("MedianScore", "MeanScore", "AvgFinish"), names(sub))
+    dt <- merge(sub[, c("LineupID", "Source", mcols, "CashRate"), with = FALSE],
                 base, by = "LineupID")
-    
+
     setcolorder(dt, c("LineupID", "Source", std_cols, "TotalSalary", "AvgOwn",
-                      "MedianScore", "AvgFinish", "CashRate"))
+                      mcols, "CashRate"))
     setorder(dt, -CashRate)
     
     slot_labels <- get_slot_labels(rv$config, length(std_cols))
@@ -2168,7 +2491,7 @@ register_cash_game_observers <- function(input, output, session, rv) {
               class = "stripe hover compact") %>%
       { if ("TotalSalary" %in% names(dt)) formatCurrency(., "TotalSalary", "$", digits = 0) else . } %>%
       { if ("AvgOwn" %in% names(dt)) formatRound(., "AvgOwn", 2) else . } %>%
-      formatRound(c("MedianScore", "CashRate"), 1) %>%
+      formatRound(intersect(c("MedianScore", "MeanScore", "CashRate"), names(dt)), 1) %>%
       formatStyle("CashRate", fontWeight = "600", color = "#ddd") %>%
       formatStyle("Source",
                   color      = styleEqual(c("Yours", "Field"), c("#FFE500", "#aaaaaa")),
@@ -2245,7 +2568,9 @@ register_cash_game_observers <- function(input, output, session, rv) {
         if (nrow(sub) == 0L) next
         base <- du_rv$combined[, c("LineupID", std_cols, "TotalSalary", "AvgOwn"),
                                with = FALSE]
-        dl <- merge(sub[, .(LineupID, Source, MedianScore, AvgFinish, CashRate)],
+        dl <- merge(sub[, c("LineupID", "Source",
+                            intersect(c("MedianScore", "MeanScore", "AvgFinish"),
+                                      names(sub)), "CashRate"), with = FALSE],
                     base, by = "LineupID")
         setorder(dl, -CashRate)
         dl <- add_ids(copy(dl))
