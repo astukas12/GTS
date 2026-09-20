@@ -25,9 +25,59 @@ library(parallel)
 # Callers also skip the cluster entirely at n == 1: a one-worker PSOCK cluster
 # pays full serialisation cost for no parallelism, so the serial branch is
 # strictly faster there. No change on any machine with 3+ cores.
+# Total physical RAM in GB, best effort. Used to size two things that were
+# hard-coded for a big desktop: how many PSOCK workers to spawn, and how large
+# a scoring matrix to materialise. Measured on the machine this runs on:
+# 7.6 GB total with ~1.5 GB free while the app holds a sim -- against a 4 GB
+# matrix trigger that therefore never fired, and 7 worker processes each
+# carrying its own copy of data.table plus a data chunk.
+#
+# Every probe is wrapped: an unknown machine falls back to 8 GB, which keeps
+# today's behaviour rather than silently throttling someone.
+.opt_total_ram_gb <- local({
+  cached <- NULL
+  function() {
+    if (!is.null(cached)) return(cached)
+    probe <- function(cmd, args) {
+      out <- suppressWarnings(system2(cmd, args, stdout = TRUE, stderr = FALSE))
+      v <- suppressWarnings(as.numeric(grep("^[0-9]+$", trimws(out), value = TRUE)[1]))
+      if (length(v) != 1L || is.na(v) || v <= 0) NA_real_ else v / 1024^3
+    }
+    g <- tryCatch({
+      if (.Platform$OS.type == "windows") {
+        # wmic is gone on current Windows 11 -- it returned nothing here and the
+        # 8 GB fallback silently hid a 7.6 GB machine. CIM first, wmic second.
+        v <- probe("powershell",
+                   c("-NoProfile", "-Command",
+                     "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory"))
+        if (is.na(v)) v <- probe("wmic", c("ComputerSystem", "get", "TotalPhysicalMemory"))
+        v
+      } else if (file.exists("/proc/meminfo")) {
+        kb <- suppressWarnings(as.numeric(gsub("[^0-9]", "",
+                grep("^MemTotal", readLines("/proc/meminfo"), value = TRUE)[1])))
+        if (is.na(kb)) NA_real_ else kb / 1024^2
+      } else NA_real_
+    }, error = function(e) NA_real_)
+    if (is.null(g) || length(g) != 1L || is.na(g) || g <= 0) g <- 8
+    cached <<- g                       # one probe per session, not per solve
+    g
+  }
+})
+
+# Largest scoring matrix worth materialising, in GB. A quarter of RAM: the
+# process also holds the sim table, the lineup pool and the workers, so half
+# would thrash. Floor of 0.5 GB keeps small slates on the fast path.
+.opt_matrix_budget_gb <- function() max(0.5, .opt_total_ram_gb() * 0.25)
+
 .opt_workers <- function(cap = 7L) {
   n <- suppressWarnings(as.integer(parallel::detectCores()))
   if (length(n) != 1L || is.na(n) || n < 1L) n <- 1L
+  # NOT capped by RAM, though each PSOCK worker is its own R process with
+  # its own data.table and data slice. That cap was written and then
+  # removed: benchmarked on the 7.6 GB machine at 6,000 sims, more
+  # workers won cleanly -- 7 workers 12.5s, 5 15.4s, 3 16.3s, 1 37.2s.
+  # Memory pressure is real on that box but throttling cores is not the
+  # lever; the scoring matrix is (see .opt_matrix_budget_gb).
   max(1L, min(n - 1L, cap))
 }
 
@@ -1437,7 +1487,8 @@ find_optimal_lineups_combinatorial_mvp <- function(sim_results, config, verbose 
 # =============================================================================
 
 score_all_lineups <- function(lineup_data, sim_results, verbose = TRUE, sims_per_batch = 5000,
-                              progress_callback = NULL) {
+                              progress_callback = NULL,
+                              max_matrix_gb = .opt_matrix_budget_gb()) {
   
   if (verbose) cat("\nPhase 2: Scoring lineups (matrix method)...\n")
   
@@ -1452,7 +1503,9 @@ score_all_lineups <- function(lineup_data, sim_results, verbose = TRUE, sims_per
   # MEMORY CHECK: Calculate if we can fit full matrix in memory (assume 4GB available)
   # Use as.numeric() to avoid integer overflow for large matrices
   matrix_size_gb <- (as.numeric(n_lineups) * as.numeric(n_sims) * 8) / (1024^3)
-  use_efficient_mode <- matrix_size_gb > 4
+  # Was a hard-coded 4 GB, which never fired on a 7.6 GB machine even as
+  # the app ran out of memory around it. Now a share of actual RAM.
+  use_efficient_mode <- matrix_size_gb > max_matrix_gb
   
   if (verbose) {
     cat(sprintf("  %s lineups × %s sims | Mode: %s\n",
@@ -1461,7 +1514,7 @@ score_all_lineups <- function(lineup_data, sim_results, verbose = TRUE, sims_per
                 mode))
     
     if (use_efficient_mode) {
-      cat(sprintf("  Memory-efficient: %.1f GB needed, using rank accumulation\n", matrix_size_gb))
+      cat(sprintf("  Memory-efficient: %.2f GB needed vs %.2f GB budget, using rank accumulation\n", matrix_size_gb))
     }
   }
   
@@ -3195,4 +3248,89 @@ find_optimal_lineups_nfl_classic_locked <- function(sim_results, config, verbose
        mode = "nfl_classic_locked",
        lock_info = list(locked = locked, excluded = excluded, cond_frac = frac,
                         n_cond_sims = length(keep_ids), n_solved = length(full9)))
+}
+
+
+# ============================================================================
+# REFERENCE FIELD  (20 Sep 2026)
+# ============================================================================
+# Win% and Top n% are POOL-RELATIVE -- calculate_distribution_metrics ranks
+# each lineup against the others in the same score matrix. So to make a second,
+# smaller pool comparable with the main pool, the two have to share a field.
+#
+# The obvious way is to score both together, and that is what the Lineup Lab
+# did first. It works but it is nearly all waste: ~94% of the scored lineups
+# are the main pool's, which the app scored minutes earlier and threw away.
+# Scoring is the dominant phase at high sim counts, so that is the whole cost.
+#
+# The fix: the only thing a second pool needs from the field is, PER SIM, the
+# best score and the score at each percentile cut-off. That is 5 numbers per
+# sim -- 800KB at 20,000 sims, against ~800MB for the matrix that produced
+# them. Cache those once when the main pool is scored and any later pool can be
+# measured against the same field for the cost of scoring only itself.
+#
+# The threshold definitions are lifted verbatim from
+# calculate_distribution_metrics so the numbers mean the same thing:
+#   win   : score == the sim's column max        -> here, score >= ref$max
+#   top p : score >= the k-th largest score,
+#           k = ceiling(n_lineups * p)           -> here, score >= ref$kth[, p]
+#
+# One deliberate difference. Scored together, a sim has exactly one winner, so
+# two lineups that both beat the field split nothing -- only one is credited.
+# Against a cached field both are credited, because the question becomes "does
+# this lineup beat everything in the main pool" rather than "is it the single
+# best of this particular pile". That is the more stable statistic: it does not
+# move when the user asks for 500 lineups instead of 300.
+
+# Summarise a scored pool into the per-sim thresholds a later pool is measured
+# against. Returns NULL for the memory-efficient score_all_lineups path, which
+# never materialises a matrix -- callers fall back to scoring together.
+field_reference <- function(score_matrix, percentiles = c(0.01, 0.05, 0.10, 0.20),
+                            chunk_size = 2000L) {
+  if (is.null(score_matrix) || !is.matrix(score_matrix)) return(NULL)
+  n_l <- nrow(score_matrix); n_s <- ncol(score_matrix)
+  if (n_l < 1L || n_s < 1L) return(NULL)
+
+  .has_ms  <- requireNamespace("matrixStats", quietly = TRUE)
+  .colMaxs <- if (.has_ms) matrixStats::colMaxs else function(x) apply(x, 2L, max)
+  .colOrd  <- if (.has_ms) matrixStats::colOrderStats else
+              function(x, which) apply(x, 2L, function(v) sort(v, partial = which)[which])
+
+  kr  <- ceiling(n_l * percentiles)
+  mx  <- numeric(n_s)
+  kth <- matrix(-Inf, nrow = n_s, ncol = length(percentiles))
+
+  for (a in seq(1L, n_s, by = chunk_size)) {
+    b  <- min(a + chunk_size - 1L, n_s)
+    cs <- score_matrix[, a:b, drop = FALSE]
+    mx[a:b] <- .colMaxs(cs)
+    for (p in seq_along(percentiles)) {
+      k <- kr[p]
+      # k >= n_lineups means the cut takes the whole pool; -Inf lets everything
+      # through, matching the ncol() short-circuit in the original.
+      if (k < n_l) kth[a:b, p] <- .colOrd(cs, which = n_l - k + 1L)
+    }
+  }
+  list(max = mx, kth = kth, percentiles = percentiles,
+       n_lineups = n_l, n_sims = n_s)
+}
+
+# Rates for a pool measured against a cached field rather than against itself.
+# Returns percentages in the same units as calculate_distribution_metrics.
+rates_vs_field <- function(score_matrix, ref, chunk_size = 2000L) {
+  stopifnot(is.matrix(score_matrix), !is.null(ref))
+  n_l <- nrow(score_matrix); n_s <- ncol(score_matrix)
+  if (n_s != ref$n_sims)
+    stop(sprintf("field reference is %s sims, this pool is %s -- re-run the main pool",
+                 format(ref$n_sims, big.mark = ","), format(n_s, big.mark = ",")))
+  win <- integer(n_l)
+  tp  <- matrix(0L, nrow = n_l, ncol = length(ref$percentiles))
+  for (a in seq(1L, n_s, by = chunk_size)) {
+    b  <- min(a + chunk_size - 1L, n_s)
+    cs <- score_matrix[, a:b, drop = FALSE]
+    win <- win + rowSums(cs >= rep(ref$max[a:b], each = n_l))
+    for (p in seq_along(ref$percentiles))
+      tp[, p] <- tp[, p] + rowSums(cs >= rep(ref$kth[a:b, p], each = n_l))
+  }
+  list(win_rate = win / n_s * 100, top_pcts = tp / n_s * 100)
 }

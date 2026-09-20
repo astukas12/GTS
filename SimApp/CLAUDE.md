@@ -134,12 +134,43 @@ to be fixed in that solver — `k == 0` (a position with no slots left) and
 minimums are all >= 1; verified by re-running the unconstrained NFL classic
 solve and getting a bit-identical 1,821-lineup pool.
 
-**Metrics are scored against every sim, not the conditioned subset**, so Win% /
-Top1% on a Lab lineup mean exactly what they mean on the main pool. `n_sims`
-returned by the solver is deliberately the full count. `Top1Count` is
-re-attached after `calculate_distribution_metrics` (which drops it) and shown as
-`Repeats`, but per the table above it is near-constant at 1–2 and should not be
-ranked on; it is there so the degeneracy is visible rather than hidden.
+**Metrics need the same sims AND the same field.** Same sims: scored against
+every sim, never the conditioned subset, so `n_sims` from the solver is
+deliberately the full count. Same field: Win% / Top n% are **pool-relative**
+(`score_all_lineups` ranks each lineup against the others in its own matrix), so
+a 300-lineup Lab pool scored alone posts ~14x better rates purely for having
+less competition. The Lab is therefore measured against the **main pool as its
+field**.
+
+That used to mean scoring both pools together — correct but ~94% waste, since
+the main pool was already scored minutes earlier. `field_reference()` now
+summarises a scored pool into its per-sim best score and percentile cut-offs
+(**782 KB** at 20k sims vs the ~800 MB matrix), stashed as
+`rv$dk_field_ref` / `rv$fd_field_ref`; `rates_vs_field()` measures the Lab
+against it. Measured at 20k sims: **44.4s → 4.2s, a 10.7x speedup**, with
+rho 0.993–0.9997 and 94–100% top-50 overlap against the combined-scoring
+answer, the cached side reading +0.08 to +0.26 pts higher exactly as predicted
+(its field excludes the Lab's own good lineups). One deliberate difference:
+against a cached field two lineups that both beat it are both credited, where
+scoring together credits only the single best — the cached statistic is the
+more stable one, since it does not move when the user asks for 500 lineups
+instead of 300. Falls back to scoring together when there is no cached field
+(memory-efficient scoring path, or a stale sim count).
+
+`Top1Count` is re-attached after `calculate_distribution_metrics` (which drops
+it) but is **not displayed** — per the table above it is 1–2 for everything, and
+showing it invited sorting on noise.
+
+**The picker is a pill board, not a dropdown.** Filter by game chip / position
+chip / name, then click a player: once locks (green), twice keeps out (red),
+three times clears. Two multi-selectize boxes were the first cut and were the
+wrong control — a DFS player picks a game stack or a position group, not a name
+from an alphabetical list of 317. State lives in `rv$ll_lock_set` /
+`rv$ll_excl_set`; the board caps at 120 pills and says so. The exposure table
+additionally carries **LOCK / EXCL** columns that refine the pool **already
+built**, with no re-solve (`rv$ll_pool_lock` / `rv$ll_pool_excl`) — the same
+two-button idiom as the main exposure table. ★ marks players the solve was
+built around, so their 100% rows read as construction rather than a finding.
 
 **Gating.** The tab hides itself unless the sport is `NFL_CLASSIC` *and* that
 platform's normal pool already exists, because the Portfolio Builder only
@@ -149,6 +180,35 @@ cleared by `reset_all_state()` like any other sim-derived state.
 `find_optimal_lineups_nfl_classic_locked()` in `OptimalLineups_Core.R` holds the
 constraint maths and is commented in full. Other sports need their own slot
 bounds before the tab can be offered to them.
+
+## Worker count and memory limits (20 Sep 2026)
+
+Two hard-coded constants were sized for a big desktop and are now probed.
+
+`.opt_workers()` replaces six copies of `min(detectCores() - 1, 7)`. That
+expression **crashed** on a single-core machine (`min(0, 7)` →
+`makeCluster(0)`) and when `detectCores()` returns `NA`, which it is documented
+to be allowed to do — an error instead of lineups, on every sport. It now
+floors at 1 and skips the cluster entirely at one worker, where a one-process
+PSOCK cluster pays full serialisation for no parallelism. Identical on 3+ cores.
+
+It is deliberately **not** capped by RAM. That cap was written and reverted:
+benchmarked on the 7.6 GB dev machine at 6,000 sims, more workers won cleanly —
+7 workers 12.5s, 5 15.4s, 3 16.3s, 1 37.2s.
+
+`.opt_matrix_budget_gb()` replaces `score_all_lineups`' hard-coded 4 GB trigger
+for its memory-efficient path with a quarter of actual RAM
+(`.opt_total_ram_gb()`, cached once per session). The dev machine has **7.6 GB
+total and ~1.5 GB free with a sim loaded**, so a 4 GB trigger never fired while
+the app starved around it — R segfaulted reading a 20k sim cache during this
+work. The efficient path is **numerically identical** (all five metrics matched
+to 1e-10 on a 3,000-lineup / 6,000-sim pool) and ~2.2x slower, so it is a pure
+exact memory-for-speed trade. Note `field_reference()` returns NULL on that
+path, so the Lab falls back to scoring both pools together.
+
+`.opt_total_ram_gb()` probes PowerShell CIM first: `wmic` is gone on current
+Windows 11 and returned nothing, silently reporting the fallback 8 GB for a
+7.6 GB machine. Unknown platforms still fall back to 8 GB rather than throttle.
 
 ## Running it
 

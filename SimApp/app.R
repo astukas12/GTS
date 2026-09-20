@@ -617,6 +617,12 @@ server <- function(input, output, session) {
     rv$ll_results          <- NULL
     rv$ll_info             <- NULL
     rv$ll_platform         <- NULL
+    rv$ll_lock_set         <- character(0)
+    rv$dk_field_ref        <- NULL
+    rv$fd_field_ref        <- NULL
+    rv$ll_excl_set         <- character(0)
+    rv$ll_pool_lock        <- character(0)
+    rv$ll_pool_excl        <- character(0)
     # rv$cfb_full_sim_results / _metadata (the pristine whole-card CFB_CLASSIC
     # sim a Tournament-Lineups slate pick re-slices from) are deliberately NOT
     # cleared here -- reset_all_state() runs on every new sim AND on every
@@ -655,11 +661,21 @@ server <- function(input, output, session) {
     dk_lock_v          = 0L,
     fd_lock_v          = 0L,
     sd_lock_v          = 0L,
-    # Lineup Lab: the constrained pool, the lock that produced it, and which
-    # site it was solved for (see lineup_lab_module.R).
+    # Lineup Lab: the constrained pool, the lock that produced it, which
+    # site it was solved for, and the player sets the pill board writes
+    # (see lineup_lab_module.R).
     ll_results         = NULL,
     ll_info            = NULL,
     ll_platform        = NULL,
+    ll_lock_set        = character(0),
+    # Per-sim thresholds of each platform's main pool, so the Lab can be
+    # measured against it without re-scoring it.
+    dk_field_ref       = NULL,
+    fd_field_ref       = NULL,
+    ll_excl_set        = character(0),
+    # Row-level refine on the BUILT Lab pool (no re-solve).
+    ll_pool_lock       = character(0),
+    ll_pool_excl       = character(0),
     # Lock / exclude now lives in the exposure table: click the LOCK cell on a
     # row to cycle it through lock -> exclude -> clear. These hold the player
     # names for each state. "_cpt" is the captain/MVP slot specifically, which
@@ -1788,6 +1804,13 @@ server <- function(input, output, session) {
         progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
                                     format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
         score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
+        # Lineup Lab measures a constrained pool against THIS pool as its
+        # field. Summarise it now, while the matrix is in hand: per sim, the
+        # best score and each percentile cut-off. ~800KB at 20k sims, against
+        # re-scoring 5,000 lineups later (the Lab's dominant cost). NULL on the
+        # memory-efficient path, where the Lab falls back to scoring together.
+        rv$dk_field_ref <- field_reference(score_matrix,
+                                        opt_config$percentiles %||% c(0.01,0.05,0.10,0.20))
         progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
         own_data <- copy(rv$sim_metadata)
         if ("DKOwn" %in% names(own_data)) { setnames(own_data, "DKOwn", "Own")
@@ -2030,6 +2053,13 @@ server <- function(input, output, session) {
         progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
                                     format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
         score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
+        # Lineup Lab measures a constrained pool against THIS pool as its
+        # field. Summarise it now, while the matrix is in hand: per sim, the
+        # best score and each percentile cut-off. ~800KB at 20k sims, against
+        # re-scoring 5,000 lineups later (the Lab's dominant cost). NULL on the
+        # memory-efficient path, where the Lab falls back to scoring together.
+        rv$fd_field_ref <- field_reference(score_matrix,
+                                        opt_config$percentiles %||% c(0.01,0.05,0.10,0.20))
         progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
         own_data <- copy(rv$sim_metadata)
         if ("FDOwn" %in% names(own_data)) { setnames(own_data, "FDOwn", "Own")
