@@ -2467,7 +2467,10 @@ Phase 1: optimal classic lineup for %s sims
   setorder(SS, SimID, Pos, Salary, -fpj)
   SS[, keep := {
     hh <- h[1]; k <- logical(.N); top <- rep(-Inf, hh)
-    for (i in seq_len(.N)) {
+    # hi[P] == 0 means the roster has no room left at P at all (the constrained
+    # solve decrements hi by the locked count). Nothing at that position can be
+    # needed, and top[hh] would index position zero.
+    if (hh >= 1L) for (i in seq_len(.N)) {
       k[i] <- fpj[i] > top[hh]
       if (k[i]) { x <- fpj[i]; top <- c(top[top >= x], x, top[top < x])[seq_len(hh)] }
     }
@@ -2495,7 +2498,22 @@ Phase 1: optimal classic lineup for %s sims
     for (j in seq_along(P)) {
       ix <- which(pos == P[j]); later <- P[-seq_len(j)]
       yn <- integer(0); ys <- numeric(0); yv <- numeric(0); ym <- list()
-      for (k in intersect(lo[[j]]:hi[[j]], seq_along(ix))) {
+      # c(0L, ...) lets a position contribute ZERO players when lo[j] == 0.
+      # No caller reaches that on a full roster (CFB and NFL minimums are all
+      # >= 1), but the constrained solve decrements lo by the locked count, so
+      # locking every WR slot leaves lo[["WR"]] == 0 and k == 0 must be legal.
+      # combn(n, 0) is a 0-row/1-col matrix, so the subset sums below come out
+      # as 0 with no special-casing.
+      for (k in intersect(lo[[j]]:hi[[j]], c(0L, seq_along(ix)))) {
+        # Taking none from this position: one option, no salary, no points.
+        # Not foldable into the general branch -- matrix(integer(0), nrow = 0)
+        # comes back 0x0, so colSums gives numeric(0) and the empty subset is
+        # silently dropped instead of carried forward as a real choice.
+        if (k == 0L) {
+          yn <- c(yn, 0L); ys <- c(ys, 0); yv <- c(yv, 0)
+          ym <- c(ym, list(integer(0)))
+          next
+        }
         cm <- matrix(ix[combs(length(ix), k)], nrow = k)
         cs <- colSums(matrix(sal[cm], nrow = k)); cv <- colSums(matrix(pts[cm], nrow = k))
         f <- which(cs <= cap); f <- f[front(rep(k, length(f)), cs[f], cv[f])]
@@ -2901,4 +2919,253 @@ find_optimal_lineups_nfl_classic <- function(sim_results, config, verbose = TRUE
                            format(nrow(uni), big.mark = ","),
                            as.numeric(difftime(Sys.time(), start_time, units = "secs"))))
   list(unique_lineups = uni, n_sims = n_sims_full, config = config, mode = "nfl_classic")
+}
+
+
+# ============================================================================
+# CONSTRAINED CLASSIC SOLVE  --  "Lineup Lab" (20 Sep 2026)
+# ============================================================================
+# Re-solves an ALREADY-COMPLETED sim under a user constraint: a set of players
+# forced into every lineup (any number, any positions), optionally restricted to
+# the sims where that set actually produced. Nothing is re-simulated -- the same
+# draws that built the main pool are re-optimised under a smaller feasible set,
+# so the constrained lineups are directly comparable to the unconstrained ones.
+#
+# WHY IT EXISTS. To give the user a pool built around players they have chosen,
+# with the rest of the roster filled in by the sim rather than by a stacking
+# rule. The main pool is capped at 5,000 lineups drawn from a space far larger
+# than that, so a specific player -- especially a mid or low-salary one -- may
+# barely appear in it, or appear only in rosters built for a different script.
+#
+# WHAT IT DOES NOT DO, measured rather than assumed (live 2026-09-20 W2 Sunday
+# sheet, 20,000 sims): it does not make lineups "separate" via repeat counts.
+# The unconstrained pool gives 34,217 distinct lineups with max Top1Count = 1
+# and 0.00% winning more than one sim. Locking does essentially nothing to that:
+#
+#   lock                    cond    sims   distinct  max repeats  % with >1
+#   (none)                  100%   20,000   34,217        1         0.00%
+#   QB                      100%   20,000   19,999        2         0.01%
+#   QB + team WR            100%   20,000   19,999        2         0.01%
+#   QB + WR + bring-back    100%   20,000   19,988        2         0.06%
+#   QB + WR + bring-back     25%    5,000    4,999        2         0.02%
+#
+# Six free slots across ~300 priced players is still astronomically more
+# rosters than there are sims, so one sim still means one distinct optimum.
+# Top1Count cannot rank a big classic and no amount of locking changes that.
+# What DOES separate lineups is WinRate / Top1Pct / Top5Pct, which come from
+# scoring every pool lineup against every sim -- those are already computed and
+# they are the columns to rank on here, exactly as on the main pool.
+#
+# The conditioning is a real effect and is the other half of the point: inside
+# the draws where the locked set produced, the game environments correlate, so
+# its pass-catchers recur and the stack emerges from the sim instead of being
+# imposed on it. Measured on a QB lock, same-team players per lineup went from
+# 1.48 at cond=100% to 1.74 at cond=15%.
+#
+# TWO INDEPENDENT KNOBS, and they do different jobs:
+#
+#   lock_players  -- feasibility. Forces those players into every lineup.
+#   cond_frac     -- relevance. Keeps only the top fraction of sims by how well
+#                    the locked set did, so the other slots are chosen in the
+#                    world where the lock hit rather than averaged over the
+#                    world where it busted.
+#
+# cond_frac = 1 is the honest "lock, do not condition" behaviour and is a
+# legitimate choice; it just tends to spend the pool on lineups built around a
+# dead QB. Strength is the MEAN PERCENTILE RANK of the locked players within
+# their own distributions -- scale-free, so a DST and a QB combine sensibly and
+# no player dominates the ranking just for scoring on a bigger scale.
+#
+# HOW THE FORCING IS DONE. Not by filtering solutions after the fact (that finds
+# almost nothing) and not by a new solver: the locked players are REMOVED from
+# the candidate pool and the problem is shrunk to match -- cap less their
+# salary, roster less their count, and per-position bounds less their positions.
+# .classic_exact_chunk then solves that reduced problem exactly, and the locked
+# players are put back. The reduced solve is a strictly smaller instance of the
+# one Phase 1 already runs, so it inherits its exactness (see the notes on
+# .classic_exact_chunk: a Pareto merge, not a heuristic and not lpSolve).
+#
+# METRICS ARE SCORED AGAINST ALL SIMS, NOT THE CONDITIONED SUBSET. The caller
+# passes the full sim table to score_all_lineups, and n_sims below is the TRUE
+# total. Win% on a constrained lineup therefore means the same thing it means on
+# the main pool -- scored inside a lock's best 20% of sims every number would
+# look inflated and nothing would be comparable.
+.nfl_classic_lock_sims <- function(SR, locked, frac, verbose = TRUE) {
+  all_ids <- unique(SR$SimID)
+  if (!length(locked) || frac >= 1) return(all_ids)
+  L <- SR[Player %chin% locked, .(SimID, Player, FantasyPoints)]
+  # Only sims carrying every locked player can be ranked on the whole set.
+  ok <- L[, .N, by = SimID][N == length(locked), SimID]
+  L  <- L[SimID %chin% ok]
+  if (!nrow(L)) return(all_ids)
+  # Percentile rank inside each locked player's own distribution, then average
+  # across the set. frank handles the heavy ties (a DST's many 0.0s) by rank
+  # averaging, so one bust is not silently promoted above another.
+  L[, pr := frank(FantasyPoints, ties.method = "average") / .N, by = Player]
+  cs <- L[, .(strength = mean(pr)), by = SimID]
+  setorder(cs, -strength)
+  keep <- head(cs$SimID, max(1L, ceiling(nrow(cs) * frac)))
+  if (verbose)
+    cat(sprintf("  conditioned to %s of %s sims (top %.0f%% by locked-set strength)\n",
+                format(length(keep), big.mark = ","),
+                format(length(all_ids), big.mark = ","), frac * 100))
+  keep
+}
+
+find_optimal_lineups_nfl_classic_locked <- function(sim_results, config, verbose = TRUE) {
+  setDT(sim_results)
+  if (!"Pos" %in% names(sim_results))
+    stop("constrained optimiser needs a Pos column on sim_results")
+  if (!"StartOrder" %in% names(sim_results)) sim_results[, StartOrder := 1L]
+
+  POS  <- .NFL_CLASSIC_POS
+  LO   <- .NFL_CLASSIC_LO; HI <- .NFL_CLASSIC_HI
+  need <- 9L
+  cap  <- config$salary_cap %||% 50000
+  max_lineups <- config$max_lineups %||% 1000L
+  locked   <- unique(as.character(config$lock_players    %||% character(0)))
+  excluded <- unique(as.character(config$exclude_players %||% character(0)))
+  frac     <- config$cond_frac %||% 1
+  start_time <- Sys.time()
+
+  SR <- sim_results[!is.na(FantasyPoints) & !is.na(Salary) & Salary > 0 &
+                    Pos %chin% POS,
+                    .(SimID, Player, FantasyPoints, Salary, Pos, StartOrder)]
+  if (!nrow(SR)) stop("constrained optimiser: no priced players on sim_results")
+  n_sims_full <- uniqueN(SR$SimID)   # TRUE total -- the metrics denominator
+
+  # ---- validate the lock before spending anything on it --------------------
+  missing <- setdiff(locked, unique(SR$Player))
+  if (length(missing))
+    stop("not on this slate (or unpriced): ", paste(missing, collapse = ", "))
+  if (length(intersect(locked, excluded)))
+    stop("locked and excluded at once: ",
+         paste(intersect(locked, excluded), collapse = ", "))
+  if (length(locked) > need)
+    stop(sprintf("%d players locked into a %d-man roster", length(locked), need))
+
+  linfo <- unique(SR[Player %chin% locked, .(Player, Pos, Salary, StartOrder)],
+                  by = "Player")
+  # as.integer strips the table class -- .classic_exact_chunk walks `names(lo)`
+  # to order the positions, and arithmetic on a table can drop plain names.
+  lock_cnt <- setNames(as.integer(table(factor(linfo$Pos, levels = POS))), POS)
+  lo2 <- setNames(pmax(LO - lock_cnt, 0L), POS)
+  hi2 <- setNames(HI - lock_cnt, POS)
+  if (any(hi2 < 0)) {
+    bad <- POS[hi2 < 0]
+    stop(sprintf("too many %s locked -- a lineup holds at most %s",
+                 paste(bad, collapse = "/"),
+                 paste(sprintf("%d %s", HI[bad], bad), collapse = ", ")))
+  }
+  need2    <- need - nrow(linfo)
+  lock_sal <- sum(linfo$Salary)
+  cap2     <- cap - lock_sal
+  if (cap2 < 0)
+    stop(sprintf("locked players cost $%s of a $%s cap",
+                 format(lock_sal, big.mark = ","), format(cap, big.mark = ",")))
+  if (sum(lo2) > need2 || sum(hi2) < need2)
+    stop("that lock cannot be completed into a legal roster")
+
+  # ---- conditioning --------------------------------------------------------
+  keep_ids <- .nfl_classic_lock_sims(SR, locked, frac, verbose)
+  SRc <- SR[SimID %chin% keep_ids]
+
+  # Means/salaries for ranking come from the CONDITIONED sims and are taken
+  # BEFORE the locked players are dropped, so AvgScore below reads as "what this
+  # lineup averages in the world the user asked about" and still covers the
+  # locked names.
+  pm <- SRc[, .(mu = mean(FantasyPoints), sal = Salary[1]), by = .(Player, Pos)]
+
+  # ---- reduced problem -----------------------------------------------------
+  # Positions whose remaining bound is zero are dropped outright: locking the QB
+  # leaves hi2[["QB"]] == 0, and every other QB on the slate is then unusable.
+  # Leaving them in is not just waste -- the dominance prune keeps the top hi[P]
+  # at each position and has nothing to keep when hi[P] is 0.
+  RR <- SRc[!Player %chin% c(locked, excluded) & Pos %chin% POS[hi2 > 0L]]
+  if (need2 > 0L) {
+    top_n   <- config$candidate_top_n   %||% 40L
+    cheap_n <- config$candidate_cheap_n %||% 10L
+    pmr <- RR[, .(mu = mean(FantasyPoints), sal = Salary[1]), by = .(Player, Pos)]
+    keep_pl <- pmr[, .SD[union(head(order(-mu), top_n), head(order(sal), cheap_n)), Player],
+                   by = Pos]$V1
+    RR <- RR[Player %chin% keep_pl]
+    if (!nrow(RR)) stop("nothing left to fill the roster after that lock/exclude")
+  }
+
+  if (verbose)
+    cat(sprintf("\nConstrained solve | lock: %s | %s sims | $%s left for %d slots\n",
+                if (length(locked)) paste(locked, collapse = " + ") else "(none)",
+                format(uniqueN(SRc$SimID), big.mark = ","),
+                format(cap2, big.mark = ","), need2))
+
+  # ---- exact solve, one optimum per conditioned sim ------------------------
+  # No fast path here, unlike the unconstrained Phase 1. Locking studs eats the
+  # cap, so nearly every constrained sim is cap-binding and the fast path would
+  # fall through to the exact solve anyway -- and conditioning has already cut
+  # the sim count, so exact-on-everything is affordable and provably right.
+  if (need2 == 0L) {
+    # Fully specified roster: the lock IS the lineup, identical in every sim.
+    chosen <- CJ(SimID = unique(SRc$SimID), Player = linfo$Player)
+    chosen <- merge(chosen, linfo[, .(Player, Pos, StartOrder)], by = "Player")
+  } else {
+    SS <- RR[, .(SimID, Player, Pos, StartOrder, Salary, FantasyPoints)]
+    sids <- unique(SS$SimID)
+    use_par <- isTRUE(config$use_parallel %||% TRUE) && length(sids) > 500L
+    if (use_par) {
+      n_cores <- min(parallel::detectCores() - 1L, 7L)
+      grp <- split(sids, cut(seq_along(sids), n_cores, labels = FALSE))
+      cl <- parallel::makeCluster(n_cores, type = "PSOCK")
+      on.exit(parallel::stopCluster(cl), add = TRUE)
+      sol <- rbindlist(parallel::parLapply(cl, lapply(grp, function(g) SS[SimID %in% g]),
+                                           .classic_exact_chunk, cap = cap2, lo = lo2,
+                                           hi = hi2, need = need2))
+    } else {
+      sol <- .classic_exact_chunk(SS, cap2, lo2, hi2, need2)
+    }
+    if (is.null(sol) || !nrow(sol))
+      stop("no legal lineup contains that lock under the salary cap")
+    # Put the locked players back. Every sim that solved gets the same names.
+    back <- CJ(SimID = unique(sol$SimID), Player = linfo$Player)
+    back <- merge(back, linfo[, .(Player, Pos, StartOrder)], by = "Player")
+    chosen <- rbindlist(list(sol[, .(SimID, Player, Pos, StartOrder)],
+                             back[, .(SimID, Player, Pos, StartOrder)]), use.names = TRUE)
+  }
+  # Only sims that produced a complete roster survive.
+  full9  <- chosen[, .N, by = SimID][N == need, SimID]
+  chosen <- chosen[SimID %chin% full9]
+  if (!nrow(chosen)) stop("no legal lineup contains that lock under the salary cap")
+
+  # ---- same shaping as the unconstrained pool ------------------------------
+  full <- .nfl_assign_slots_vec(chosen)
+  wide <- dcast(full, SimID ~ slot_i, value.var = "Player")
+  pc <- paste0("Player", seq_len(need))
+  setnames(wide, as.character(seq_len(need)), pc)
+  key <- apply(as.matrix(wide[, ..pc]), 1L, function(r) paste(sort(r), collapse = "|"))
+  wide[, lkey := key]
+  cnt <- wide[, .(Top1Count = .N), by = lkey]
+  uni <- merge(wide[!duplicated(lkey)], cnt, by = "lkey")
+
+  mu  <- setNames(pm$mu, pm$Player)
+  uni[, AvgScore := rowSums(matrix(mu[unlist(.SD)], nrow = nrow(uni))), .SDcols = pc]
+  sprd <- config$pool_spread %||% 0
+  if (sprd > 0) {
+    tT <- sprd * stats::sd(uni$AvgScore)
+    g  <- -log(-log(stats::runif(nrow(uni))))
+    uni[, rk := AvgScore / tT + g]
+  } else uni[, rk := AvgScore]
+  setorder(uni, -Top1Count, -rk)
+  if (nrow(uni) > max_lineups) uni <- head(uni, max_lineups)
+
+  sal <- setNames(pm$sal, pm$Player)
+  uni[, TotalSalary := rowSums(matrix(sal[unlist(.SD)], nrow = nrow(uni))), .SDcols = pc]
+  uni[, c("lkey", "rk") := NULL]
+
+  if (verbose) cat(sprintf("  %s distinct lineups | %.1fs\n",
+                           format(nrow(uni), big.mark = ","),
+                           as.numeric(difftime(Sys.time(), start_time, units = "secs"))))
+  # n_sims is the FULL count on purpose -- see the header note on metrics.
+  list(unique_lineups = uni, n_sims = n_sims_full, config = config,
+       mode = "nfl_classic_locked",
+       lock_info = list(locked = locked, excluded = excluded, cond_frac = frac,
+                        n_cond_sims = length(keep_ids), n_solved = length(full9)))
 }

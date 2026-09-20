@@ -12,6 +12,7 @@ source("sport_configs_universal.R")
 source("OptimalLineups_Core.R")
 source("portfolio_helpers_universal.R")
 source("cash_game_module.R")
+source("lineup_lab_module.R")
 
 # Source all sport engines once at startup.
 # Never re-source inside reactive observers — re-sourcing re-executes all
@@ -113,7 +114,8 @@ ui <- dashboardPage(
       menuItem("Sim Results",        tabName = "sim_results", icon = icon("chart-bar")),
       menuItem("Tournament Lineups", tabName = "scoring",     icon = icon("trophy")),
       menuItem("Cash Games",         tabName = "cash_games",  icon = icon("coins")),
-      menuItem("Portfolio Builder",  tabName = "portfolio",   icon = icon("layer-group"))
+      menuItem("Portfolio Builder",  tabName = "portfolio",   icon = icon("layer-group")),
+      menuItem("Lineup Lab",         tabName = "lineup_lab",  icon = icon("flask"))
     )
   ),
   
@@ -573,7 +575,12 @@ ui <- dashboardPage(
       # ======================================================================
       # TAB 5: PORTFOLIO BUILDER
       # ======================================================================
-      tabItem(tabName = "portfolio", uiOutput("portfolio_tabs_ui"))
+      tabItem(tabName = "portfolio", uiOutput("portfolio_tabs_ui")),
+
+      # ======================================================================
+      # TAB 6: LINEUP LAB -- re-solve a finished sim under a user lock
+      # ======================================================================
+      tabItem(tabName = "lineup_lab", render_lineup_lab_tab_ui())
     )
   )
 )
@@ -605,6 +612,11 @@ server <- function(input, output, session) {
     rv$sd_portfolio        <- NULL;  rv$sd_builds <- list();  rv$sd_build_counter <- 0
     rv$sport_visuals       <- NULL
     rv$full_sim_results    <- NULL
+    # Lineup Lab pools belong to the sim that produced them -- a new sim (or a
+    # slate switch) invalidates them exactly like the main pool.
+    rv$ll_results          <- NULL
+    rv$ll_info             <- NULL
+    rv$ll_platform         <- NULL
     # rv$cfb_full_sim_results / _metadata (the pristine whole-card CFB_CLASSIC
     # sim a Tournament-Lineups slate pick re-slices from) are deliberately NOT
     # cleared here -- reset_all_state() runs on every new sim AND on every
@@ -643,6 +655,11 @@ server <- function(input, output, session) {
     dk_lock_v          = 0L,
     fd_lock_v          = 0L,
     sd_lock_v          = 0L,
+    # Lineup Lab: the constrained pool, the lock that produced it, and which
+    # site it was solved for (see lineup_lab_module.R).
+    ll_results         = NULL,
+    ll_info            = NULL,
+    ll_platform        = NULL,
     # Lock / exclude now lives in the exposure table: click the LOCK cell on a
     # row to cycle it through lock -> exclude -> clear. These hold the player
     # names for each state. "_cpt" is the captain/MVP slot specifically, which
@@ -6347,6 +6364,15 @@ server <- function(input, output, session) {
   # CASH GAME MODULE
   # ==========================================================================
   register_cash_game_observers(input, output, session, rv)
+
+  # Lineup Lab re-solves the finished sim under a user lock. The helpers it
+  # needs are defined in this server scope, so they are handed over rather
+  # than duplicated in the module.
+  register_lineup_lab_observers(
+    input, output, session, rv,
+    helpers = list(prepare_optimization_data = prepare_optimization_data,
+                   drop_invalid_classic      = drop_invalid_classic,
+                   add_custom_metrics        = add_custom_metrics))
   
   
 }
