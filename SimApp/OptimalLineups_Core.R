@@ -38,8 +38,13 @@ library(parallel)
   cached <- NULL
   function() {
     if (!is.null(cached)) return(cached)
+    # timeout matters: this runs inside score_all_lineups on a customer's
+    # machine, and a blocked or slow shell would hang the app mid-Phase-2
+    # rather than error. 5s is far more than a CIM query needs; on timeout the
+    # probe returns NA and we fall back to 8 GB.
     probe <- function(cmd, args) {
-      out <- suppressWarnings(system2(cmd, args, stdout = TRUE, stderr = FALSE))
+      out <- suppressWarnings(system2(cmd, args, stdout = TRUE, stderr = FALSE,
+                                      timeout = 5))
       v <- suppressWarnings(as.numeric(grep("^[0-9]+$", trimws(out), value = TRUE)[1]))
       if (length(v) != 1L || is.na(v) || v <= 0) NA_real_ else v / 1024^3
     }
@@ -1503,9 +1508,17 @@ score_all_lineups <- function(lineup_data, sim_results, verbose = TRUE, sims_per
   # MEMORY CHECK: Calculate if we can fit full matrix in memory (assume 4GB available)
   # Use as.numeric() to avoid integer overflow for large matrices
   matrix_size_gb <- (as.numeric(n_lineups) * as.numeric(n_sims) * 8) / (1024^3)
-  # Was a hard-coded 4 GB, which never fired on a 7.6 GB machine even as
-  # the app ran out of memory around it. Now a share of actual RAM.
-  use_efficient_mode <- matrix_size_gb > max_matrix_gb
+  # Was a hard-coded 4 GB, which never fired on a 7.6 GB machine even as the
+  # app ran out of memory around it. Now a share of actual RAM -- but the RAM
+  # probe costs ~3s (PowerShell startup) and would land on the first optimise
+  # click of every session. It is only needed when the answer is actually in
+  # doubt, so the obvious cases short-circuit BEFORE `max_matrix_gb` is
+  # touched: R evaluates default arguments lazily, so not referencing it means
+  # not probing. Under 1 GB is fine on any machine anyone runs this on; 8 GB+
+  # is too big for any of them. A 20k-sim / 5,000-lineup pool is 0.75 GB, so
+  # the normal path never probes at all.
+  use_efficient_mode <- matrix_size_gb > 1 &&
+                        (matrix_size_gb >= 8 || matrix_size_gb > max_matrix_gb)
   
   if (verbose) {
     cat(sprintf("  %s lineups × %s sims | Mode: %s\n",
