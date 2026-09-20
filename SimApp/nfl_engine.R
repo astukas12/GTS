@@ -969,6 +969,31 @@ nfl_reslice_for_lineups <- function(sim_results, sim_metadata, file_path, menu_r
   sr <- as.data.table(sim_results)[Team %in% teams]
   md <- as.data.table(sim_metadata)[Team %in% teams]
 
+  # Cap the sim count on a showdown slice.
+  #
+  # The NFL showdown config already says default_n_sims = 25,000 -- "plenty to
+  # rank the pool" -- but that default never fires in practice, because nobody
+  # loads a showdown sheet directly. The classic slate is simulated first and
+  # the showdown is resliced out of it, so it silently inherits the classic's
+  # count. At 50,000 that costs twice over: the winning-script enumeration is
+  # linear in sims, and Phase 2's lineup x sim matrix doubles to ~4 GB, which
+  # pushes score_all_lineups onto its memory-efficient path (exact, ~2.2x
+  # slower) on a 7.6 GB machine. Halving sims is the single biggest lever on
+  # showdown runtime and the config already says it is enough.
+  #
+  # Sims are iid, so keeping the first N distinct SimIDs is unbiased and
+  # deterministic. The classic pool is untouched -- this is the slice only.
+  if (identical(as.character(menu_row$slate_arg), "SD")) {
+    sd_cap <- tryCatch(get_sport_config("NFL")$default_n_sims, error = function(e) 25000L)
+    sd_cap <- if (is.null(sd_cap) || is.na(sd_cap)) 25000L else as.integer(sd_cap)
+    ids    <- sort(unique(sr$SimID))
+    if (length(ids) > sd_cap) {
+      sr <- sr[SimID %in% ids[seq_len(sd_cap)]]
+      message(sprintf("[nfl] showdown slice: %s sims kept of %s (config default_n_sims)",
+                      format(sd_cap, big.mark = ","), format(length(ids), big.mark = ",")))
+    }
+  }
+
   fresh <- nfl_build_meta(sl$players, sl$team, sl$projections, unique(sr$Player))
   pcols <- intersect(c("Pos","DKID","DKCID","DKSalary","DKCSalary","DKProj","DKOwn","CPTOwn",
                        "FDID","FDSalary","FDProj","FDOwn","MVPOwn"), names(md))
