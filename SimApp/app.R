@@ -620,6 +620,7 @@ server <- function(input, output, session) {
     rv$ll_lock_set         <- character(0)
     rv$dk_field_ref        <- NULL
     rv$fd_field_ref        <- NULL
+    rv$dk_cash_curve       <- NULL
     rv$ll_excl_set         <- character(0)
     rv$ll_pool_lock        <- character(0)
     rv$ll_pool_excl        <- character(0)
@@ -671,6 +672,7 @@ server <- function(input, output, session) {
     # Per-sim thresholds of each platform's main pool, so the Lab can be
     # measured against it without re-scoring it.
     dk_field_ref       = NULL,
+    dk_cash_curve      = NULL,
     fd_field_ref       = NULL,
     ll_excl_set        = character(0),
     # Row-level refine on the BUILT Lab pool (no re-solve).
@@ -1860,6 +1862,21 @@ server <- function(input, output, session) {
                            pool_spread=rv$config$pool_spread %||% 0,
                            phase1_metric=rv$config$phase1_metric %||% "mean",
                            phase1_sims=rv$config$phase1_sims %||% 5000L)
+        # Cash curve. A cash lineup has to beat the chalk people actually
+        # enter, not the ~93,000-roster universe the enumerator walks, so its
+        # measure is field-relative -- and the field has to exist BEFORE the
+        # sweep, because the sweep is where it gets measured. See the ladder
+        # block in find_optimal_lineups_enum_captain. Showdown only: classic
+        # has no enumerable universe to ride along with.
+        rv$dk_cash_curve <- NULL
+        if (identical(dk_mode, "enum_captain")) {
+          opt_config$cash_field <- cash_ladder_field(
+            rv$sim_metadata, rv$simulation_results, rv$config,
+            platform = "SD", n_flex = opt_config$roster_size - 1L,
+            salary_cap = opt_config$salary_cap, score_col = "DKScore")
+          opt_config$cash_salary_floor <- rv$config$cash_salary_floor %||% 48000
+          opt_config$cash_keep         <- rv$config$cash_keep %||% 2000L
+        }
         progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
         lineup_data <- find_optimal_lineups(opt_data, opt_config, mode=dk_mode, k=1, verbose=TRUE,
                                             progress_callback=function(frac, detail)
@@ -1872,6 +1889,9 @@ server <- function(input, output, session) {
         # metadata has no Team column (F1), so gating on mode alone is safe.
         if (dk_mode %in% c("combinatorial_captain", "enum_captain"))
           lineup_data <- drop_single_team_sd(lineup_data, rv$sim_metadata)
+        # Lives beside the pool, not in it: calculate_distribution_metrics
+        # returns a plain data.table and would drop anything attached here.
+        rv$dk_cash_curve <- lineup_data$cash
         progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
                                     format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
         score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE,
