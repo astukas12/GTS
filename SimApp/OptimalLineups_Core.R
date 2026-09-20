@@ -8,6 +8,30 @@ library(lpSolve)
 library(parallel)
 
 # =============================================================================
+# WORKER COUNT
+# =============================================================================
+# Every PSOCK path below used `min(detectCores() - 1, 7)` directly. That is a
+# hard crash on two real machine configurations:
+#
+#   single core        -> min(1 - 1, 7)  == 0   -> makeCluster(0)
+#                         "numeric 'names' must be >= 1"
+#   detectCores() = NA -> min(NA - 1, 7) == NA  -> makeCluster(NA)
+#                         "missing value where TRUE/FALSE needed"
+#
+# detectCores() is documented as being allowed to fail and return NA, and a
+# throttled VM or locked-down laptop can report one core. Either way the
+# customer gets an error instead of lineups. Floor at 1 and treat NA as 1.
+#
+# Callers also skip the cluster entirely at n == 1: a one-worker PSOCK cluster
+# pays full serialisation cost for no parallelism, so the serial branch is
+# strictly faster there. No change on any machine with 3+ cores.
+.opt_workers <- function(cap = 7L) {
+  n <- suppressWarnings(as.integer(parallel::detectCores()))
+  if (length(n) != 1L || is.na(n) || n < 1L) n <- 1L
+  max(1L, min(n - 1L, cap))
+}
+
+# =============================================================================
 # MAIN ENTRY POINT - MODE ROUTER
 # =============================================================================
 
@@ -141,8 +165,8 @@ find_optimal_lineups_standard <- function(sim_results, config, k = 3, verbose = 
   }
   
   # Process all sims
-  if (use_parallel && n_sims > 100) {
-    n_cores <- min(detectCores() - 1, 7)
+  n_cores <- .opt_workers()
+  if (use_parallel && n_sims > 100 && n_cores > 1L) {
     if (verbose) cat(sprintf("  Using %d cores\n", n_cores))
     
     cl <- makeCluster(n_cores, type = "PSOCK")
@@ -383,8 +407,8 @@ find_optimal_lineups_mvp <- function(sim_results, config, k = 3, verbose = TRUE)
   }
   
   # Process all sims
-  if (use_parallel && n_sims > 100) {
-    n_cores <- min(detectCores() - 1, 7)
+  n_cores <- .opt_workers()
+  if (use_parallel && n_sims > 100 && n_cores > 1L) {
     if (verbose) cat(sprintf("  Using %d cores\n", n_cores))
     
     cl <- makeCluster(n_cores, type = "PSOCK")
@@ -586,8 +610,8 @@ find_optimal_lineups_captain <- function(sim_results, config, k = 3, verbose = T
   }
   
   # Process all sims
-  if (use_parallel && n_sims > 100) {
-    n_cores <- min(detectCores() - 1, 7)
+  n_cores <- .opt_workers()
+  if (use_parallel && n_sims > 100 && n_cores > 1L) {
     if (verbose) cat(sprintf("  Using %d cores\n", n_cores))
     
     cl <- makeCluster(n_cores, type = "PSOCK")
@@ -2656,9 +2680,10 @@ find_optimal_lineups_cfb_classic <- function(sim_results, config, verbose = TRUE
                                      format(length(under), big.mark = ","),
                                      format(length(slow_ids), big.mark = ",")))
     SS <- SR[SimID %chin% slow_ids, .(SimID, Player, Pos, StartOrder, Salary, FantasyPoints)]
-    use_par <- isTRUE(config$use_parallel %||% TRUE) && length(slow_ids) > 500L
+    n_cores <- .opt_workers()
+    use_par <- isTRUE(config$use_parallel %||% TRUE) && length(slow_ids) > 500L &&
+               n_cores > 1L
     if (use_par) {
-      n_cores <- min(parallel::detectCores() - 1L, 7L)
       grp <- split(slow_ids, cut(seq_along(slow_ids), n_cores, labels = FALSE))
       cl <- parallel::makeCluster(n_cores, type = "PSOCK")
       on.exit(parallel::stopCluster(cl), add = TRUE)
@@ -2857,9 +2882,10 @@ find_optimal_lineups_nfl_classic <- function(sim_results, config, verbose = TRUE
   if (length(slow_ids)) {
     SS <- SR[SimID %chin% slow_ids, .(SimID, Player, Pos, StartOrder, Salary, FantasyPoints)]
     lo <- .NFL_CLASSIC_LO; hi <- .NFL_CLASSIC_HI
-    use_par <- isTRUE(config$use_parallel %||% TRUE) && length(slow_ids) > 500L
+    n_cores <- .opt_workers()
+    use_par <- isTRUE(config$use_parallel %||% TRUE) && length(slow_ids) > 500L &&
+               n_cores > 1L
     if (use_par) {
-      n_cores <- min(parallel::detectCores() - 1L, 7L)
       grp <- split(slow_ids, cut(seq_along(slow_ids), n_cores, labels = FALSE))
       cl <- parallel::makeCluster(n_cores, type = "PSOCK")
       on.exit(parallel::stopCluster(cl), add = TRUE)
@@ -3110,9 +3136,10 @@ find_optimal_lineups_nfl_classic_locked <- function(sim_results, config, verbose
   } else {
     SS <- RR[, .(SimID, Player, Pos, StartOrder, Salary, FantasyPoints)]
     sids <- unique(SS$SimID)
-    use_par <- isTRUE(config$use_parallel %||% TRUE) && length(sids) > 500L
+    n_cores <- .opt_workers()
+    use_par <- isTRUE(config$use_parallel %||% TRUE) && length(sids) > 500L &&
+               n_cores > 1L
     if (use_par) {
-      n_cores <- min(parallel::detectCores() - 1L, 7L)
       grp <- split(sids, cut(seq_along(sids), n_cores, labels = FALSE))
       cl <- parallel::makeCluster(n_cores, type = "PSOCK")
       on.exit(parallel::stopCluster(cl), add = TRUE)
