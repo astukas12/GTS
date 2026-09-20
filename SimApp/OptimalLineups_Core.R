@@ -1174,13 +1174,115 @@ find_optimal_lineups_enum_captain <- function(sim_results, config, verbose = TRU
   n_flag    <- max(1L, as.integer(round(M * win_pct)))
   kth       <- M - n_flag + 1L
   hit_count <- integer(M)
-  for (s in seq_len(n_sims)) {
-    sc <- score_mat[, s]
-    ls <- cpt_multiplier * sc[cpt_v]
-    for (r in seq_len(n_flex)) ls <- ls + sc[flex_m[r, ]]
-    thr <- sort(ls, partial = kth)[kth]
-    hit_count[ls >= thr] <- hit_count[ls >= thr] + 1L
+
+  # This is the longest step in the app and it used to run silently: at 50,000
+  # sims over a 93,040-lineup band it is ~4.7 billion lineup-scores, several
+  # minutes with nothing printed between the band line above and the
+  # winning-script line below. Report progress on the same cadence as every
+  # other phase so a long wait is legible rather than a hang.
+  t_ws <- Sys.time()
+
+  # Each sim is independent and hit_count is an INTEGER sum, so splitting the
+  # sims across workers and adding the per-worker vectors is bit-identical to
+  # the sequential loop -- not an approximation, and not order-sensitive the
+  # way a floating-point reduction would be. On the dev box (.opt_workers() = 7)
+  # this is the difference between minutes and under a minute at 50,000 sims.
+  #
+  # Sims are processed in ROUNDS so progress can still be reported: each round
+  # is fanned out across the workers, and the bar advances when the round ends.
+  ws_kernel <- function(ss) {
+    hc <- integer(M)
+    for (s in ss) {
+      sc <- score_mat[, s]
+      ls <- cpt_multiplier * sc[cpt_v]
+      for (r in seq_len(n_flex)) ls <- ls + sc[flex_m[r, ]]
+      thr <- sort(ls, partial = kth)[kth]
+      # `hit_count[ls >= thr] <- hit_count[ls >= thr] + 1L` evaluated the
+      # comparison twice and built two length-M index vectors per sim. One
+      # vectorised add over the logical is the same answer for less work.
+      hc <- hc + (ls >= thr)
+    }
+    hc
   }
+
+  # Worker count, sized by what each one has to hold. Every PSOCK worker is a
+  # separate R process carrying its own copy of score_mat plus the lineup index
+  # arrays. That is ~90 MB total on a showdown band, which is nothing -- but
+  # this machine has 7.6 GB with ~1.5 GB free once a sim is loaded, and R has
+  # already died once under that pressure. Keep the whole fan-out inside a
+  # small share of RAM rather than assuming the payload is always small.
+  payload_gb <- (as.numeric(length(score_mat)) * 8 +
+                 as.numeric(length(cpt_v) + length(flex_m)) * 4) / 1024^3
+  n_work <- .opt_workers()
+  if (payload_gb > 0) {
+    afford <- as.integer(floor((.opt_total_ram_gb() * 0.15) / payload_gb))
+    n_work <- max(1L, min(n_work, afford))
+  }
+
+  if (n_work > 1L && n_sims >= 200L) {
+    cl <- parallel::makeCluster(n_work)
+    on.exit(try(parallel::stopCluster(cl), silent = TRUE), add = TRUE)
+    parallel::clusterExport(
+      cl,
+      c("score_mat", "cpt_v", "flex_m", "cpt_multiplier", "n_flex", "kth", "M"),
+      envir = environment())
+
+    # Rounds exist so the progress bar can move. Measured warm, round count
+    # made no difference to runtime (1 round 8.6s, 25 rounds 8.8s at 3,000
+    # sims), so spend them on a smooth bar. chunk arithmetic, not cut(),
+    # which throws on a single interval.
+    n_round <- max(1L, min(20L, n_sims %/% (n_work * 25L)))
+    rsize   <- ceiling(n_sims / n_round)
+    rounds  <- split(seq_len(n_sims), ceiling(seq_len(n_sims) / rsize))
+    if (verbose) {
+      cat(sprintf("  winning-script: %s sims x %s lineups on %d workers\n",
+                  format(n_sims, big.mark = ","), format(M, big.mark = ","), n_work))
+      flush.console()
+    }
+
+    done <- 0L
+    for (ri in seq_along(rounds)) {
+      slice <- rounds[[ri]]
+      psize <- ceiling(length(slice) / n_work)
+      parts <- split(slice, ceiling(seq_along(slice) / psize))
+      parts <- parts[vapply(parts, length, integer(1)) > 0L]
+      res   <- parallel::parLapply(cl, parts, ws_kernel)
+      for (hc in res) hit_count <- hit_count + hc
+      done <- done + length(slice)
+      if (verbose) {
+        el  <- as.numeric(difftime(Sys.time(), t_ws, units = "secs"))
+        eta <- el / done * (n_sims - done)
+        cat(sprintf("\r  Phase 1 winning-script: %.0f%% | %s of %s sims | %.0fs | ETA: %.0fs   ",
+                    done / n_sims * 100, format(done, big.mark = ","),
+                    format(n_sims, big.mark = ","), el, eta))
+        flush.console()
+      }
+    }
+    parallel::stopCluster(cl)
+
+  } else {
+    # Single worker, or too few sims for the fan-out to pay for itself.
+    ws_step <- max(1L, as.integer(n_sims %/% 100L))
+    for (s in seq_len(n_sims)) {
+      hit_count <- hit_count + local({
+        sc <- score_mat[, s]
+        ls <- cpt_multiplier * sc[cpt_v]
+        for (r in seq_len(n_flex)) ls <- ls + sc[flex_m[r, ]]
+        thr <- sort(ls, partial = kth)[kth]
+        ls >= thr
+      })
+      if (verbose && (s %% ws_step == 0L || s == n_sims)) {
+        el  <- as.numeric(difftime(Sys.time(), t_ws, units = "secs"))
+        eta <- el / s * (n_sims - s)
+        cat(sprintf("\r  Phase 1 winning-script: %.0f%% | %s of %s sims | %.0fs | ETA: %.0fs   ",
+                    s / n_sims * 100, format(s, big.mark = ","),
+                    format(n_sims, big.mark = ","), el, eta))
+        flush.console()
+      }
+    }
+  }
+  if (verbose) { cat("\n"); flush.console() }
+
   idx6 <- rbind(matrix(cpt_v, nrow = 1L), flex_m)           # roster_size x M (for AvgScore)
   wtv  <- c(cpt_multiplier, rep(1, n_flex))
 

@@ -544,6 +544,299 @@ build_field_tiers <- function(metadata, specs, salary_cap, salary_floor,
 
 
 # ============================================================================
+# FIELD VALUE SOURCE — ownership, else projections, else our own sim medians
+#
+# A field model needs one number per player saying how likely the field is to
+# roster him. Projected ownership is that number when the sheet carries it.
+# Most showdown slices never get one — the 2026-09-20 W2 Sunday sheet carries
+# ETR projections and a captain salary for all 13 slices and zero ownership on
+# every one — so the chain falls back per PLAYER, not per sheet:
+#
+#   1. sheet ownership     use it directly
+#   2. projection          ETR, or any outside projection column
+#   3. our own sim median  always available once a sim has run
+#
+# 2 and 3 are both fantasy points on the same scale, so one formula turns
+# either into ownership. Whatever mix it lands on, the tab says so — a field
+# synthesized from medians is a weaker claim than a field built on real
+# ownership and the numbers should never pretend otherwise.
+# ============================================================================
+
+# Synthesized-ownership shape.
+#
+# Ownership is NOT proportional to value per dollar. Tried that first and it
+# fails on exactly the player it should handle: on the 20 Sep WAS/DAL showdown
+# Dyami Brown sits at DK's $200 minimum with a 3.2 projection, giving a value
+# per $1k of 16.0 against a slate median of 1.5. Raised to any useful power he
+# takes ~99% of the field weight and the whole field collapses onto one lineup.
+# A $200 punt does get rostered; he does not get rostered by everyone.
+#
+# So the field is modelled as value-TILTED projection — weight ~ Value^A over
+# Salary^B with B well under A — which keeps the ordering led by who is
+# expected to score while still giving cheap punts real exposure. Captain
+# ownership uses raw projection (the field captains the stud, not the punt) and
+# is more concentrated than flex. Both are then capped, because no showdown
+# player is on 90% of flex rosters however good the number says he is.
+FIELD_A_VALUE  <- 2.0    # projection exponent, flex
+FIELD_B_SALARY <- 0.6    # salary discount exponent, flex
+FIELD_K_CPT    <- 2.0    # projection exponent, captain
+FIELD_MAX_FLEX <- 65     # cap on any one player's flex ownership, %
+FIELD_MAX_CPT  <- 35     # cap on any one player's captain ownership, %
+FIELD_MIN_OWN  <- 0.5    # nobody on a showdown slate is at exactly 0%
+
+#' Normalize raw weights to a total ownership, capped and floored.
+#'
+#' Water-fills the cap: anyone over it is pinned there and the remaining
+#' ownership is redistributed across the rest in proportion to their weight.
+normalize_own <- function(w, total, cap, min_own = FIELD_MIN_OWN) {
+  w   <- pmax(as.numeric(w), 1e-12)
+  own <- total * w / sum(w)
+  for (i in seq_len(50L)) {
+    over <- own > cap
+    if (!any(over)) break
+    spare <- total - sum(over) * cap
+    own[over] <- cap
+    free <- !over
+    if (!any(free) || spare <= 0) break
+    own[free] <- spare * w[free] / sum(w[free])
+  }
+  own <- pmax(own, min_own)
+  own * total / sum(own)
+}
+
+#' Per-player median sim score (base points, before any slot multiplier).
+sim_median_scores <- function(sim_res, score_col = "DKScore") {
+  sr <- as.data.table(sim_res)
+  if (!score_col %in% names(sr) || !"Player" %in% names(sr)) return(NULL)
+  sr[, .(Med = median(get(score_col), na.rm = TRUE)), by = Player]
+}
+
+#' Resolve the salary / ownership / projection column names for a showdown pool.
+#'
+#' NFL showdown carries its captain salary as DKCSalary and never declares it in
+#' platform_columns, so the captain salary is resolved by candidate name and
+#' falls back to flex x multiplier when the sheet has none.
+cash_sd_cols <- function(config, meta, platform = "SD") {
+  nm   <- names(meta)
+  pick <- function(cands) { h <- cands[cands %in% nm]; if (length(h)) h[1] else NULL }
+
+  pc   <- config$platform_columns %||% config$platform_cols
+  dkc  <- pc$DK %||% pc$SD %||% list()
+
+  mult <- dkc$cpt_multiplier %||%
+    config$showdown_config$DK$captain_multiplier %||%
+    config$captain_multiplier %||% 1.5
+
+  list(
+    flex_sal = pick(c(dkc$salary, "SDSalary", "DKSalary", "Salary")),
+    cpt_sal  = pick(c(dkc$cpt_salary, "CPTSalary", "DKCSalary", "SDCSalary")),
+    flex_own = pick(c(dkc$ownership, "DKOwn", "Own")),
+    cpt_own  = pick(c(dkc$cpt_ownership, "CPTOwn", "MVPOwn")),
+    proj     = pick(c("DKProj", "Proj", "Projection")),
+    cpt_mult = as.numeric(mult)
+  )
+}
+
+#' Build per-player field ownership for a captain-format slate.
+#'
+#' @return list(own = data.table(Player, FlexSal, CptSal, FlexOwn, CptOwn,
+#'                               Value, Source),
+#'              label = one-line description of where the numbers came from,
+#'              counts = named integer of players per source)
+cash_field_ownership <- function(meta, sim_res, cols, score_col = "DKScore",
+                                 n_flex_slots = 5L) {
+
+  d <- unique(as.data.table(copy(meta)), by = "Player")
+
+  if (is.null(cols$flex_sal)) stop("No salary column found for the field model.")
+  d[, FlexSal := suppressWarnings(as.numeric(get(cols$flex_sal)))]
+  d <- d[!is.na(FlexSal) & FlexSal > 0]
+  if (!nrow(d)) stop("No players with a usable salary for the field model.")
+
+  if (!is.null(cols$cpt_sal)) {
+    d[, CptSal := suppressWarnings(as.numeric(get(cols$cpt_sal)))]
+  } else {
+    d[, CptSal := NA_real_]
+  }
+  d[is.na(CptSal) | CptSal <= 0, CptSal := FlexSal * cols$cpt_mult]
+
+  own_pct <- function(x) {
+    x <- suppressWarnings(as.numeric(x))
+    if (all(is.na(x))) return(x)
+    m <- max(x, na.rm = TRUE)
+    if (is.finite(m) && m <= 1) x * 100 else x
+  }
+  grab_own <- function(cl) {
+    if (is.null(cl) || !cl %in% names(d)) return(rep(NA_real_, nrow(d)))
+    v <- own_pct(d[[cl]]); v[is.na(v) | v <= 0] <- NA_real_; v
+  }
+  d[, ShOwn := grab_own(cols$flex_own)]
+  d[, ShCpt := grab_own(cols$cpt_own)]
+
+  # Value: the projection where we have one, our own sim median where we do not
+  d[, Proj := if (!is.null(cols$proj) && cols$proj %in% names(d))
+                suppressWarnings(as.numeric(get(cols$proj))) else NA_real_]
+  d[!is.na(Proj) & Proj <= 0, Proj := NA_real_]
+
+  med <- sim_median_scores(sim_res, score_col)
+  d[, Med := NA_real_]
+  if (!is.null(med)) d[med, Med := i.Med, on = "Player"]
+  d[!is.na(Med) & Med <= 0, Med := NA_real_]
+
+  d[, Value := fifelse(!is.na(Proj), Proj, Med)]
+  d[, VSrc  := fifelse(!is.na(Proj), "proj", fifelse(!is.na(Med), "median", "none"))]
+  d <- d[!is.na(Value) & Value > 0]
+  if (!nrow(d))
+    stop("No player has a projection or a sim median — cannot model a field.")
+
+  # Synthesize from value, then let real ownership override player by player.
+  # Flex ownership sums to 100% x the number of flex slots and captain ownership
+  # to 100%, which is what a real showdown field has to sum to.
+  n_flex_slots <- max(1L, n_flex_slots)
+  w_flex <- pmax(d$Value, 1e-9) ^ FIELD_A_VALUE /
+            pmax(d$FlexSal / 1000, 1e-6) ^ FIELD_B_SALARY
+  w_cpt  <- pmax(d$Value, 1e-9) ^ FIELD_K_CPT
+  d[, SynFlex := normalize_own(w_flex, 100 * n_flex_slots, FIELD_MAX_FLEX)]
+  d[, SynCpt  := normalize_own(w_cpt,  100,                FIELD_MAX_CPT)]
+
+  d[, FlexOwn := fifelse(!is.na(ShOwn), ShOwn, SynFlex)]
+  d[, CptOwn  := fifelse(!is.na(ShCpt), ShCpt, SynCpt)]
+  d[, OSrc    := fifelse(!is.na(ShOwn), "own", VSrc)]
+
+  counts <- c(own    = sum(d$OSrc == "own"),
+              proj   = sum(d$OSrc == "proj"),
+              median = sum(d$OSrc == "median"))
+  n_all  <- nrow(d)
+
+  label <- if (counts[["own"]] == n_all) {
+    "Field from sheet ownership"
+  } else if (counts[["own"]] > 0) {
+    sprintf("Field mixed — %d from sheet ownership, %d synthesized from projections, %d from our sim medians",
+            counts[["own"]], counts[["proj"]], counts[["median"]])
+  } else if (counts[["median"]] == 0) {
+    sprintf("No ownership on this sheet — field synthesized from projections (%d players)",
+            counts[["proj"]])
+  } else if (counts[["proj"]] == 0) {
+    sprintf("No ownership or projections — field synthesized from our sim medians (%d players)",
+            counts[["median"]])
+  } else {
+    sprintf("No ownership — field synthesized from projections (%d) and our sim medians (%d)",
+            counts[["proj"]], counts[["median"]])
+  }
+
+  list(own    = d[, .(Player, FlexSal, CptSal, FlexOwn, CptOwn,
+                      Value, Source = OSrc,
+                      Team = if ("Team" %in% names(d)) Team else NA_character_)],
+       label  = label,
+       counts = counts)
+}
+
+
+# ============================================================================
+# SHOWDOWN FIELD LINEUP GENERATION — captain-aware ownership sampling
+#
+# The SD path used to take YOUR OWN tournament pool, rank it by median and call
+# the top N "the field" — so the cash rate was measured against a hundred copies
+# of your own optimizer's taste, and ownership was never consulted at all. This
+# draws an actual public field instead: captain sampled from captain ownership,
+# five flex from flex ownership, rejected down to legal rosters. Same output
+# shape as every other builder, so derive_tier_field / scoring / evaluation are
+# untouched.
+# ============================================================================
+
+#' Sample a public showdown field.
+#'
+#' @param own_dt  data.table from cash_field_ownership()$own
+#' @param n_flex  number of non-captain slots (5 on DK/FD NFL showdown)
+#' @return data.table: LineupID, Captain, Util1..N, TotalSalary, AvgOwn
+generate_field_lineups_showdown <- function(own_dt, n = 1500L, n_flex = 5L,
+                                            salary_cap   = 50000,
+                                            salary_floor = NULL,
+                                            require_two_teams = TRUE,
+                                            n_draw = 60000L, alpha = 1.0,
+                                            seed = 42L) {
+  p   <- copy(as.data.table(own_dt))
+  n_p <- nrow(p)
+  if (n_p < n_flex + 1L)
+    stop(sprintf("Only %d players in the showdown pool — need %d.", n_p, n_flex + 1L))
+  if (is.null(salary_floor)) salary_floor <- salary_cap * 0.90
+
+  set.seed(seed)
+  cpt <- sample.int(n_p, n_draw, replace = TRUE,
+                    prob = pmax(p$CptOwn,  1e-9) ^ alpha)
+  fl  <- matrix(sample.int(n_p, n_draw * n_flex, replace = TRUE,
+                           prob = pmax(p$FlexOwn, 1e-9) ^ alpha),
+                nrow = n_draw)
+
+  # Sorted flex indices: rejects a repeated flex, dedupes, and fixes the slot
+  # order so two draws of the same roster are one lineup.
+  srt <- t(apply(fl, 1L, sort))
+  ok  <- rowSums(srt[, -1L, drop = FALSE] == srt[, -n_flex, drop = FALSE]) == 0L
+  ok  <- ok & rowSums(srt == cpt) == 0L          # captain cannot also be a flex
+
+  tot <- p$CptSal[cpt] + rowSums(matrix(p$FlexSal[srt], nrow = n_draw))
+
+  if (require_two_teams && !all(is.na(p$Team))) {
+    tm <- cbind(p$Team[cpt], matrix(p$Team[srt], nrow = n_draw))
+    ok <- ok & rowSums(tm != tm[, 1L]) > 0L      # DK showdown: >= 2 teams
+  }
+
+  band <- ok & tot <= salary_cap & tot >= salary_floor
+  ef   <- salary_floor
+  # A thin slate can leave the band short, but do not chase it below 85% of the
+  # cap — the field does not leave $7,500 of salary on the table, and a floor
+  # that low quietly turns the "public field" into a bag of punt rosters.
+  while (sum(band) < n && ef > salary_cap * 0.85) {
+    ef   <- ef - 500
+    band <- ok & tot <= salary_cap & tot >= ef
+  }
+  keep <- which(band)
+  if (!length(keep)) stop("Showdown field generation produced no legal lineups.")
+
+  key  <- paste(cpt[keep],
+                apply(srt[keep, , drop = FALSE], 1L, paste, collapse = "-"), sep = "|")
+  keep <- keep[!duplicated(key)]
+
+  lown <- cbind(log(pmax(p$CptOwn[cpt[keep]], 1e-9)),
+                matrix(log(pmax(p$FlexOwn[srt[keep, , drop = FALSE]], 1e-9)),
+                       nrow = length(keep)))
+  aown <- exp(rowMeans(lown))
+  ord  <- head(order(-aown), n)
+
+  slot_cols <- c("Captain", paste0("Util", seq_len(n_flex)))
+  fk <- srt[keep, , drop = FALSE][ord, , drop = FALSE]
+  dt <- data.table(Captain = p$Player[cpt[keep][ord]])
+  for (j in seq_len(n_flex)) set(dt, j = slot_cols[j + 1L], value = p$Player[fk[, j]])
+  dt[, TotalSalary := tot[keep][ord]]
+  dt[, AvgOwn      := round(aown[ord], 2)]
+  dt[, LineupID    := paste0("F", seq_len(.N))]
+  setcolorder(dt, c("LineupID", slot_cols, "TotalSalary", "AvgOwn"))
+
+  cat(sprintf("  [Field-SD] %s draws -> %s legal unique -> %d kept (cap $%s, floor $%s)\n",
+              format(n_draw, big.mark = ","), format(length(keep), big.mark = ","),
+              nrow(dt), format(salary_cap, big.mark = ","), format(ef, big.mark = ",")))
+  dt[]
+}
+
+#' Build showdown field tiers: one sampled master, then derive per contest.
+build_field_tiers_showdown <- function(own_dt, specs, salary_cap, n_flex,
+                                       salary_floor = NULL, seed = 42L) {
+  n_master <- max(sapply(specs, `[[`, "n_field")) * 3L
+  cat(sprintf("\n  [Field-SD] Master build: n=%d\n", n_master))
+  master <- generate_field_lineups_showdown(own_dt, n = n_master, n_flex = n_flex,
+                                            salary_cap   = salary_cap,
+                                            salary_floor = salary_floor,
+                                            seed = seed)
+  tiers <- lapply(specs, function(s) derive_tier_field(master, s, seed = seed))
+  names(tiers) <- names(specs)
+  for (k in names(tiers))
+    cat(sprintf("  [Field-SD] %-14s %4d lineups\n", specs[[k]]$label, nrow(tiers[[k]])))
+  cat("\n")
+  list(master = master, tiers = tiers)
+}
+
+
+# ============================================================================
 # NBA FIELD LINEUP GENERATION — LP on projections
 #
 # For NBA the positional constraints make combn impractical, so the field is
@@ -871,12 +1164,34 @@ get_cash_platform_data <- function(rv, platform = NULL) {
 # every tier's field plus your lineups; tiers then index into the result.
 # ============================================================================
 
+#' Scoring weight for each slot column — the captain slot is not worth 1.0x.
+#'
+#' Used by the median-ranking passes, which build a 0/1 incidence matrix and
+#' multiply it by the per-player sim scores. A plain 0/1 matrix scores a
+#' showdown captain flat, which is how this module used to pick "your top N by
+#' median" on every showdown slate.
+slot_weights <- function(slot_cols, cpt_mult = 1.5, acpt_mult = 1.25) {
+  vapply(slot_cols, function(cl) {
+    if (identical(cl, "Captain") || identical(cl, "MVP")) as.numeric(cpt_mult)
+    else if (identical(cl, "ACaptain")) as.numeric(acpt_mult)
+    else 1
+  }, numeric(1))
+}
+
 #' Wrap a flat lineup pool into the lineup_data list format score_all_lineups expects.
-make_lineup_data <- function(lineup_pool, sim_results, player_cols, score_col = "DKScore") {
+#' @param cpt_multiplier captain/MVP scoring multiplier. score_all_lineups()
+#'   keys the captain slot off the column being named "Captain" and reads the
+#'   multiplier out of `config` — omit either and a showdown captain is scored
+#'   at 1.0x, which is what this module did to every showdown until 20 Sep 2026.
+make_lineup_data <- function(lineup_pool, sim_results, player_cols, score_col = "DKScore",
+                             cpt_multiplier = NULL, acpt_multiplier = NULL) {
   list(
     unique_lineups = lineup_pool[, player_cols, with = FALSE],
     n_sims         = length(unique(sim_results$SimID)),
-    config         = list(platform_col = score_col, percentiles = c(0.01, 0.05, 0.10, 0.20)),
+    config         = list(platform_col = score_col, percentiles = c(0.01, 0.05, 0.10, 0.20),
+                          cpt_multiplier  = cpt_multiplier  %||% 1.5,
+                          mvp_multiplier  = cpt_multiplier  %||% 1.5,
+                          acpt_multiplier = acpt_multiplier %||% 1.25),
     mode           = "standard",
     platform_col   = score_col
   )
@@ -889,7 +1204,10 @@ make_lineup_data <- function(lineup_pool, sim_results, player_cols, score_col = 
 # Weighted-rank primitive: for each sim, sort lineups by score desc and cumsum
 # the entry weights.  A lineup's weighted rank is the total weight of all
 # entries scoring strictly higher, +1.  Cash rate is P(rank <= cash line);
-# ROI is (cash_rate * mult - 1).
+# ROI is (cash_rate * mult - 1). Computed but NOT displayed: the payout
+# multipliers are gross of site rake and the field model behind the cash rate
+# has not been calibrated against real contest standings, so the tab reports
+# cash rate only and makes no claim about what is worth entering.
 #
 # The rank matrix is never materialized — counters accumulate inside the chunk
 # loop, so peak memory is one chunk regardless of sim count.
@@ -992,7 +1310,7 @@ evaluate_contest <- function(S, weights, spec, chunk = 2000L, verbose = TRUE,
 #' @param tiers      named list of field data.tables
 #' @param your_ids   character vector of your LineupIDs
 #' @param specs      named list of contest specs
-#' @return list(long = per-contest results, wide = ROI pivot)
+#' @return list(long = per-contest results, wide = cash-rate pivot)
 run_all_contests <- function(S_all, tiers, your_ids, specs,
                              progress = NULL, prog_from = 0.55, prog_to = 0.90) {
   
@@ -1030,35 +1348,27 @@ run_all_contests <- function(S_all, tiers, your_ids, specs,
   
   long <- rbindlist(out, use.names = TRUE)
   
-  # Wide ROI pivot across YOUR lineups only
+  # Wide cash-rate pivot across YOUR lineups only
   yours <- long[Source == "Yours"]
   wide  <- NULL
   if (nrow(yours) > 0L) {
-    roi_w  <- dcast(yours, LineupID ~ Contest, value.var = "ROI")
-    cash_w <- dcast(yours, LineupID ~ Contest, value.var = "CashRate")
-    setnames(cash_w, setdiff(names(cash_w), "LineupID"),
-             paste0(setdiff(names(cash_w), "LineupID"), " Cash%"))
-    wide <- merge(roi_w, cash_w, by = "LineupID")
-    
+    wide <- dcast(yours, LineupID ~ Contest, value.var = "CashRate")
+
     # Column order follows spec order (2x/3x/5x/10x), not dcast's alphabetical
     spec_labels <- sapply(specs, `[[`, "label")
     ct_cols     <- spec_labels[spec_labels %in% names(wide)]
-    cash_labels <- paste0(ct_cols, " Cash%")
-    cash_labels <- cash_labels[cash_labels %in% names(wide)]
-    
+
     if (length(ct_cols) > 0L) {
-      # BestContest: index of max ROI per row, NA-safe
-      roi_mat <- as.matrix(wide[, ct_cols, with = FALSE])
-      roi_mat[is.na(roi_mat)] <- -Inf
-      best_i  <- max.col(roi_mat, ties.method = "first")
+      cm <- as.matrix(wide[, ct_cols, with = FALSE])
+      cm[is.na(cm)] <- -Inf
+      best_i <- max.col(cm, ties.method = "first")
       wide[, BestContest := ct_cols[best_i]]
-      wide[, BestROI := apply(roi_mat, 1L, function(r) { m <- max(r); if (is.finite(m)) m else NA_real_ })]
-      
-      setcolorder(wide, c("LineupID", ct_cols, cash_labels, "BestContest", "BestROI"))
-      setorder(wide, -BestROI)
+      wide[, BestCash := apply(cm, 1L, function(r) { m <- max(r); if (is.finite(m)) m else NA_real_ })]
+      setcolorder(wide, c("LineupID", ct_cols, "BestContest", "BestCash"))
+      setorder(wide, -BestCash)
     }
   }
-  
+
   list(long = long, wide = wide)
 }
 
@@ -1164,28 +1474,13 @@ render_cash_game_tab_ui <- function() {
             })
         ),
         
-        # ── Info strip ───────────────────────────────────────────────────────
-        div(style = paste0("display:flex;align-items:center;gap:0;background:#141414;",
-                           "border:1px solid #222;border-radius:6px;overflow:hidden;",
-                           "margin-bottom:10px;height:42px;"),
-            div(style = "display:flex;align-items:center;padding:0 18px;height:42px;border-right:1px solid #222;flex-shrink:0;",
-                span(style = "font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#444;margin-right:10px;", "Mode"),
-                uiOutput("du_mode_desc_ui")
-            ),
-            div(style = "display:flex;align-items:center;padding:0 18px;height:42px;border-right:1px solid #222;flex-shrink:0;",
-                span(style = "font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#444;margin-right:10px;", "Field"),
-                uiOutput("du_field_desc_ui")
-            ),
-            div(style = "display:flex;align-items:center;padding:0 18px;height:42px;border-right:1px solid #222;flex-shrink:0;",
-                span(style = "font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#444;margin-right:10px;", "Your Pool"),
-                uiOutput("du_yours_desc_ui")
-            ),
-            div(style = "display:flex;align-items:center;padding:0 18px;height:42px;flex-shrink:0;",
-                span(style = "font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#444;margin-right:10px;", "Cash Lines"),
-                uiOutput("du_cashline_desc_ui")
-            )
-        ),
-        
+        # ── One-line setup summary. The old four-cell strip spelled out Mode /
+        # Field / Your Pool / Cash Lines in jargon before the user had run
+        # anything; it is one sentence now and the detail moved to the results.
+        div(style = paste0("background:#141414;border:1px solid #222;border-radius:6px;",
+                           "padding:10px 14px;margin-bottom:10px;font-size:12px;color:#bbb;"),
+            uiOutput("du_setup_line")),
+
         # ── Action button ────────────────────────────────────────────────────
         div(style = "display:flex;align-items:center;gap:10px;margin-bottom:16px;",
             actionButton("du_run", "Run Contests",
@@ -1194,20 +1489,32 @@ render_cash_game_tab_ui <- function() {
         ),
         
         uiOutput("du_status_msg"),
+        uiOutput("du_field_mode_ui"),
         
         conditionalPanel(
           condition = "output.du_has_results == true",
           
-          # ── Contest comparison: your lineups x contest ROI ──────────────────
-          box(width = NULL, title = "Contest Comparison \u2014 ROI by Tier",
-              status = "primary", solidHeader = TRUE,
-              div(style = "color:#777;font-size:11px;margin-bottom:8px;",
-                  "ROI% per contest type for each of your lineups. ",
-                  "BestContest flags the tier where the lineup earns most."),
-              DTOutput("du_compare_tbl") %>%
-                shinycssloaders::withSpinner(color = "#FFE500", type = 6)
+          # ── Cash rate by contest ───────────────────────────────────────────
+          # Cash rate only. ROI needs a payout curve and a rake assumption, and
+          # the field model behind these numbers has not been calibrated against
+          # real contest standings yet, so the tab does not make a claim about
+          # what to enter — it reports how often each lineup finishes paid.
+          box(width = NULL, title = "Cash Rates", status = "primary",
+              solidHeader = TRUE,
+              uiOutput("du_summary_tbl"),
+              div(style = "color:#777;font-size:11px;margin-top:10px;line-height:1.6;",
+                  tags$b(style = "color:#999;", "Pays"),
+                  " the share of the field this contest pays. ",
+                  tags$b(style = "color:#999;", "Best cash %"),
+                  " how often your strongest lineup finishes inside those places, ",
+                  "against a simulated field. ",
+                  tags$b(style = "color:#999;", "Median / Top quartile"),
+                  " the same figure for the middle and the upper quarter of your ",
+                  "lineups, so you can see the spread rather than one number."),
+              div(style = "height:14px;"),
+              uiOutput("du_best_lineup_ui")
           ),
-          
+
           # ── Per-contest ranked lineups ─────────────────────────────────────
           box(width = NULL,
               title = uiOutput("du_results_title"),
@@ -1224,7 +1531,20 @@ render_cash_game_tab_ui <- function() {
           
           box(width = NULL, title = "Player Exposure \u2014 Field vs Yours",
               status = "primary", solidHeader = TRUE,
+              div(style = "color:#777;font-size:11px;margin-bottom:8px;",
+                  "How often each player appears in the simulated field versus in your ",
+                  "lineups. A big gap either way is where your edge or your risk is."),
               DTOutput("du_exposure_tbl") %>%
+                shinycssloaders::withSpinner(color = "#FFE500", type = 6)
+          ),
+
+          box(width = NULL, title = "Every Lineup \u00d7 Every Contest",
+              status = "primary", solidHeader = TRUE, collapsible = TRUE,
+              collapsed = TRUE,
+              div(style = "color:#777;font-size:11px;margin-bottom:8px;",
+                  "The full grid, if you want it: cash % for each of your lineups in each ",
+                  "contest. BestContest is where that lineup cashes most often."),
+              DTOutput("du_compare_tbl") %>%
                 shinycssloaders::withSpinner(color = "#FFE500", type = 6)
           )
         )
@@ -1243,7 +1563,7 @@ register_cash_game_observers <- function(input, output, session, rv) {
   
   du_rv <- reactiveValues(
     long        = NULL,   # per-contest results (all lineups)
-    wide        = NULL,   # your lineups x contest ROI pivot
+    wide        = NULL,   # your lineups x contest cash-rate pivot
     tiers       = NULL,   # field data.tables per contest
     combined    = NULL,   # union pool with slot columns
     exposure    = NULL,
@@ -1253,7 +1573,8 @@ register_cash_game_observers <- function(input, output, session, rv) {
     id_col      = NULL,
     specs       = NULL,
     view        = NULL,   # which contest tab is being viewed
-    std_cols    = NULL
+    std_cols    = NULL,
+    field_label = NULL    # where the field's ownership came from
   )
   
   output$du_has_results <- reactive({
@@ -1306,39 +1627,29 @@ register_cash_game_observers <- function(input, output, session, rv) {
     "DK"
   })
   
-  output$du_mode_desc_ui <- renderUI({
-    plat_label <- switch(du_platform(), FD = "FanDuel", SD = "Showdown (DK)", "DraftKings")
-    n_ct <- length(du_contests())
-    span(style = "color:#FFE500;font-weight:700;font-size:13px;",
-         sprintf("%d Contests \u2014 %s", n_ct, plat_label))
-  })
   
-  output$du_cashline_desc_ui <- renderUI({
-    keys <- du_contests()
-    txt  <- paste(sapply(keys, function(k)
-      sprintf("%s: %.0f%%", CONTEST_TYPES[[k]]$short, CONTEST_TYPES[[k]]$cash_pct * 100)),
-      collapse = "  \u2022  ")
-    span(style = "color:#aaa;font-size:12px;", txt)
-  })
   
-  output$du_field_desc_ui <- renderUI({
+  # One sentence describing what a run will do, in place of the old strip.
+  output$du_setup_line <- renderUI({
+    req(rv$config)
     specs  <- scale_contest_specs(rv$config %||% list())
     keys   <- du_contests()
-    is_nba <- isTRUE(rv$config$sport_name == "NBA")
-    sizes  <- paste(sapply(keys, function(k) specs[[k]]$n_field), collapse = "/")
-    desc   <- if (du_platform() == "SD") paste0("Tournament pool subsets (", sizes, ")")
-    else if (is_nba)          paste0("LP-optimized master, tiers ", sizes)
-    else if (isTRUE(rv$config$sport_name == "NFL_CLASSIC"))
-                              paste0("Own-weighted legal rosters, tiers ", sizes)
-    else                      paste0("Chalk core + fill, tiers ", sizes)
-    span(style = "color:#aaa;font-size:12px;", desc)
+    cash_p <- get_cash_params(rv$config %||% list())
+    plat   <- switch(du_platform(), FD = "FanDuel", SD = "DraftKings showdown", "DraftKings")
+    n_sims <- if (!is.null(rv$simulation_results))
+      length(unique(rv$simulation_results$SimID)) else NA_integer_
+    biggest <- max(vapply(specs[keys], `[[`, numeric(1), "n_field"))
+    tagList(
+      span(style = "color:#FFE500;font-weight:700;", plat), " \u00b7 ",
+      if (!is.na(n_sims)) span(sprintf("%s sims", format(n_sims, big.mark = ",")))
+      else span("no sim loaded"), " \u00b7 ",
+      span(sprintf("%d contest%s", length(keys), if (length(keys) == 1L) "" else "s")),
+      " \u00b7 ",
+      span(sprintf("your best %d lineups against a simulated field of up to %d entrants",
+                   cash_p$n_yours, biggest))
+    )
   })
   
-  output$du_yours_desc_ui <- renderUI({
-    cash_p <- get_cash_params(rv$config %||% list())
-    span(style = "color:#aaa;font-size:12px;",
-         paste0("Top ", cash_p$n_yours, " by median score"))
-  })
   
   # ── View pills (which contest's ranked table to show) ─────────────────────
   output$du_view_pills_ui <- renderUI({
@@ -1391,6 +1702,7 @@ register_cash_game_observers <- function(input, output, session, rv) {
       
       all_specs <- scale_contest_specs(rv$config)
       specs     <- all_specs[du_contests()]
+
       
       constraints <- get_dk_constraints(rv$config)
       sal_cap     <- switch(plat,
@@ -1411,7 +1723,15 @@ register_cash_game_observers <- function(input, output, session, rv) {
       
       player_cols <- get_player_cols(dk_opt)
       r_size      <- length(player_cols)
-      std_cols    <- paste0("Player", seq_len(r_size))
+
+      # A showdown pool keeps its native Captain / Util1..N slot names all the
+      # way through. score_all_lineups() decides whether to apply the captain
+      # multiplier by looking for a column literally called "Captain", so
+      # renaming the slots to Player1..N — which this module used to do
+      # unconditionally — silently scored every showdown captain at 1.0x.
+      is_captain_pool <- "Captain" %in% player_cols
+      is_two_tier_cpt <- is_captain_pool && "ACaptain" %in% player_cols
+      std_cols    <- if (is_captain_pool) player_cols else paste0("Player", seq_len(r_size))
       n_sims      <- length(unique(sim_res$SimID))
       n_gpp       <- nrow(dk_opt)
       
@@ -1422,11 +1742,42 @@ register_cash_game_observers <- function(input, output, session, rv) {
       if (!"LineupID" %in% names(dk_opt)) dk_opt[, LineupID := paste0("GPP", seq_len(.N))]
       
       # ── Step 1: Build field tiers ────────────────────────────────────────
+      # field_label always says where the field's ownership came from; a
+      # field synthesized from medians is a weaker claim than one built on
+      # real ownership and the tab has to show which it got.
+      field_label <- NULL
+      cpt_mult    <- if (is_captain_pool) cash_sd_cols(rv$config, meta_raw, plat)$cpt_mult else NULL
       cat("  [Contests] Step 1/4: Building field tiers...\n"); flush.console()
       progress$set(detail = "Step 1/4: Building field tiers...", value = 0.05)
       
-      if (plat == "SD") {
-        # SD: rank the tournament SD pool by true median, tiers = head() subsets
+      # Gate on the ROSTER SHAPE, not the platform. An NFL showdown pool is
+      # filed under rv$dk_optimal_lineups, not rv$sd_optimal_lineups, so a
+      # `plat == "SD"` test sent it down the flat-roster path and it died in
+      # prep_pool with "no players with valid salary and ownership".
+      if (is_captain_pool && !is_two_tier_cpt) {
+        # Showdown: sample an actual public field. Ownership where the sheet has
+        # it, otherwise synthesized from projections, otherwise from our own sim
+        # medians — resolved per player, and reported on the tab either way.
+        sd_cols  <- cash_sd_cols(rv$config, meta_raw, plat)
+        fo       <- cash_field_ownership(meta_raw, sim_res, sd_cols, score_col,
+                                         n_flex_slots = r_size - 1L)
+        cpt_mult <- sd_cols$cpt_mult
+        field_label <- fo$label
+        cat(sprintf("  [Field-SD] %s\n", field_label))
+
+        ft <- build_field_tiers_showdown(
+          fo$own, specs,
+          salary_cap   = sal_cap,
+          n_flex       = r_size - 1L,
+          salary_floor = sal_cap * 0.90
+        )
+        master <- ft$master
+        tiers  <- ft$tiers
+
+      } else if (plat == "SD" || is_captain_pool) {
+        # Two-tier captain (tennis CPT / A-CPT) has no sampler yet, so it keeps
+        # the old behaviour: your own tournament pool standing in for the field.
+        field_label <- "Field derived from your own tournament pool (no sampler for this roster format)"
         sd_pool <- copy(as.data.table(opt_lus))
         if (!"LineupID" %in% names(sd_pool)) sd_pool[, LineupID := paste0("GPP", seq_len(.N))]
         sd_pc  <- get_player_cols(sd_pool)
@@ -1443,11 +1794,12 @@ register_cash_game_observers <- function(input, output, session, rv) {
         for (ci in seq_len(ceiling(n_sd / csz))) {
           i1 <- (ci - 1L) * csz + 1L; i2 <- min(ci * csz, n_sd)
           ch <- sd_pool[i1:i2]
-          mm <- matrix(0L, nrow = nrow(ch), ncol = length(sd_all))
+          mm <- matrix(0, nrow = nrow(ch), ncol = length(sd_all))
           colnames(mm) <- sd_all
+          sw <- slot_weights(std_cols, cpt_mult %||% 1.5)
           for (pc in std_cols) {
             pi <- sd_idx[ch[[pc]]]; ok <- !is.na(pi)
-            mm[cbind(which(ok), pi[ok])] <- 1L
+            mm[cbind(which(ok), pi[ok])] <- sw[[pc]]
           }
           med[i1:i2] <- apply(mm %*% sm, 1, median)
         }
@@ -1465,6 +1817,7 @@ register_cash_game_observers <- function(input, output, session, rv) {
       } else if (is_nfl_classic) {
         if (!own_col %in% names(meta_raw))
           stop(own_col, " not found in metadata.")
+        field_label <- sprintf("Field from sheet ownership (%s)", own_col)
         ft     <- build_field_tiers_nfl_classic(meta_raw, specs, sal_cap,
                                                 salary_floor = sal_cap - 1000,
                                                 platform = plat)
@@ -1474,6 +1827,7 @@ register_cash_game_observers <- function(input, output, session, rv) {
       } else if (is_nba) {
         if (!proj_col %in% names(meta_raw))
           stop(proj_col, " not found in metadata — NBA field requires ETR projections.")
+        field_label <- sprintf("Sharp field \u2014 LP-optimal on %s", proj_col)
         ft     <- build_field_tiers_nba(meta_raw, specs, sal_cap, platform = plat)
         master <- ft$master
         tiers  <- ft$tiers
@@ -1481,6 +1835,7 @@ register_cash_game_observers <- function(input, output, session, rv) {
       } else {
         if (!own_col %in% names(meta_raw))
           stop(own_col, " not found in metadata.")
+        field_label <- sprintf("Field from sheet ownership (%s)", own_col)
         ft <- build_field_tiers(
           metadata     = meta_raw,
           specs        = specs,
@@ -1522,11 +1877,12 @@ register_cash_game_observers <- function(input, output, session, rv) {
         for (ci in seq_len(ceiling(n_gpp / csz))) {
           i1 <- (ci - 1L) * csz + 1L; i2 <- min(ci * csz, n_gpp)
           ch <- dk_opt[i1:i2]
-          mm <- matrix(0L, nrow = nrow(ch), ncol = length(all_pl))
+          mm <- matrix(0, nrow = nrow(ch), ncol = length(all_pl))
           colnames(mm) <- all_pl
+          sw <- slot_weights(player_cols, cpt_mult %||% 1.5)
           for (pc in player_cols) {
             pi <- pl_idx[ch[[pc]]]; ok <- !is.na(pi)
-            mm[cbind(which(ok), pi[ok])] <- 1L
+            mm[cbind(which(ok), pi[ok])] <- sw[[pc]]
           }
           med[i1:i2] <- apply(mm %*% sm, 1, median)
           cat(sprintf("\r  [Contests] Step 2/4: %d%%", round(i2 / n_gpp * 100)))
@@ -1566,7 +1922,8 @@ register_cash_game_observers <- function(input, output, session, rv) {
       progress$set(detail = sprintf("Step 3/4: Scoring %d lineups...", nrow(combined)),
                    value = 0.28)
       
-      ld  <- make_lineup_data(combined, sim_res, std_cols, score_col)
+      ld  <- make_lineup_data(combined, sim_res, std_cols, score_col,
+                              cpt_multiplier = cpt_mult)
       S   <- score_all_lineups(ld, sim_res, verbose = TRUE)
       if (nrow(S) != nrow(combined))
         stop(sprintf("Scoring row mismatch: %d scored vs %d lineups.",
@@ -1604,6 +1961,7 @@ register_cash_game_observers <- function(input, output, session, rv) {
       du_rv$specs    <- specs
       du_rv$std_cols <- std_cols
       du_rv$view     <- names(specs)[1]
+      du_rv$field_label <- field_label
       du_rv$has_results <- TRUE
       
       elapsed <- as.numeric(difftime(Sys.time(), t_total, units = "secs"))
@@ -1624,6 +1982,20 @@ register_cash_game_observers <- function(input, output, session, rv) {
   
   
   # ── Status ───────────────────────────────────────────────────────────────
+  # Where the field's ownership came from. Always shown once a run completes —
+  # a field synthesized from sim medians is a much weaker claim than one built
+  # on real projected ownership, and the cash rates inherit that.
+  output$du_field_mode_ui <- renderUI({
+    lbl <- du_rv$field_label
+    if (is.null(lbl) || !nzchar(lbl)) return(NULL)
+    synth <- grepl("synthesi[sz]ed|your own tournament pool", lbl)
+    div(style = sprintf(
+          "margin:6px 0 2px 0;padding:6px 10px;border-left:3px solid %s;font-size:12px;color:#bbb;",
+          if (synth) "#d9a441" else "#4a90d9"),
+        icon(if (synth) "triangle-exclamation" else "circle-info"),
+        " ", lbl)
+  })
+
   output$du_status_msg <- renderUI({
     msg <- du_rv$status
     if (is.null(msg)) {
@@ -1641,22 +2013,115 @@ register_cash_game_observers <- function(input, output, session, rv) {
   })
   
   
+  # ── The verdict: which contest is worth entering ─────────────────────────
+  #
+  # One row per CONTEST, not per lineup. The decision the tab exists to serve is
+  # "which contest do I enter", and the old landing table answered a different
+  # question — fifty rows of your lineups across ten numeric columns, every row
+  # flagging the same BestContest.
+  du_summary <- reactive({
+    req(du_rv$long, du_rv$specs)
+    yours <- du_rv$long[Source == "Yours"]
+    req(nrow(yours) > 0L)
+
+    rbindlist(lapply(names(du_rv$specs), function(k) {
+      sp  <- du_rv$specs[[k]]
+      sub <- yours[ContestKey == k]
+      if (!nrow(sub)) return(NULL)
+      best <- sub[which.max(CashRate)]
+      data.table(
+        Contest    = sp$label,
+        Pays       = sprintf("top %.0f%%", sp$cash_pct * 100),
+        Best       = best$CashRate,
+        Upper      = as.numeric(quantile(sub$CashRate, 0.75, na.rm = TRUE)),
+        Median     = as.numeric(median(sub$CashRate, na.rm = TRUE)),
+        OfN        = nrow(sub),
+        ContestKey = k,
+        BestID     = best$LineupID
+      )
+    }), use.names = TRUE)
+  })
+
+  # Four rows and six columns. DataTables brings pagination chrome, a JS
+  # dependency and its own failure modes for a table this size -- it rendered
+  # empty here despite the data being right -- so this is plain HTML. It also
+  # styles far more precisely than formatStyle() does.
+  output$du_summary_tbl <- renderUI({
+    sm <- du_summary()
+    if (is.null(sm) || !nrow(sm)) return(NULL)
+
+    th <- function(x, align = "left")
+      tags$th(style = sprintf(paste0("text-align:%s;padding:7px 12px;font-size:10px;",
+                                     "font-weight:700;letter-spacing:.07em;",
+                                     "text-transform:uppercase;color:#777;",
+                                     "border-bottom:1px solid #2c2c2c;"), align), x)
+    td <- function(x, align = "left", extra = "")
+      tags$td(style = sprintf(paste0("text-align:%s;padding:9px 12px;font-size:13px;",
+                                     "border-bottom:1px solid #1e1e1e;%s"), align, extra), x)
+
+    rows <- lapply(seq_len(nrow(sm)), function(i) {
+      r <- sm[i]
+      tags$tr(
+        td(r$Contest, "left",  "color:#FFE500;font-weight:600;"),
+        td(r$Pays,    "left",  "color:#999;"),
+        td(sprintf("%.1f%%", r$Best),   "right", "color:#eee;font-weight:700;"),
+        td(sprintf("%.1f%%", r$Upper),  "right", "color:#aaa;"),
+        td(sprintf("%.1f%%", r$Median), "right", "color:#aaa;"),
+        td(format(r$OfN, big.mark = ","), "right", "color:#777;")
+      )
+    })
+
+    tags$table(
+      style = "width:100%;border-collapse:collapse;",
+      tags$thead(tags$tr(
+        th("Contest"), th("Pays"), th("Best cash %", "right"),
+        th("Top quartile", "right"), th("Median", "right"), th("Lineups", "right"))),
+      tags$tbody(rows)
+    )
+  })
+
+  # The highest cash-rate lineup, spelled out. A LineupID is not an answer.
+  output$du_best_lineup_ui <- renderUI({
+    sm <- du_summary()
+    req(nrow(sm) > 0L, du_rv$combined)
+    top <- sm[which.max(Best)]
+    row <- du_rv$combined[LineupID == top$BestID]
+    req(nrow(row) == 1L)
+
+    sc  <- du_rv$std_cols
+    lbl <- get_slot_labels(rv$config, length(sc)) %||% sc
+    pills <- lapply(seq_along(sc), function(i) {
+      is_cpt <- identical(sc[i], "Captain") || identical(sc[i], "MVP")
+      span(style = paste0("display:inline-block;margin:3px 6px 3px 0;padding:4px 10px;",
+                          "border-radius:4px;font-size:12px;",
+                          if (is_cpt) "background:#3a3206;color:#FFE500;font-weight:700;border:1px solid #6b5c0a;"
+                          else "background:#1b1b1b;color:#ddd;border:1px solid #2c2c2c;"),
+           if (is_cpt) paste0(lbl[i], "  ") else NULL,
+           as.character(row[[sc[i]]][1]))
+    })
+    div(
+      div(style = "font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#666;margin-bottom:6px;",
+          sprintf("Highest cash rate \u2014 %s, %.1f%%", top$Contest, top$Best)),
+      div(pills),
+      div(style = "color:#777;font-size:11px;margin-top:6px;",
+          sprintf("%s \u00b7 $%s salary",
+                  top$BestID,
+                  format(round(as.numeric(row$TotalSalary[1])), big.mark = ",")))
+    )
+  })
+
   # ── Contest comparison table ─────────────────────────────────────────────
   output$du_compare_tbl <- renderDT({
     req(du_rv$wide)
     dt <- copy(du_rv$wide)
     
-    roi_cols  <- intersect(sapply(du_rv$specs, `[[`, "label"), names(dt))
-    cash_cols <- grep(" Cash%$", names(dt), value = TRUE)
+    cash_cols <- intersect(sapply(du_rv$specs, `[[`, "label"), names(dt))
     
     datatable(dt, rownames = FALSE,
               options = list(pageLength = 25, scrollX = TRUE,
                              searching = FALSE, lengthChange = FALSE, dom = "tp"),
               class = "stripe hover compact") %>%
-      formatRound(intersect(c(roi_cols, cash_cols, "BestROI"), names(dt)), 1) %>%
-      formatStyle(roi_cols,
-                  color = styleInterval(c(-0.001, 0.001), c("#e06666", "#888", "#7fd18f")),
-                  fontWeight = "600") %>%
+      formatRound(intersect(c(cash_cols, "BestCash"), names(dt)), 1) %>%
       formatStyle("BestContest", color = "#FFE500", fontWeight = "700")
   })
   
@@ -1667,7 +2132,7 @@ register_cash_game_observers <- function(input, output, session, rv) {
     k   <- du_rv$view
     lbl <- du_rv$specs[[k]]$label
     sub <- du_rv$long[ContestKey == k]
-    span(sprintf("%s \u2014 %d Lineups Ranked by ROI  (%d Yours / %d Field)",
+    span(sprintf("%s \u2014 %d Lineups Ranked by Cash Rate  (%d Yours / %d Field)",
                  lbl, nrow(sub),
                  sum(sub$Source == "Yours"), sum(sub$Source == "Field")),
          style = "color:#FFE500;")
@@ -1684,12 +2149,12 @@ register_cash_game_observers <- function(input, output, session, rv) {
     std_cols <- du_rv$std_cols
     base     <- du_rv$combined[, c("LineupID", std_cols, "TotalSalary", "AvgOwn"),
                                with = FALSE]
-    dt <- merge(sub[, .(LineupID, Source, MedianScore, AvgFinish, CashRate, ROI)],
+    dt <- merge(sub[, .(LineupID, Source, MedianScore, AvgFinish, CashRate)],
                 base, by = "LineupID")
     
     setcolorder(dt, c("LineupID", "Source", std_cols, "TotalSalary", "AvgOwn",
-                      "MedianScore", "AvgFinish", "CashRate", "ROI"))
-    setorder(dt, -ROI, -CashRate)
+                      "MedianScore", "AvgFinish", "CashRate"))
+    setorder(dt, -CashRate)
     
     slot_labels <- get_slot_labels(rv$config, length(std_cols))
     if (!is.null(slot_labels)) {
@@ -1703,10 +2168,8 @@ register_cash_game_observers <- function(input, output, session, rv) {
               class = "stripe hover compact") %>%
       { if ("TotalSalary" %in% names(dt)) formatCurrency(., "TotalSalary", "$", digits = 0) else . } %>%
       { if ("AvgOwn" %in% names(dt)) formatRound(., "AvgOwn", 2) else . } %>%
-      formatRound(c("MedianScore", "CashRate", "ROI"), 1) %>%
-      formatStyle("ROI",
-                  color = styleInterval(c(-0.001, 0.001), c("#e06666", "#888", "#7fd18f")),
-                  fontWeight = "600") %>%
+      formatRound(c("MedianScore", "CashRate"), 1) %>%
+      formatStyle("CashRate", fontWeight = "600", color = "#ddd") %>%
       formatStyle("Source",
                   color      = styleEqual(c("Yours", "Field"), c("#FFE500", "#aaaaaa")),
                   fontWeight = styleEqual(c("Yours", "Field"), c("700", "400")))
@@ -1782,9 +2245,9 @@ register_cash_game_observers <- function(input, output, session, rv) {
         if (nrow(sub) == 0L) next
         base <- du_rv$combined[, c("LineupID", std_cols, "TotalSalary", "AvgOwn"),
                                with = FALSE]
-        dl <- merge(sub[, .(LineupID, Source, MedianScore, AvgFinish, CashRate, ROI)],
+        dl <- merge(sub[, .(LineupID, Source, MedianScore, AvgFinish, CashRate)],
                     base, by = "LineupID")
-        setorder(dl, -ROI, -CashRate)
+        setorder(dl, -CashRate)
         dl <- add_ids(copy(dl))
         
         sheet <- substr(du_rv$specs[[k]]$label, 1, 28)
