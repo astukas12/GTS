@@ -1166,6 +1166,9 @@ find_optimal_lineups_enum_captain <- function(sim_results, config, verbose = TRU
                            format(round(sal_floor), big.mark = ","),
                            format(salary_cap, big.mark = ","), format(M, big.mark = ",")))
 
+  idx6 <- rbind(matrix(cpt_v, nrow = 1L), flex_m)           # roster_size x M (for AvgScore)
+  wtv  <- c(cpt_multiplier, rep(1, n_flex))
+
   # ---- ladder setup: the cash curve rides along with the sweep ----
   #
   # A GPP lineup is ranked by hit_count -- "was this ever in the top 1% of the
@@ -1184,9 +1187,10 @@ find_optimal_lineups_enum_captain <- function(sim_results, config, verbose = TRU
   # (a 45% double-up reads the 55th rung; a 4-man reads an integral over all of
   # them) with no second sweep.
   #
-  # Measured at this slate's shape: the field pass is 0.05s per 300 sims, the
-  # bucketing and tally 0.70s, against 1.47s for the sweep they ride with. The
-  # tournament run pays ~50% for it; the Cash tab stops scoring anything at all.
+  # Measured on the WAS@DAL band (97,869 lineups, 1,000 sims): the sweep goes
+  # 10.8s -> 11.7s, +8%. Tallying all 97,869 instead of the cash candidate set
+  # costs +44%, which is not worth it -- see the candidate note below. The Cash
+  # tab stops scoring anything at all, so end to end this is a large net win.
   cf      <- config$cash_field
   has_lad <- FALSE
   if (!is.null(cf)) {
@@ -1202,15 +1206,37 @@ find_optimal_lineups_enum_captain <- function(sim_results, config, verbose = TRU
       fw     <- as.numeric(cf$weights)[fok]
       cutw   <- (1 - cf$pct) * sum(fw)   # weight of entries that must be beaten
       K      <- length(cf$pct)
-      off_m  <- seq_len(M)
+      # The ladder does NOT measure all M. It costs a findInterval and a
+      # tally per lineup per sim, and at 93,000 lineups that was ~44% on the
+      # sweep -- too much to pay on a button you are already waiting through.
+      #
+      # It does not need to. Cash lineups live in one corner of the band, and
+      # the candidates can be picked by the weighted mean of player means,
+      # which needs no sims at all. That is NOT the ceiling filter this whole
+      # change exists to undo: hit_count asks "were you ever top 1%", which
+      # throws away exactly the consistent lineup a double-up wants. Mean is
+      # the opposite bias, and measured on WAS@DAL the best cash lineup was
+      # rank 1 by mean -- so a few thousand candidates is a loose net around
+      # it, not a cut through it.
+      cash_floor <- config$cash_salary_floor %||% 48000
+      cash_cap   <- config$cash_pool_max     %||% 6000L
+      wm_all <- as.numeric(wtv %*% matrix(mu[idx6], nrow = roster_size))
+      c_elig <- which(lsal_v >= cash_floor)
+      if (length(c_elig) < cash_cap) c_elig <- seq_len(M)
+      cidx   <- c_elig[order(wm_all[c_elig], decreasing = TRUE)[
+                         seq_len(min(cash_cap, length(c_elig)))]]
+      n_cash <- length(cidx)
+      off_m  <- seq_len(n_cash)
       n_fl   <- length(f_cpt)
       off_f  <- seq_len(n_fl)
       f_nm   <- list(cpt = as.character(cf$cpt)[fok],
                      flex = matrix(as.character(cf$flex), nrow = nrow(cf$flex))[, fok, drop = FALSE])
       has_lad<- TRUE
       if (verbose)
-        cat(sprintf("  cash ladder: %d field lineups (of %d) x %d cut lines\n",
-                    n_fl, length(cf$cpt), K))
+        cat(sprintf("  cash ladder: %s candidates (>= $%s, top by mean) vs %d field x %d cut lines
+",
+                    format(n_cash, big.mark = ","), format(cash_floor, big.mark = ","),
+                    n_fl, K))
     } else if (verbose) {
       cat("  cash ladder: field did not survive the player map -- skipped\n")
     }
@@ -1224,7 +1250,7 @@ find_optimal_lineups_enum_captain <- function(sim_results, config, verbose = TRU
   n_flag    <- max(1L, as.integer(round(M * win_pct)))
   kth       <- M - n_flag + 1L
   hit_count <- integer(M)
-  cnt_all   <- if (has_lad) integer(M * (K + 1L)) else NULL
+  cnt_all   <- if (has_lad) integer(n_cash * (K + 1L)) else NULL
   fcn_all   <- if (has_lad) integer(n_fl * (K + 1L)) else NULL
 
   # This is the longest step in the app and it used to run silently: at 50,000
@@ -1251,7 +1277,7 @@ find_optimal_lineups_enum_captain <- function(sim_results, config, verbose = TRU
   # transfer instead of n_round of them.
   ws_kernel <- function(ss, stash = FALSE) {
     hc  <- integer(M)
-    cnt <- if (has_lad) integer(M * (K + 1L)) else NULL
+    cnt <- if (has_lad) integer(n_cash * (K + 1L)) else NULL
     fcn <- if (has_lad) integer(n_fl * (K + 1L)) else NULL
     for (s in ss) {
       sc <- score_mat[, s]
@@ -1276,7 +1302,7 @@ find_optimal_lineups_enum_captain <- function(sim_results, config, verbose = TRU
         # one pass. Tally it as a histogram: cnt is M x (K+1) flattened, so the
         # whole sim is one indexed add. A ladder of counts is the compression --
         # the raw M x n_sims scores would be 18 GB.
-        idx <- findInterval(ls, q) * M + off_m
+        idx <- findInterval(ls[cidx], q) * n_cash + off_m
         cnt[idx] <- cnt[idx] + 1L
         # The field's own lineups, measured on the same cut lines. 1,000 more
         # rows against 93,000 is ~1% more work, and it is what lets the Cash
@@ -1307,7 +1333,7 @@ find_optimal_lineups_enum_captain <- function(sim_results, config, verbose = TRU
   payload_gb <- (as.numeric(length(score_mat)) * 8 +
                  as.numeric(length(cpt_v) + length(flex_m)) * 4 +
                  # the ladder tally each worker accumulates and ships back
-                 if (has_lad) as.numeric(M + n_fl) * (K + 1) * 4 else 0) / 1024^3
+                 if (has_lad) as.numeric(n_cash + n_fl) * (K + 1) * 4 else 0) / 1024^3
   n_work <- .opt_workers()
   if (payload_gb > 0) {
     afford <- as.integer(floor((.opt_total_ram_gb() * 0.15) / payload_gb))
@@ -1321,7 +1347,8 @@ find_optimal_lineups_enum_captain <- function(sim_results, config, verbose = TRU
       cl,
       c("score_mat", "cpt_v", "flex_m", "cpt_multiplier", "n_flex", "kth", "M",
         "has_lad", if (has_lad) c("f_cpt", "f_flex", "fw", "cutw", "K",
-                                  "off_m", "off_f", "n_fl") else NULL),
+                                  "off_m", "off_f", "n_fl", "cidx",
+                                  "n_cash") else NULL),
       envir = environment())
 
     # Rounds exist so the progress bar can move. Measured warm, round count
@@ -1390,9 +1417,6 @@ find_optimal_lineups_enum_captain <- function(sim_results, config, verbose = TRU
   }
   if (verbose) { cat("\n"); flush.console() }
 
-  idx6 <- rbind(matrix(cpt_v, nrow = 1L), flex_m)           # roster_size x M (for AvgScore)
-  wtv  <- c(cpt_multiplier, rep(1, n_flex))
-
   # ---- 4. drop zero-hit, rank by hit_count, keep the top enum_keep ----
   live <- which(hit_count > 0L)
   ord  <- live[order(hit_count[live], decreasing = TRUE)]
@@ -1433,30 +1457,20 @@ find_optimal_lineups_enum_captain <- function(sim_results, config, verbose = TRU
       for (k in seq(K + 1L, 2L)) { acc <- acc + C[, k]; out[, k - 1L] <- acc }
       out
     }
-    R <- at_least(cnt_all, M)
-
-    # Cash lineups do not leave salary on the table, so the band is tightened at
-    # the cash end only -- the enumeration and the GPP pool above are untouched.
-    cash_floor <- config$cash_salary_floor %||% 48000
-    cash_keep  <- config$cash_keep         %||% 2000L
-    elig <- which(lsal_v >= cash_floor)
-    if (length(elig) < cash_keep) {
-      if (verbose) cat(sprintf("  cash floor $%s leaves only %s lineups -- using the full band\n",
-                               format(cash_floor, big.mark = ","),
-                               format(length(elig), big.mark = ",")))
-      elig <- seq_len(M)
-    }
+    R <- at_least(cnt_all, n_cash)          # rows are cidx, the candidate set
 
     # Keep a lineup if it is near the top on ANY cut line, not on an average of
     # them: the 45% line and the 99.5% line reward different rosters and the
     # stored curve has to be able to answer both.
-    best <- rep(.Machine$integer.max, length(elig))
+    cash_keep <- min(config$cash_keep %||% 2000L, n_cash)
+    best <- rep(.Machine$integer.max, n_cash)
     for (k in seq_len(K)) {
-      o  <- order(R[elig, k], decreasing = TRUE)
-      rk <- integer(length(o)); rk[o] <- seq_along(o)
+      o  <- order(R[, k], decreasing = TRUE)
+      rk <- integer(n_cash); rk[o] <- seq_along(o)
       best <- pmin(best, rk)
     }
-    csel <- elig[order(best)[seq_len(min(cash_keep, length(elig)))]]
+    krow <- order(best)[seq_len(cash_keep)]  # rows of R / positions in cidx
+    csel <- cidx[krow]                       # positions in the full band
 
     cl <- data.table(Captain = all_players[cpt_v[csel]])
     for (k in seq_len(n_flex))
@@ -1477,21 +1491,21 @@ find_optimal_lineups_enum_captain <- function(sim_results, config, verbose = TRU
           mu[rbind(matrix(f_cpt, nrow = 1L), f_flex)], nrow = roster_size))]
 
     cash <- list(pct       = cf$pct,
-                 curve     = R[csel, , drop = FALSE] / n_sims,
+                 curve     = R[krow, , drop = FALSE] / n_sims,
                  lineups   = cl,
                  n_sims    = n_sims,
                  field     = list(label = cf$label, n_field = n_fl,
                                   max_weight = cf$max_weight, alpha = cf$alpha,
                                   lineups = fdt, curve = fR / n_sims),
                  signature = cf$sig,
-                 salary_floor = if (identical(elig, seq_len(M))) NA_real_ else cash_floor)
+                 salary_floor = cash_floor,
+                 n_candidates = n_cash)
 
     if (verbose) {
-      bi <- which.max(R[csel, which.min(abs(cf$pct - 0.55))])
-      cat(sprintf("  cash curve: %s lineups kept (>= $%s) | best double-up %.1f%%\n",
-                  format(nrow(cl), big.mark = ","),
-                  format(cash_floor, big.mark = ","),
-                  100 * cash$curve[bi, which.min(abs(cf$pct - 0.55))]))
+      k55 <- which.min(abs(cf$pct - 0.55))
+      cat(sprintf("  cash curve: %s kept of %s candidates | best double-up %.1f%%\n",
+                  format(nrow(cl), big.mark = ","), format(n_cash, big.mark = ","),
+                  100 * max(cash$curve[, k55])))
     }
   }
 
