@@ -1125,7 +1125,15 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
 
   DSTB <- readRDS(file.path(nfl_db_dir(), "nfl_dst_box.rds")); setDT(DSTB)
   setkey(DSTB, game_id, def_team)
-  dst_cols <- c("def_sacks", "def_int", "def_fum_rec", "def_td", "def_block", "def_safety", "pa", "pf")
+  # st_td = the special-teams part of def_td (punt / kickoff / FG-block returns), the
+  # only return TDs a returner PLAYER scores. A box built before it existed would
+  # pay the returner for every pick-six and fumble return, so say so loudly.
+  if (!"st_td" %in% names(DSTB)) {
+    warning("nfl_dst_box has no st_td column (stale data): returners will be credited ",
+            "every defensive TD. Rebuild with GTS/NFL/R/dst.R build_dst_box(refresh = TRUE).")
+    DSTB[, st_td := def_td]
+  }
+  dst_cols <- c("def_sacks", "def_int", "def_fum_rec", "def_td", "st_td", "def_block", "def_safety", "pa", "pf")
 
   # per-sim DST line for a drawn-game identity (the defence paired with that
   # offence in the real game). NO EXTRA DRAW -- same game_id the offence used.
@@ -1217,21 +1225,26 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
       D[player == cf$qb, `:=`(pyds = pv[sim], ptd = ptv[sim], pint = inv[sim])]
     }
 
-    # kicker: FG points as they were kicked + one XP per offensive TD (v1
-    # approximation -- slim carries no XP event; missed XP / 2pt not modelled).
+    # kicker: FG points as they were kicked + one XP per touchdown THIS TEAM scores
+    # (v1 approximation -- slim carries no XP event; missed XP / 2pt not modelled).
+    # That is its offensive TDs plus the TDs its own defence / special teams score
+    # (the drawn game's def_td, the same events the DST row and returner slot score):
+    # a defensive TD's XP goes to the scoring team's kicker, never the offence's.
     if (!is.na(cf$k)) {
       tdv <- D[, .(t = sum(rtd) + sum(ctd)), by = sim]
       xpv <- rep(0, n_sims); xpv[tdv$sim] <- tdv$t
+      xpv <- xpv + cf$dl$ret_td
       D[player == cf$k, `:=`(fgp = fgv[sim], xp = xpv[sim])]
     }
 
-    # return TDs: the drawn game's non-offensive return-TD count, credited to
-    # ONE returner slot (KR first, else PR) at +6 each -- the same events the
-    # DST row also scores. v1 does not split defensive vs ST return TDs.
+    # return TDs: the drawn game's SPECIAL-TEAMS return-TD count (punt / kickoff /
+    # FG-block returns), credited to ONE returner slot (KR first, else PR) at +6
+    # each. The DST row scores those AND the pick-sixes / fumble returns (ret_td);
+    # a returner is an offensive player and gets none of the defensive ones.
     ret_slot <- if (!is.na(cf$kr) && nzchar(cf$kr)) cf$kr
                 else if (!is.na(cf$pr) && nzchar(cf$pr)) cf$pr else NA_character_
     if (!is.na(ret_slot)) {
-      rtv <- cf$dl$ret_td
+      rtv <- cf$dl$st_td
       D[player == ret_slot, rettd := rettd + rtv[sim]]
     }
 
