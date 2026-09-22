@@ -212,6 +212,7 @@ Windows 11 and returned nothing, silently reporting the fallback 8 GB for a
 
 ## Running it
 
-A working launch config lives at `TheLab/.claude/launch.json` (name: `simapp`)
-— it starts SimApp on port 7788. Real input sheets for testing are in
-`Documents\GTS\<Sport>\` and `TheLab/InputFiles/`.
+A working launch config lives at `.claude/launch.json` in the repo root (name:
+`simapp`) — it starts SimApp on port 7788. Real input sheets for testing are in
+`Documents\GTS\<Sport>\`, with 72 older NASCAR ones in
+`Documents\GTS\Nascar\InputFiles\archive\`.
