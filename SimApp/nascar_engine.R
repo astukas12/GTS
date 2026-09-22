@@ -1934,6 +1934,7 @@ nascar_stage_deal <- function(f_start, f_fin, room, l_start, l_fin, val, theta, 
   n <- length(f_start)
   pts <- numeric(n)
   owner <- matrix(NA_integer_, nrow(val), 3)
+  stage <- line <- matrix(0, n, 3)              # per-car points by stage: total, and from its own lines
   use_q <- !is.null(f_q) && !is.null(l_q)
   for (s in 1:3) {
     lines <- which(val[, s] > 0)
@@ -1959,6 +1960,7 @@ nascar_stage_deal <- function(f_start, f_fin, room, l_start, l_fin, val, theta, 
       owner[j, s] <- i
       g <- min(val[j, s], room[i])
       pts[i] <- pts[i] + g; room[i] <- room[i] - g
+      stage[i, s] <- stage[i, s] + g; line[i, s] <- line[i, s] + g
       if (val[j, s] - g > 1e-9) spill[[length(spill) + 1]] <- list(left = val[j, s] - g, ord = setdiff(order(d), i))
     }
     for (sp in spill) {                          # evenly over the four nearest cars with room
@@ -1969,10 +1971,11 @@ nascar_stage_deal <- function(f_start, f_fin, room, l_start, l_fin, val, theta, 
         if (!length(ks)) break
         g <- pmin(left / length(ks), room[ks])
         pts[ks] <- pts[ks] + g; room[ks] <- room[ks] - g; left <- left - sum(g)
+        stage[ks, s] <- stage[ks, s] + g
       }
     }
   }
-  list(pts = pts, owner = owner)
+  list(pts = pts, owner = owner, stage = stage, line = line)
 }
 
 assign_dominator_points_stagewise <- function(race_result, race_weights, stage_data, platform) {
@@ -1998,6 +2001,8 @@ assign_dominator_points_stagewise <- function(race_result, race_weights, stage_d
                             l_q = if (isTRUE(stage_data$q_on)) rd$q else NULL,
                             late_q = if (is.null(stage_data$late_q)) 0 else stage_data$late_q)
   set(race_result, j = col_name, value = deal$pts)
+  # Sim review capture (GTS/Common/SIM_REVIEW_PLAN.md): unset for customers, set only by the re-sim worker
+  if (!is.null(h <- getOption("nascar.dom_hook"))) h(race_result$SimID[1], race_id, deal, race_result$Name, platform)
   race_result
 }
 
