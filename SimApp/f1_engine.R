@@ -176,36 +176,28 @@ sim_finish_positions <- function(prob_mat, n) {
   as.integer(rank(raw + runif(n) * 0.001, ties.method = "first"))
 }
 
-# DNFs: drivers with ClassPct=0 always DNF; remainder filled by weighted sample
+# DNFs: the sheet's matrix is the whole result, so the BOTTOM n_dnf of the
+# sampled order are the retirements.
+#
+# This used to draw the DNFs separately, weighted by 1 - ClassPct and
+# independent of where the car had been sampled to finish, then re-rank. Against
+# any sheet whose rows already carry attrition in their tail that counts it
+# twice: a front-runner sampled to P20 by his own DNF mass could come back
+# classified, while a car sampled to P3 was marked retired and dropped to the
+# back. Finish points and grid-differential points were both scrambled, and
+# exactly for the drivers the sheet had said the most about.
+#
+# ClassPct is now a QA output of the sheet rather than an input to the draw. The
+# one thing it still does is the hard case: ClassPct = 0 means the car does not
+# see the flag whatever the field does, so those are pushed to the back first.
 apply_dnfs_fast <- function(finish_pos, cls_pct, n_dnf, n) {
-  cls <- rep(TRUE, n)
-  
-  # Hard DNFs: ClassPct = 0 means always unclassified regardless of n_dnf
-  always_dnf <- which(cls_pct == 0 | is.na(cls_pct))
-  cls[always_dnf] <- FALSE
-  
-  # How many additional random DNFs needed beyond the hard ones?
-  n_remaining <- max(0L, n_dnf - length(always_dnf))
-  
-  if (n_remaining > 0) {
-    eligible <- which(cls)
-    if (length(eligible) > 0) {
-      dnf_w  <- pmax(1 - cls_pct[eligible], 0)
-      if (sum(dnf_w) == 0) dnf_w[] <- 1
-      n_pick <- min(n_remaining, length(eligible))
-      extra  <- eligible[sample.int(length(eligible), n_pick,
-                                    prob = dnf_w / sum(dnf_w), replace = FALSE)]
-      cls[extra] <- FALSE
-    }
-  }
-  
-  # Re-rank: classified (ordered by finish) then DNF (ordered by finish)
-  cls_idx          <- which(cls)[order(finish_pos[cls])]
-  dnf_idx          <- which(!cls)[order(finish_pos[!cls])]
-  new_pos          <- integer(n)
-  new_pos[cls_idx] <- seq_along(cls_idx)
-  new_pos[dnf_idx] <- length(cls_idx) + seq_along(dnf_idx)
-  list(pos = new_pos, classified = cls)
+  hard <- which(cls_pct == 0 | is.na(cls_pct))
+  key  <- finish_pos
+  if (length(hard)) key[hard] <- key[hard] + n      # behind every running car
+  pos  <- as.integer(rank(key, ties.method = "first"))
+
+  n_dnf <- min(max(as.integer(n_dnf), length(hard)), n)
+  list(pos = pos, classified = pos <= (n - n_dnf))
 }
 
 # Fastest lap: vectorized weight build, single sample
@@ -233,8 +225,13 @@ assign_laps_led_fast <- function(finish_pos, grid_pos, ll_max, ll_by_season, n_s
     amt  <- race$ll[r]; if (amt <= 0L) next
     elig <- which(!assigned & ll_max >= amt)
     if (length(elig) == 0L) next
-    # Vectorized distance across eligible drivers
-    dist <- abs(grid_pos[elig] - race$grid[r]) + abs(finish_pos[elig] - race$finish[r])
+    # Who led a race is mostly about where they FINISHED, and only then about
+    # where they started, so the match is lexicographic: finishing position
+    # first, grid as the tie-break. Weighting the two equally let a profile's
+    # small mid-race stint be handed to the winner before the winner's own row
+    # was reached, and the winner then led zero laps -- on a third of sims.
+    dist <- 100 * abs(finish_pos[elig] - race$finish[r]) +
+                  abs(grid_pos[elig]   - race$grid[r])
     best <- elig[which.min(dist + runif(length(elig)) * 0.001)]
     ll_out[best]   <- min(ll_out[best] + amt, ll_max[best])
     assigned[best] <- TRUE
