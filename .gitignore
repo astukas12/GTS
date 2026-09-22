@@ -15,10 +15,6 @@
 .Ruserdata
 *.Rproj
 
-# Local fixtures. 72 real NASCAR input sheets, ~5.7MB. Kept out of git so
-# customers do not download them; they are test fixtures, not app data.
-TheLab/InputFiles/
-
 # Sweat's pre-2026 MMA-only app (212KB). Kept on disk only as the reference for
 # porting its Simulation Analysis tab; not app code, so off the download path.
 Sweat/app_legacy_mma.R

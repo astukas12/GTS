@@ -1,7 +1,7 @@
 # Sweat
 
 The Golden Ticket contest sweat tool — multi-sport DFS contest analysis. Lives
-in the `GTS` repo alongside `SimApp/` and `TheLab/`; see the repo-root CLAUDE.md
+in the `GTS` repo alongside `SimApp/`; see the repo-root CLAUDE.md
 for why the repo is public and must stay so.
 
 Customers run it exactly like SimApp — a standalone `GTSSweatLaunch.R` on their

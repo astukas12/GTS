@@ -1,14 +1,19 @@
 # GTS
 
-Four R/Shiny apps for Golden Ticket Sims, a daily-fantasy sports simulation
+Three R/Shiny apps for Golden Ticket Sims, a daily-fantasy sports simulation
 operation. Solo-maintained.
 
 | App | What it is | How it reaches users |
 | --- | --- | --- |
 | `SimApp/` | The simulator. 10 sport engines behind one dashboard. | `runGitHub` off `main` — see below |
-| `TheLab/` | NASCAR research + input-sheet builder. | shinyapps.io |
 | `AuctionDraft/` | Status unknown — do not assume it is live. | — |
 | `OhHell/` | Status unknown — do not assume it is live. | — |
+
+`TheLab/` (NASCAR research + input-sheet builder) was retired on 22 Sep 2026.
+Nobody used the deployed app, and the scripted sheet build and reports in
+`Documents\GTS\Nascar\` replaced it. Its database, updater, brand assets and
+input sheets moved to `Documents\GTS\` — see "The wider operation" below. A zip
+of the whole folder is at `Documents\GTS\_archive\TheLab_2026-09-22.zip`.
 
 ## `main` is production
 
@@ -60,7 +65,11 @@ scope — no need to request access:
 
 - `C:\Users\astuk\OneDrive\Documents\GTS` — the working-data tree. Per-sport
   folders holding InputMaker scripts, database-update scripts, and real input
-  sheets. Has its own CLAUDE.md.
+  sheets. Has its own CLAUDE.md. Since TheLab was retired it also holds the
+  NASCAR database and its updater (`Nascar\NascarData.xlsx`,
+  `Nascar\DBUpdate_2026.R`), the brand assets every report inlines
+  (`Common\brand\logo.jpg`, `gts_theme.css`) and the 72 archived NASCAR input
+  sheets (`Nascar\InputFiles\archive\`).
 - `C:\Users\astuk\OneDrive\Documents\GitHub\NicheSportSimsPublic` — the previous
   generation: 15 Shiny apps behind their own customer launcher. Sims run through
   `SimApp` now, so treat it as legacy. Two things in it still matter — a working
@@ -70,10 +79,9 @@ scope — no need to request access:
 
 - R 4.4.2 at `C:\Program Files\R\R-4.4.2\bin\Rscript.exe`.
 - Windows. Paths in R code use forward slashes or escaped backslashes.
-- `TheLab` deploys separately via `rsconnect` → shinyapps.io, account
-  `goldenticketsims`. That path publishes from local files and does not read
-  GitHub, so TheLab's deployed state and repo state are independent. **SimApp is
-  the opposite** — see "`main` is production" above.
+- Nothing in this repo deploys anywhere but `main`. `TheLab` used to publish to
+  shinyapps.io (account `goldenticketsims`) from local files; it is retired, and
+  the shinyapps.io app is the last loose end.
 - This repo is public and must stay so. Keep credentials, tokens, and customer
   data out of every file here.
 
@@ -123,5 +131,6 @@ build. Plan mode is the right tool for this.
   `tennis_engine.R`, so it has to stay tracked — but it is on every customer's
   download path. Converting it to `.rds` would shrink it sharply; that is a code
   change and wants a test around it.
-- `TheLab/NascarData.xlsx` (4.7MB) is used only by TheLab, yet SimApp customers
-  download it too. Splitting TheLab out is the fix, and it is not scoped yet.
+- Retiring `TheLab` on 22 Sep 2026 took 5.4MB of `NascarData.xlsx` and 13MB in
+  total off every customer's `runGitHub` download path. `SimApp/tennis_clean_database.xlsx`
+  is now the largest tracked file.
