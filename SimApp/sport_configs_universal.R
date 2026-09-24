@@ -235,6 +235,84 @@ SPORT_CONFIGS <- list(
   # distributions as Classic; the multipliers apply only when scoring a
   # lineup, in find_optimal_lineups_enum_tennis_captain.
   # ==========================================================================
+  # DK "Cup" match play (game type 129): 1 CPT at 1.5x points AND 1.5x salary,
+  # plus 5 golfers, $50,000, 24 players over one team event. Unlike a normal
+  # showdown, DK allows all six from one side, so this config deliberately
+  # carries the side as `Side` (never `Team`) -- drop_single_team_sd() keys on
+  # `Team` and would otherwise throw away legal six-American rosters.
+  #
+  # The input is a .rds DRAWS file, not a workbook: the match-play modelling
+  # (pairings, keep rates, match odds, Data Golf skill) runs upstream in
+  # GTS/Golf/PresidentsCup and ships one simulated week per row. See
+  # presidents_cup_engine.R.
+  PRESIDENTS_CUP = list(
+    sport_name         = "PRESIDENTS_CUP",
+    sport_display_name = "Presidents Cup",
+    player_label       = "Golfer",
+    player_label_plural = "Golfers",
+
+    detection = list(
+      required_sheets   = c("players", "thursday", "settings"),
+      required_columns  = NULL,
+      min_sheet_matches = 3,
+      min_column_matches = 0
+    ),
+
+    input_file = list(
+      load_all_sheets = TRUE,
+      player_sheet    = "players"
+    ),
+
+    platforms    = c("DK"),
+    roster_sizes = list(DK = 6),
+    salary_caps  = list(DK = 50000),
+
+    optimization_modes = list(DK = "enum_captain"),
+    max_lineups  = 5000,
+    enum_win_pct = 0.01,
+    enum_keep    = 50000L,
+    enum_salary_floor_frac = 0.88,
+    default_n_sims = 25000L,
+
+    showdown_config = list(
+      DK = list(enabled = TRUE, mode = "captain", captain_multiplier = 1.5,
+                captain_salary_multiplier = 1.5)
+    ),
+
+    simulation = list(
+      function_name = "run_presidents_cup_simulation",
+      requires_historical_data = FALSE,
+      output_format = list(
+        sim_results = c("SimID", "Player", "DKScore"),
+        metadata    = c("Player", "DKSalary", "DKID", "DKOwn", "Side")
+      )
+    ),
+
+    standard_metrics = c("WinRate", "Top1Pct", "Top5Pct", "Top10Pct", "Top20Pct",
+                         "AvgScore", "TotalSalary", "AvgOwn"),
+
+    custom_metrics = list(),
+
+    metadata_columns = list(
+      list(name = "Side",      label = "Side",    type = "text",    display = TRUE, filter = TRUE),
+      list(name = "E_Matches", label = "E Match", type = "numeric", display = TRUE, filter = FALSE)
+    ),
+
+    portfolio_filters = list(
+      rate_minimums = list(
+        list(name = "Win",   label = "Win",    step = 0.1),
+        list(name = "Top1",  label = "Top 1",  step = 0.1),
+        list(name = "Top5",  label = "Top 5",  step = 0.1),
+        list(name = "Top10", label = "Top 10", step = 0.1),
+        list(name = "Top20", label = "Top 20", step = 0.1)
+      ),
+      range_filters = list(
+        list(name = "Salary", label = "Salary (K)", column = "TotalSalary", step = 0.1, format = "salary_k"),
+        list(name = "AvgOwn", label = "Avg Own",    column = "AvgOwn",      step = 0.1, format = "decimal")
+      )
+    )
+  ),
+
   TENNIS_SHOWDOWN = list(
     sport_name         = "TENNIS_SHOWDOWN",
     sport_display_name = "Tennis Showdown",
@@ -1670,6 +1748,16 @@ SPORT_CONFIGS <- list(
 
 detect_sport <- function(file_path) {
   file_ext <- tools::file_ext(file_path)
+
+  # A .rds input is a draws file: one simulated week per row, written by a
+  # pipeline outside the app. It names its own sport in a marker field, so
+  # there is nothing to sniff.
+  if (tolower(file_ext) == "rds") {
+    d <- tryCatch(readRDS(file_path), error = function(e) NULL)
+    if (is.list(d) && !is.null(d$gts_sport) && d$gts_sport %in% names(SPORT_CONFIGS))
+      return(d$gts_sport)
+    return(NULL)
+  }
   
   if (file_ext %in% c("xlsx", "xls")) {
     sheets <- readxl::excel_sheets(file_path)
