@@ -1829,7 +1829,10 @@ score_all_lineups <- function(lineup_data, sim_results, verbose = TRUE, sims_per
                 mode))
     
     if (use_efficient_mode) {
-      cat(sprintf("  Memory-efficient: %.2f GB needed vs %.2f GB budget, using rank accumulation\n", matrix_size_gb))
+      # Two placeholders, one argument: this line errored out the whole run
+      # the first time the efficient path was actually taken.
+      cat(sprintf("  Memory-efficient: %.2f GB needed vs %.2f GB budget, using rank accumulation\n",
+                  matrix_size_gb, max_matrix_gb))
     }
   }
   

@@ -270,12 +270,13 @@ SPORT_CONFIGS <- list(
     optimization_modes = list(DK = "enum_captain"),
     max_lineups  = 5000,
     enum_win_pct = 0.01,
-    # enum_keep also gates the auto-widen fallback in
-    # find_optimal_lineups_enum_captain: it re-runs at floor 0.75 when
-    # M < 2 * enum_keep. At 50,000 that fired every time and silently put the
-    # band back to $44,000, which is how a 331,081-lineup pool reached the
-    # winning-script sweep and killed a worker at 50,000 sims.
-    enum_keep    = 20000L,
+    # 10,000, the same pool the other showdown sports keep. It also gates the
+    # auto-widen fallback in find_optimal_lineups_enum_captain, which re-runs at
+    # floor 0.75 when M < 2 * enum_keep: at 50,000 that fired every time and
+    # silently put the band back to $44,000, which is how a 331,081-lineup pool
+    # reached the winning-script sweep and killed a worker. With the 0.97 band
+    # leaving 70,961 lineups, 10,000 clears that test with room to spare.
+    enum_keep    = 10000L,
     # Tighter than the showdown default of 0.88. With 24 golfers and six slots
     # there is no reason to leave $6,000 unspent in a Cup, and the band drives
     # everything downstream: $44,000 leaves 331,081 legal lineups, $48,500
