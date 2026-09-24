@@ -51,7 +51,8 @@ read_presidents_cup_input <- function(file_path) {
     as.data.table(readxl::read_excel(file_path, sheet = hit[1]))
   }
   out <- list(players = get1("players"), thursday = get1("thursday"),
-              pairs = get1("pairs"), settings = get1("settings"), tags = get1("tags"))
+              pairs = get1("pairs"), settings = get1("settings"), tags = get1("tags"),
+              practice = get1("practice"))
   p <- out$players
   miss <- setdiff(c("Player", "Side", "Salary", "DGSkill"), names(p))
   if (length(miss)) stop("players sheet is missing: ", paste(miss, collapse = ", "))
@@ -339,6 +340,22 @@ run_presidents_cup_simulation <- function(input_data, n_sims = 25000, config = N
   pkey <- function(a, b) paste(pmin(a, b), pmax(a, b), sep = "|")
   pastdt <- input_data$pairs
   tags <- input_data$tags
+  # Practice pods. On Thursday BOTH captains paired strictly inside one -- 10 of
+  # 10 announced pairs shared a pod (USA Wednesday's, INTL Tuesday's). A pair
+  # that practised together is therefore much likelier to be sent out together.
+  # The weight is deliberately short of the maximum-likelihood fit, which runs
+  # away to "pods are a hard rule" off a single session with no counterexample.
+  prac <- input_data$practice
+  prac_w <- as.numeric(pc_setting(st, "practice_weight", 2.5))
+  prac_keys <- character(0)
+  if (!is.null(prac) && nrow(prac) && all(c("Group", "Player") %in% names(prac))) {
+    by_grp <- split(prac$Player, paste(prac$Day, prac$Side, prac$Group))
+    prac_keys <- unique(unlist(lapply(by_grp, function(g) {
+      g <- unique(g[g %in% P$Player])
+      if (length(g) < 2) return(character(0))
+      combn(g, 2, function(v) pkey(v[1], v[2]))
+    })))
+  }
   pairU <- lapply(sides, function(side) {
     nm <- P[Side == side]$Player; n <- length(nm)
     U <- matrix(0, n, n); K2 <- outer(nm, nm, pkey)
@@ -357,6 +374,7 @@ run_presidents_cup_simulation <- function(input_data, n_sims = 25000, config = N
       if (side == sides[2]) U <- U + cf[["nat"]] * same
     }
     if (side == sides[1]) U <- U + cf[["rgap"]] * abs(outer(seq_len(n), seq_len(n), "-")) / 3.45
+    if (length(prac_keys)) U <- U + prac_w * matrix(K2 %in% prac_keys, n)
     if (nrow(tags) && all(c("player1", "player2", "tag") %in% tolower(names(tags)))) {
       setnames(tags, tolower(names(tags)))
       tk <- pkey(tags$player1, tags$player2)
@@ -489,11 +507,35 @@ run_presidents_cup_simulation <- function(input_data, n_sims = 25000, config = N
                                                           sum, na.rm = TRUE)), 2))
   setorder(projections, -Proj)
 
+  # Pair shares per session -- the pairs-check view, and what a practice-pod or
+  # tag change should be judged on.
+  pkeys <- if (length(prac_keys)) prac_keys else character(0)
+  pair_rows <- list()
+  for (s in seq_len(n_team_sessions)) {
+    ks <- character(0)
+    for (i in seq_len(n_players)) {
+      j <- partner[, i, s]; j <- j[j > i]
+      if (length(j)) ks <- c(ks, pkey(rep(P$Player[i], length(j)), P$Player[j]))
+    }
+    if (!length(ks)) next
+    tb <- sort(table(ks), decreasing = TRUE)
+    pair_rows[[s]] <- data.table(Session = labels[s], Pair = names(tb),
+                                 Share = as.numeric(tb) / n_sims,
+                                 Practice = names(tb) %in% pkeys)
+  }
+  pair_shares <- rbindlist(pair_rows)
+  if (nrow(pair_shares)) {
+    pod <- pair_shares[, .(pod_share = sum(Share[Practice]) / sum(Share)), by = Session]
+    cat("Presidents Cup: pairs sharing a practice pod --",
+        paste(sprintf("%s %.0f%%", pod$Session, 100 * pod$pod_share), collapse = ", "), "
+")
+  }
+
   secs <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
   cat(sprintf("Presidents Cup: %s weeks in %.0fs%s\n", format(n_sims, big.mark = ","), secs,
               if (pinned) sprintf(" (Thursday pinned, importance ESS %.0f)", ess) else ""))
   pr(1, "Done")
 
   list(sim_results = sim_results, metadata = metadata, projections = projections,
-       has_fd = FALSE, has_sd = TRUE, has_classic = FALSE)
+       pair_shares = pair_shares, has_fd = FALSE, has_sd = TRUE, has_classic = FALSE)
 }
