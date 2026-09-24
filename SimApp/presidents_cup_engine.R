@@ -51,8 +51,7 @@ read_presidents_cup_input <- function(file_path) {
     as.data.table(readxl::read_excel(file_path, sheet = hit[1]))
   }
   out <- list(players = get1("players"), thursday = get1("thursday"),
-              pairs = get1("pairs"), settings = get1("settings"), tags = get1("tags"),
-              takes = get1("takes"))
+              pairs = get1("pairs"), settings = get1("settings"), tags = get1("tags"))
   p <- out$players
   miss <- setdiff(c("Player", "Side", "Salary", "DGSkill"), names(p))
   if (length(miss)) stop("players sheet is missing: ", paste(miss, collapse = ", "))
@@ -321,23 +320,15 @@ run_presidents_cup_simulation <- function(input_data, n_sims = 25000, config = N
   pr(0.10, "Built the matchup table...")
 
   # static selection utility: skill gap to teammates, plus the trust offset
-  # Playing time = the market anchor in `Trust` plus any hand takes on the
-  # `takes` sheet, both in captain-trust units (+ plays more). Team sessions are
-  # a fixed number of slots, so takes are re-centred inside each side: talking
-  # one player up necessarily talks his team-mates down.
+  # Playing time dial: ONE number per player on the players sheet, in
+  # captain-trust log-odds (+ plays more). It already carries the market anchor
+  # and any hand takes; the sheet's TrustNote says where it came from. Customers
+  # edit this column directly. Sessions are a fixed number of slots, so it is
+  # re-centred within each side -- talking one player up talks his team-mates down.
   trust <- if ("Trust" %in% names(P)) ifelse(is.na(P$Trust), 0, P$Trust) else rep(0, n_players)
-  tk <- input_data$takes
-  if (!is.null(tk) && nrow(tk) && all(c("Player", "Bump") %in% names(tk))) {
-    bad <- setdiff(tk$Player, P$Player)
-    if (length(bad)) stop("takes sheet names not in the players sheet: ", paste(bad, collapse = ", "))
-    add <- numeric(n_players)
-    add[match(tk$Player, P$Player)] <- as.numeric(tk$Bump)
-    for (sd_nm in unique(P$Side)) { i <- P$Side == sd_nm; add[i] <- add[i] - mean(add[i]) }
-    trust <- trust + add
-    cat(sprintf("Presidents Cup: %d hand takes applied (%s)
-", nrow(tk),
-                paste(sprintf("%s %+.2f", tk$Player, tk$Bump), collapse = ", ")))
-  }
+  for (sd_nm in unique(P$Side)) { i <- P$Side == sd_nm; trust[i] <- trust[i] - mean(trust[i]) }
+
+  # Static selection utility: the skill gap to team-mates, plus Trust.
   su_of <- function(side) {
     i <- P$Side == side
     (b[["skill"]] + b[["skill_pres"]]) * P$DGSkill[i] + trust[i]
