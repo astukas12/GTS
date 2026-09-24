@@ -270,8 +270,18 @@ SPORT_CONFIGS <- list(
     optimization_modes = list(DK = "enum_captain"),
     max_lineups  = 5000,
     enum_win_pct = 0.01,
-    enum_keep    = 50000L,
-    enum_salary_floor_frac = 0.88,
+    # enum_keep also gates the auto-widen fallback in
+    # find_optimal_lineups_enum_captain: it re-runs at floor 0.75 when
+    # M < 2 * enum_keep. At 50,000 that fired every time and silently put the
+    # band back to $44,000, which is how a 331,081-lineup pool reached the
+    # winning-script sweep and killed a worker at 50,000 sims.
+    enum_keep    = 20000L,
+    # Tighter than the showdown default of 0.88. With 24 golfers and six slots
+    # there is no reason to leave $6,000 unspent in a Cup, and the band drives
+    # everything downstream: $44,000 leaves 331,081 legal lineups, $48,500
+    # leaves 70,961. The wide band sent a 331k-lineup sweep into the
+    # winning-script phase and a PSOCK worker died serialising it.
+    enum_salary_floor_frac = 0.97,
     default_n_sims = 25000L,
 
     showdown_config = list(
@@ -584,7 +594,11 @@ SPORT_CONFIGS <- list(
     # floor 0.88 keeps the band at ~135k lineups (~5 min to score at 25k sims);
     # only ~2.6% of true per-sim optima fall below it. Loosen toward 0.83 for
     # more cheap-boom builds at the cost of runtime.
-    enum_salary_floor_frac = 0.88,
+    # Tighter than the showdown default of 0.88. With 24 golfers and only six
+    # slots there is no reason to leave $6,000 on the table in a Cup -- the
+    # lineups that actually win all sit at $48,500+, and the wide band was
+    # sending hundreds of thousands of dead rosters into Phase 1 scoring.
+    enum_salary_floor_frac = 0.97,
     enum_win_pct           = 0.01,
     enum_keep              = 10000L,
     # Showdown scoring is per-sim ranking, not pool generation, so it needs far
@@ -1559,7 +1573,11 @@ SPORT_CONFIGS <- list(
     # Same switch as NFL showdown -- see find_optimal_lineups_enum_captain.
     # Measured on the FSU@SMU showdown (27 players): ~61k legal lineups at
     # floor 0.88, smaller than NFL's ~135k, so Phase 1 should run faster there.
-    enum_salary_floor_frac = 0.88,
+    # Tighter than the showdown default of 0.88. With 24 golfers and only six
+    # slots there is no reason to leave $6,000 on the table in a Cup -- the
+    # lineups that actually win all sit at $48,500+, and the wide band was
+    # sending hundreds of thousands of dead rosters into Phase 1 scoring.
+    enum_salary_floor_frac = 0.97,
     enum_win_pct           = 0.01,
     enum_keep              = 10000L,
     default_n_sims         = 25000L,
