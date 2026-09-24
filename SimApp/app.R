@@ -19,7 +19,7 @@ source("lineup_lab_module.R")
 # top-level code on every upload/sim run.
 local({
   engines <- c("nascar", "mma", "tennis", "golf", "f1", "nfl", "nfl_preseason",
-                 "cbb", "nba", "soccer", "cfb")
+                 "cbb", "nba", "soccer", "cfb", "presidents_cup")
   for (e in engines) {
     f <- paste0(e, "_engine.R")
     if (file.exists(f)) source(f) else warning("Engine not found at startup: ", f)
@@ -44,7 +44,8 @@ load_sport_input <- function(file_path, sport, config, slate = NULL, game = NULL
     CFB  = read_cfb_input,
     CFB_CLASSIC = read_cfb_input,
     NFL  = read_nfl_input,
-    NFL_CLASSIC = read_nfl_input
+    NFL_CLASSIC = read_nfl_input,
+    PRESIDENTS_CUP = read_presidents_cup_input
   )
   if (sport %in% names(reader_map)) {
     # slate/game only mean anything to the CFB reader (a multi-slate
@@ -471,7 +472,9 @@ ui <- dashboardPage(
                           div(id = "gts_file_wrap", class = "gts-file-wrap",
                               # Shiny handles the actual upload — we just hide it visually
                               div(id = "gts_shiny_file_container",
-                                  fileInput("input_file", NULL, accept = c(".xlsx", ".xls"))
+                                  # .rds is the Presidents Cup draws file (match play does not
+                                  # fit a workbook); every other sport stays .xlsx.
+                                  fileInput("input_file", NULL, accept = c(".xlsx", ".xls", ".rds"))
                               ),
                               # Our visible controls
                               tags$button(
