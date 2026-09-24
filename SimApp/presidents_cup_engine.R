@@ -51,7 +51,8 @@ read_presidents_cup_input <- function(file_path) {
     as.data.table(readxl::read_excel(file_path, sheet = hit[1]))
   }
   out <- list(players = get1("players"), thursday = get1("thursday"),
-              pairs = get1("pairs"), settings = get1("settings"), tags = get1("tags"))
+              pairs = get1("pairs"), settings = get1("settings"), tags = get1("tags"),
+              takes = get1("takes"))
   p <- out$players
   miss <- setdiff(c("Player", "Side", "Salary", "DGSkill"), names(p))
   if (length(miss)) stop("players sheet is missing: ", paste(miss, collapse = ", "))
@@ -320,7 +321,23 @@ run_presidents_cup_simulation <- function(input_data, n_sims = 25000, config = N
   pr(0.10, "Built the matchup table...")
 
   # static selection utility: skill gap to teammates, plus the trust offset
+  # Playing time = the market anchor in `Trust` plus any hand takes on the
+  # `takes` sheet, both in captain-trust units (+ plays more). Team sessions are
+  # a fixed number of slots, so takes are re-centred inside each side: talking
+  # one player up necessarily talks his team-mates down.
   trust <- if ("Trust" %in% names(P)) ifelse(is.na(P$Trust), 0, P$Trust) else rep(0, n_players)
+  tk <- input_data$takes
+  if (!is.null(tk) && nrow(tk) && all(c("Player", "Bump") %in% names(tk))) {
+    bad <- setdiff(tk$Player, P$Player)
+    if (length(bad)) stop("takes sheet names not in the players sheet: ", paste(bad, collapse = ", "))
+    add <- numeric(n_players)
+    add[match(tk$Player, P$Player)] <- as.numeric(tk$Bump)
+    for (sd_nm in unique(P$Side)) { i <- P$Side == sd_nm; add[i] <- add[i] - mean(add[i]) }
+    trust <- trust + add
+    cat(sprintf("Presidents Cup: %d hand takes applied (%s)
+", nrow(tk),
+                paste(sprintf("%s %+.2f", tk$Player, tk$Bump), collapse = ", ")))
+  }
   su_of <- function(side) {
     i <- P$Side == side
     (b[["skill"]] + b[["skill_pres"]]) * P$DGSkill[i] + trust[i]
@@ -458,10 +475,15 @@ run_presidents_cup_simulation <- function(input_data, n_sims = 25000, config = N
 
   nm <- apply(played, c(1, 2), sum)
   gv <- function(col, default) if (col %in% names(P)) P[[col]] else rep(default, n_players)
+  # DKID is the GOLFER-slot draftable id, CPTID the CAPTAIN-slot one. DK issues
+  # both and create_download_showdown() picks CPTID for the captain; a single id
+  # (or DK's playerId) uploads as an invalid entry.
   metadata <- data.table(
     Player    = P$Player,
     DKSalary  = as.numeric(P$Salary),
     DKID      = as.character(gv("DKID", "")),
+    CPTID     = as.character(gv("CPTID", "")),
+    CPTSalary = as.numeric(gv("CPTSalary", NA)),
     DKOwn     = as.numeric(gv("Own", 0)),
     Side      = P$Side,
     E_Matches = round(colMeans(nm), 2))

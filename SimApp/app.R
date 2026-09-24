@@ -570,7 +570,17 @@ ui <- dashboardPage(
                 )
               ),
               conditionalPanel(
-                condition = "output.has_sim_results == true",
+                condition = "output.has_sim_results == true && output.cash_supported == false",
+                div(style = "text-align:center;padding:60px 40px;",
+                    icon("coins", class = "fa-3x", style = "color:#333;margin-bottom:20px;"),
+                    p("Cash games are off for this sport.",
+                      style = "color:#888;font-size:15px;margin-top:10px;"),
+                    p("The double-up simulator needs projected ownership to build a field, and this contest has none.",
+                      style = "color:#555;font-size:13px;")
+                )
+              ),
+              conditionalPanel(
+                condition = "output.has_sim_results == true && output.cash_supported == true",
                 render_cash_game_tab_ui()
               )
       ),
@@ -1872,7 +1882,7 @@ server <- function(input, output, session) {
         # block in find_optimal_lineups_enum_captain. Showdown only: classic
         # has no enumerable universe to ride along with.
         rv$dk_cash_curve <- NULL
-        if (identical(dk_mode, "enum_captain")) {
+        if (identical(dk_mode, "enum_captain") && isTRUE(rv$config$cash_games$enabled %||% TRUE)) {
           opt_config$cash_field <- cash_ladder_field(
             rv$sim_metadata, rv$simulation_results, rv$config,
             platform = "SD", n_flex = opt_config$roster_size - 1L,
@@ -4136,6 +4146,9 @@ server <- function(input, output, session) {
   # ==========================================================================
   
   output$has_sim_results   <- reactive({ !is.null(rv$simulation_results) && nrow(rv$simulation_results)>0 })
+  # A sport can switch the cash module off (see PRESIDENTS_CUP): no ownership
+  # projection means no field, and no field means no honest cash line.
+  output$cash_supported    <- reactive({ isTRUE(rv$config$cash_games$enabled %||% TRUE) })
   
   # Initialize sim_results_platform so pills work before first click
   output$sim_platform_init <- renderUI({
@@ -4144,6 +4157,7 @@ server <- function(input, output, session) {
     radioButtons("sim_results_platform", NULL, choices=plats, selected=plats[1], inline=TRUE)
   })
   outputOptions(output, "has_sim_results",   suspendWhenHidden=FALSE)
+  outputOptions(output, "cash_supported",    suspendWhenHidden=FALSE)
   output$sport_detected    <- reactive({ rv$sport %||% "" })
   outputOptions(output, "sport_detected",    suspendWhenHidden=FALSE)
   output$has_sport_visuals <- reactive({

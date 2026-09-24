@@ -279,6 +279,12 @@ SPORT_CONFIGS <- list(
                 captain_salary_multiplier = 1.5)
     ),
 
+    # No cash games for this one. The double-up simulator builds a field from
+    # projected ownership, and a one-off team event has neither an ownership
+    # projection nor a public projection set to derive one from -- a field made
+    # up out of nothing would give a confident cash line that means nothing.
+    cash_games = list(enabled = FALSE),
+
     simulation = list(
       function_name = "run_presidents_cup_simulation",
       requires_historical_data = FALSE,
