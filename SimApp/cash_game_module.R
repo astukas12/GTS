@@ -2104,8 +2104,13 @@ register_cash_game_observers <- function(input, output, session, rv) {
         
         sd_all <- unique(sim_res$Player)
         sd_idx <- setNames(seq_along(sd_all), sd_all)
+        # fun.aggregate is NOT optional: one duplicated Player x SimID (MMA's engine used
+        # to emit a couple per run) makes dcast aggregate with length() for EVERY cell,
+        # turning the whole score matrix into row counts. Same guard as
+        # OptimalLineups_Core.R. Added 25 Sep 2026.
         sw     <- dcast(sim_res[, .(SimID, Player, DKScore)],
-                        Player ~ SimID, value.var = "DKScore", fill = 0)
+                        Player ~ SimID, value.var = "DKScore",
+                        fun.aggregate = mean, fill = 0)
         sm     <- as.matrix(sw[, -1, with = FALSE]); rownames(sm) <- sw$Player
         
         n_sd <- nrow(sd_pool); csz <- 500L
@@ -2188,8 +2193,10 @@ register_cash_game_observers <- function(input, output, session, rv) {
         if (!score_col %in% names(sim_res)) stop(score_col, " not found in sim results.")
         all_pl <- unique(sim_res$Player)
         pl_idx <- setNames(seq_along(all_pl), all_pl)
+        # fun.aggregate is NOT optional -- see the note on the showdown dcast above.
         sw <- dcast(sim_res[, c("SimID","Player", score_col), with = FALSE],
-                    Player ~ SimID, value.var = score_col, fill = 0)
+                    Player ~ SimID, value.var = score_col,
+                    fun.aggregate = mean, fill = 0)
         sm <- as.matrix(sw[, -1, with = FALSE]); rownames(sm) <- sw$Player
         
         csz <- 500L; med <- numeric(n_gpp)

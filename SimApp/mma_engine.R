@@ -334,11 +334,27 @@ run_mma_simulation <- function(input_data, n_sims, config, progress_callback = N
       block      <- block[SimID %in% keep_ids]
       existing_ids <- keep_ids
     } else if (n_existing < n_sims) {
-      # Duplicate a few rows to reach n_sims (rare ±1 rounding edge case)
-      extra_ids  <- sample(existing_ids, n_sims - n_existing, replace = TRUE)
-      extra_rows <- block[SimID %in% extra_ids][
-        sample(.N, n_sims - n_existing, replace = TRUE)]
-      block      <- rbind(block, extra_rows)
+      # Duplicate a few sims to reach n_sims (the ±1 rounding edge case).
+      #
+      # This used to copy random ROWS while KEEPING their SimID, which was wrong twice
+      # over (fixed 25 Sep 2026): the copies collided with the rows they came from, so a
+      # fighter had two rows in one sim, and because the copies reused existing ids the
+      # block still covered only n_existing distinct sims. A single duplicated
+      # Player x SimID is not a small error downstream -- dcast() without fun.aggregate
+      # silently switches the WHOLE matrix to counts, so every score becomes a 1 or a 2
+      # (mma_engine's win matrix, and the Cash Game tab's median scores). Picking random
+      # rows could also copy a winner without his paired loser.
+      #
+      # Copy whole sims instead -- both fighters of the pair -- onto fresh, unused ids.
+      need    <- n_sims - n_existing
+      src_ids <- sample(existing_ids, need, replace = TRUE)
+      new_ids <- max(existing_ids) + seq_len(need)
+      extra   <- rbindlist(lapply(seq_len(need), function(j) {
+        r <- block[SimID == src_ids[j]]
+        r[, SimID := new_ids[j]]
+        r
+      }))
+      block      <- rbind(block, extra)
       existing_ids <- sort(unique(block$SimID))
     }
     
@@ -515,7 +531,13 @@ calculate_mma_lineup_metrics <- function(scored_lineups, sim_results, metadata) 
   all_players <- unique(sim_results$Player)
   
   # Wide matrix: rows=Player (alphabetical after dcast), cols=SimID
-  win_wide <- dcast(win_lookup, Player ~ SimID, value.var = "Win", fill = 0L)
+  # fun.aggregate is NOT optional. Without it, ONE duplicated Player x SimID makes dcast
+  # aggregate with length() -- for EVERY cell, not just the duplicate -- so the win flags
+  # silently become row counts. Win is a 0/1 flag and any duplicate is an identical copy,
+  # so max() is the identity here. OptimalLineups_Core.R guards its own dcasts the same
+  # way ("multiple rows per player per sim in some configurations").
+  win_wide <- dcast(win_lookup, Player ~ SimID, value.var = "Win",
+                    fun.aggregate = max, fill = 0L)
   sim_id_cols <- as.character(all_sims)
   # Ensure column order matches all_sims
   sim_id_cols <- intersect(sim_id_cols, names(win_wide))

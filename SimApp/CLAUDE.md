@@ -181,6 +181,23 @@ cleared by `reset_all_state()` like any other sim-derived state.
 constraint maths and is commented in full. Other sports need their own slot
 bounds before the tab can be offered to them.
 
+## `dcast` must always name `fun.aggregate` (25 Sep 2026)
+
+`dcast(x, Player ~ SimID, value.var = ...)` with no `fun.aggregate` does not
+merely warn on a duplicate key — **one** duplicated `Player x SimID` makes it
+aggregate with `length()` for **every cell**, so a whole score matrix silently
+becomes row counts (10/20/30/40 -> 2/1/1/1). `OptimalLineups_Core.R` already
+collapsed duplicates before two of its dcasts ("multiple rows per player per sim
+in some configurations"); four other sites did not, and `mma_engine.R` was in
+fact producing duplicates — its pad-to-`n_sims` branch copied rows while keeping
+their SimID. Cause fixed in the engine (copy whole sims onto fresh ids) and the
+four sites guarded: `mma_engine.R` win matrix, `OptimalLineups_Core.R` gate
+scoring and the `TotalEW`/`Win6Pct`/`Win5PlusPct` win matrix, and both
+`cash_game_module.R` score matrices. `mean` for scores, `max` for the 0/1 `Win`
+flag — identities when there is no duplicate, so no other sport's output moves.
+`tennis_engine.R:588` and `soccer_engine.R:1316` are still unguarded; they have
+not been seen to produce duplicates.
+
 ## Worker count and memory limits (20 Sep 2026)
 
 Two hard-coded constants were sized for a big desktop and are now probed.
