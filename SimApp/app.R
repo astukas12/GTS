@@ -4201,6 +4201,9 @@ server <- function(input, output, session) {
         div(class = "gts-sr-seg",
             downloadButton("download_sim_sample", "Sim Sample",
                            icon  = icon("download"),
+                           class = "gts-dl-btn-real"),
+            downloadButton("download_sim_full", "Sim Full",
+                           icon  = icon("download"),
                            class = "gts-dl-btn-real")
         )
     )
@@ -4583,22 +4586,22 @@ server <- function(input, output, session) {
   
   
   
-  # ── Sim sample download — 1000 randomly sampled sims, all sports ─────────
-  output$download_sim_sample <- downloadHandler(
-    filename = function() {
-      sport <- rv$sport %||% "sim"
-      paste0(sport, "_SimSample_", format(Sys.Date(), "%Y%m%d"), ".csv")
-    },
-    content = function(file) {
+  # ── Sim downloads — "Sim Sample" is 1000 randomly sampled sims, "Sim Full"
+  # every sim. Same join and column order; n_max = NULL keeps them all. ────
+  write_sim_download <- function(file, n_max) {
       req(rv$simulation_results, rv$sim_metadata)
-      sim  <- copy(rv$simulation_results);  setDT(sim)
+      sim  <- as.data.table(rv$simulation_results)
       meta <- copy(rv$sim_metadata);        setDT(meta)
-      
-      # Sample up to 1000 unique sim IDs
-      all_ids     <- unique(sim$SimID)
-      sample_ids  <- sample(all_ids, min(1000L, length(all_ids)))
-      sim_sample  <- sim[SimID %in% sample_ids]
-      
+
+      # Sample up to n_max unique sim IDs (all of them when n_max is NULL)
+      if (is.null(n_max)) {
+        sim_sample  <- sim
+      } else {
+        all_ids     <- unique(sim$SimID)
+        sample_ids  <- sample(all_ids, min(n_max, length(all_ids)))
+        sim_sample  <- sim[SimID %in% sample_ids]
+      }
+
       # Join key metadata: salary + own for the active platform
       platform   <- input$sim_results_platform %||% "DK"
       salary_col <- if (platform == "SD") "SDSalary" else paste0(platform, "Salary")
@@ -4623,12 +4626,27 @@ server <- function(input, output, session) {
                       setdiff(names(dl), c(id_cols, meta_extra, "SimID", score_cols)))
       col_order  <- intersect(col_order, names(dl))
       setcolorder(dl, col_order)
-      
+
       fwrite(dl, file)
-    }
+  }
+
+  output$download_sim_sample <- downloadHandler(
+    filename = function() {
+      sport <- rv$sport %||% "sim"
+      paste0(sport, "_SimSample_", format(Sys.Date(), "%Y%m%d"), ".csv")
+    },
+    content = function(file) write_sim_download(file, 1000L)
   )
-  
-  
+
+  output$download_sim_full <- downloadHandler(
+    filename = function() {
+      sport <- rv$sport %||% "sim"
+      paste0(sport, "_SimFull_", format(Sys.Date(), "%Y%m%d"), ".csv")
+    },
+    content = function(file) write_sim_download(file, NULL)
+  )
+
+
   # ==========================================================================
   # SPORT-SPECIFIC VISUALIZATIONS
   # ==========================================================================
