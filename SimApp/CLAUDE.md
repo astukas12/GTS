@@ -198,6 +198,18 @@ flag — identities when there is no duplicate, so no other sport's output moves
 `tennis_engine.R:588` and `soccer_engine.R:1316` are still unguarded; they have
 not been seen to produce duplicates.
 
+## Cash tab on a classic with no ownership (25 Sep 2026)
+
+Classic sub-slates normally carry no ownership (ETR publishes it for the main
+classic only). `prep_pool()` needs positive ownership, so the Cash tab used to
+stop with "No players with valid salary and ownership" on every such slate.
+`synth_classic_ownership()` (`cash_game_module.R`) now fills it when the slate
+has NO positive ownership at all: the showdown field chain applied to a classic
+roster (sheet projection, else sim median; value-tilted weight; sums to 100% x
+roster slots; capped at `FIELD_MAX_FLEX`), and the field label says
+SYNTHESIZED. A sheet with any real ownership takes the old path unchanged.
+The generic classic path only; NFL classic and NBA have their own field builders.
+
 ## Worker count and memory limits (20 Sep 2026)
 
 Two hard-coded constants were sized for a big desktop and are now probed.

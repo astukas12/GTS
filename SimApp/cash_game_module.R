@@ -613,6 +613,48 @@ sim_median_scores <- function(sim_res, score_col = "DKScore") {
   sr[, .(Med = median(get(score_col), na.rm = TRUE)), by = Player]
 }
 
+#' Synthesized field ownership for a CLASSIC slate that carries none.
+#'
+#' A classic sub-slate usually has no ownership at all (CFB 25 Sep 2026: ETR
+#' publishes it for the main classic only, so the 2-game night classic read NA on
+#' every player and prep_pool() stopped the whole Cash tab). This is the showdown
+#' chain above applied to a classic roster: value = the sheet's projection, else
+#' our own sim median; weight = the same value-tilted shape; normalised so the
+#' field's ownership sums to 100% x roster slots, capped per player.
+#' Only called when the slate has NO positive ownership -- a sheet that carries
+#' real ownership is never touched, so its field is exactly as before.
+#'
+#' @return list(own = data.table(Player, Own), label, counts)
+synth_classic_ownership <- function(meta, sim_res, sal_col = "DKSalary",
+                                    proj_col = "DKProj", score_col = "DKScore",
+                                    roster_size = 8L) {
+  d <- unique(as.data.table(copy(meta)), by = "Player")
+  if (!sal_col %in% names(d)) stop(sal_col, " not found in metadata.")
+  d[, Sal := suppressWarnings(as.numeric(get(sal_col)))]
+  d <- d[!is.na(Sal) & Sal > 0]
+  if (!nrow(d)) stop("No players with a usable salary for the field model.")
+
+  d[, Proj := if (!is.null(proj_col) && proj_col %in% names(d))
+                suppressWarnings(as.numeric(get(proj_col))) else NA_real_]
+  d[!is.na(Proj) & Proj <= 0, Proj := NA_real_]
+  med <- sim_median_scores(sim_res, score_col)
+  d[, Med := NA_real_]
+  if (!is.null(med)) d[med, Med := i.Med, on = "Player"]
+  d[!is.na(Med) & Med <= 0, Med := NA_real_]
+  d[, Value := fifelse(!is.na(Proj), Proj, Med)]
+  d[, VSrc  := fifelse(!is.na(Proj), "proj", "median")]
+  d <- d[!is.na(Value) & Value > 0]
+  if (nrow(d) < roster_size)
+    stop("Too few players with a projection or sim median to model a field.")
+
+  w <- pmax(d$Value, 1e-9) ^ FIELD_A_VALUE / pmax(d$Sal / 1000, 1e-6) ^ FIELD_B_SALARY
+  d[, Own := normalize_own(w, total = 100 * roster_size, cap = FIELD_MAX_FLEX)]
+  counts <- table(factor(d$VSrc, levels = c("proj", "median")))
+  label <- sprintf("Field SYNTHESIZED -- the sheet has no ownership for this slate (value from %d projections, %d sim medians)",
+                   counts[["proj"]], counts[["median"]])
+  list(own = d[, .(Player, Own)], label = label, counts = counts)
+}
+
 #' Resolve the salary / ownership / projection column names for a showdown pool.
 #'
 #' NFL showdown carries its captain salary as DKCSalary and never declares it in
@@ -2160,6 +2202,17 @@ register_cash_game_observers <- function(input, output, session, rv) {
         if (!own_col %in% names(meta_raw))
           stop(own_col, " not found in metadata.")
         field_label <- sprintf("Field from sheet ownership (%s)", own_col)
+        # No ownership anywhere on this slate (a classic sub-slate): synthesize it
+        # rather than stop. Any positive ownership on the sheet is used as-is.
+        if (!any(suppressWarnings(as.numeric(meta_raw[[own_col]])) > 0, na.rm = TRUE)) {
+          syn <- synth_classic_ownership(meta_raw, sim_res, sal_col = sal_col,
+                                         proj_col = proj_col, score_col = score_col,
+                                         roster_size = r_size)
+          meta_raw[, (own_col) := NA_real_]
+          meta_raw[syn$own, (own_col) := i.Own, on = "Player"]
+          field_label <- syn$label
+          cat(sprintf("  [Contests] %s\n", field_label))
+        }
         ft <- build_field_tiers(
           metadata     = meta_raw,
           specs        = specs,
