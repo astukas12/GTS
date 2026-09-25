@@ -2518,8 +2518,12 @@ find_optimal_lineups_winbased <- function(sim_results, config, verbose = TRUE) {
                              format(min(gate_sims, n_sims), big.mark = ",")))
 
     sub_ids    <- head(sort(unique(sim_results$SimID)), gate_sims)
+    # fun.aggregate as everywhere else in this file: without it a single duplicated
+    # Player x SimID makes dcast aggregate with length() for EVERY cell, turning the
+    # score matrix into row counts. Guarded 25 Sep 2026 (MMA's engine was emitting a
+    # couple of duplicates per run; fixed there too).
     score_wide <- dcast(sim_results[SimID %in% sub_ids], Player ~ SimID,
-                        value.var = "FantasyPoints", fill = 0)
+                        value.var = "FantasyPoints", fun.aggregate = mean, fill = 0)
     setorder(score_wide, Player)
     score_mat <- as.matrix(score_wide[, -1, with = FALSE])
     n_sub     <- ncol(score_mat)
@@ -2550,7 +2554,12 @@ find_optimal_lineups_winbased <- function(sim_results, config, verbose = TRUE) {
   # STAGE 3: reported metrics on the surviving pool, from the simulation.
   # Order must match unique_lineups -- app.R assigns these columns by position.
   # ---------------------------------------------------------------------------
-  win_wide <- dcast(sim_results, Player ~ SimID, value.var = "Win", fill = 0)
+  # Win is a 0/1 flag and a duplicate is an identical copy, so max() is the identity --
+  # but it must be stated, or one duplicate silently turns the whole matrix into counts
+  # and TotalEW / Win6Pct / Win5PlusPct (shown in app.R as Exp Wins / All Win% / 5+ Win%)
+  # all read as if every fighter won every sim. Guarded 25 Sep 2026.
+  win_wide <- dcast(sim_results, Player ~ SimID, value.var = "Win",
+                    fun.aggregate = max, fill = 0)
   setorder(win_wide, Player)
   win_mat  <- as.matrix(win_wide[, -1, with = FALSE])
 
