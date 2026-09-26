@@ -31,6 +31,59 @@ local({
 # HELPERS (outside server so they are available at parse time)
 # ============================================================================
 
+# quantile(x, p) (type 7, R's default) for an x ALREADY SORTED ascending.
+# Sorting a whole sim once by (Player, score) and reading every percentile off
+# by index gives the same numbers as quantile()/median() per player, without
+# re-sorting each player once per percentile.
+q7_sorted <- function(x, p) {
+  n <- length(x); index <- 1 + (n - 1) * p
+  lo <- floor(index); hi <- ceiling(index); h <- index - lo
+  if (h > 0 && x[hi] != x[lo]) (1 - h) * x[lo] + h * x[hi] else x[lo]
+}
+
+# Box-plot statistics per group, computed here instead of in the browser.
+# Handing plotly every sim row (25k+ per player) is what made these charts
+# slow: the whole vector goes over the wire as JSON and plotly re-derives the
+# box client-side. This sends seven numbers per player. Q1/Median/Q3 and
+# 1.5 x IQR whiskers match what plotly drew from the raw rows; the hundreds of
+# outlier dots per player are replaced by one P99 point.
+sim_box_stats <- function(dt, val_col, group_col = "Player") {
+  s <- as.data.table(dt)[, .(g = get(group_col), x = get(val_col))][!is.na(x)]
+  setorder(s, g, x)
+  st <- s[, {
+    q1 <- q7_sorted(x, .25); q3 <- q7_sorted(x, .75); f <- 1.5 * (q3 - q1)
+    .(Q1 = q1, Median = q7_sorted(x, .5), Q3 = q3,
+      Lo = x[x >= q1 - f][1], Hi = x[x <= q3 + f][sum(x <= q3 + f)],
+      P99 = q7_sorted(x, .99), Mean = mean(x))
+  }, by = g]
+  setnames(st, "g", group_col)
+  st
+}
+
+# Horizontal box plot from sim_box_stats() output, one precomputed box per
+# row in `levels` order (first level at the bottom, as with a factor axis).
+sim_box_plot <- function(st, levels, color, fill, title, x_title, h_px, margin_l) {
+  st <- as.data.table(st)[match(levels, Player)][!is.na(Player)]
+  plot_ly() %>%
+    add_trace(type = "box", orientation = "h", y = st$Player,
+              q1 = st$Q1, median = st$Median, q3 = st$Q3,
+              lowerfence = st$Lo, upperfence = st$Hi,
+              marker = list(color = color), line = list(color = color),
+              fillcolor = fill, showlegend = FALSE) %>%
+    add_markers(x = st$P99, y = st$Player, showlegend = FALSE,
+                marker = list(color = color, size = 5, symbol = "diamond"),
+                hoverinfo = "text",
+                text = paste0(st$Player, "<br>1-in-100: ", round(st$P99, 1))) %>%
+    layout(
+      title=list(text=title, font=list(color="#FFE500",size=14)),
+      xaxis=list(title=x_title, gridcolor="#2a2a2a", color="#888"),
+      yaxis=list(title="", color="#ccc", tickfont=list(size=11),
+                 categoryorder="array", categoryarray=levels),
+      paper_bgcolor="#121212", plot_bgcolor="#141414",
+      font=list(color="#FFFFFF",size=11), showlegend=FALSE,
+      height=h_px, margin=list(l=margin_l,r=30,t=40,b=50))
+}
+
 # Config-driven input loader.
 # Sports with dedicated read_*_input() functions use those (Golf, F1, CBB).
 # All other sports are handled generically from config$input_file fields.
@@ -4236,9 +4289,12 @@ server <- function(input, output, session) {
     salary_col <- if (platform == "SD") "SDSalary" else paste0(platform, "Salary")
     own_col    <- if (platform == "SD") "SDOwn"    else paste0(platform, "Own")
     
-    sim  <- copy(rv$simulation_results);  setDT(sim)
+    # No copy of the sim: nothing below modifies it in place (the SD filter and
+    # the stats both build new tables), and at 25k+ sims the copy is ~0.5 GB.
+    sim  <- rv$simulation_results
+    if (!is.data.table(sim)) sim <- as.data.table(sim)
     meta <- copy(rv$sim_metadata);        setDT(meta)
-    
+
     # Filter to platform-eligible players for SD
     if (platform == "SD" && "SDSalary" %in% names(meta)) {
       eligible <- meta[!is.na(SDSalary) & SDSalary > 0, Player]
@@ -4253,13 +4309,19 @@ server <- function(input, output, session) {
     # Compute stats once — this is the expensive step at 50k sims. `GTS` is our
     # own simulated mean (was labelled "Avg"); it sits beside ETR so the two
     # projections read side by side.
-    proj <- sim[, .(
-      GTS    = round(mean(get(score_col)),            1),
-      Median = round(median(get(score_col)),          1),
-      P90    = round(quantile(get(score_col), 0.90),  1),
-      P75    = round(quantile(get(score_col), 0.75),  1),
-      P20    = round(quantile(get(score_col), 0.20),  1)
+    # One sort of (Player, score), then each percentile read off by index
+    # (q7_sorted) -- the same numbers as median()/quantile() per player.
+    sc <- sim[, .(Player, x = get(score_col))]
+    if (anyNA(sc$x)) stop("missing values in ", score_col)   # quantile()'s old failure
+    setorder(sc, Player, x)
+    proj <- sc[, .(
+      GTS    = round(mean(x),              1),
+      Median = round(q7_sorted(x, 0.50),   1),
+      P90    = round(q7_sorted(x, 0.90),   1),
+      P75    = round(q7_sorted(x, 0.75),   1),
+      P20    = round(q7_sorted(x, 0.20),   1)
     ), by = Player]
+    rm(sc)
     
     # Standard columns: Salary + Own
     std_cols <- intersect(c("Player", salary_col, own_col), names(meta))
@@ -4493,19 +4555,52 @@ server <- function(input, output, session) {
     filter_pills_ui("projfilter", rv$sim_metadata)
   })
 
-  # build_projections + the pill filters. Kept apart from the renderDT so the
+  # build_projections is the expensive step (every sim row), so it runs ONCE
+  # per sim per platform. The cache is a fresh environment each time the sim
+  # changes; within one sim, a pill click, the pill row's own reset on render,
+  # and the platform input settling from NULL to its first value all reuse it,
+  # and flipping DK -> FD -> DK recomputes nothing.
+  proj_cache <- reactive({
+    rv$simulation_results; rv$sim_metadata; rv$config
+    new.env(parent = emptyenv())
+  })
+
+  # What the table is showing: platform + pill selection. A reactiveVal only
+  # invalidates when its value actually changes, so the churn on opening the
+  # tab -- the platform input settling from NULL to its first value, and the
+  # pill row's reset script turning each filter from NULL to an empty list --
+  # no longer re-renders the table (it used to render 4 times per open).
+  proj_view <- reactiveVal(NULL)
+  observe({
+    sel <- function(k) sort(as.character(unlist(input[[paste0("projfilter_", k)]])))
+    proj_view(list(platform = results_platform(),
+                   pos = sel("pos"), team = sel("team"), game = sel("game")))
+  }, priority = 10)
+
+  proj_base <- reactive({
+    req(rv$simulation_results, rv$sim_metadata, proj_view())
+    plat  <- proj_view()$platform
+    cache <- proj_cache()
+    if (is.null(cache[[plat]])) cache[[plat]] <- build_projections(plat)
+    cache[[plat]]
+  })
+
+  # The cached table + the pill filters. Kept apart from the renderDT so the
   # display-order / formatting code has one clean input.
   proj_display <- reactive({
-    req(rv$simulation_results, rv$sim_metadata)
-    proj <- build_projections(results_platform())
-    req(proj); setDT(proj)
-    apply_pill_filter(proj, "projfilter", input, rv$sim_metadata)
+    proj <- proj_base()
+    req(proj)
+    v <- proj_view()
+    apply_pill_filter(copy(proj), "projfilter",
+                      list(projfilter_pos = v$pos, projfilter_team = v$team,
+                           projfilter_game = v$game),
+                      rv$sim_metadata)
   })
 
   # ── Projections table display ────────────────────────────────────────────
   output$sim_projections_table <- renderDT({
     req(rv$simulation_results, rv$sim_metadata)
-    platform <- results_platform()
+    platform <- proj_view()$platform
     proj <- copy(proj_display())
     req(proj)
     
@@ -4946,6 +5041,10 @@ server <- function(input, output, session) {
     d <- rv$sport_visuals$team_dist[Metric == m]
     if (!is.null(input$cfb_team_filter)) d <- d[team %in% input$cfb_team_filter]
     req(nrow(d) > 0)
+    # 500 draws per team is plenty for a density outline; the engine keeps up
+    # to 2,000 (already a random sample of sims), which on a 24-team classic
+    # was 48k points and ~430 KB of JSON per metric click.
+    d <- d[, head(.SD, 500L), by = team]
     pal <- cfb_team_pal(sort(unique(d$team)))
     CFB_DARK(plot_ly(d, x = ~Value, y = ~team, color = ~team, colors = pal,
             type = "violin", orientation = "h", points = FALSE, width = 0.85,
@@ -5175,23 +5274,14 @@ server <- function(input, output, session) {
       if (length(selected) == 0) {
         selected <- plot_data[, .(Avg=mean(Score)), by=Player][order(-Avg)][1:min(15,.N)]$Player
       }
-      plot_data <- as.data.frame(plot_data[Player %in% selected])
-      # Order by median descending
-      med_order <- plot_data |> tapply(plot_data$Player, FUN=function(x) median(x$Score)) |> sort(decreasing=TRUE) |> names()
-      plot_data$Player <- factor(plot_data$Player, levels=rev(med_order))
-      n_players <- length(unique(plot_data$Player))
-      h <- max(300, n_players * 42)
-      plot_ly(data=plot_data, x=~Score, y=~Player, type="box", orientation="h",
-              marker=list(color=color_hex, size=3), line=list(color=color_hex),
-              fillcolor=paste0(substr(color_hex,1,7),"33")) %>%
-        layout(
-          title=list(text=title, font=list(color="#FFE500",size=14)),
-          xaxis=list(title="DK Fantasy Points", gridcolor="#2a2a2a", color="#888"),
-          yaxis=list(title="", color="#ccc", tickfont=list(size=11)),
-          paper_bgcolor="#121212", plot_bgcolor="#141414",
-          font=list(color="#FFFFFF",size=11), showlegend=FALSE,
-          margin=list(l=160,r=30,t=40,b=50),
-          height=h)
+      st <- sim_box_stats(plot_data[Player %in% selected], "Score")
+      req(nrow(st) > 0)
+      # Highest median at the top
+      h <- max(300, nrow(st) * 42)
+      sim_box_plot(st, levels = st[order(Median), Player],
+                   color = color_hex, fill = paste0(substr(color_hex,1,7),"33"),
+                   title = title, x_title = "DK Fantasy Points",
+                   h_px = h, margin_l = 160)
     }
   }
   output$tennis_all_wins_plot  <- renderPlotly(make_tennis_box_plot("all_wins","Score Distribution — All Wins","#FFE500","tennis_player_filter")())
@@ -5566,20 +5656,12 @@ server <- function(input, output, session) {
         avgs <- rv$simulation_results[, .(Avg=mean(DKScore)), by=Player]
         setorder(avgs, -Avg); selected <- head(avgs$Player, 15)
       }
-      plot_data <- as.data.frame(rv$simulation_results[Player %in% selected])
-      med_ord <- tapply(plot_data$DKScore, plot_data$Player, median)
-      plot_data$Player <- factor(plot_data$Player, levels=rev(names(sort(med_ord))))
+      st <- sim_box_stats(rv$simulation_results[Player %in% selected], "DKScore")
       h_px <- max(300, length(selected) * 34)
-      plot_ly(data=plot_data, x=~DKScore, y=~Player, type="box", orientation="h",
-              marker=list(color="#FFE500", size=3), line=list(color="#FFE500"),
-              fillcolor="rgba(255,229,0,0.25)") %>%
-        layout(
-          title=list(text="DK Score Distribution", font=list(color="#FFE500",size=14)),
-          xaxis=list(title="DK Fantasy Points", gridcolor="#2a2a2a", color="#888"),
-          yaxis=list(title="", color="#ccc", tickfont=list(size=11)),
-          paper_bgcolor="#121212", plot_bgcolor="#141414",
-          font=list(color="#FFFFFF",size=11), showlegend=FALSE,
-          height=h_px, margin=list(l=180,r=30,t=40,b=50))
+      sim_box_plot(st, levels = rev(st[order(Median), Player]),
+                   color = "#FFE500", fill = "rgba(255,229,0,0.25)",
+                   title = "DK Score Distribution", x_title = "DK Fantasy Points",
+                   h_px = h_px, margin_l = 180)
     }, error=function(e) { plotly_empty() })
   })
   
@@ -5744,17 +5826,17 @@ server <- function(input, output, session) {
       score_col <- if (plat == "FD" && "FDScore" %in% names(rv$simulation_results)) "FDScore" else "DKScore"
       
       players_to_show <- td$Player
-      sim_dt <- as.data.table(rv$simulation_results)[Player %in% players_to_show,
-                                                     .(Player, Score = get(score_col))]
-      
+      # Subset first, THEN convert: as.data.table() on the whole sim copied it
+      # (twice) just to keep one team's players.
+      res     <- rv$simulation_results
+      idx     <- which(res$Player %in% players_to_show)
+      sim_nba <- data.table(Player = res$Player[idx], SimID = res$SimID[idx],
+                            Score  = res[[score_col]][idx])
+
       # Cap at 2000 sims per player to keep plotly responsive
-      n_sims_total <- length(unique(rv$simulation_results$SimID))
-      if (n_sims_total > 2000) {
-        keep_sims <- unique(rv$simulation_results$SimID)[seq_len(2000)]
-        sim_dt    <- as.data.table(rv$simulation_results)[Player %in% players_to_show &
-                                                            SimID %in% keep_sims,
-                                                          .(Player, Score = get(score_col))]
-      }
+      all_sims <- unique(res$SimID)
+      if (length(all_sims) > 2000) sim_nba <- sim_nba[SimID %in% all_sims[seq_len(2000)]]
+      sim_dt <- sim_nba[, .(Player, Score)]
       
       req(nrow(sim_dt) > 0)
       
