@@ -1082,6 +1082,16 @@ find_optimal_lineups_combinatorial_captain <- function(sim_results, config, verb
 #   enum_win_pct            0.01   per-sim "won this script" cutoff (top frac)
 #   enum_keep               10000  lineups kept, ranked by hit_count
 # =============================================================================
+# BAND BY LINEUP COUNT, not by salary alone (25 Sep 2026, Andrew; CFB + NFL).
+# The 0.97 floor often leaves too few rosters (ARMY@TEMP: 7,096) and the old
+# fallback jumped straight to 0.75*cap -- 361,767 rosters, 643s of a 13-min
+# run spent scoring rosters $12,500 under the cap. For these sports the band is
+# instead the top ENUM_BAND_TARGET rosters by salary (ties at the cut kept): the
+# floor drops only as far as it must. Code, not config, on purpose -- no sport
+# config or UI control reaches it. Other showdown sports keep the old fallback.
+ENUM_BAND_TARGET        <- 100000L
+ENUM_BAND_TARGET_SPORTS <- c("CFB", "NFL")
+
 find_optimal_lineups_enum_captain <- function(sim_results, config, verbose = TRUE) {
   if (verbose) cat("\nPhase 1: Enumerating showdown lineups (salary band + winning-script rank)...\n")
 
@@ -1150,12 +1160,25 @@ find_optimal_lineups_enum_captain <- function(sim_results, config, verbose = TRU
   cap_parts <- cap_parts[!vapply(cap_parts, is.null, logical(1))]
   if (!length(cap_parts)) stop("enum_captain: no lineup in the salary band -- check salaries / cap")
   E <- do.call(cbind, cap_parts)                            # (n_flex+2) x M
+  band_sport <- isTRUE(config$sport %in% ENUM_BAND_TARGET_SPORTS)
+  # Re-entered at 0.75*cap below: cut back to the top ENUM_BAND_TARGET by salary.
+  if (band_sport && isTRUE(config$.band_cut) && ncol(E) > ENUM_BAND_TARGET) {
+    thr <- sort(E[n_flex + 2L, ], decreasing = TRUE)[ENUM_BAND_TARGET]
+    E   <- E[, E[n_flex + 2L, ] >= thr, drop = FALSE]
+    sal_floor <- thr
+  }
   cpt_v  <- E[1L, ]
   flex_m <- E[2:(n_flex + 1L), , drop = FALSE]              # n_flex x M  (ascending player idx)
   lsal_v <- E[n_flex + 2L, ]
   M <- length(cpt_v)
 
-  if (M < 2L * enum_keep && floor_frac > 0.75) {
+  if (band_sport && M < ENUM_BAND_TARGET && floor_frac > 0.75) {
+    if (verbose) cat(sprintf("  only %s lineups in band -- lowering the floor to take the top %s by salary\n",
+                             format(M, big.mark = ","), format(ENUM_BAND_TARGET, big.mark = ",")))
+    return(find_optimal_lineups_enum_captain(
+      sim_results, modifyList(config, list(enum_salary_floor_frac = 0.75, .band_cut = TRUE)), verbose))
+  }
+  if (!band_sport && M < 2L * enum_keep && floor_frac > 0.75) {
     if (verbose) cat(sprintf("  only %s lineups in band -- widening floor to 0.75*cap and re-enumerating\n",
                              format(M, big.mark = ",")))
     return(find_optimal_lineups_enum_captain(
