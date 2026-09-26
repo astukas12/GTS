@@ -1891,7 +1891,13 @@ prepare_stage_dominator_data <- function(race_profiles, driver_data = NULL) {
   # engine's .2 / .6 (.079); stage 3's share to starters 1-5 .234 vs real .275 (was .395), to
   # finishers 1-5 .589 vs real .541 (was .462). Needs only the flag, not quality ranks.
   metric_grid <- "MetricGrid" %in% names(rp) && isTRUE(as.logical(rp$MetricGrid[1]))
-  if (q_on && metric_grid) params$theta[1] <- min(params$theta[1], NASCAR_STAGE1_METRIC_THETA)
+  # Stage1Theta (26 Sep 2026, Kansas Trucks): the sheet sets the metric-night stage-1 grid weight per race,
+  # because metric grids vary -- some are close to the true order, some leave the fast cars out of position
+  # (Kansas: best car 4th, the 8th- and 10th-best cars on the front row, so .95 never let the 4th starter
+  # lead stage 1). The builders always write it; sheets built before it existed get the old constant.
+  s1_theta <- if ("Stage1Theta" %in% names(rp) && !is.na(suppressWarnings(as.numeric(rp$Stage1Theta[1]))))
+    as.numeric(rp$Stage1Theta[1]) else NASCAR_STAGE1_METRIC_THETA
+  if (q_on && metric_grid) params$theta[1] <- min(params$theta[1], s1_theta)
   if (metric_grid) params$theta[2:3] <- pmin(params$theta[2:3], NASCAR_STAGE23_METRIC_THETA)
   if (metric_grid) params$kappa[2:3] <- pmin(params$kappa[2:3], NASCAR_METRIC_KAPPA23)
   late_q <- if (metric_grid && q_on) NASCAR_METRIC_LATE_QUALITY else 0
