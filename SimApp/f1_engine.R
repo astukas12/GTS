@@ -619,6 +619,23 @@ f1_constructor_analysis <- function(cnstr_results, constructors) {
 # The Captain's DKScore (flex score) gets multiplied by 1.5 there automatically.
 # ============================================================================
 
+# Flex-combination tables, built once when the engine is sourced rather than per
+# sim: the INDICES are the same every sim (only the scores behind them change),
+# so there is no reason to pay combn() fifty thousand times.
+#   F1_FLEX_COMB[[n]]  4 x C(n,4) matrix of indices into the score-ordered pool
+#   F1_FLEX_HAS[[n]]   n x C(n,4) logical, TRUE where that driver is in that combo
+FLEX_POOL <- 16L
+F1_FLEX_COMB <- vector("list", FLEX_POOL)
+F1_FLEX_HAS  <- vector("list", FLEX_POOL)
+for (n in 4L:FLEX_POOL) {
+  cb <- utils::combn(n, 4L)
+  F1_FLEX_COMB[[n]] <- cb
+  h <- matrix(FALSE, n, ncol(cb))
+  h[cbind(as.vector(cb), rep(seq_len(ncol(cb)), each = 4L))] <- TRUE
+  F1_FLEX_HAS[[n]] <- h
+}
+rm(n, cb, h)
+
 find_optimal_f1_lineups <- function(sim_results, metadata, config, verbose = TRUE) {
   # Per-sim greedy optimal — matches generic combinatorial_captain pattern exactly.
   # Extra F1 constraints vs generic:
@@ -699,55 +716,56 @@ find_optimal_f1_lineups <- function(sim_results, metadata, config, verbose = TRU
     
     best_score  <- -Inf
     best_lineup <- NULL
-    
-    for (ci in seq_len(nd)) {
-      cs <- d_csal[ci]
-      if (is.na(cs) || cs > salary_cap) next
-      cpt_score <- d_score[ci] * 1.5
-      cpt       <- d_name[ci]
-      rem1      <- salary_cap - cs
-      
-      for (ki in seq_len(nc)) {
-        ks <- cn_sal[ki]
-        if (is.na(ks) || ks > rem1) next
-        rem2 <- rem1 - ks
-        con  <- cn_name[ki]
-        
-        # Stacking: 0 flex from con's team if captain is on it, else 1
-        team_drvs <- cnstr_team[[con]]
-        flex_limit <- if (cpt %in% team_drvs) 0L else 1L
-        
-        picked     <- character(4L)
-        n_picked   <- 0L
-        sal_used   <- 0
-        flex_score <- 0
-        team_cnt   <- 0L
-        
-        for (fi in seq_len(nd)) {
-          if (n_picked == 4L) break
-          if (fi == ci) next
-          ps <- d_fsal[fi]
-          if (sal_used + ps > rem2) next
-          if (d_name[fi] %in% team_drvs) {
-            if (team_cnt >= flex_limit) next
-            team_cnt <- team_cnt + 1L
-          }
-          n_picked         <- n_picked + 1L
-          picked[n_picked] <- d_name[fi]
-          sal_used         <- sal_used + ps
-          flex_score       <- flex_score + d_score[fi]
-        }
-        
-        if (n_picked < 4L) next
-        
-        total <- cpt_score + cn_score[ki] + flex_score
+
+    # ---- the four flex slots are chosen EXACTLY, not greedily ---------------
+    # This was a single pass down the score order taking whatever fitted, with no
+    # backtracking, so it would lock in an expensive scorer and then have to fill
+    # the rest with cheap filler. Measured on 60 sims of the Baku 50k run against
+    # a full exact solve over every C(22,5) block: the greedy was short in 72% of
+    # sims, by 11.1 points on average and 49 at worst -- 3.5% of the optimum,
+    # given away in the pool the customer actually gets.
+    #
+    # The fix is to enumerate all four-driver combinations from the FLEX_POOL
+    # best scorers in this sim and take the best legal one. At 16 that is 1,820
+    # combinations, masked and maximised as vectors rather than looped. An exact
+    # fill from the top 14 already matched the full optimum in 60 of 60 sims, so
+    # 16 is the same answer with margin.
+    #
+    # (The 75% pts/$ pre-filter above is NOT what was wrong -- it costs under
+    # 0.2 points per sim, because it is applied to each sim's REALISED scores and
+    # a driver who scores well in a sim has good points per dollar in that sim.
+    # It is left alone, and the score-ranked pool below is a second safety net.)
+    np <- min(FLEX_POOL, nd)
+    cmb <- F1_FLEX_COMB[[np]]                  # 4 x C(np,4), built once at load
+    p_sal <- matrix(d_fsal[cmb], nrow = 4L)
+    cmb_sal <- colSums(p_sal)
+    cmb_sc  <- colSums(matrix(d_score[cmb], nrow = 4L))
+
+    for (ki in seq_len(nc)) {
+      ks <- cn_sal[ki]
+      if (is.na(ks) || ks > salary_cap) next
+      con <- cn_name[ki]
+      team_drvs <- cnstr_team[[con]]
+      # how many of this constructor's drivers each combo uses
+      cmb_tm <- colSums(matrix(d_name[cmb] %in% team_drvs, nrow = 4L))
+
+      for (ci in seq_len(nd)) {
+        cs <- d_csal[ci]
+        if (is.na(cs) || cs + ks > salary_cap) next
+        rem2 <- salary_cap - cs - ks
+        flex_limit <- if (d_name[ci] %in% team_drvs) 0L else 1L
+        ok <- cmb_sal <= rem2 & cmb_tm <= flex_limit
+        if (ci <= np) ok <- ok & !F1_FLEX_HAS[[np]][ci, ]   # captain cannot be a flex
+        if (!any(ok)) next
+        j <- which(ok)[which.max(cmb_sc[ok])]
+        total <- d_score[ci] * 1.5 + cn_score[ki] + cmb_sc[j]
         if (total > best_score) {
           best_score  <- total
           best_lineup <- list(
-            Captain     = cpt,
-            Flex        = sort(picked[1:4]),
+            Captain     = d_name[ci],
+            Flex        = sort(d_name[cmb[, j]]),
             Constructor = con,
-            TotalSalary = cs + ks + sal_used,
+            TotalSalary = cs + ks + cmb_sal[j],
             TotalScore  = total
           )
         }
