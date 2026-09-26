@@ -1868,6 +1868,9 @@ server <- function(input, output, session) {
                            progress_frequency=500, use_parallel=TRUE,
                            max_lineups=rv$config$max_lineups %||% 5000L,
                            enum_keep=rv$config$enum_keep %||% 50000L,
+                           # the enumerator's showdown band is sized by sport
+                           # (ENUM_BAND_TARGET_SPORTS in OptimalLineups_Core.R)
+                           sport=rv$sport,
                            # opt_config is a FRESH list: the enumerator's salary
                            # band and flag width live in the sport config and
                            # never arrived, so every sport ran the 0.88 default.
