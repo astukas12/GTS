@@ -86,7 +86,7 @@ off `kneel` / `scramble` columns in `slim_<y>_era.rds` (GTS/NFL
 `build_templates.R`). Untagged era files deal every run by share, bit-identical
 to before. **The sheet contract changed with it:** a QB's `carry_usage` is his
 share of DESIGNED runs. An old-contract sheet on tagged data gives the QB his
-scrambles twice (~+2.4 carries). Readbacks `car_qr` / `cyds_qr` in
+scrambles twice (~+2.2 carries). Readbacks `car_qr` / `cyds_qr` in
 `sim_components`. Record: GTS/NFL/slates/review/2026-09-27_W3_SUN/KNEEL_FIX.md.
 
 ## Showdown optimizers guarantee ≥ 2 teams
