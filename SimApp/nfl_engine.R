@@ -37,7 +37,11 @@
 #   rz_tgt_share  P(he is the target | the completion was inside the 20). A
 #                 SECOND player vector, dealt against only for rz events. Blank
 #                 = the positional multiplier (TE 1.25 / RB 1.01 / WR 0.91).
-#   carry_usage   P(handed any given NORMAL designed carry). Sums to 1.
+#   carry_usage   P(handed any given NORMAL designed carry). Sums to 1. For the QB
+#                 this is his share of DESIGNED runs only (sneaks, options, draws) --
+#                 NOT his scrambles or kneel-downs, which he gets from the drawn game
+#                 (see "QB-ROUTED RUNS" below). A market rush line counts all three,
+#                 so a sheet builder must take the routed volume off it first.
 #   sy_share      P(handed a short-yardage carry: dn>=3 & dist<=2). Blank = carry_usage.
 #   gl_share      P(handed a goal-line carry: ytg<=3). Blank = carry_usage.
 #   kicker / punt_returner / kick_returner / dst   one name / identity each
@@ -48,6 +52,18 @@
 # distances and results, every DST counting stat, points allowed, team fumbles
 # lost. Each was tested for player signal and found to have little or none
 # (QB INT split-half 0.125, kicker FG% -0.04, README "Turnovers and kicking").
+#
+# QB-ROUTED RUNS (27 Sep 2026). The pool tags every run `kneel` / `scramble`
+# (GTS/NFL/R/build_templates.R). Those go to the team's PASSER -- the QB who
+# takes the passing line -- with their real yardage and TDs, and never through
+# the carry shares; only designed runs are dealt by carry_usage / sy / gl. Before
+# this, a drawn game's ~2.0 scrambles + ~0.8 kneels a team-game were dealt by
+# share, mostly onto the lead back (W3 Sunday at 10k: Gibbs 22.1 carries vs an
+# 18.5 line; Goff 1.4 carries vs a real ~2.5-3.5), and each kept its yardage, so
+# backs took kneels at -1 and scrambles at +5-8. Readbacks: car_qr / cyds_qr.
+# BACKWARD COMPATIBLE: era files without the tags deal every run by share, as
+# before -- and a sheet built for that contract (QB carry_usage = share of ALL
+# runs) should not be run on tagged data, or the QB takes his scrambles twice.
 #
 # SACKS have no offensive-side effect: a sacked QB loses nothing here (rushing
 # and passing lines are untouched), and the only sack scoring is +1 per sack to
@@ -694,13 +710,27 @@ nfl_deal_receiving <- function(events, pb, pb_rz, players, a0 = NFL_CATCH_A0, n_
 # deal a drawn game's designed runs to runners (QB included), CARRY BY CARRY.
 # Three situations read off the EVENT: goal line (gl==1) first, then short
 # yardage (sy==1), then normal. Normal carries get the per-game Dirichlet.
-nfl_deal_rushing <- function(events, shares, players, a0 = NFL_CARRY_A0, n_sims) {
+# `qb` + an event column `qr` (1 = kneel or scramble): those runs go to `qb`
+# whole, yardage and TDs as played, and only the rest are dealt by share. With
+# no `qr` column or no `qb`, every run is dealt by share (the pre-tag behaviour).
+# Returns per (sim, player): car, cyds, ctd, and the QB-routed part car_qr, cyds_qr.
+nfl_deal_rushing <- function(events, shares, players, a0 = NFL_CARRY_A0, n_sims,
+                             qb = NA_character_) {
   nP <- length(players)
   E <- data.table::as.data.table(events)
-  if (!nrow(E) || !nP)
-    return(data.table(sim = integer(0), player = character(0), car = integer(0),
-                      cyds = numeric(0), ctd = numeric(0)))
+  empty <- data.table(sim = integer(0), player = character(0), car = integer(0),
+                      cyds = numeric(0), ctd = numeric(0), car_qr = integer(0), cyds_qr = numeric(0))
+  if (!nrow(E)) return(empty)
   E <- data.table::copy(E[is.finite(sim)])
+  routed <- empty
+  if ("qr" %in% names(E) && length(qb) == 1L && !is.na(qb) && nzchar(qb)) {
+    Q <- E[!is.na(qr) & qr == 1L]
+    if (nrow(Q))
+      routed <- Q[, .(car = .N, cyds = sum(yds), ctd = sum(td == 1L, na.rm = TRUE),
+                      car_qr = .N, cyds_qr = sum(yds)), by = sim][, player := qb][]
+    E <- E[is.na(qr) | qr != 1L]
+  }
+  if (!nrow(E) || !nP) return(routed[, names(empty), with = FALSE])
   gl <- if ("gl" %in% names(E)) E$gl else 0L
   sy <- if ("sy" %in% names(E)) E$sy else 0L
   E[, sit := data.table::fifelse(!is.na(gl) & gl == 1L, 3L,
@@ -717,7 +747,11 @@ nfl_deal_rushing <- function(events, shares, players, a0 = NFL_CARRY_A0, n_sims)
   if (length(ii))
     data.table::set(E, ii, "w", nfl_dirichlet_winners(E$sim[ii], P$normal, a0, n_sims))
   out <- E[, .(car = .N, cyds = sum(yds), ctd = sum(td == 1L, na.rm = TRUE)), by = .(sim, w)]
-  out[, player := players[w]][, w := NULL][]
+  out[, player := players[w]][, w := NULL][, `:=`(car_qr = 0L, cyds_qr = 0)]
+  if (!nrow(routed)) return(out[])
+  out <- data.table::rbindlist(list(out, routed), use.names = TRUE)
+  out[, .(car = sum(car), cyds = sum(cyds), ctd = sum(ctd),
+          car_qr = sum(car_qr), cyds_qr = sum(cyds_qr)), by = .(sim, player)]
 }
 
 # =============================================================================
@@ -1177,10 +1211,16 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
   draw <- Gp[idx]
 
   say("loading events", 0.12)
+  # qr = the QB-routed run tag (kneel | scramble); NA on era files built before
+  # the tags existed, and routing is on only when EVERY season carries them.
   EV <- rbindlist(lapply(nfl_pool_seasons(), function(y) {
     x <- readRDS(file.path(nfl_data_dir(), sprintf("slim_%d_era.rds", y))); setDT(x)
-    x[, .(game_id, posteam, kind, yds, made, ytg, td, rz, gl, sy)]
+    tagged <- all(c("kneel", "scramble") %in% names(x))
+    x[, .(game_id, posteam, kind, yds, made, ytg, td, rz, gl, sy,
+          qr = if (tagged) as.integer(kneel == 1L | scramble == 1L) else NA_integer_)]
   }))
+  qb_routing <- !anyNA(EV[kind == NFL_EVT_RUN, qr])
+  say(if (qb_routing) "run events tagged: kneels + scrambles -> the QB" else "run events untagged: every run dealt by share", 0.13)
   setkey(EV, game_id, posteam)
   BLK <- EV[, .(s = .I[1], e = .I[.N]), by = .(game_id, posteam)]; setkey(BLK, game_id, posteam)
 
@@ -1256,20 +1296,23 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
     E2[, sim := rep(sel$sim, lens)]
 
     cmpE  <- E2[kind == NFL_EVT_CMP,  .(sim, yds, td, rz)]
-    runE  <- E2[kind == NFL_EVT_RUN,  .(sim, yds, td, gl, sy)]
+    runE  <- E2[kind == NFL_EVT_RUN,  .(sim, yds, td, gl, sy, qr)]
     fgv   <- rep(0, n_sims)
     fgg   <- E2[kind == NFL_EVT_FG & !is.na(made) & made == 1L,
                 .(fg = sum(nfl_fg_points(ytg))), by = sim]
     if (nrow(fgg)) fgv[fgg$sim] <- fgg$fg
 
     rec <- if (nR) nfl_deal_receiving(cmpE, cf$pb, cf$pb_rz, R$player, n_sims = n_sims) else NULL
-    rsh <- if (nS) nfl_deal_rushing(runE, S[, .(carry_usage, sy_share, gl_share)], S$player, n_sims = n_sims) else NULL
+    qb_rt <- if (qb_routing) cf$qb else NA_character_
+    rsh <- if (nS || !is.na(qb_rt))
+      nfl_deal_rushing(runE, S[, .(carry_usage, sy_share, gl_share)], S$player, n_sims = n_sims,
+                       qb = qb_rt) else NULL
 
     # ---- assemble the (sim x player) grid --------------------------------
     D <- CJ(sim = seq_len(n_sims), player = cf$who, sorted = FALSE)
     if (!is.null(rec)) D <- merge(D, rec, by = c("sim", "player"), all.x = TRUE)
     if (!is.null(rsh)) D <- merge(D, rsh, by = c("sim", "player"), all.x = TRUE)
-    for (cl in c("rec", "ryds", "rtd", "rec_b5", "rec_rz", "car", "cyds", "ctd"))
+    for (cl in c("rec", "ryds", "rtd", "rec_b5", "rec_rz", "car", "cyds", "ctd", "car_qr", "cyds_qr"))
       if (!cl %in% names(D)) D[, (cl) := 0] else D[is.na(get(cl)), (cl) := 0]
     D[, `:=`(pyds = 0, ptd = 0, pint = 0, fgp = 0, xp = 0, rettd = 0L, fum = 0L,
              is_dst = FALSE,
@@ -1337,7 +1380,7 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
     dl <- cf$dl
     Ddst <- data.table(sim = seq_len(n_sims), player = cf$dst_id,
                        rec = 0, ryds = 0, rtd = 0, rec_b5 = 0, rec_rz = 0,
-                       car = 0, cyds = 0, ctd = 0,
+                       car = 0, cyds = 0, ctd = 0, car_qr = 0, cyds_qr = 0,
                        pyds = 0, ptd = 0, pint = 0, fgp = 0, xp = 0, rettd = 0L, fum = 0L,
                        is_dst = TRUE,
                        def_sacks = dl$def_sacks, def_int = dl$def_int,
@@ -1390,7 +1433,7 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
               sport_visuals = sv)
   if (isTRUE(keep_components)) {
     ccols <- intersect(c("SimID", "player", "team", "is_dst", "rec", "ryds", "rtd",
-                         "rec_b5", "rec_rz", "car", "cyds", "ctd", "pyds", "ptd", "pint",
+                         "rec_b5", "rec_rz", "car", "cyds", "ctd", "car_qr", "cyds_qr", "pyds", "ptd", "pint",
                          "fgp", "xp", "rettd", "fum", "def_sacks", "def_int", "def_fum_rec",
                          "def_td", "def_block", "pa", "DKScore", "FDScore"), names(A))
     res$sim_components <- A[, ..ccols]
