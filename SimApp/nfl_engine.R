@@ -122,6 +122,17 @@ NFL_POOL_BW        <- 0.9
 # close on the hard-total games that already relaxed before this existed.
 NFL_POOL_DIMS_PYDS <- c(NFL_POOL_DIMS, "fpass_yds", "dpass_yds")
 NFL_POOL_W_PYDS    <- c(NFL_POOL_W, 1.2, 1.2)
+# TEAM COMPLETIONS (27 Sep 2026, W3 Sunday sign-off). Pass yards alone let the pool
+# hit the QB's yardage line through the WRONG kind of game -- fewer, longer
+# completions plus extra carries: PIT drew ~26 team carries vs ~20 the market
+# implies, 20.1 completions vs a 22.5 line, and every lead back ran 60-70% over his
+# attempt line (Gibbs, Warren, Brown) while BAL ran the other way. Points + pass
+# yards + completions together pin the offense's SHAPE, so carries follow. Sourced
+# from the same Pinnacle board ("Total Pass Completions"), per side, same fallback
+# to the pool median when a QB has no line. options(nfl.target_cmp = FALSE) turns
+# it off -- the path is then identical to before (the A/B switch).
+NFL_POOL_DIMS_CMP  <- c("fcmp", "dcmp")
+NFL_POOL_W_CMP     <- c(1.2, 1.2)
 NFL_ESS_FLOOR      <- 150
 NFL_ESS_HARDFLOOR  <- 60
 
@@ -289,17 +300,37 @@ nfl_pass_yard_props <- function() {
       data.table(matchup = x$id, desc = x$special$description,
                  over_id = ids[nms == "Over"][1])
     }))
-    props <- props[grepl(" Total Passing Yards$", desc)]
+    props <- props[grepl(" Total (Passing Yards|Pass Completions)$", desc)]
     if (!nrow(props)) return(NULL)
-    props[, player := sub(" Total .*$", "", desc)]
+    props[, `:=`(player = sub(" Total .*$", "", desc), stat = sub("^.* Total ", "", desc))]
     px <- rbindlist(lapply(Filter(function(x) x$period == 0 && x$key == "s;0;ou", mk), function(x)
       rbindlist(lapply(x$prices, function(p)
         data.table(matchup = x$matchupId, pid = p$participantId, points = p$points %||% NA_real_)))))
     props <- merge(props, px[, .(matchup, over_id = pid, line = points)],
                    by = c("matchup", "over_id"))
-    props <- unique(props[!is.na(line), .(player, line)], by = "player")
-    if (!nrow(props)) NULL else props
+    nfl_props_from_table(props[!is.na(line)])
   }, error = function(e) NULL)
+}
+
+# A prop TABLE (player, stat, line -- Pinnacle's stat names) -> the object the
+# engine takes as `.props`: the pass-yard lines, with the completions lines riding
+# along as attr "cmp". Kept as an attribute so every existing caller that reads
+# `props[player == qb, line]` for pass yards is unchanged. Shared by the SimApp
+# fetch above and the GTS/NFL review / TD-layer scripts (they read a saved board).
+nfl_props_from_table <- function(tbl) {
+  if (is.null(tbl) || !nrow(tbl)) return(NULL)
+  tbl <- as.data.table(tbl)
+  py <- unique(tbl[stat == "Passing Yards", .(player, line)], by = "player")
+  cm <- unique(tbl[stat == "Pass Completions", .(player, line)], by = "player")
+  if (!nrow(py) && !nrow(cm)) return(NULL)
+  setattr(py, "cmp", if (nrow(cm)) cm else NULL)
+  py
+}
+
+# the QB's completions line from `.props`' "cmp" attribute; NA when absent
+nfl_qb_cmp_line <- function(qb, props) {
+  if (is.null(props)) return(NA_real_)
+  nfl_qb_pass_line(qb, attr(props, "cmp"))
 }
 
 # Exact match first (Pinnacle spells all 24 W1 Sunday starters verbatim as of
@@ -410,6 +441,10 @@ nfl_calibrate_target <- function(G, target, market, bw = NFL_POOL_BW,
     deliver <- c(deliver, list(list(nm = "fpass_yds", mkt = "fpass_yds", col = "fpass_yds", tol = 1)))
   if (!is.null(market$dpass_yds))
     deliver <- c(deliver, list(list(nm = "dpass_yds", mkt = "dpass_yds", col = "dpass_yds", tol = 1)))
+  if (!is.null(market$fcmp))
+    deliver <- c(deliver, list(list(nm = "fcmp", mkt = "fcmp", col = "fcmp", tol = 0.1)))
+  if (!is.null(market$dcmp))
+    deliver <- c(deliver, list(list(nm = "dcmp", mkt = "dcmp", col = "dcmp", tol = 0.1)))
   bounds <- lapply(deliver, function(d) range(G[[d$col]], na.rm = TRUE))
 
   # fO_pr/dO_pr TRACK the pys kernel-centre via the pool's own pr~pys fit,
@@ -491,7 +526,7 @@ nfl_pool_weights_guarded <- function(G, target, market,
     base
   }
   style <- c("fO_pr", "fO_pys", "dO_pr", "dO_pys")
-  mkt   <- c("total", "absp", "fpass_yds", "dpass_yds")
+  mkt   <- c("total", "absp", "fpass_yds", "dpass_yds", "fcmp", "dcmp")
 
   # is_tail: is the ASK itself far in the pool's own total/absp distribution,
   # independent of style? z-score against the pool's real mean/sd on each dim
@@ -1110,15 +1145,31 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
     if (is.finite(pyds_f)) market$fpass_yds <- pyds_f
     if (is.finite(pyds_d)) market$dpass_yds <- pyds_d
   }
+  # Team completions (NFL_POOL_DIMS_CMP) -- same per-side rules as pass yards.
+  cmp_f <- cmp_d <- NA_real_
+  if (isTRUE(getOption("nfl.target_cmp", TRUE))) {
+    cmp_f <- nfl_qb_cmp_line(qb_of(fav), props)
+    cmp_d <- nfl_qb_cmp_line(qb_of(dog), props)
+    if (is.finite(cmp_f) || is.finite(cmp_d)) {
+      dims <- c(dims, NFL_POOL_DIMS_CMP); weights <- c(weights, NFL_POOL_W_CMP)
+      target$fcmp <- if (is.finite(cmp_f)) cmp_f else stats::median(Gp$fcmp)
+      target$dcmp <- if (is.finite(cmp_d)) cmp_d else stats::median(Gp$dcmp)
+      if (is.finite(cmp_f)) market$fcmp <- cmp_f
+      if (is.finite(cmp_d)) market$dcmp <- cmp_d
+    }
+  }
 
   r <- nfl_pool_weights_guarded(Gp, target, market = market, dims = dims, weights = weights,
                                 verbose = FALSE)
   say(sprintf("pool calibrated: ESS %.0f%s, total %.1f, margin %.1f, pys f %.2f d %.2f%s",
               r$ess, if (r$relaxed) sprintf(" [relaxed to rung %d]", r$rung) else "",
               r$total, r$margin, pys_f, pys_d,
-              if (is.finite(pyds_f) || is.finite(pyds_d))
+              paste0(if (is.finite(pyds_f) || is.finite(pyds_d))
                 sprintf(", pyds f %s d %s", format(round(pyds_f,1)), format(round(pyds_d,1)))
-              else ""), 0.08)
+              else "",
+              if (is.finite(cmp_f) || is.finite(cmp_d))
+                sprintf(", cmp f %s d %s", format(round(cmp_f,1)), format(round(cmp_d,1)))
+              else "")), 0.08)
 
   set.seed(if (is.null(seed) || is.na(seed))
              as.integer(Sys.time()) %% .Machine$integer.max else as.integer(seed))
