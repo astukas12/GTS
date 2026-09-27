@@ -61,6 +61,15 @@
 # share, mostly onto the lead back (W3 Sunday at 10k: Gibbs 22.1 carries vs an
 # 18.5 line; Goff 1.4 carries vs a real ~2.5-3.5), and each kept its yardage, so
 # backs took kneels at -1 and scrambles at +5-8. Readbacks: car_qr / cyds_qr.
+# SCRAMBLE THINNING (27 Sep 2026, later). A drawn scramble belongs to the DRAWN
+# QB; a pocket QB inherited ~2 a game he does not make (Goff P(over 0.5 rush yd)
+# .77 vs a .45 market). The game tab's scr_rate_away / scr_rate_home (the sheet
+# QB's scrambles per dropback) against each drawn scramble's scr_rate (its
+# scrambler's, stamped at build time): keep it with p = min(1, sheet / drawn).
+# A dropped scramble is DELETED -- a throwaway, not a carry for anyone; team
+# rush yards fall by its yardage, points stay the drawn game's. Scramble TDs are
+# never dropped. Kneels are never thinned (game state, not the QB). Blank rate
+# or untagged data -> no thinning, and no random draws, so the path is identical.
 # BACKWARD COMPATIBLE: era files without the tags deal every run by share, as
 # before -- and a sheet built for that contract (QB carry_usage = share of ALL
 # runs) should not be run on tagged data, or the QB takes his scrambles twice.
@@ -715,7 +724,7 @@ nfl_deal_receiving <- function(events, pb, pb_rz, players, a0 = NFL_CATCH_A0, n_
 # no `qr` column or no `qb`, every run is dealt by share (the pre-tag behaviour).
 # Returns per (sim, player): car, cyds, ctd, and the QB-routed part car_qr, cyds_qr.
 nfl_deal_rushing <- function(events, shares, players, a0 = NFL_CARRY_A0, n_sims,
-                             qb = NA_character_) {
+                             qb = NA_character_, qb_scr = NA_real_) {
   nP <- length(players)
   E <- data.table::as.data.table(events)
   empty <- data.table(sim = integer(0), player = character(0), car = integer(0),
@@ -725,6 +734,14 @@ nfl_deal_rushing <- function(events, shares, players, a0 = NFL_CARRY_A0, n_sims,
   routed <- empty
   if ("qr" %in% names(E) && length(qb) == 1L && !is.na(qb) && nzchar(qb)) {
     Q <- E[!is.na(qr) & qr == 1L]
+    # thin the drawn QB's scrambles to the sheet QB's rate (header: SCRAMBLE THINNING)
+    if (nrow(Q) && length(qb_scr) == 1L && is.finite(qb_scr) && qb_scr > 0 && "sr" %in% names(Q)) {
+      cand <- which(Q$sc %in% 1L & !(Q$td %in% 1L) & is.finite(Q$sr) & Q$sr > 0)
+      if (length(cand)) {
+        drop <- cand[stats::runif(length(cand)) > pmin(1, qb_scr / Q$sr[cand])]
+        if (length(drop)) Q <- Q[-drop]
+      }
+    }
     if (nrow(Q))
       routed <- Q[, .(car = .N, cyds = sum(yds), ctd = sum(td == 1L, na.rm = TRUE),
                       car_qr = .N, cyds_qr = sum(yds)), by = sim][, player := qb][]
@@ -880,12 +897,14 @@ read_nfl_input <- function(file_path, slate = NULL, game = NULL) {
   }
 
   # melt pys_target + derive the DST opponent from the (now possibly sliced) game tab
-  tt[, `:=`(pys_target = NA_real_, dst_opp = NA_character_)]
+  tt[, `:=`(pys_target = NA_real_, dst_opp = NA_character_, scr_rate = NA_real_)]
   for (i in seq_len(nrow(tt))) {
     tm <- tt$team[i]; row <- g[away == tm | home == tm][1]
     if (nrow(row)) {
       tt$pys_target[i] <- if (identical(row$away, tm)) suppressWarnings(as.numeric(row$pys_target_away))
                           else                          suppressWarnings(as.numeric(row$pys_target_home))
+      side <- if (identical(row$away, tm)) "scr_rate_away" else "scr_rate_home"
+      if (side %in% names(row)) tt$scr_rate[i] <- suppressWarnings(as.numeric(row[[side]]))
       tt$dst_opp[i]    <- if (identical(row$away, tm)) row$home else row$away
     }
   }
@@ -1217,7 +1236,9 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
     x <- readRDS(file.path(nfl_data_dir(), sprintf("slim_%d_era.rds", y))); setDT(x)
     tagged <- all(c("kneel", "scramble") %in% names(x))
     x[, .(game_id, posteam, kind, yds, made, ytg, td, rz, gl, sy,
-          qr = if (tagged) as.integer(kneel == 1L | scramble == 1L) else NA_integer_)]
+          qr = if (tagged) as.integer(kneel == 1L | scramble == 1L) else NA_integer_,
+          sc = if (tagged) as.integer(scramble) else NA_integer_,
+          sr = if ("scr_rate" %in% names(x)) as.numeric(scr_rate) else NA_real_)]
   }))
   qb_routing <- !anyNA(EV[kind == NFL_EVT_RUN, qr])
   say(if (qb_routing) "run events tagged: kneels + scrambles -> the QB" else "run events untagged: every run dealt by share", 0.13)
@@ -1264,6 +1285,7 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
          pb    = nfl_catch_pb(R),
          pb_rz = nfl_rz_pb(R),
          k = tr$kicker, pr = tr$punt_returner, kr = tr$kick_returner,
+         scr = if ("scr_rate" %in% names(tr)) as.numeric(tr$scr_rate[1]) else NA_real_,
          dst_id = if (!is.na(tr$dst) && nzchar(trimws(tr$dst))) tr$dst else tm,
          dl = if (tm == fav) dl_fav else dl_dog,
          pint_src = if (tm == fav) dl_dog else dl_fav,   # our QB's INTs = opp defence's picks
@@ -1296,7 +1318,7 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
     E2[, sim := rep(sel$sim, lens)]
 
     cmpE  <- E2[kind == NFL_EVT_CMP,  .(sim, yds, td, rz)]
-    runE  <- E2[kind == NFL_EVT_RUN,  .(sim, yds, td, gl, sy, qr)]
+    runE  <- E2[kind == NFL_EVT_RUN,  .(sim, yds, td, gl, sy, qr, sc, sr)]
     fgv   <- rep(0, n_sims)
     fgg   <- E2[kind == NFL_EVT_FG & !is.na(made) & made == 1L,
                 .(fg = sum(nfl_fg_points(ytg))), by = sim]
@@ -1306,7 +1328,7 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
     qb_rt <- if (qb_routing) cf$qb else NA_character_
     rsh <- if (nS || !is.na(qb_rt))
       nfl_deal_rushing(runE, S[, .(carry_usage, sy_share, gl_share)], S$player, n_sims = n_sims,
-                       qb = qb_rt) else NULL
+                       qb = qb_rt, qb_scr = cf$scr) else NULL
 
     # ---- assemble the (sim x player) grid --------------------------------
     D <- CJ(sim = seq_len(n_sims), player = cf$who, sorted = FALSE)
