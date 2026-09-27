@@ -2,9 +2,9 @@
 # nfl_engine.R -- NFL, DraftKings + FanDuel, classic + showdown
 # -----------------------------------------------------------------------------
 # SIMULATE A REAL SUNDAY, THEN DEAL IT OUT. Every simulated game here is an
-# actual historical NFL game -- BOTH TEAMS, as played -- drawn from a
-# 1,359-game pool (2021-2025 REG) matched on both teams' pre-game profiles and
-# calibrated to the market. Its completions, designed runs, sacks and field
+# actual historical NFL game -- BOTH TEAMS, as played -- drawn from a pool of
+# 2021-2025 REG games plus 2026 to date (nfl_pool_seasons()), matched on both
+# teams' pre-game profiles and calibrated to the market. Its completions, designed runs, sacks and field
 # goals are dealt to this slate's players one event at a time.
 #
 # Because events are DEALT rather than shared out, player totals sum to the team
@@ -87,7 +87,17 @@ nfl_db_dir <- function() {
   "C:/Users/astuk/OneDrive/Documents/GTS/NFL/db"
 }
 
-NFL_SEASONS <- 2021:2025
+# The pool's seasons are whatever era files the data dir holds -- 2021-2025, plus
+# 2026 once the weekly refresh (GTS/NFL/R/weekly_refresh.R) has shipped it. Read
+# at run time, not source time, because nfl_data_dir() depends on options and the
+# working directory. Never hard-code the list: a refreshed nfl_data/ with a
+# hard-coded 2021:2025 here silently ignores every current-season game.
+nfl_pool_seasons <- function() {
+  f <- list.files(nfl_data_dir(), pattern = "^slim_[0-9]{4}_era\\.rds$")
+  s <- sort(as.integer(sub("^slim_([0-9]{4})_era\\.rds$", "\\1", f)))
+  if (!length(s)) stop("nfl_pool_seasons: no slim_<year>_era.rds in ", nfl_data_dir())
+  s
+}
 
 # =============================================================================
 # CONSTANTS -- every one measured on 2021-2025 REG (GTS/NFL, parts 1-9)
@@ -309,7 +319,7 @@ nfl_qb_pass_line <- function(qb, props) {
 # =============================================================================
 
 # One row per GAME: favourite side (f*) and underdog side (d*), priors + outcomes.
-nfl_pool_frame <- function(seasons = NFL_SEASONS) {
+nfl_pool_frame <- function(seasons = nfl_pool_seasons()) {
   P <- readRDS(file.path(nfl_data_dir(), "nfl_profiles_with_priors.rds")); setDT(P)
   P <- P[season %in% seasons & !is.na(spread) & !is.na(total)]
   P[, is_fav := (is_home & spread > 0) | (!is_home & spread < 0)]   # + spread = home favoured
@@ -1116,7 +1126,7 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
   draw <- Gp[idx]
 
   say("loading events", 0.12)
-  EV <- rbindlist(lapply(NFL_SEASONS, function(y) {
+  EV <- rbindlist(lapply(nfl_pool_seasons(), function(y) {
     x <- readRDS(file.path(nfl_data_dir(), sprintf("slim_%d_era.rds", y))); setDT(x)
     x[, .(game_id, posteam, kind, yds, made, ytg, td, rz, gl, sy)]
   }))
