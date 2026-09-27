@@ -1832,6 +1832,13 @@ NASCAR_STAGE23_METRIC_THETA <- c(0.1, 0.0)  # stage-2 and stage-3 grid weight on
 # sheet: Love (metric pole) 31.4 -> 29.8 dominator pts (stage 1 kept), Allgaier (fastest, 9th) 11.8 -> 20.6.
 NASCAR_METRIC_KAPPA23       <- c(0.25, 0.25)
 NASCAR_METRIC_LATE_QUALITY  <- 0.30
+# Metric-grid nights, stage 1 (27 Sep 2026, Cup Kansas -- a stopgap until stage 1 is dealt by probability).
+# Stage 1 was grid + pre-race quality only, both fixed across sims, so the biggest stage-1 line landed on
+# the same car in every sim: the 2nd starter took .31 of stage 1 (Larson 16.0 pts vs Hamlin 1.9, Bell 2.2;
+# swapping their starts moved it with the slot). Blending the sim's finish into the quality term lets the
+# front-runners share it: at Stage1Theta .60, Larson 9.9 / Bell 7.2 / Hamlin 2.8, pole .09. Timed nights
+# are untouched (0 there).
+NASCAR_STAGE1_METRIC_FIN    <- 0.30
 
 nascar_stage_dom_params <- function(series, track_type) {
   key_s <- tolower(series); key_t <- tolower(track_type)
@@ -1901,6 +1908,7 @@ prepare_stage_dominator_data <- function(race_profiles, driver_data = NULL) {
   if (metric_grid) params$theta[2:3] <- pmin(params$theta[2:3], NASCAR_STAGE23_METRIC_THETA)
   if (metric_grid) params$kappa[2:3] <- pmin(params$kappa[2:3], NASCAR_METRIC_KAPPA23)
   late_q <- if (metric_grid && q_on) NASCAR_METRIC_LATE_QUALITY else 0
+  s1_fin <- if (metric_grid && q_on) NASCAR_STAGE1_METRIC_FIN else 0
   # No car's race total may beat the biggest single-car day in the pool. Stages
   # are dealt separately, so without this a car can stack one driver's stage 1
   # and 3 on another driver's big stage 2 (Bristol Trucks: 3% of sims, up to 88
@@ -1908,7 +1916,7 @@ prepare_stage_dominator_data <- function(race_profiles, driver_data = NULL) {
   cap <- list(DK = max(vapply(races, function(r) max(rowSums(r$DK)), 0)),
               FD = max(vapply(races, function(r) max(rowSums(r$FD)), 0)))
   list(races = races, theta = params$theta, kappa = params$kappa, cap = cap, q_on = q_on, f_q = f_q,
-       metric_grid = metric_grid, late_q = late_q)
+       metric_grid = metric_grid, late_q = late_q, s1_fin = s1_fin)
 }
 
 # One drawn race's stage lines dealt to one field. Pure: no data.table, no
@@ -1936,7 +1944,7 @@ prepare_stage_dominator_data <- function(race_profiles, driver_data = NULL) {
 # ~2% of points). Tried and rejected the same day: sharing in proportion to
 # each leader's own line (piles it on the #2 car).
 nascar_stage_deal <- function(f_start, f_fin, room, l_start, l_fin, val, theta, kappa,
-                              f_q = NULL, l_q = NULL, late_q = 0) {
+                              f_q = NULL, l_q = NULL, late_q = 0, s1_fin = 0) {
   n <- length(f_start)
   pts <- numeric(n)
   owner <- matrix(NA_integer_, nrow(val), 3)
@@ -1949,7 +1957,8 @@ nascar_stage_deal <- function(f_start, f_fin, room, l_start, l_fin, val, theta, 
     spill <- list()                              # (points left, cars nearest-first) per capped line
     for (j in lines) {
       if (!any(free)) break
-      second <- if (s == 1 && use_q) (f_q - l_q[j])
+      second <- if (s == 1 && use_q && s1_fin > 0) sqrt((1 - s1_fin) * (f_q - l_q[j])^2 + s1_fin * (f_fin - l_fin[j])^2)
+                else if (s == 1 && use_q) (f_q - l_q[j])
                 else if (use_q && late_q > 0) sqrt((1 - late_q) * (f_fin - l_fin[j])^2 + late_q * (f_q - match(j, lines))^2)
                 else (f_fin - l_fin[j])
       d <- sqrt(theta[s] * (f_start - l_start[j])^2 + (1 - theta[s]) * second^2)
@@ -2005,7 +2014,8 @@ assign_dominator_points_stagewise <- function(race_result, race_weights, stage_d
                             rd$start, rd$fin, rd[[platform]], stage_data$theta, stage_data$kappa,
                             f_q = if (isTRUE(stage_data$q_on)) stage_data$f_q else NULL,
                             l_q = if (isTRUE(stage_data$q_on)) rd$q else NULL,
-                            late_q = if (is.null(stage_data$late_q)) 0 else stage_data$late_q)
+                            late_q = if (is.null(stage_data$late_q)) 0 else stage_data$late_q,
+                            s1_fin = if (is.null(stage_data$s1_fin)) 0 else stage_data$s1_fin)
   set(race_result, j = col_name, value = deal$pts)
   # Sim review capture (GTS/Common/SIM_REVIEW_PLAN.md): unset for customers, set only by the re-sim worker
   if (!is.null(h <- getOption("nascar.dom_hook"))) h(race_result$SimID[1], race_id, deal, race_result$Name, platform)
