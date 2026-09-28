@@ -1090,7 +1090,7 @@ find_optimal_lineups_combinatorial_captain <- function(sim_results, config, verb
 # floor drops only as far as it must. Code, not config, on purpose -- no sport
 # config or UI control reaches it. Other showdown sports keep the old fallback.
 ENUM_BAND_TARGET        <- 100000L
-ENUM_BAND_TARGET_SPORTS <- c("CFB", "NFL")
+ENUM_BAND_TARGET_SPORTS <- c("CFB", "NFL", "NHL")   # NHL 27 Sep: ~40-man games, 128s at 1k sims without it
 
 find_optimal_lineups_enum_captain <- function(sim_results, config, verbose = TRUE) {
   if (verbose) cat("\nPhase 1: Enumerating showdown lineups (salary band + winning-script rank)...\n")

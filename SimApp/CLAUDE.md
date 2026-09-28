@@ -251,6 +251,33 @@ path, so the Lab falls back to scoring both pools together.
 Windows 11 and returned nothing, silently reporting the fallback 8 GB for a
 7.6 GB machine. Unknown platforms still fall back to 8 GB rather than throttle.
 
+## NHL (`nhl_engine.R` + `nhl/`, 27 Sep 2026) — DK classic + showdown
+
+The input is the nightly workbook from `GTS/NHL/R/live/build_slate.R` (Games /
+Players / Goalies / IDs_<dg>); the whole frame (roles, rates, market, each
+game's solved grid) is computed there, so the engine only simulates. `nhl/`
+holds GTS/NHL's model **copied verbatim** (team_model, player_model, grid /
+goalie / player cores, dk_scoring, add_dk_shutout) plus `nhl_params.rds`
+(60 KB). Fixes in GTS/NHL do not reach here until re-copied. The model is
+sourced into `NHL_ENV`, not globalenv — it defines short helper names (`lin`,
+`cmp`, `H`, `STATES`) that would collide with other engines.
+
+Parity: same workbook, same seed, GTS's own `sim_team_box`/`sim_players` vs
+`run_nhl_simulation` — bit-identical (358k skater + 20k goalie rows, 27 Sep).
+Re-run that check after any re-copy.
+
+- **DK gives each player a separate ID per roster slot**: showdown CPT + FLEX,
+  classic skaters position + UTIL. Metadata carries DKID / DKUID and SDID /
+  SDCID; `nhl_classic_download()` puts DKUID in the UTIL column.
+- Classic: `find_optimal_lineups_nhl_classic()` (NFL classic's method, C 2-3 /
+  W 3-4 / D 2-3 / G 1) then DK's 3-team / 2-game rule. A MAIN / LATE pill row
+  re-points the classic ids without re-simming.
+- Showdown: `enum_captain` with `.band_cut = TRUE` on the first pass — a
+  38-man game puts 1.2M rosters in the default band (128s at 1k sims); the top
+  100k by salary is ~$49k+ (29s).
+- Starting goalies only (DFO's starter), scored off the box's starter line. No
+  ownership source yet, so no AvgOwn / leverage.
+
 ## Running it
 
 A working launch config lives at `.claude/launch.json` in the repo root (name:
