@@ -19,7 +19,7 @@ source("lineup_lab_module.R")
 # top-level code on every upload/sim run.
 local({
   engines <- c("nascar", "mma", "tennis", "golf", "f1", "nfl", "nfl_preseason",
-                 "cbb", "nba", "soccer", "cfb", "presidents_cup")
+                 "cbb", "nba", "soccer", "cfb", "presidents_cup", "nhl")
   for (e in engines) {
     f <- paste0(e, "_engine.R")
     if (file.exists(f)) source(f) else warning("Engine not found at startup: ", f)
@@ -98,7 +98,8 @@ load_sport_input <- function(file_path, sport, config, slate = NULL, game = NULL
     CFB_CLASSIC = read_cfb_input,
     NFL  = read_nfl_input,
     NFL_CLASSIC = read_nfl_input,
-    PRESIDENTS_CUP = read_presidents_cup_input
+    PRESIDENTS_CUP = read_presidents_cup_input,
+    NHL  = read_nhl_input
   )
   if (sport %in% names(reader_map)) {
     # slate/game only mean anything to the CFB reader (a multi-slate
@@ -138,6 +139,7 @@ sport_icon_name <- function(sport) {
          CBB    = "basketball-ball",
          NBA    = "basketball-ball",
          SOCCER = "futbol",
+         NHL    = "hockey-puck",
          "circle"
   )
 }
@@ -678,6 +680,7 @@ server <- function(input, output, session) {
     rv$sd_portfolio        <- NULL;  rv$sd_builds <- list();  rv$sd_build_counter <- 0
     rv$sport_visuals       <- NULL
     rv$full_sim_results    <- NULL
+    rv$nhl_classic_dg      <- NULL   # a fresh NHL sim's metadata points at the main classic
     # Lineup Lab pools belong to the sim that produced them -- a new sim (or a
     # slate switch) invalidates them exactly like the main pool.
     rv$ll_results          <- NULL
@@ -1405,6 +1408,8 @@ server <- function(input, output, session) {
       else create_download_showdown(optimal_lineups, metadata)
     } else if ("MVP" %in% names(optimal_lineups)) {
       create_download_mvp(optimal_lineups, metadata)
+    } else if (identical(sport, "NHL")) {
+      nhl_classic_download(optimal_lineups, metadata)   # UTIL takes its own DK id
     } else {
       d0 <- create_download_standard(optimal_lineups, metadata, platform)
       if (identical(sport, "NFL_PRESEASON_CLASSIC")) d0 <- ps_classic_headers(setDT(d0), platform)
@@ -1838,6 +1843,35 @@ server <- function(input, output, session) {
                                                           progress$set(value=0.70 + frac*0.30, detail=detail))
         final_results <- add_custom_metrics(final_results, rv$sim_metadata, rv$config)
         for (wc in intersect(c("TotalEW","Win6Pct","Win5PlusPct"), names(final_results)))
+          final_results[, (wc) := NULL]
+        rv$dk_optimal_lineups <- final_results
+
+      } else if (rv$sport == "NHL") {
+        # DK classic C C W W W D D G UTIL, $50k: find_optimal_lineups_nhl_classic
+        # (nhl_engine.R) -- the NFL classic method with NHL's slot bounds -- then
+        # DK's 3-team / 2-game rule. No NHL ownership source yet, so no AvgOwn.
+        # The classic is whichever one input$nhl_classic_select points
+        # rv$sim_metadata at (the main classic by default).
+        progress$set(message="Finding optimal DraftKings lineups...", value=0)
+        opt_data <- prepare_optimization_data(rv$simulation_results, rv$sim_metadata, "DK")
+        opt_data <- merge(opt_data, rv$sim_metadata[, .(Player, Pos, StartOrder)], by="Player", all.x=TRUE)
+        dk_ok <- rv$sim_metadata[!is.na(DKID) & DKID != "" & DKID != "NA", Player]
+        opt_data <- opt_data[Player %in% dk_ok]
+        opt_config <- list(roster_size=rv$config$roster_sizes$DK, salary_cap=rv$config$salary_caps$DK,
+                           percentiles=c(0.01,0.05,0.10,0.20), platform_col="DKScore",
+                           max_lineups=rv$config$max_lineups %||% 5000L,
+                           candidate_top_n=rv$config$candidate_top_n %||% 40L,
+                           use_parallel=TRUE)
+        progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
+        lineup_data <- find_optimal_lineups_nhl_classic(opt_data, opt_config, verbose=TRUE)
+        lineup_data <- nhl_drop_invalid_classic(lineup_data, rv$sim_metadata)
+        progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
+                                    format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
+        score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
+        progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
+        final_results <- calculate_distribution_metrics(score_matrix, lineup_data, opt_config,
+                                                        ownership_data=NULL, verbose=TRUE)
+        for (wc in intersect(c("AvgOwn","TotalEW","Win6Pct","Win5PlusPct"), names(final_results)))
           final_results[, (wc) := NULL]
         rv$dk_optimal_lineups <- final_results
 
@@ -2277,6 +2311,46 @@ server <- function(input, output, session) {
         if ("AvgOwn" %in% names(final_results)) final_results[, AvgOwn := NULL]
         rv$sd_optimal_lineups <- final_results
         
+      } else if (rv$sport == "NHL") {
+        # One game of the night: its players carry that showdown's FLEX / CPT
+        # ids (SDID / SDCID) and salaries. Every legal CPT + 5 in the salary
+        # band is enumerated and ranked (enum_captain); Team rides along for
+        # DK's both-teams rule.
+        sd_meta <- copy(rv$sim_metadata); setDT(sd_meta)
+        selected_sd <- if (!is.null(input$sd_game_select)) input$sd_game_select else {
+          sdf <- unique(sd_meta[!is.na(ShowdownFile) & ShowdownFile != "", ShowdownFile])
+          if (length(sdf)) sdf[1] else stop("No showdown game found on this slate.")
+        }
+        sd_meta <- sd_meta[!is.na(ShowdownFile) & ShowdownFile == selected_sd &
+                           !is.na(SDID) & SDID != "" & !is.na(SDSalary)]
+        if (nrow(sd_meta) == 0) stop(sprintf("No players found for showdown: %s", selected_sd))
+        sd_sim <- rv$simulation_results[Player %in% sd_meta$Player]
+        nhl_sd_config <- list(roster_size = 6L, salary_cap = rv$config$salary_caps$SD %||% 50000,
+                              percentiles = c(0.01, 0.05, 0.10, 0.20), platform_col = "DKScore",
+                              cpt_multiplier = 1.5, max_lineups = 5000L, sport = "NHL",
+                              # A ~38-man NHL game puts 1.2M rosters in the default
+                              # [0.88 cap, cap] band (1k sims: 127s). Cut to the top
+                              # ENUM_BAND_TARGET by salary on the first pass, the
+                              # band CFB / NFL reach on their fallback pass.
+                              .band_cut = TRUE)
+        progress$set(message = sprintf("Finding optimal NHL Showdown lineups (%s)...",
+                                       sd_meta$GameKey[1] %||% selected_sd),
+                     detail = "Phase 1: Enumerating lineups...", value = 0.05)
+        opt_data_sd <- prepare_optimization_data(sd_sim, sd_meta, "SD")
+        opt_data_sd <- merge(opt_data_sd, sd_meta[, .(Player, Team)], by = "Player")
+        lineup_data <- find_optimal_lineups(opt_data_sd, nhl_sd_config, mode = "enum_captain",
+                                            k = 1, verbose = TRUE)
+        lineup_data <- drop_single_team_sd(lineup_data, sd_meta)
+        progress$set(detail = sprintf("Phase 2: Scoring %s lineups...",
+                                      format(nrow(lineup_data$unique_lineups), big.mark = ",")), value = 0.35)
+        score_matrix <- score_all_lineups(lineup_data, opt_data_sd, verbose = TRUE)
+        progress$set(detail = "Phase 3: Calculating metrics...", value = 0.70)
+        final_results <- calculate_distribution_metrics(score_matrix, lineup_data, nhl_sd_config,
+                                                        ownership_data = NULL, verbose = TRUE)
+        for (wc in intersect(c("AvgOwn","TotalEW","Win6Pct","Win5PlusPct"), names(final_results)))
+          final_results[, (wc) := NULL]
+        rv$sd_optimal_lineups <- final_results
+
       } else if (rv$sport == "NFL_PRESEASON_CLASSIC") {
         # A preseason showdown is one GAME out of the classic slate, so the
         # pool must be cut to that game's two teams first -- the generic branch
@@ -2505,7 +2579,7 @@ server <- function(input, output, session) {
     # Gate the picker on available_platforms(), NOT config$platforms: the two
     # disagreeing is exactly what put a game picker on screen with no Score
     # Showdown button beside it.
-    sd_game_selector <- if (isTRUE(rv$sport %in% c("CBB","NBA","SOCCER","NFL_PRESEASON_CLASSIC")) && "SD" %in% available_platforms() &&
+    sd_game_selector <- if (isTRUE(rv$sport %in% c("CBB","NBA","SOCCER","NFL_PRESEASON_CLASSIC","NHL")) && "SD" %in% available_platforms() &&
                             !is.null(rv$input_data$games)) {
       games_with_sd <- rv$input_data$games[!is.na(ShowdownFile) & ShowdownFile != ""]
       if (nrow(games_with_sd) > 1) {
@@ -2527,12 +2601,32 @@ server <- function(input, output, session) {
         )
       }
     }
+    # NHL: one workbook serves every DK classic of the night (main + late).
+    # A pill re-points the metadata's classic ids / salaries; nothing re-sims.
+    nhl_classic_selector <- if (isTRUE(rv$sport == "NHL") && length(rv$input_data$classic_dgs) > 1) {
+      dgs <- rv$input_data$classic_dgs
+      cur <- rv$nhl_classic_dg %||% dgs[1]
+      lab <- vapply(dgs, function(g) {
+        gi <- unique(rv$input_data$ids[[g]]$`Game Info`)
+        tm <- sort(unique(sub("^.* ([0-9]{1,2}:[0-9]{2}[AP]M) ET$", "\\1", gi)))
+        sprintf("%s %d games, %s", if (g == dgs[1]) "MAIN" else "LATE", length(gi), tm[1])
+      }, "")
+      div(id = "nhl_classic_pills", style = "margin-bottom:14px;",
+          span(class = "gts-sr-label",
+               style = "margin-right:10px;color:#FFE500;font-size:11px;font-weight:700;letter-spacing:.06em;",
+               "DK CLASSIC:"),
+          lapply(seq_along(dgs), function(i)
+            tags$button(class = paste("gts-pill", if (dgs[i] == cur) "active" else ""),
+                        onclick = sprintf("Shiny.setInputValue('nhl_classic_select','%s',{priority:'event'});", dgs[i]),
+                        lab[i])))
+    }
     # Use available_platforms() so FD/SD are hidden when data is absent
     active_plats <- available_platforms()
     fluidRow(box(title="Lineup Scoring", status="warning", solidHeader=TRUE, width=12,
                  p("Find and score optimal lineups across all platforms:"),
                  cfb_slate_selector,
                  nfl_slate_selector,
+                 nhl_classic_selector,
                  sd_game_selector,
                  fluidRow(lapply(active_plats, function(platform) {
                    pname <- switch(platform,"DK"="DraftKings","FD"="FanDuel","SD"="Showdown")
@@ -2547,6 +2641,21 @@ server <- function(input, output, session) {
                  DTOutput("lineup_results_table")
     ))
   })
+
+  # NHL classic picker: same sim, the other contest's DK ids and salaries.
+  # Players not in that classic lose their DKID and drop out of the DK pool.
+  # The DK pool and portfolio belong to the old contest, so they go.
+  observeEvent(input$nhl_classic_select, {
+    req(isTRUE(rv$sport == "NHL"), rv$sim_metadata, rv$input_data)
+    dg <- input$nhl_classic_select
+    if (identical(dg, rv$nhl_classic_dg %||% rv$input_data$classic_dgs[1])) return()
+    rv$sim_metadata <- nhl_metadata_for_classic(rv$sim_metadata, rv$input_data, dg)
+    rv$nhl_classic_dg <- dg
+    rv$dk_optimal_lineups <- NULL
+    rv$dk_portfolio <- NULL; rv$dk_builds <- list(); rv$dk_build_counter <- 0
+    showNotification(sprintf("DK classic set to %s: %d priced players. Score DraftKings again.",
+                             dg, rv$sim_metadata[!is.na(DKID), .N]), type = "message", duration = 5)
+  }, ignoreInit = TRUE)
 
   # Picking a contest on Tournament Lineups re-slices the ALREADY-SIMULATED
   # whole card down to that contest -- no re-dealing. Swaps rv$sport/config
@@ -4182,6 +4291,8 @@ server <- function(input, output, session) {
           dl <- create_download_showdown(dl, rv$sim_metadata)
         } else if ("MVP" %in% names(dl)) {
           dl <- create_download_mvp(dl, rv$sim_metadata)
+        } else if (isTRUE(rv$sport == "NHL")) {
+          dl <- nhl_classic_download(dl, rv$sim_metadata)   # UTIL takes its own DK id
         } else if (isTRUE(rv$sport == "CBB")) {
           dl <- if (rv$sport == "NBA") create_download_nba(dl, rv$sim_metadata, platform) else create_download_cbb(dl, rv$sim_metadata, platform)
         } else if (id_col %in% names(rv$sim_metadata)) {

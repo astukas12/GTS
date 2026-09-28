@@ -1763,6 +1763,94 @@ SPORT_CONFIGS <- list(
         metadata    = c("Player", "Team", "Pos", "DKID")
       )
     )
+  ),
+
+
+  # ==========================================================================
+  # NHL  --  DK classic (C C W W W D D G UTIL) + DK showdown (CPT 1.5x + 5)
+  # ==========================================================================
+  # One workbook per night from GTS/NHL/R/live/build_slate.R; every game is
+  # simulated once, the classic uses its games, each showdown its own game.
+  # nhl_engine.R has the engine, the classic optimiser and the upload format.
+  NHL = list(
+    sport_name          = "NHL",
+    sport_display_name  = "NHL",
+    player_label        = "Player",
+    player_label_plural = "Players",
+
+    detection = list(
+      # Games + Players + Goalies, and a Games tab carrying the model's log SOG
+      # matchup (lrel_h) -- no other sport's workbook has that column.
+      custom_detect = function(sheets, file_path = NULL) {
+        if (!all(c("Games", "Players", "Goalies") %in% sheets)) return(FALSE)
+        if (is.null(file_path)) return(TRUE)
+        g <- tryCatch(suppressMessages(readxl::read_excel(file_path, sheet = "Games", n_max = 1)),
+                      error = function(e) NULL)
+        !is.null(g) && "lrel_h" %in% names(g)
+      }
+    ),
+
+    platforms          = c("DK", "SD"),
+    roster_sizes       = list(DK = 9, SD = 6),
+    salary_caps        = list(DK = 50000, SD = 50000),
+    optimization_modes = list(DK = "nhl_classic", SD = "enum_captain"),
+    max_lineups        = 5000,
+    candidate_top_n    = 999,   # no mean-based cut (NFL classic's 13 Sep lesson: it drops ceiling plays)
+
+    standard_metrics = c("WinRate", "Top1Rate", "Top5Rate", "Top10Rate", "Top20Rate", "TotalSalary"),
+    custom_metrics   = list(),
+
+    metadata_columns = list(
+      list(name = "Team",     label = "Team",     type = "text", display = TRUE,  filter = TRUE),
+      list(name = "PosGroup", label = "Position", type = "text", display = TRUE,  filter = TRUE),
+      list(name = "GameKey",  label = "Game",     type = "text", display = FALSE, filter = FALSE)
+    ),
+
+    portfolio_filters = list(
+      rate_minimums = list(
+        list(name = "Win",   label = "Win",    step = 0.1),
+        list(name = "Top1",  label = "Top 1",  step = 0.1),
+        list(name = "Top5",  label = "Top 5",  step = 0.5),
+        list(name = "Top10", label = "Top 10", step = 1),
+        list(name = "Top20", label = "Top 20", step = 2)
+      ),
+      range_filters = list(
+        list(name = "Salary", label = "Salary (K)", column = "TotalSalary", step = 0.1, format = "salary_k")
+      )
+    ),
+
+    platform_columns = list(
+      DK = list(salary = "DKSalary", id = "DKID", ownership = "DKOwn", score = "DKScore"),
+      SD = list(salary = "SDSalary", id = "SDID", cpt_id = "SDCID",
+                ownership = "DKOwn", score = "DKScore", cpt_multiplier = 1.5,
+                platform_label = "DK Showdown")
+    ),
+
+    download_formats = list(
+      DK     = "{Name} ({DKID})",
+      SD     = "{Name} ({SDID})",
+      SD_CPT = "{Name} ({SDCID})"
+    ),
+
+    input_file = list(
+      type            = "excel",
+      load_all_sheets = TRUE,
+      player_sheet    = NULL  # read_nhl_input() reads Games / Players / Goalies / IDs_<dg>
+    ),
+
+    simulation = list(
+      function_name = "run_nhl_simulation",
+      output_format = list(
+        sim_results = c("SimID", "Player", "DKScore"),
+        metadata    = c("Player", "Team", "Pos", "PosGroup", "DKID", "DKUID", "DKSalary",
+                        "SDID", "SDCID", "SDSalary", "GameKey", "ShowdownFile")
+      )
+    ),
+
+    dk_export_slots = list(
+      DK = c("C", "C", "W", "W", "W", "D", "D", "G", "UTIL"),
+      SD = c("CPT", "UTIL", "UTIL", "UTIL", "UTIL", "UTIL")
+    )
   )
 )
 
