@@ -3441,15 +3441,29 @@ find_optimal_lineups_nfl_classic <- function(sim_results, config, verbose = TRUE
   keep
 }
 
+# NFL classic is the original caller and keeps its name; the solve itself is
+# sport-agnostic given a classic's slot rules (NHL, 29 Sep 2026).
 find_optimal_lineups_nfl_classic_locked <- function(sim_results, config, verbose = TRUE) {
+  find_optimal_lineups_classic_locked(sim_results, config, verbose,
+    rules = list(pos = .NFL_CLASSIC_POS, lo = .NFL_CLASSIC_LO, hi = .NFL_CLASSIC_HI,
+                 need = 9L, assign = .nfl_assign_slots_vec, mode = "nfl_classic_locked"))
+}
+
+# `rules`: pos / lo / hi / need -- the classic's per-position bounds, the same
+# ones its unconstrained solver hands .classic_exact_chunk; assign -- that
+# sport's (SimID, Player, Pos, StartOrder) -> slot_i dealer; mode -- a label;
+# valid (optional) -- function(player matrix) -> logical, a site rule applied
+# BEFORE the max_lineups cut so a tight lock still fills the pool with legal
+# rosters (NHL's 3-team / 2-game rule; NFL leaves it to the caller as before).
+find_optimal_lineups_classic_locked <- function(sim_results, config, verbose = TRUE, rules) {
   setDT(sim_results)
   if (!"Pos" %in% names(sim_results))
     stop("constrained optimiser needs a Pos column on sim_results")
   if (!"StartOrder" %in% names(sim_results)) sim_results[, StartOrder := 1L]
 
-  POS  <- .NFL_CLASSIC_POS
-  LO   <- .NFL_CLASSIC_LO; HI <- .NFL_CLASSIC_HI
-  need <- 9L
+  POS  <- rules$pos
+  LO   <- rules$lo; HI <- rules$hi
+  need <- as.integer(rules$need)
   cap  <- config$salary_cap %||% 50000
   max_lineups <- config$max_lineups %||% 1000L
   locked   <- unique(as.character(config$lock_players    %||% character(0)))
@@ -3566,7 +3580,7 @@ find_optimal_lineups_nfl_classic_locked <- function(sim_results, config, verbose
   if (!nrow(chosen)) stop("no legal lineup contains that lock under the salary cap")
 
   # ---- same shaping as the unconstrained pool ------------------------------
-  full <- .nfl_assign_slots_vec(chosen)
+  full <- rules$assign(chosen)
   wide <- dcast(full, SimID ~ slot_i, value.var = "Player")
   pc <- paste0("Player", seq_len(need))
   setnames(wide, as.character(seq_len(need)), pc)
@@ -3574,6 +3588,17 @@ find_optimal_lineups_nfl_classic_locked <- function(sim_results, config, verbose
   wide[, lkey := key]
   cnt <- wide[, .(Top1Count = .N), by = lkey]
   uni <- merge(wide[!duplicated(lkey)], cnt, by = "lkey")
+  n_invalid <- 0L
+  if (is.function(rules$valid)) {
+    ok <- rules$valid(as.matrix(uni[, ..pc]))
+    n_invalid <- sum(!ok)
+    if (verbose && n_invalid)
+      cat(sprintf("  dropped %s lineup(s) breaking the site's team/game rule (before the cap)
+",
+                  format(n_invalid, big.mark = ",")))
+    uni <- uni[ok]
+    if (!nrow(uni)) stop("every lineup with that lock breaks the site's team/game rule -- loosen it")
+  }
 
   mu  <- setNames(pm$mu, pm$Player)
   uni[, AvgScore := rowSums(matrix(mu[unlist(.SD)], nrow = nrow(uni))), .SDcols = pc]
@@ -3595,9 +3620,10 @@ find_optimal_lineups_nfl_classic_locked <- function(sim_results, config, verbose
                            as.numeric(difftime(Sys.time(), start_time, units = "secs"))))
   # n_sims is the FULL count on purpose -- see the header note on metrics.
   list(unique_lineups = uni, n_sims = n_sims_full, config = config,
-       mode = "nfl_classic_locked",
+       mode = rules$mode %||% "classic_locked",
        lock_info = list(locked = locked, excluded = excluded, cond_frac = frac,
-                        n_cond_sims = length(keep_ids), n_solved = length(full9)))
+                        n_cond_sims = length(keep_ids), n_solved = length(full9),
+                        n_invalid = n_invalid))
 }
 
 

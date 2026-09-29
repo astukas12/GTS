@@ -29,11 +29,13 @@
 # own, so the stack comes out of the sim (same-team players per lineup 1.48 ->
 # 1.74 going from cond 100% to cond 15% on a QB lock).
 #
-# SCOPE. NFL classic only for now (DK and FD). The solver reads DK/FD classic
-# slot rules; every other sport needs its own bounds before it can be offered,
-# so the tab hides itself rather than pretending.
+# SCOPE. NFL classic (DK and FD) and, from 29 Sep 2026, NHL DK classic. Each
+# sport is one entry in .LL_SPORTS below: its slot rules for the solver, its
+# position chips, and its site team/game rule. Any other sport needs its own
+# bounds before it can be offered, so the tab hides itself rather than
+# pretending.
 #
-# Pairs with find_optimal_lineups_nfl_classic_locked() in OptimalLineups_Core.R,
+# Pairs with find_optimal_lineups_classic_locked() in OptimalLineups_Core.R,
 # which is where the constraint maths lives and is commented in full.
 # ============================================================================
 
@@ -41,6 +43,48 @@
 # with slightly different NA/length handling and are sourced after this file,
 # so nothing here relies on which one wins.
 .ll_or <- function(a, b) if (is.null(a)) b else a
+
+# One entry per sport the Lab is offered for. `rules()` is a function so the
+# engine constants it names (sourced after this file) are read at solve time.
+# `ok()` says whether the loaded slate is one the Lab can take -- NHL's SLATE
+# pill can point at a showdown, where the DK classic pool is not the one shown.
+# `game_rule`: "table" builds drop_invalid_classic's `games` from the sheet's
+# game table (NFL); "meta" passes NULL so lineup_rules reads GameKey off the
+# metadata (NHL).
+.LL_SPORTS <- list(
+  NFL_CLASSIC = list(
+    pos_chips = c("QB", "RB", "WR", "TE", "DST"),
+    units     = FALSE,
+    ok        = function(rv) TRUE,
+    game_rule = "table",
+    rules     = function(md) list(pos = .NFL_CLASSIC_POS, lo = .NFL_CLASSIC_LO,
+                                  hi = .NFL_CLASSIC_HI, need = 9L,
+                                  assign = .nfl_assign_slots_vec,
+                                  mode = "nfl_classic_locked")),
+  NHL = list(
+    pos_chips = c("C", "W", "D", "G"),
+    units     = TRUE,
+    ok        = function(rv) !startsWith(.ll_or(rv$nhl_slate, "C:"), "S:"),
+    game_rule = "meta",
+    rules     = function(md) list(pos = .NHL_CLASSIC_POS, lo = .NHL_CLASSIC_LO,
+                                  hi = .NHL_CLASSIC_HI, need = 9L,
+                                  assign = .nhl_assign_slots_vec,
+                                  valid = function(M) .nhl_classic_valid(M, md),
+                                  mode = "nhl_classic_locked"))
+)
+
+# Hockey is played in units, so the NHL board gets a unit row once a game is
+# picked: each team's forward lines (L1-L4), D pairs (D1-D3) and PP units. A
+# unit chip narrows the board to those players; "lock these" then locks them
+# in one click. Labels come off the sheet's Line / PP columns.
+.ll_units <- function(d) {
+  if (!all(c("Line", "PP") %in% names(d)))
+    return(data.table(Team = character(0), Unit = character(0), Player = character(0)))
+  ev <- d[Pos != "G" & !is.na(Line),
+          .(Team, Unit = paste0(fifelse(Pos == "D", "D", "L"), Line), Player)]
+  pp <- d[Pos != "G" & PP %in% 1:2, .(Team, Unit = paste0("PP", PP), Player)]
+  rbind(ev, pp)
+}
 
 .LL_MIN_FILTERS <- list(
   c("win",   "Win",   "WinRate",  "0.01"),
@@ -112,7 +156,11 @@ render_lineup_lab_tab_ui <- function() {
 # second copy drifting in this file.
 register_lineup_lab_observers <- function(input, output, session, rv, helpers) {
 
-  ll_sport_ok <- reactive(isTRUE(rv$sport == "NFL_CLASSIC"))
+  ll_spec <- reactive({
+    sp <- .LL_SPORTS[[.ll_or(rv$sport, "")]]
+    if (is.null(sp) || !isTRUE(sp$ok(rv))) NULL else sp
+  })
+  ll_sport_ok <- reactive(!is.null(ll_spec()))
 
   # Platforms whose NORMAL pool has already been built. The Lab adds to the
   # same portfolio, and the Portfolio Builder only renders a platform tab once
@@ -128,7 +176,8 @@ register_lineup_lab_observers <- function(input, output, session, rv, helpers) {
 
   output$ll_unavailable_why <- renderUI({
     msg <- if (!ll_sport_ok())
-      "Lineup Lab is NFL classic only for now. Load an NFL classic sheet to use it."
+      paste("Lineup Lab covers NFL classic and the NHL DK classic for now.",
+            "Load one of those (on NHL, pick a classic on the SLATE row).")
     else
       paste("Run a simulation and build the normal lineup pool first --",
             "the Lab re-solves that finished sim under your constraint.")
@@ -143,7 +192,8 @@ register_lineup_lab_observers <- function(input, output, session, rv, helpers) {
   # one already used by the exposure tables and the team-split row, so there is
   # nothing new to learn.
 
-  # Player -> "AWAY @ HOME", so a game chip can filter the board.
+  # Player -> "AWAY @ HOME", so a game chip can filter the board. NHL has no
+  # `game` table; ll_players falls back to the metadata's own GameKey.
   ll_team_game <- reactive({
     g <- tryCatch(as.data.table(rv$input_data$game), error = function(e) NULL)
     if (is.null(g) || !nrow(g) || !all(c("away", "home") %in% names(g)))
@@ -159,12 +209,43 @@ register_lineup_lab_observers <- function(input, output, session, rv, helpers) {
     plat <- .ll_or(input$ll_platform, ll_platforms()[1])
     sal_col <- paste0(plat, "Salary")
     if (!sal_col %in% names(md)) sal_col <- "DKSalary"
+    xc <- intersect(c("GameKey", "Line", "PP"), names(md))
     d <- md[!is.na(get(sal_col)) & get(sal_col) > 0,
-            .(Player, Pos, Team, Salary = get(sal_col))]
+            c(list(Player = Player, Pos = Pos, Team = Team, Salary = get(sal_col)), .SD),
+            .SDcols = xc]
+    # Only players the site will take an upload for -- on NHL, the classic the
+    # SLATE row points at (players outside it have no DKID).
+    id_col <- paste0(plat, "ID")
+    if (id_col %in% names(md))
+      d <- d[Player %chin% md[!is.na(get(id_col)) & get(id_col) != "" & get(id_col) != "NA", Player]]
     t2g <- ll_team_game()
-    d[, Game := if (length(t2g)) t2g[as.character(Team)] else NA_character_]
+    if (length(t2g) || !"GameKey" %in% names(d)) {
+      d[, Game := if (length(t2g)) t2g[as.character(Team)] else NA_character_]
+    } else {
+      d[, Game := GameKey]
+    }
     setorder(d, -Salary)
     d
+  })
+
+  # Unit chips for the picked game (NHL only), and the unit filter in force --
+  # a unit left over from another game reads as ALL rather than as an empty
+  # board.
+  ll_game_units <- reactive({
+    f_game <- .ll_or(input$ll_f_game, "ALL")
+    if (!isTRUE(ll_spec()$units) || identical(f_game, "ALL")) return(NULL)
+    d <- ll_players()
+    u <- unique(.ll_units(d[Game == f_game])[, .(Team, Unit)])
+    if (!nrow(u)) return(NULL)
+    u[, ord := fcase(startsWith(Unit, "L"), 1L, startsWith(Unit, "D"), 2L, default = 3L)]
+    setorder(u, Team, ord, Unit)
+    u[, key := paste(Team, Unit)]
+    u
+  })
+  ll_unit_eff <- reactive({
+    f <- .ll_or(input$ll_f_unit, "ALL")
+    u <- ll_game_units()
+    if (is.null(u) || !f %chin% u$key) "ALL" else f
   })
 
   # One chip. `val` is what the filter input is set to when clicked.
@@ -201,8 +282,14 @@ register_lineup_lab_observers <- function(input, output, session, rv, helpers) {
             # Position chips.
             div(class = "gts-llchips", style = "margin-top:5px;",
                 .ll_chip("ALL", "ALL", "ll_f_pos", f_pos),
-                lapply(c("QB", "RB", "WR", "TE", "DST"),
+                lapply(ll_spec()$pos_chips,
                        function(p) .ll_chip(p, p, "ll_f_pos", f_pos))),
+            # Unit chips (NHL, once a game is picked): TEAM L1 / D1 / PP1 ...
+            if (!is.null(ll_game_units()))
+              div(class = "gts-llchips", style = "margin-top:5px;",
+                  .ll_chip("ALL UNITS", "ALL", "ll_f_unit", ll_unit_eff()),
+                  lapply(ll_game_units()$key,
+                         function(k) .ll_chip(k, k, "ll_f_unit", ll_unit_eff()))),
             div(style = "margin-top:6px;",
                 tags$input(id = "ll_f_search", type = "text", class = "gts-llsearch",
                            placeholder = "or type a name...",
@@ -249,6 +336,11 @@ register_lineup_lab_observers <- function(input, output, session, rv, helpers) {
     q      <- trimws(.ll_or(input$ll_f_search, ""))
     if (!identical(f_game, "ALL")) d <- d[Game == f_game]
     if (!identical(f_pos,  "ALL")) d <- d[Pos  == f_pos]
+    f_unit <- ll_unit_eff()
+    if (!identical(f_unit, "ALL")) {
+      u <- .ll_units(d)
+      d <- d[Player %chin% u[paste(Team, Unit) == f_unit, Player]]
+    }
     if (nzchar(q)) d <- d[grepl(q, Player, ignore.case = TRUE, fixed = FALSE)]
     if (!nrow(d))
       return(div(class = "gts-llboard",
@@ -271,8 +363,18 @@ register_lineup_lab_observers <- function(input, output, session, rv, helpers) {
         p,
         tags$span(class = "llp-sal", sprintf("%.1f", d$Salary[i] / 1000)))
     })
+    # A unit is a lock of 2-5 players at once; offer it whenever the board is
+    # down to a roster's worth.
+    n_new <- sum(!d$Player %chin% lk)
+    lock_all <- if (nrow(d) >= 2L && nrow(d) <= 9L && n_new > 0L)
+      tags$span(class = "gts-llclear", style = "color:#4caf50;margin-left:0;",
+                onclick = sprintf(
+                  "Shiny.setInputValue('ll_lock_shown',{p:%s,nonce:Math.random()},{priority:'event'});",
+                  jsonlite::toJSON(d$Player)),
+                sprintf("LOCK THESE %d", nrow(d)))
     tagList(
       div(class = "gts-llboard", pills),
+      if (!is.null(lock_all)) div(style = "margin-top:4px;", lock_all),
       if (capped)
         tags$span(style = "color:#666;font-size:10px;",
                   sprintf("showing the 120 highest-salary matches — pick a game or type a name to narrow")))
@@ -310,6 +412,13 @@ register_lineup_lab_observers <- function(input, output, session, rv, helpers) {
     }
   })
 
+  observeEvent(input$ll_lock_shown, {
+    p <- as.character(unlist(input$ll_lock_shown$p))
+    req(length(p))
+    rv$ll_lock_set <- union(.ll_or(rv$ll_lock_set, character(0)), p)
+    rv$ll_excl_set <- setdiff(.ll_or(rv$ll_excl_set, character(0)), p)
+  })
+
   observeEvent(input$ll_clear, {
     rv$ll_lock_set <- character(0); rv$ll_excl_set <- character(0)
   })
@@ -326,6 +435,7 @@ register_lineup_lab_observers <- function(input, output, session, rv, helpers) {
   # ---- the solve -----------------------------------------------------------
   observeEvent(input$ll_run, {
     req(rv$simulation_results, rv$sim_metadata, rv$config)
+    sp <- ll_spec(); req(sp)
     plat <- .ll_or(input$ll_platform, ll_platforms()[1])
     lock <- .ll_or(rv$ll_lock_set, character(0))
     if (!length(lock)) {
@@ -341,7 +451,11 @@ register_lineup_lab_observers <- function(input, output, session, rv, helpers) {
     tryCatch({
       md <- as.data.table(rv$sim_metadata)
       opt_data <- helpers$prepare_optimization_data(rv$simulation_results, md, plat)
-      opt_data <- merge(opt_data, md[, .(Player, Pos)], by = "Player", all.x = TRUE)
+      # StartOrder routes the UTIL/FLEX to the latest start for late swap. NFL
+      # already has it on sim_results; NHL carries it on the metadata.
+      mc <- c("Player", "Pos",
+              if ("StartOrder" %in% names(md) && !"StartOrder" %in% names(opt_data)) "StartOrder")
+      opt_data <- merge(opt_data, md[, ..mc], by = "Player", all.x = TRUE)
       # Only players the site will actually accept an upload for.
       id_col <- paste0(plat, "ID")
       if (id_col %in% names(md)) {
@@ -359,20 +473,27 @@ register_lineup_lab_observers <- function(input, output, session, rv, helpers) {
         exclude_players = .ll_or(rv$ll_excl_set, character(0)),
         cond_frac      = .ll_or(input$ll_cond, 30) / 100,
         use_parallel   = TRUE,
+        candidate_top_n = .ll_or(rv$config$candidate_top_n, 40L),
         pool_spread    = .ll_or(rv$config$pool_spread, 0)
       )
 
       progress$set(detail = "Phase 1: constrained solve...", value = 0.1)
-      ld <- find_optimal_lineups_nfl_classic_locked(opt_data, cfg, verbose = TRUE)
+      ld <- find_optimal_lineups_classic_locked(opt_data, cfg, verbose = TRUE,
+                                                rules = sp$rules(md))
 
-      # Same DK/FD classic legality rule the normal pool gets: >= 2 teams and
-      # >= 2 games. A tight lock can otherwise leave a one-game roster.
-      gtab <- tryCatch(as.data.table(rv$input_data$game), error = function(e) NULL)
-      if (!is.null(gtab) && nrow(gtab))
-        ld <- helpers$drop_invalid_classic(ld, md,
-                gtab[, .(AwayTeam = away, HomeTeam = home)])
+      # Same classic legality rule the normal pool gets (the lineup rulebook):
+      # NFL >= 2 teams + 2 games, NHL >= 3 teams + 2 games. A tight lock can
+      # otherwise leave a one-game roster.
+      if (identical(sp$game_rule, "table")) {
+        gtab <- tryCatch(as.data.table(rv$input_data$game), error = function(e) NULL)
+        if (!is.null(gtab) && nrow(gtab))
+          ld <- helpers$drop_invalid_classic(ld, md,
+                  gtab[, .(AwayTeam = away, HomeTeam = home)])
+      } else {
+        ld <- helpers$drop_invalid_classic(ld, md, NULL)
+      }
       if (!nrow(ld$unique_lineups))
-        stop("every lineup with that lock used only one game -- loosen it")
+        stop("every lineup with that lock breaks the site's team/game rule -- loosen it")
 
       progress$set(detail = sprintf("Phase 2: scoring %s lineups...",
                                     format(nrow(ld$unique_lineups), big.mark = ",")),
@@ -451,7 +572,12 @@ register_lineup_lab_observers <- function(input, output, session, rv, helpers) {
       }
       if (!nrow(fr)) stop("scoring returned nothing for the constrained pool")
       fr <- helpers$add_custom_metrics(fr, md, rv$config)
-      for (wc in intersect(c("TotalEW", "Win6Pct", "Win5PlusPct"), names(fr)))
+      # No ownership on the sheet (NHL has no source yet): AvgOwn would read a
+      # flat 0, so it goes, as it does on that sport's main pool.
+      # (NHL carries DKOwn as an all-NA placeholder, so test the values.)
+      has_own <- own_col %in% names(md) && any(md[[own_col]] > 0, na.rm = TRUE)
+      drop <- c("TotalEW", "Win6Pct", "Win5PlusPct", if (!has_own) "AvgOwn")
+      for (wc in intersect(drop, names(fr)))
         fr[, (wc) := NULL]
 
       # calculate_distribution_metrics drops Top1Count. Put it back as a shown
