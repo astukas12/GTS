@@ -681,6 +681,8 @@ server <- function(input, output, session) {
     rv$sport_visuals       <- NULL
     rv$full_sim_results    <- NULL
     rv$nhl_classic_dg      <- NULL   # a fresh NHL sim's metadata points at the main classic
+    rv$nhl_slate           <- NULL   # "C:<dg>" / "S:<dg>" -- NULL is the main classic
+    rv$sd_game_scored      <- NULL   # the showdown the SD pool was built for
     # Lineup Lab pools belong to the sim that produced them -- a new sim (or a
     # slate switch) invalidates them exactly like the main pool.
     rv$ll_results          <- NULL
@@ -1850,7 +1852,7 @@ server <- function(input, output, session) {
         # DK classic C C W W W D D G UTIL, $50k: find_optimal_lineups_nhl_classic
         # (nhl_engine.R) -- the NFL classic method with NHL's slot bounds -- then
         # DK's 3-team / 2-game rule. No NHL ownership source yet, so no AvgOwn.
-        # The classic is whichever one input$nhl_classic_select points
+        # The classic is whichever one the SLATE pill (input$nhl_slate_select) points
         # rv$sim_metadata at (the main classic by default).
         progress$set(message="Finding optimal DraftKings lineups...", value=0)
         opt_data <- prepare_optimization_data(rv$simulation_results, rv$sim_metadata, "DK")
@@ -2317,10 +2319,11 @@ server <- function(input, output, session) {
         # band is enumerated and ranked (enum_captain); Team rides along for
         # DK's both-teams rule.
         sd_meta <- copy(rv$sim_metadata); setDT(sd_meta)
-        selected_sd <- if (!is.null(input$sd_game_select)) input$sd_game_select else {
+        selected_sd <- if (startsWith(rv$nhl_slate %||% "", "S:")) sub("^S:", "", rv$nhl_slate) else {
           sdf <- unique(sd_meta[!is.na(ShowdownFile) & ShowdownFile != "", ShowdownFile])
           if (length(sdf)) sdf[1] else stop("No showdown game found on this slate.")
         }
+        rv$sd_game_scored <- selected_sd
         sd_meta <- sd_meta[!is.na(ShowdownFile) & ShowdownFile == selected_sd &
                            !is.na(SDID) & SDID != "" & !is.na(SDSalary)]
         if (nrow(sd_meta) == 0) stop(sprintf("No players found for showdown: %s", selected_sd))
@@ -2579,7 +2582,7 @@ server <- function(input, output, session) {
     # Gate the picker on available_platforms(), NOT config$platforms: the two
     # disagreeing is exactly what put a game picker on screen with no Score
     # Showdown button beside it.
-    sd_game_selector <- if (isTRUE(rv$sport %in% c("CBB","NBA","SOCCER","NFL_PRESEASON_CLASSIC","NHL")) && "SD" %in% available_platforms() &&
+    sd_game_selector <- if (isTRUE(rv$sport %in% c("CBB","NBA","SOCCER","NFL_PRESEASON_CLASSIC")) && "SD" %in% available_platforms() &&
                             !is.null(rv$input_data$games)) {
       games_with_sd <- rv$input_data$games[!is.na(ShowdownFile) & ShowdownFile != ""]
       if (nrow(games_with_sd) > 1) {
@@ -2601,35 +2604,48 @@ server <- function(input, output, session) {
         )
       }
     }
-    # NHL: one workbook serves every DK classic of the night (main + late).
-    # A pill re-points the metadata's classic ids / salaries; nothing re-sims.
-    nhl_classic_selector <- if (isTRUE(rv$sport == "NHL") && length(rv$input_data$classic_dgs) > 1) {
+    # NHL: one workbook serves every DK contest of the night -- each classic
+    # (main + late) and each game's showdown. As on NFL, one SLATE pill row
+    # picks the contest and a single Score DraftKings button scores it. A
+    # classic pick re-points the metadata's classic ids / salaries; nothing
+    # re-sims either way.
+    nhl_slate_selector <- NULL
+    if (isTRUE(rv$sport == "NHL") && !is.null(rv$input_data)) {
       dgs <- rv$input_data$classic_dgs
-      cur <- rv$nhl_classic_dg %||% dgs[1]
-      lab <- vapply(dgs, function(g) {
+      cl_lab <- vapply(dgs, function(g) {
         gi <- unique(rv$input_data$ids[[g]]$`Game Info`)
         tm <- sort(unique(sub("^.* ([0-9]{1,2}:[0-9]{2}[AP]M) ET$", "\\1", gi)))
-        sprintf("%s %d games, %s", if (g == dgs[1]) "MAIN" else "LATE", length(gi), tm[1])
+        sprintf("%s - %d game, %s", if (g == dgs[1]) "Main" else "Late", length(gi), tm[1])
       }, "")
-      div(id = "nhl_classic_pills", style = "margin-bottom:14px;",
+      sdg <- if (!is.null(rv$input_data$games))
+        rv$input_data$games[!is.na(ShowdownFile) & ShowdownFile != ""] else NULL
+      keys <- c(if (length(dgs)) paste0("C:", dgs), if (!is.null(sdg)) paste0("S:", sdg$ShowdownFile))
+      labs <- c(cl_lab, if (!is.null(sdg)) paste("Showdown -", sdg$GameKey))
+      cur  <- rv$nhl_slate %||% keys[1]
+      if (length(keys) > 1)
+        nhl_slate_selector <- div(id = "nhl_slate_pills", style = "margin-bottom:14px;",
           span(class = "gts-sr-label",
                style = "margin-right:10px;color:#FFE500;font-size:11px;font-weight:700;letter-spacing:.06em;",
-               "DK CLASSIC:"),
-          lapply(seq_along(dgs), function(i)
-            tags$button(class = paste("gts-pill", if (dgs[i] == cur) "active" else ""),
-                        onclick = sprintf("Shiny.setInputValue('nhl_classic_select','%s',{priority:'event'});", dgs[i]),
-                        lab[i])))
+               "SLATE:"),
+          lapply(seq_along(keys), function(i)
+            tags$button(class = paste("gts-pill", if (keys[i] == cur) "active" else ""),
+                        onclick = sprintf("Shiny.setInputValue('nhl_slate_select','%s',{priority:'event'});", keys[i]),
+                        labs[i])))
     }
     # Use available_platforms() so FD/SD are hidden when data is absent
     active_plats <- available_platforms()
+    # NHL: the slate pill decides which optimiser the one button runs.
+    if (isTRUE(rv$sport == "NHL"))
+      active_plats <- if (startsWith(rv$nhl_slate %||% "C:", "S:")) "SD" else "DK"
     fluidRow(box(title="Lineup Scoring", status="warning", solidHeader=TRUE, width=12,
                  p("Find and score optimal lineups across all platforms:"),
                  cfb_slate_selector,
                  nfl_slate_selector,
-                 nhl_classic_selector,
+                 nhl_slate_selector,
                  sd_game_selector,
                  fluidRow(lapply(active_plats, function(platform) {
                    pname <- switch(platform,"DK"="DraftKings","FD"="FanDuel","SD"="Showdown")
+                   if (isTRUE(rv$sport == "NHL")) pname <- "DraftKings"
                    column(6, actionButton(paste0("run_",tolower(platform),"_optimization"),
                                           paste("Score", pname), class="btn-warning btn-block",
                                           style="margin-bottom:10px;font-size:16px;padding:12px;"))
@@ -2642,19 +2658,25 @@ server <- function(input, output, session) {
     ))
   })
 
-  # NHL classic picker: same sim, the other contest's DK ids and salaries.
-  # Players not in that classic lose their DKID and drop out of the DK pool.
-  # The DK pool and portfolio belong to the old contest, so they go.
-  observeEvent(input$nhl_classic_select, {
+  # NHL slate picker. A classic: same sim, that contest's DK ids and salaries
+  # (players not in it lose their DKID and drop out of the DK pool); the DK
+  # pool and portfolio belong to the old contest, so they go. A showdown: the
+  # SD optimiser scores that game next; an SD pool from another game goes.
+  observeEvent(input$nhl_slate_select, {
     req(isTRUE(rv$sport == "NHL"), rv$sim_metadata, rv$input_data)
-    dg <- input$nhl_classic_select
-    if (identical(dg, rv$nhl_classic_dg %||% rv$input_data$classic_dgs[1])) return()
-    rv$sim_metadata <- nhl_metadata_for_classic(rv$sim_metadata, rv$input_data, dg)
-    rv$nhl_classic_dg <- dg
-    rv$dk_optimal_lineups <- NULL
-    rv$dk_portfolio <- NULL; rv$dk_builds <- list(); rv$dk_build_counter <- 0
-    showNotification(sprintf("DK classic set to %s: %d priced players. Score DraftKings again.",
-                             dg, rv$sim_metadata[!is.na(DKID), .N]), type = "message", duration = 5)
+    key <- input$nhl_slate_select
+    dg  <- sub("^[CS]:", "", key)
+    rv$nhl_slate <- key
+    if (startsWith(key, "C:")) {
+      if (identical(dg, rv$nhl_classic_dg %||% rv$input_data$classic_dgs[1])) return()
+      rv$sim_metadata <- nhl_metadata_for_classic(rv$sim_metadata, rv$input_data, dg)
+      rv$nhl_classic_dg <- dg
+      rv$dk_optimal_lineups <- NULL
+      rv$dk_portfolio <- NULL; rv$dk_builds <- list(); rv$dk_build_counter <- 0
+    } else if (!identical(dg, rv$sd_game_scored)) {
+      rv$sd_optimal_lineups <- NULL
+      rv$sd_portfolio <- NULL; rv$sd_builds <- list(); rv$sd_build_counter <- 0
+    }
   }, ignoreInit = TRUE)
 
   # Picking a contest on Tournament Lineups re-slices the ALREADY-SIMULATED
@@ -3226,7 +3248,7 @@ server <- function(input, output, session) {
       has_nfl_cptown <- is_nfl_sd && cptown_col %in% names(rv$sim_metadata) &&
                         any(rv$sim_metadata[[cptown_col]] > 0, na.rm = TRUE)
       split_own  <- (is_nba && is_sd) || is_cfb || has_nfl_cptown
-      salary_col <- if (is_sd) "DKSalary" else paste0(platform, "Salary")
+      salary_col <- if (is_sd) { if ("SDSalary" %in% names(rv$sim_metadata)) "SDSalary" else "DKSalary" } else paste0(platform, "Salary")
       own_col    <- if (is_sd) NULL        else paste0(platform, "Own")
       cpt_cols  <- grep("^Captain", names(filtered), value=TRUE)
       util_cols <- grep("^Util",    names(filtered), value=TRUE)
@@ -3236,11 +3258,7 @@ server <- function(input, output, session) {
       has_captain <- length(cpt_cols) > 0
       n_lineups  <- nrow(filtered)
       all_counts <- table(unlist(filtered[, ..all_pc]))
-      meta_players <- if (is_sd) {
-        rv$sim_metadata[!is.na(SDSalary) & SDSalary > 0, Player]
-      } else {
-        rv$sim_metadata$Player
-      }
+      meta_players <- slate_meta(tolower(platform))$Player
       # Vectorised count lookup. This was a for-loop doing `exp_tbl$col[i] <- ..`
       # per player, which reallocates the column on every iteration -- O(n^2)
       # copying on a 200+ player slate, three times over (total/cpt/util).
@@ -3805,7 +3823,7 @@ server <- function(input, output, session) {
       has_nfl_cptown <- is_nfl_sd && cptown_col %in% names(rv$sim_metadata) &&
                         any(rv$sim_metadata[[cptown_col]] > 0, na.rm = TRUE)
       split_own <- (is_nba && is_sd) || is_cfb || has_nfl_cptown
-      salary_col <- if (is_sd) "DKSalary" else paste0(platform, "Salary")
+      salary_col <- if (is_sd) { if ("SDSalary" %in% names(rv$sim_metadata)) "SDSalary" else "DKSalary" } else paste0(platform, "Salary")
       own_col    <- if (is_sd) NULL        else paste0(platform, "Own")
       cpt_cols  <- grep("^Captain", names(port), value=TRUE)
       util_cols <- grep("^Util",    names(port), value=TRUE)
@@ -3813,9 +3831,7 @@ server <- function(input, output, session) {
       if (is_nfl_sd && !length(util_cols)) util_cols <- grep("^Player[0-9]", names(port), value=TRUE)
       all_pc    <- grep("^Player|^Captain|^MVP|^Util|^G[1-4]$|^F[1-3]$|^C1$", names(port), value=TRUE)
       has_captain <- length(cpt_cols) > 0
-      meta_players <- if (is_sd) {
-        rv$sim_metadata[!is.na(SDSalary) & SDSalary > 0, Player]
-      } else rv$sim_metadata$Player
+      meta_players <- slate_meta(tolower(platform))$Player
       
       # Helper: compute per-player exposure % for a subset of lineups
       compute_exp <- function(sub_port) {
@@ -4203,7 +4219,7 @@ server <- function(input, output, session) {
       # show, rolled up by pos/team/game, over whatever the pill filter left.
       n <- nrow(port)
       cnt <- if (n && length(all_pc)) table(unlist(port[, ..all_pc])) else table(character(0))
-      meta_players <- rv$sim_metadata$Player
+      meta_players <- slate_meta(lp)$Player
       pct <- if (n) { v <- as.numeric(cnt[meta_players]); v[is.na(v)] <- 0; v / n * 100 }
              else rep(0, length(meta_players))
       mc  <- intersect(c("Player","Pos","PosGroup","DKPos","FDPos","Team"), names(rv$sim_metadata))
@@ -4243,7 +4259,7 @@ server <- function(input, output, session) {
                     # instead of the one each was built with.
     renderUI({
       req(rv$sim_metadata)
-      filter_pills_ui(prefix, rv$sim_metadata, exclude_lp = exclude_lp)
+      filter_pills_ui(prefix, slate_meta(sub("^.*_", "", prefix)), exclude_lp = exclude_lp)
     })
   }
   # EXCLUDE SELECTED: push every player the pill row currently matches (team,
@@ -4523,6 +4539,24 @@ server <- function(input, output, session) {
   # position) instead of clicking EXCL down a 20-player roster. NULL (the
   # projections-table filter row, which has no lock/excl concept) renders
   # the pill row exactly as before.
+  # The players on the slate a platform's pool was built for: priced on that
+  # platform, and on a showdown only the game that was scored. The exposure
+  # tables and their pills list these, not every player the sim drew -- a
+  # multi-contest sheet (NHL main + late, one game's showdown) sims the whole
+  # night, and a player who could never be rostered is not a 0% finding.
+  # Falls back to every player when the platform carries no salaries.
+  slate_meta <- function(lp) {
+    m <- rv$sim_metadata
+    if (is.null(m) || !nrow(m)) return(m)
+    m <- as.data.table(m)
+    sal <- if (identical(lp, "sd")) "SDSalary" else paste0(toupper(lp), "Salary")
+    if (sal %in% names(m) && any(m[[sal]] > 0, na.rm = TRUE))
+      m <- m[!is.na(get(sal)) & get(sal) > 0]
+    if (identical(lp, "sd") && !is.null(rv$sd_game_scored) && "ShowdownFile" %in% names(m))
+      m <- m[ShowdownFile %in% rv$sd_game_scored]
+    m
+  }
+
   filter_pills_ui <- function(prefix, meta, exclude_lp = NULL) {
     if (is.null(meta) || !nrow(meta)) return(NULL)
     meta <- as.data.table(meta)
@@ -4563,7 +4597,7 @@ server <- function(input, output, session) {
         pill_row("pos",  "POS",  pos_vals),
         pill_row("team", "TEAM", team_vals),
         pill_row("game", "GAME", game_vals,
-                 show = function(v) sub("\\s+", " @ ", v)),
+                 show = function(v) sub("\\s+(@\\s+)?", " @ ", v)),   # NHL keys already carry the @
         div(class = "gts-pf-row",
             span(class = "gts-pf-clear", onclick = clear_js, "✕ CLEAR"),
             excl_btn),
@@ -4647,7 +4681,7 @@ server <- function(input, output, session) {
       if (uniqueN(dg$GameKey) > 1) {
         t <- dg[, .(val = sum(get(value_col), na.rm = TRUE)), by = GameKey]
         game_tbl <- setnames(t, "GameKey", "key")[order(-val)]
-        game_tbl[, key := sub("\\s+", " @ ", key)]
+        game_tbl[, key := sub("\\s+(@\\s+)?", " @ ", key)]
       }
     }
     rows <- Filter(Negate(is.null), list(tile_row("POS", pos_tbl), tile_row("TEAM", team_tbl),
@@ -4879,6 +4913,7 @@ server <- function(input, output, session) {
     else if (rv$sport %in% c("NFL_PRESEASON","NFL_PRESEASON_CLASSIC"))
       render_nfl_preseason_visuals(rv$sport_visuals)
     else if (rv$sport %in% c("CFB","CFB_CLASSIC")) render_cfb_visuals(rv$sport_visuals)
+    else if (rv$sport == "NHL") render_nhl_visuals(rv$sport_visuals)
     else NULL
   })
   
@@ -5320,6 +5355,326 @@ server <- function(input, output, session) {
     datatable(rv$sport_visuals$stat_line[Player %in% cfb_keep()], rownames = FALSE,
               options = list(dom = "tp", pageLength = 30, searching = FALSE,
                              scrollX = TRUE, order = list(list(4, "desc"))))
+  })
+
+  # ==========================================================================
+  # NHL SIM RESULTS -- validation first. Every panel lays the sim against
+  # something it should agree with: the game market, the goalie's team price,
+  # the Pinnacle SOG line, the builder's own smoke sim (SheetDK), and the
+  # correlation structure a hockey sim has to have (linemates together, skaters
+  # against the goalie facing them). nhl_sim_visuals() (nhl_engine.R) builds
+  # every table; nothing here touches per-sim data.
+  # ==========================================================================
+  NHL_UNIT_COL <- c(L1 = "#FFE500", L2 = "#E8B84B", L3 = "#B8923A", L4 = "#7d6a3a",
+                    D1 = "#7BAFD4", D2 = "#5a8aad", D3 = "#3f6580", G = "#A87FE0",
+                    PP1 = "#FFE500", PP2 = "#E8B84B", `no PP` = "#5a5a52")
+  nhl_pct <- function(x) round(100 * x, 1)
+
+  render_nhl_visuals <- function(visuals) {
+    req(visuals)
+    games <- visuals$games$Game
+    chk <- visuals$checks
+    beta <- if (!is.null(visuals$meta) && "item" %in% names(visuals$meta))
+      visuals$meta[item == "beta", value] else character(0)
+    fluidRow(column(12,
+      box(width = NULL, title = "NHL Simulation Analysis", status = "primary", solidHeader = TRUE,
+        div(style = "margin-bottom:12px;color:#bbb;font-size:12px;",
+            sprintf("%d games  |  %s sims  |  correlations off the first %s",
+                    length(games), format(visuals$n_sims, big.mark = ","),
+                    format(visuals$n_corr, big.mark = ","))),
+        if (length(beta) && nzchar(beta[1]))
+          div(style = "margin-bottom:10px;padding:8px 12px;border-left:3px solid #E8B84B;background:#2a2416;color:#f0dca0;font-size:12px;",
+              beta[1]),
+        if (!is.null(chk) && nrow(chk))
+          tags$details(style = "margin-bottom:12px;padding:8px 12px;border-left:3px solid #d9534f;background:#2a1a1a;color:#f0c0c0;font-size:12px;",
+            tags$summary(style = "cursor:pointer;",
+                         sprintf("SHEET CHECKS: %d flagged by the builder (click to read)", nrow(chk))),
+            tags$ul(style = "margin:8px 0 0 0;",
+              lapply(seq_len(nrow(chk)), function(i)
+                tags$li(sprintf("%s%s: %s", chk$check[i],
+                                if (!is.na(chk$team[i])) paste0(" (", chk$team[i], ")") else "",
+                                chk$detail[i]))))),
+
+        div(class = "gts-chart-filter",
+            span(class = "gts-chart-filter-label", "Game:"),
+            radioButtons("nhl_game_filter", NULL, choices = c("All games" = "ALL", setNames(games, games)),
+                         selected = "ALL", inline = TRUE)),
+        div(class = "gts-chart-filter", style = "margin-bottom:10px;",
+            span(class = "gts-chart-filter-label", "Positions:"),
+            checkboxGroupInput("nhl_pos_filter", NULL, choices = c("C","W","D","G"),
+                               selected = c("C","W","D","G"), inline = TRUE)),
+
+        tabsetPanel(id = "nhl_tabs", type = "tabs",
+          tabPanel("Games vs market", div(style = "margin-top:14px;"),
+            tags$p(style = "color:#888;font-size:11px;margin:0 0 10px 0;",
+                   "On the line is agreement. Win and over include OT and the shootout goal; a push voids, as in the de-vigged price. Red: win off by more than 3 points, over by more than 6."),
+            plotlyOutput("nhl_market_scatter", height = "380px"),
+            div(style = "margin-top:14px;", DTOutput("nhl_games_table")),
+            h5(style = "margin-top:22px;color:#FFE500;", "Goals per team"),
+            plotlyOutput("nhl_goal_dist", height = "320px")),
+
+          tabPanel("Goalies", div(style = "margin-top:14px;"),
+            tags$p(style = "color:#888;font-size:11px;margin:0 0 10px 0;",
+                   "Bar is the 10th to 90th percentile of saves, dot the mean. The goalie's win sits a touch under his team's when he can be pulled."),
+            plotlyOutput("nhl_saves_plot", height = "380px"),
+            div(style = "margin-top:14px;", DTOutput("nhl_goalie_table"))),
+
+          tabPanel("Skaters & props", div(style = "margin-top:14px;"),
+            uiOutput("nhl_prop_note"),
+            plotlyOutput("nhl_prop_scatter", height = "380px"),
+            h5(style = "margin-top:18px;color:#FFE500;", "Where each team's DK points come from"),
+            radioButtons("nhl_unit_view", NULL, inline = TRUE,
+                         choices = c("Lines and pairs" = "line", "Power play" = "pp"), selected = "line"),
+            plotlyOutput("nhl_unit_share", height = "360px"),
+            div(style = "margin-top:14px;", DTOutput("nhl_skater_table"))),
+
+          tabPanel("Correlation", div(style = "margin-top:14px;"),
+            tags$p(style = "color:#888;font-size:11px;margin:0 0 10px 0;",
+                   "Average correlation of DK points between two players, by how they are related. Linemates and the PP unit should run positive; skaters against the goalie facing them negative."),
+            plotlyOutput("nhl_corr_sum", height = "300px"),
+            h5(style = "margin-top:18px;color:#FFE500;", "One game, player by player"),
+            uiOutput("nhl_corr_hint"),
+            plotlyOutput("nhl_corr_heat", height = "760px")),
+
+          tabPanel("Score range", div(style = "margin-top:14px;"),
+            tags$p(style = "color:#888;font-size:11px;margin:0 0 10px 0;",
+                   "Bar is the middle half, line the 10th to 90th, white dot the mean, diamond the one-in-a-hundred game. All games shows the top 60 by mean."),
+            plotlyOutput("nhl_range_plot", height = "auto"))
+        )
+      )))
+  }
+
+  nhl_game_sel <- reactive({
+    g <- input$nhl_game_filter
+    if (is.null(g) || identical(g, "ALL")) NULL else g
+  })
+  nhl_pos_sel <- reactive(input$nhl_pos_filter %||% c("C","W","D","G"))
+
+  output$nhl_market_scatter <- renderPlotly({
+    req(rv$sport == "NHL", rv$sport_visuals$games)
+    g <- copy(rv$sport_visuals$games)
+    if (!is.null(nhl_game_sel())) g <- g[Game == nhl_game_sel()]
+    d <- rbind(g[, .(Game, what = "Home win",       mkt = p_home,     sim = sim_p_home)],
+               g[, .(Game, what = "Over the total", mkt = p_over,     sim = sim_p_over)],
+               g[, .(Game, what = "Tied after 60",  mkt = p_reg_draw, sim = sim_p_reg_draw)])[!is.na(mkt)]
+    req(nrow(d) > 0)
+    rng <- range(c(d$mkt, d$sim)); rng <- c(max(0, rng[1] - .05), min(1, rng[2] + .05))
+    cols <- c(`Home win` = "#FFE500", `Over the total` = "#7BAFD4", `Tied after 60` = "#A87FE0")
+    CFB_DARK(plot_ly(d, x = ~mkt * 100, y = ~sim * 100, color = ~what, colors = cols,
+                     type = "scatter", mode = "markers", marker = list(size = 11, line = list(color = "#111", width = 1)),
+                     hoverinfo = "text",
+                     text = ~sprintf("%s<br>%s<br>market %.1f%%  sim %.1f%%  (%+.1f)", Game, what,
+                                     100 * mkt, 100 * sim, 100 * (sim - mkt)))) %>%
+      add_segments(x = 100 * rng[1], xend = 100 * rng[2], y = 100 * rng[1], yend = 100 * rng[2],
+                   inherit = FALSE, line = list(color = "#5a5a52", dash = "dot"), showlegend = FALSE,
+                   hoverinfo = "none") %>%
+      layout(xaxis = list(title = "Market %", gridcolor = "#2a2a2a", zeroline = FALSE),
+             yaxis = list(title = "Sim %", gridcolor = "#2a2a2a", zeroline = FALSE),
+             margin = list(l = 50, r = 20, t = 30, b = 50))
+  })
+
+  output$nhl_games_table <- renderDT({
+    req(rv$sport == "NHL", rv$sport_visuals$games)
+    g <- rv$sport_visuals$games
+    d <- g[, .(Game, `Home win mkt` = nhl_pct(p_home), `Home win sim` = nhl_pct(sim_p_home),
+               `Win diff` = nhl_pct(sim_p_home - p_home),
+               Total = total, `Over mkt` = nhl_pct(p_over), `Over sim` = nhl_pct(sim_p_over),
+               `Over diff` = nhl_pct(sim_p_over - p_over),
+               `Tied@60 mkt` = nhl_pct(p_reg_draw), `Tied@60 sim` = nhl_pct(sim_p_reg_draw),
+               `Sim goals` = sprintf("%.2f - %.2f", away_goals, home_goals),
+               `Sim SOG` = sprintf("%.1f - %.1f", away_sog, home_sog))]
+    datatable(d, rownames = FALSE, class = "compact",
+              options = list(dom = "t", paging = FALSE, searching = FALSE, scrollX = TRUE)) %>%
+      formatStyle("Win diff",  color = styleInterval(c(-3, 3), c("#ff6b6b", "#e0e0e0", "#ff6b6b"))) %>%
+      formatStyle("Over diff", color = styleInterval(c(-6, 6), c("#ff6b6b", "#e0e0e0", "#ff6b6b")))
+  })
+
+  output$nhl_goal_dist <- renderPlotly({
+    req(rv$sport == "NHL", rv$sport_visuals$goal_dist)
+    d <- copy(rv$sport_visuals$goal_dist)
+    gsel <- nhl_game_sel() %||% d$Game[1]
+    d <- d[Game == gsel]
+    req(nrow(d) > 0)
+    d[, lab := fifelse(g >= 7L, "7+", as.character(g))]
+    tm <- unique(d[order(is_home)]$Team)
+    CFB_DARK(plot_ly(d, x = ~lab, y = ~pct * 100, color = ~factor(Team, levels = tm),
+                     colors = c("#7BAFD4", "#FFE500"), type = "bar",
+                     hoverinfo = "text", text = ~sprintf("%s score %s in %.1f%% of games", Team, lab, 100 * pct),
+                     textposition = "none")) %>%
+      layout(barmode = "group", title = list(text = gsel, font = list(size = 12), x = 0.02),
+             xaxis = list(title = "Goals (shootout winner counts one)", type = "category"),
+             yaxis = list(title = "% of sims", gridcolor = "#2a2a2a"),
+             margin = list(l = 50, r = 20, t = 40, b = 50))
+  })
+
+  output$nhl_saves_plot <- renderPlotly({
+    req(rv$sport == "NHL", rv$sport_visuals$goalies)
+    d <- copy(rv$sport_visuals$goalies)
+    if (!is.null(nhl_game_sel())) d <- d[Game == nhl_game_sel()]
+    req(nrow(d) > 0)
+    setorder(d, saves)
+    d[, lab := factor(sprintf("%s (%s)", Player, Team), levels = sprintf("%s (%s)", Player, Team))]
+    CFB_DARK(plot_ly(d) %>%
+      add_segments(x = ~sv_p10, xend = ~sv_p90, y = ~lab, yend = ~lab,
+                   line = list(color = "#A87FE0", width = 10), opacity = .7, showlegend = FALSE,
+                   hoverinfo = "text", text = ~sprintf("%s<br>saves p10 %.0f to p90 %.0f", Player, sv_p10, sv_p90)) %>%
+      add_markers(x = ~saves, y = ~lab, marker = list(color = "#fff", size = 8, line = list(color = "#111", width = 1.5)),
+                  showlegend = FALSE, hoverinfo = "text",
+                  text = ~sprintf("%s<br>mean %.1f saves, 35+ in %.1f%%", Player, saves, 100 * p_35sv))) %>%
+      layout(xaxis = list(title = "Saves", gridcolor = "#2a2a2a", zeroline = FALSE),
+             yaxis = list(title = "", automargin = TRUE), margin = list(l = 10, r = 20, t = 10, b = 50))
+  })
+
+  output$nhl_goalie_table <- renderDT({
+    req(rv$sport == "NHL", rv$sport_visuals$goalies)
+    d <- rv$sport_visuals$goalies
+    if (!is.null(nhl_game_sel())) d <- d[Game == nhl_game_sel()]
+    out <- d[, .(Goalie = Player, Team, Game, `Team win mkt` = nhl_pct(mkt_win), `Team win sim` = nhl_pct(team_win),
+                 `Goalie W` = nhl_pct(g_win), Saves = round(saves, 1), GA = round(ga, 2),
+                 `35+ sv` = nhl_pct(p_35sv), Shutout = nhl_pct(shutout), Pulled = nhl_pct(relieved),
+                 DK = round(dk, 2), SheetDK = if ("SheetDK" %in% names(d)) round(SheetDK, 2) else NA_real_)]
+    datatable(out, rownames = FALSE, class = "compact",
+              options = list(dom = "t", paging = FALSE, searching = FALSE, scrollX = TRUE))
+  })
+
+  nhl_skaters <- reactive({
+    req(rv$sport == "NHL", rv$sport_visuals$skaters)
+    d <- rv$sport_visuals$skaters
+    if (!is.null(nhl_game_sel())) d <- d[GameKey == nhl_game_sel()]
+    d[Pos %in% nhl_pos_sel()]
+  })
+
+  output$nhl_prop_note <- renderUI({
+    req(rv$sport == "NHL", rv$sport_visuals$skaters)
+    n <- rv$sport_visuals$skaters[!is.na(MktOver), .N]
+    if (n == 0)
+      tags$p(style = "color:#E8B84B;font-size:12px;margin:0 0 10px 0;",
+             "No SOG prop lines on this sheet. Pinnacle posts them on game day; rebuild the sheet after they are up and they appear here.")
+    else
+      tags$p(style = "color:#888;font-size:11px;margin:0 0 10px 0;",
+             sprintf("%d skaters have a Pinnacle SOG line. On the line is agreement. The builder already pulls rates part-way toward the prop, so what is left is the gap it chose to keep.", n))
+  })
+
+  output$nhl_prop_scatter <- renderPlotly({
+    d <- nhl_skaters()[!is.na(MktOver) & !is.na(SimOver)]
+    req(nrow(d) > 0)
+    CFB_DARK(plot_ly(d, x = ~MktOver * 100, y = ~SimOver * 100, color = ~Pos,
+                     colors = c(C = "#FFE500", W = "#7BAFD4", D = "#A87FE0"),
+                     type = "scatter", mode = "markers", marker = list(size = 9, line = list(color = "#111", width = 1)),
+                     hoverinfo = "text",
+                     text = ~sprintf("%s (%s %s)<br>over %.1f SOG: market %.1f%%  sim %.1f%%<br>sim mean %.2f SOG",
+                                     Player, Team, Pos, SOGLine, 100 * MktOver, 100 * SimOver, SOG))) %>%
+      add_segments(x = 0, xend = 100, y = 0, yend = 100, inherit = FALSE, showlegend = FALSE,
+                   line = list(color = "#5a5a52", dash = "dot"), hoverinfo = "none") %>%
+      layout(xaxis = list(title = "Market P(over the SOG line) %", gridcolor = "#2a2a2a", range = c(0, 100)),
+             yaxis = list(title = "Sim P(over) %", gridcolor = "#2a2a2a", range = c(0, 100)),
+             margin = list(l = 50, r = 20, t = 20, b = 50))
+  })
+
+  output$nhl_unit_share <- renderPlotly({
+    req(rv$sport == "NHL", rv$sport_visuals$line_share)
+    view <- input$nhl_unit_view %||% "line"
+    d <- copy(if (view == "pp") rv$sport_visuals$pp_share else rv$sport_visuals$line_share)
+    if (!is.null(nhl_game_sel())) {
+      tms <- strsplit(nhl_game_sel(), " @ ")[[1]]
+      d <- d[Team %in% tms]
+    }
+    req(nrow(d) > 0)
+    units <- if (view == "pp") c("PP1", "PP2", "no PP") else c("L1","L2","L3","L4","D1","D2","D3","G")
+    ord <- if (view == "pp") d[Unit == "PP1"][order(share)]$Team else d[Unit == "L1"][order(share)]$Team
+    p <- plot_ly()
+    for (u in intersect(units, unique(d$Unit))) {
+      x <- d[Unit == u]
+      p <- add_trace(p, x = 100 * x$share, y = factor(x$Team, levels = ord), name = u, type = "bar",
+                     orientation = "h", marker = list(color = NHL_UNIT_COL[[u]]), hoverinfo = "text",
+                     text = sprintf("%s %s: %.1f DK pts, %.0f%% of the team", x$Team, u, x$DK, 100 * x$share),
+                     textposition = "none")
+    }
+    CFB_DARK(p) %>% layout(barmode = "stack",
+                           xaxis = list(title = "% of team DK points", gridcolor = "#2a2a2a", range = c(0, 100)),
+                           legend = list(orientation = "h", y = 1.12, x = 0, traceorder = "normal"),
+                           yaxis = list(title = "", automargin = TRUE), margin = list(l = 10, r = 20, t = 50, b = 50))
+  })
+
+  output$nhl_skater_table <- renderDT({
+    d <- nhl_skaters()
+    req(nrow(d) > 0)
+    out <- d[, .(Player, Team, Pos, Line, PP, TOI = round(TOI, 1), SOG = round(SOG, 2),
+                 `SOG line` = SOGLine, `Over mkt` = nhl_pct(MktOver), `Over sim` = nhl_pct(SimOver),
+                 G = round(G, 2), A = round(A, 2), Pts = round(Pts, 2), `P(goal)` = nhl_pct(PGoal),
+                 BLK = round(BLK, 2), `5+ SOG` = nhl_pct(SOG5), `3+ BLK` = nhl_pct(BLK3), `3+ Pts` = nhl_pct(PTS3),
+                 DK = round(DK, 2), SheetDK = if ("SheetDK" %in% names(d)) round(SheetDK, 2) else NA_real_)]
+    if (all(is.na(out$`SOG line`))) out[, c("SOG line", "Over mkt", "Over sim") := NULL]
+    datatable(out, rownames = FALSE, class = "compact",
+              options = list(dom = "tp", pageLength = 25, searching = FALSE, scrollX = TRUE,
+                             order = list(list(which(names(out) == "DK") - 1L, "desc"))))
+  })
+
+  output$nhl_corr_sum <- renderPlotly({
+    req(rv$sport == "NHL", rv$sport_visuals$corr_sum)
+    d <- copy(rv$sport_visuals$corr_sum)
+    d[, lab := factor(rel, levels = rev(rel))]
+    CFB_DARK(plot_ly(d, x = ~r, y = ~lab, type = "bar", orientation = "h",
+                     marker = list(color = ~ifelse(r >= 0, "#FFE500", "#7BAFD4")),
+                     hoverinfo = "text", text = ~sprintf("%s<br>mean r %.3f over %d pairs", rel, r, pairs),
+                     textposition = "none")) %>%
+      layout(xaxis = list(title = "Mean correlation of DK points", gridcolor = "#2a2a2a", zeroline = TRUE,
+                          zerolinecolor = "#888"),
+             yaxis = list(title = "", automargin = TRUE), margin = list(l = 10, r = 20, t = 10, b = 50))
+  })
+
+  output$nhl_corr_hint <- renderUI({
+    req(rv$sport == "NHL", rv$sport_visuals$corr_game)
+    if (is.null(nhl_game_sel()))
+      tags$p(style = "color:#888;font-size:11px;margin:0 0 8px 0;",
+             sprintf("Showing %s. Pick a game above for another.", names(rv$sport_visuals$corr_game)[1]))
+  })
+
+  output$nhl_corr_heat <- renderPlotly({
+    req(rv$sport == "NHL", rv$sport_visuals$corr_game)
+    cg <- rv$sport_visuals$corr_game
+    gsel <- nhl_game_sel() %||% names(cg)[1]
+    x <- cg[[gsel]]; req(!is.null(x))
+    pl <- x$players; m <- x$cor
+    keep <- pl$Pos %in% nhl_pos_sel(); req(sum(keep) > 1)
+    pl <- pl[keep]; m <- m[keep, keep, drop = FALSE]
+    diag(m) <- NA
+    lab <- sprintf("%s %s %s", pl$Team,
+                   fcase(pl$Pos == "G", "G", pl$Pos == "D", paste0("D", pl$Line),
+                         default = paste0("L", pl$Line, " ", pl$Pos)), pl$Player)
+    CFB_DARK(plot_ly(x = lab, y = lab, z = m, type = "heatmap", zmin = -0.4, zmax = 0.4,
+                     colorscale = list(c(0, "#3f6fd4"), c(0.5, "#141414"), c(1, "#FFE500")),
+                     hovertemplate = "%{y}<br>%{x}<br>r = %{z:.2f}<extra></extra>")) %>%
+      layout(xaxis = list(tickfont = list(size = 9), tickangle = -60, automargin = TRUE),
+             yaxis = list(tickfont = list(size = 9), autorange = "reversed", automargin = TRUE),
+             margin = list(l = 10, r = 10, t = 10, b = 10))
+  })
+
+  output$nhl_range_plot <- renderPlotly({
+    req(rv$sport == "NHL", rv$sport_visuals$score_dist)
+    d <- copy(rv$sport_visuals$score_dist)[Pos %in% nhl_pos_sel()]
+    if (!is.null(nhl_game_sel())) d <- d[GameKey == nhl_game_sel()] else d <- d[order(-Mean)][seq_len(min(.N, 60))]
+    req(nrow(d) > 0)
+    setorder(d, Mean)
+    d[, lab := factor(sprintf("%s  (%s %s)", Player, Team, Pos), levels = sprintf("%s  (%s %s)", Player, Team, Pos))]
+    d[, col := fcase(Pos == "G", "#A87FE0", Pos == "D", "#7BAFD4", default = "#FFE500")]
+    CFB_DARK(plot_ly(height = max(420, 22 * nrow(d) + 130)) %>%
+      add_segments(data = d, x = ~P10, xend = ~P90, y = ~lab, yend = ~lab,
+                   line = list(color = "#5a5a52", width = 3), hoverinfo = "text", showlegend = FALSE,
+                   text = ~paste0(Player, "<br>p10 ", P10, " to p90 ", P90)) %>%
+      # one trace per colour: plotly ignores a per-row colour on segments
+      (function(p) { for (cc in unique(d$col)) p <- add_segments(p, data = d[col == cc],
+                   x = ~P25, xend = ~P75, y = ~lab, yend = ~lab,
+                   line = list(color = cc, width = 10), opacity = 0.75, hoverinfo = "text", showlegend = FALSE,
+                   text = ~paste0(Player, "<br>middle half: ", P25, " to ", P75)); p })() %>%
+      add_markers(data = d, x = ~Mean, y = ~lab, showlegend = FALSE,
+                  marker = list(color = "#ffffff", size = 7, line = list(color = "#111", width = 1.5)),
+                  hoverinfo = "text", text = ~paste0("mean ", Mean, ", median ", Median)) %>%
+      add_markers(data = d, x = ~P99, y = ~lab, showlegend = FALSE,
+                  marker = list(color = "#FFE500", size = 5, symbol = "diamond"),
+                  hoverinfo = "text", text = ~paste0("1-in-100 game: ", P99))) %>%
+      layout(xaxis = list(title = "DraftKings points", gridcolor = "#2a2a2a", zeroline = FALSE),
+             yaxis = list(title = "", automargin = TRUE), margin = list(l = 10, r = 30, t = 10, b = 60))
   })
 
   render_tennis_visuals <- function(visuals) {

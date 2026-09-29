@@ -1802,7 +1802,7 @@ SPORT_CONFIGS <- list(
 
     metadata_columns = list(
       list(name = "Team",     label = "Team",     type = "text", display = TRUE,  filter = TRUE),
-      list(name = "PosGroup", label = "Position", type = "text", display = TRUE,  filter = TRUE),
+      list(name = "Pos",      label = "Position", type = "text", display = TRUE,  filter = TRUE),
       list(name = "GameKey",  label = "Game",     type = "text", display = FALSE, filter = FALSE)
     ),
 
@@ -1842,7 +1842,7 @@ SPORT_CONFIGS <- list(
       function_name = "run_nhl_simulation",
       output_format = list(
         sim_results = c("SimID", "Player", "DKScore"),
-        metadata    = c("Player", "Team", "Pos", "PosGroup", "DKID", "DKUID", "DKSalary",
+        metadata    = c("Player", "Team", "Pos", "DKID", "DKUID", "DKSalary",
                         "SDID", "SDCID", "SDSalary", "GameKey", "ShowdownFile")
       )
     ),
