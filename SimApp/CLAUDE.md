@@ -220,7 +220,31 @@ has NO positive ownership at all: the showdown field chain applied to a classic
 roster (sheet projection, else sim median; value-tilted weight; sums to 100% x
 roster slots; capped at `FIELD_MAX_FLEX`), and the field label says
 SYNTHESIZED. A sheet with any real ownership takes the old path unchanged.
-The generic classic path only; NFL classic and NBA have their own field builders.
+Every classic path now falls back the same way (see the rulebook below); NBA
+keeps its own LP field.
+
+## One lineup rulebook: tournaments and the Cash tab (29 Sep 2026)
+
+`lineup_rules.R` says what makes a DK/FD lineup legal, per sport and format:
+roster slots and who may fill them (matched, so NBA "PG/SG" and Soccer "D/M"
+work), salary cap (captain at its own salary; FD MVP at
+`mvp_salary_multiplier`), and team / game rules (NFL/CFB classic 2 teams +
+2 games, NHL 3 teams + 2 games, Soccer <= 5 per team / <= 7 per game /
+3 teams, showdown >= 2 teams, F1 one driver at most from the constructor's
+team). `lineup_rules()` builds it, `lineup_legal()` checks a matrix of lineups.
+
+Both sides answer to it. The tournament filters in `app.R`
+(`drop_invalid_classic`, `drop_single_team_sd`, and NHL's classic filter) are
+now thin calls into it. The Cash tab builds its field with
+`build_field_tiers_rules()` (every positional classic, F1, Tennis Short Slate,
+FD MVP) and runs `field_keep_legal()` over every field, so the log always says
+how many field lineups were checked. The optimisers keep their own
+built-in rules; this is the check both sides must pass.
+
+Before this, the Cash field had drifted from the tournament rules: CFB, NHL, CBB
+and Soccer classic drew fields with no positions (0-QB CFB "lineups"), F1 could
+captain a constructor, and `get_player_cols()` dropped Tennis Short Slate's
+A-CPT and FD's MVP.
 
 ## Worker count and memory limits (20 Sep 2026)
 

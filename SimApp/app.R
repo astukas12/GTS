@@ -11,6 +11,7 @@ library(ggplot2)
 source("sport_configs_universal.R")
 source("OptimalLineups_Core.R")
 source("portfolio_helpers_universal.R")
+source("lineup_rules.R")
 source("cash_game_module.R")
 source("lineup_lab_module.R")
 
@@ -1292,33 +1293,17 @@ server <- function(input, output, session) {
   # On a six-game slate it never bit (0 of 5,000 lineups violated, though 6 sat
   # at exactly two games). On a THREE-game slate the margin is far thinner, so
   # this has to be a guarantee rather than a happy accident.
-  drop_invalid_classic <- function(lineup_data, metadata, games) {
-    ul <- lineup_data$unique_lineups
-    pc <- grep("^Player", names(ul), value = TRUE)
-    if (!length(pc) || is.null(games) || !nrow(games)) return(lineup_data)
-    if (!all(c("HomeTeam","AwayTeam") %in% names(games))) return(lineup_data)
-    gkey <- paste0(games$AwayTeam, "@", games$HomeTeam)
-    t2g  <- setNames(rep(gkey, 2), c(games$HomeTeam, games$AwayTeam))
-    p2t  <- setNames(metadata$Team, metadata$Player)
-    tm   <- matrix(p2t[unlist(ul[, ..pc])], nrow = nrow(ul))
-    gm   <- matrix(t2g[tm], nrow = nrow(ul))
-    ndis <- function(M) apply(M, 1, function(r) length(unique(r[!is.na(r)])))
-    keep <- ndis(tm) >= 2 & ndis(gm) >= 2
-    if (all(keep)) return(lineup_data)
-    lineup_data$unique_lineups <- ul[keep]
-    lineup_data
+  # The tournament filters answer to the same rulebook as the Cash tab's field
+  # (lineup_rules.R, 29 Sep 2026): slots, salary cap and the team / game rules.
+  # Until then each carried its own copy of part of the rules.
+  drop_invalid_classic <- function(lineup_data, metadata, games, platform = "DK") {
+    R <- lineup_rules(rv$config, metadata, platform = platform, format = "classic", games = games)
+    drop_illegal_lineups(lineup_data, R, label = paste0(" ", platform, " classic"))
   }
 
-  drop_single_team_sd <- function(lineup_data, metadata) {
-    ul <- lineup_data$unique_lineups
-    pc <- intersect(c("Captain", grep("^Util", names(ul), value = TRUE)), names(ul))
-    if (!length(pc) || !"Team" %in% names(metadata)) return(lineup_data)
-    tm <- vapply(pc, function(c_) metadata$Team[match(ul[[c_]], metadata$Player)],
-                 character(nrow(ul)))
-    keep <- apply(tm, 1, function(r) length(unique(r[!is.na(r)])) >= 2)
-    if (all(keep)) return(lineup_data)
-    lineup_data$unique_lineups <- ul[keep]
-    lineup_data
+  drop_single_team_sd <- function(lineup_data, metadata, platform = "SD") {
+    R <- lineup_rules(rv$config, metadata, platform = platform, format = "captain")
+    drop_illegal_lineups(lineup_data, R, label = paste0(" ", platform, " showdown"))
   }
 
   create_download_showdown <- function(optimal_lineups, metadata) {
@@ -1866,7 +1851,7 @@ server <- function(input, output, session) {
                            use_parallel=TRUE)
         progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
         lineup_data <- find_optimal_lineups_nhl_classic(opt_data, opt_config, verbose=TRUE, metadata=rv$sim_metadata)
-        lineup_data <- nhl_drop_invalid_classic(lineup_data, rv$sim_metadata)
+        lineup_data <- drop_invalid_classic(lineup_data, rv$sim_metadata, NULL)
         progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
                                     format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
         score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
@@ -1998,7 +1983,7 @@ server <- function(input, output, session) {
         # missing the same check. drop_single_team_sd() no-ops safely when
         # metadata has no Team column (F1), so gating on mode alone is safe.
         if (dk_mode %in% c("combinatorial_captain", "enum_captain"))
-          lineup_data <- drop_single_team_sd(lineup_data, rv$sim_metadata)
+          lineup_data <- drop_single_team_sd(lineup_data, rv$sim_metadata, platform = "DK")
         # Lives beside the pool, not in it: calculate_distribution_metrics
         # returns a plain data.table and would drop anything attached here.
         rv$dk_cash_curve <- lineup_data$cash
@@ -2144,7 +2129,7 @@ server <- function(input, output, session) {
         progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
         lineup_data <- find_optimal_lineups(opt_data, opt_config,
                                             mode=rv$config$optimization_modes$FD, k=1, verbose=TRUE)
-        lineup_data <- drop_invalid_classic(lineup_data, rv$sim_metadata, rv$input_data$games)
+        lineup_data <- drop_invalid_classic(lineup_data, rv$sim_metadata, rv$input_data$games, platform = "FD")
         progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
                                     format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
         score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
@@ -2179,7 +2164,7 @@ server <- function(input, output, session) {
         gtab <- as.data.table(rv$input_data$game)
         lineup_data <- drop_invalid_classic(
           lineup_data, rv$sim_metadata,
-          gtab[, .(AwayTeam=away, HomeTeam=home)])
+          gtab[, .(AwayTeam=away, HomeTeam=home)], platform = "FD")
         progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
                                     format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
         score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
