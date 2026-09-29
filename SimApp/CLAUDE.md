@@ -277,6 +277,14 @@ Re-run that check after any re-copy.
   100k by salary is ~$49k+ (29s).
 - Starting goalies only (DFO's starter), scored off the box's starter line. No
   ownership source yet, so no AvgOwn / leverage.
+- Tournament Lineups: one SLATE pill row (Main / Late classic, each game's
+  showdown) and one Score DraftKings button, as on NFL (`rv$nhl_slate`).
+- Sim Results is a validation tab. `nhl_sim_visuals()` summarises the box
+  scores into games vs market, goalies, skaters vs the Pinnacle SOG line
+  (`sog_line` / `sog_p_over` on Players, written by build_slate.R from 28 Sep;
+  older sheets show no prop check), DK share by line / PP unit, DK-point
+  correlation by relation + per-game heatmap, and score ranges. `SheetDK` is
+  the builder's smoke-sim mean -- a parity check on the app.
 
 ## Running it
 

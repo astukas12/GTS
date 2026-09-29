@@ -7,6 +7,7 @@
 #
 #   read_nhl_input(path)          Games / Players / Goalies / IDs_<dg> / Meta
 #   run_nhl_simulation(input)     sim_team_box() -> sim_players(), DK points
+#   nhl_sim_visuals(...)          the Sim Results tab's validation summaries
 #
 # The model is GTS/NHL's own code, copied verbatim into nhl/ (team_model.R,
 # player_model.R, fit/grid_core.R, goalie_core.R, player_core.R, dk_scoring.R;
@@ -151,8 +152,159 @@ run_nhl_simulation <- function(input_data, n_sims = 10000, config = NULL, progre
   pr <- sims[, .(DKProj = mean(DKScore)), by = Player]
   meta[pr, on = "Player", DKProj := round(i.DKProj, 2)]
   meta[T, on = "Player", StartOrder := frank(i.StartUTC, ties.method = "dense")]   # late swap: the UTIL goes to the latest start
+  pcb("Validation summaries", 0.95)
+  # Never let a summary cost the sim: a failure here leaves the tab empty.
+  vis <- tryCatch(nhl_sim_visuals(bx, sk, sims, G, T, input_data),
+                  error = function(e) { warning("NHL visuals: ", conditionMessage(e)); NULL })
   pcb("Done", 1)
-  list(sim_results = sims, metadata = meta)
+  list(sim_results = sims, metadata = meta, sport_visuals = vis)
+}
+
+# =============================================================================
+# SIM RESULTS: validation summaries
+# -----------------------------------------------------------------------------
+# Small tables only -- the per-sim box scores are summarised here and dropped.
+# Everything is laid against something the sim should agree with:
+#   games       win / total / regulation prices, market vs sim (goals count the
+#               shootout winner and a push voids, as the de-vigged price does)
+#   goal_dist   each team's goals, 0..7+
+#   goalies     the starter's saves / win / shutout; team win vs the market
+#   skaters     SOG, points, blocks, DK bonus rates; the Pinnacle SOG line and
+#               its de-vigged P(over) when the sheet carries them (sog_line /
+#               sog_p_over, written by build_slate.R); SheetDK is the
+#               builder's own smoke-sim mean, a parity check on this app
+#   line_share  each team's DK points by line / pair / PP unit
+#   corr_*      DK-point correlation, by relation (linemates, PP unit, opponent,
+#               goalie) and per game as a matrix, off the first 20k sims
+#   score_dist  DK point percentiles per player
+# =============================================================================
+nhl_sim_visuals <- function(bx, sk, sims, G, T, input_data, n_corr = 20000L) {
+  n <- uniqueN(bx$sim)
+  G <- copy(G)
+  b <- bx[, .(game, sim, is_home, goals, reg_goals, result, end, sog, s_dec, s_so, s_sv, s_ga, s_dk, relieved)]
+  b[, fg := goals + (end == "SO" & result == "W")]
+  b[G, on = "game", Team := fifelse(is_home, i.home, i.away)]
+
+  # ---- games ------------------------------------------------------------------
+  gm <- b[, .(tot = sum(fg), reg = sum(reg_goals), home_w = any(is_home & result == "W"),
+              reg_draw = end[1] != "REG"), by = .(game, sim)]
+  gm <- merge(gm, G[, .(game, total, reg_total)], by = "game")
+  gs <- gm[, .(sim_p_home = mean(home_w), sim_total = mean(tot),
+               sim_p_over = sum(tot > total) / max(1, sum(tot != total)),
+               sim_p_reg_home = mean(home_w & !reg_draw), sim_p_reg_draw = mean(reg_draw),
+               sim_reg_total = mean(reg),
+               sim_p_reg_over = sum(reg > reg_total) / max(1, sum(reg != reg_total))), by = game]
+  side <- dcast(b[, .(goals = mean(fg), sog = mean(sog)), by = .(game, is_home)],
+                game ~ is_home, value.var = c("goals", "sog"), fun.aggregate = mean)
+  mk <- function(col) if (col %in% names(G)) as.numeric(G[[col]]) else NA_real_
+  games <- data.table(game = G$game, Game = paste(G$away, "@", G$home), away = G$away, home = G$home,
+                      src = if ("mkt_src" %in% names(G)) G$mkt_src else NA_character_,
+                      p_home = mk("p_home"), total = mk("total"), p_over = mk("p_over"),
+                      p_reg_home = mk("p_reg_home"), p_reg_draw = mk("p_reg_draw"),
+                      reg_total = mk("reg_total"), p_reg_over = mk("p_reg_over"))
+  games <- merge(games, gs, by = "game")
+  games <- merge(games, side, by = "game")
+  setnames(games, c("goals_TRUE", "goals_FALSE", "sog_TRUE", "sog_FALSE"),
+           c("home_goals", "away_goals", "home_sog", "away_sog"), skip_absent = TRUE)
+  setorder(games, game)
+
+  goal_dist <- b[, .N, by = .(game, Team, is_home, g = pmin(fg, 7L))][, pct := N / n][, N := NULL]
+  setorder(goal_dist, game, -is_home, g)
+  goal_dist[G, on = "game", Game := paste(i.away, "@", i.home)]
+
+  # ---- goalies (the starter's line off the team box) --------------------------
+  gl <- b[, .(team_win = mean(result == "W"), g_win = mean(s_dec %chin% "W"),
+              shutout = mean(s_so > 0), saves = mean(s_sv),
+              sv_p10 = as.numeric(quantile(s_sv, .1)), sv_p90 = as.numeric(quantile(s_sv, .9)),
+              p_35sv = mean(s_sv >= 35), ga = mean(s_ga), relieved = mean(relieved %in% TRUE),
+              dk = mean(s_dk)), by = .(game, is_home, Team)]
+  gl[G, on = "game", mkt_win := fifelse(is_home, i.p_home, 1 - i.p_home)]
+  gl[G, on = "game", Game := paste(i.away, "@", i.home)]
+  G2 <- G[, .(game, gameId)]
+  gl <- merge(gl, G2, by = "game")
+  st <- T[Pos == "G", .(gameId, is_home, Player, playerId)]
+  gl <- merge(gl, st, by = c("gameId", "is_home"), all.x = TRUE)
+  gsd <- input_data$goalies[starter == TRUE, .(playerId, sheet_dk = as.numeric(sim_dk))]
+  if ("sim_dk" %in% names(input_data$goalies)) gl[gsd, on = "playerId", SheetDK := i.sheet_dk]
+  setorder(gl, game, -is_home)
+
+  # ---- skaters ----------------------------------------------------------------
+  sk2 <- sk[, .(playerId, game, g, a, sog, blk, toi, dk)]
+  sk2[G2, on = "game", gameId := i.gameId]
+  sks <- sk2[, .(TOI = mean(toi) / 60, SOG = mean(sog), SOG3 = mean(sog >= 3), SOG5 = mean(sog >= 5),
+                 G = mean(g), A = mean(a), Pts = mean(g + a), PGoal = mean(g > 0), PPoint = mean(g + a > 0),
+                 PTS3 = mean(g + a >= 3), BLK = mean(blk), BLK3 = mean(blk >= 3), DK = mean(dk)),
+             by = .(playerId, gameId)]
+  who <- T[Pos != "G", .(playerId, gameId, Player, Team = team, Pos, grp, Line = slot, PP = pp, GameKey)]
+  sks <- merge(who, sks, by = c("playerId", "gameId"))
+  P <- input_data$players
+  if ("sim_dk" %in% names(P)) sks[P, on = "playerId", SheetDK := as.numeric(i.sim_dk)]
+  if (all(c("sog_line", "sog_p_over") %in% names(P))) {
+    ln <- P[!is.na(sog_line) & !is.na(sog_p_over), .(playerId, sog_line = as.numeric(sog_line), sog_p_over = as.numeric(sog_p_over))]
+    if (nrow(ln)) {
+      so <- sk2[ln, on = "playerId", nomatch = NULL][, .(SimOver = mean(sog > sog_line)), by = playerId]
+      sks[ln, on = "playerId", `:=`(SOGLine = i.sog_line, MktOver = i.sog_p_over)]
+      sks[so, on = "playerId", SimOver := i.SimOver]
+    }
+  }
+  if (!"SOGLine" %in% names(sks)) sks[, `:=`(SOGLine = NA_real_, MktOver = NA_real_, SimOver = NA_real_)]
+  setorder(sks, -DK)
+
+  # ---- DK points by line / pair / PP unit, per team ----------------------------
+  unit <- function(grp, line) fifelse(grp == "D", paste0("D", line), paste0("L", line))
+  ls <- sks[, .(DK = sum(DK), SOG = sum(SOG)), by = .(Team, Unit = unit(grp, Line))]
+  ls <- rbind(ls, gl[, .(Team, Unit = "G", DK = dk, SOG = 0)])
+  ls[, share := DK / sum(DK), by = Team]
+  pp <- sks[, .(DK = sum(DK)), by = .(Team, Unit = fifelse(PP %in% 1L, "PP1", fifelse(PP %in% 2L, "PP2", "no PP")))]
+  pp[, share := DK / sum(DK), by = Team]
+
+  # ---- DK score percentiles -----------------------------------------------------
+  sd_ <- sims[, .(Mean = round(mean(DKScore), 1), P10 = round(quantile(DKScore, .10), 1),
+                  P25 = round(quantile(DKScore, .25), 1), Median = round(quantile(DKScore, .5), 1),
+                  P75 = round(quantile(DKScore, .75), 1), P90 = round(quantile(DKScore, .90), 1),
+                  P99 = round(quantile(DKScore, .99), 1)), by = Player]
+  sd_ <- merge(sd_, T[, .(Player, Team = team, Pos, GameKey)], by = "Player")
+
+  # ---- correlation ------------------------------------------------------------
+  keep_sim <- sort(unique(sims$SimID))[seq_len(min(n_corr, n))]
+  cs <- sims[SimID %in% keep_sim]
+  info <- T[, .(Player, Team = team, Pos, grp, Line = slot, PP = pp, gameId, GameKey)]
+  info[, ord := fcase(grp == "F", 10L + fcoalesce(Line, 9L), grp == "D", 20L + fcoalesce(Line, 9L), default = 30L)]
+  corr_game <- list(); pairs <- list()
+  for (gid in G$gameId) {
+    pl <- info[gameId == gid][order(Team, ord, Player)]
+    w <- dcast(cs[Player %chin% pl$Player], SimID ~ Player, value.var = "DKScore", fun.aggregate = mean)
+    m <- suppressWarnings(cor(as.matrix(w[, -1])))
+    pl <- pl[Player %chin% colnames(m)]
+    m <- round(m[pl$Player, pl$Player, drop = FALSE], 3)
+    corr_game[[pl$GameKey[1]]] <- list(players = pl[, .(Player, Team, Pos, Line, PP)], cor = m)
+    ij <- which(upper.tri(m), arr.ind = TRUE)
+    a <- pl[ij[, 1]]; z <- pl[ij[, 2]]
+    same <- a$Team == z$Team; ga <- a$Pos == "G"; gz <- z$Pos == "G"
+    sl <- fcoalesce(a$Line, -1L) == fcoalesce(z$Line, -2L)   # element-wise; NA never matches
+    rel <- fcase(same & ga & gz, NA_character_,
+                 same & (ga | gz), "Skater + own goalie",
+                 same & a$grp == "F" & z$grp == "F" & sl, "Forward linemates",
+                 same & a$grp == "D" & z$grp == "D" & sl, "D partners",
+                 same & a$PP %in% 1L & z$PP %in% 1L, "PP1 unit, not linemates",
+                 same, "Teammates, other lines",
+                 ga & gz, "Goalie vs goalie",
+                 ga | gz, "Skater vs opposing goalie",
+                 default = "Opponents")
+    pairs[[length(pairs) + 1L]] <- data.table(rel = rel, r = m[ij])
+  }
+  pairs <- rbindlist(pairs)[!is.na(rel) & is.finite(r)]
+  corr_sum <- pairs[, .(r = round(mean(r), 3), pairs = .N), by = rel]
+  lvl <- c("Forward linemates", "D partners", "PP1 unit, not linemates", "Skater + own goalie",
+           "Teammates, other lines", "Opponents", "Skater vs opposing goalie", "Goalie vs goalie")
+  corr_sum <- corr_sum[order(match(rel, lvl))]
+
+  checks <- input_data$checks
+  list(n_sims = n, n_corr = length(keep_sim), games = games, goal_dist = goal_dist, goalies = gl,
+       skaters = sks, line_share = ls, pp_share = pp, score_dist = sd_,
+       corr_sum = corr_sum, corr_game = corr_game,
+       checks = if (!is.null(checks) && "level" %in% names(checks)) checks[level != "OK"] else NULL,
+       meta = input_data$meta)
 }
 
 
