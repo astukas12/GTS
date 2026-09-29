@@ -1855,6 +1855,8 @@ server <- function(input, output, session) {
         progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
                                     format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
         score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
+        # Lineup Lab's field, as on NFL classic (see that branch).
+        rv$dk_field_ref <- field_reference(score_matrix, opt_config$percentiles)
         progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
         final_results <- calculate_distribution_metrics(score_matrix, lineup_data, opt_config,
                                                         ownership_data=NULL, verbose=TRUE)
@@ -2658,6 +2660,9 @@ server <- function(input, output, session) {
       rv$nhl_classic_dg <- dg
       rv$dk_optimal_lineups <- NULL
       rv$dk_portfolio <- NULL; rv$dk_builds <- list(); rv$dk_build_counter <- 0
+      # A Lab pool and its field belong to the old contest too.
+      rv$dk_field_ref <- NULL; rv$ll_results <- NULL; rv$ll_info <- NULL
+      rv$ll_lock_set <- character(0); rv$ll_excl_set <- character(0)
     } else if (!identical(dg, rv$sd_game_scored)) {
       rv$sd_optimal_lineups <- NULL
       rv$sd_portfolio <- NULL; rv$sd_builds <- list(); rv$sd_build_counter <- 0
