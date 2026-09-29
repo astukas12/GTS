@@ -1779,12 +1779,12 @@ SPORT_CONFIGS <- list(
     player_label_plural = "Players",
 
     detection = list(
-      # Games + Players + Goalies, and a Games tab carrying the model's log SOG
-      # matchup (lrel_h) -- no other sport's workbook has that column.
+      # Games + Players + Goalies + Model_*, and a Model_Games tab carrying the
+      # model's log SOG matchup (lrel_h) -- no other sport's workbook has that column.
       custom_detect = function(sheets, file_path = NULL) {
-        if (!all(c("Games", "Players", "Goalies") %in% sheets)) return(FALSE)
+        if (!all(c("Games", "Players", "Goalies", "Model_Games", "Model_Players") %in% sheets)) return(FALSE)
         if (is.null(file_path)) return(TRUE)
-        g <- tryCatch(suppressMessages(readxl::read_excel(file_path, sheet = "Games", n_max = 1)),
+        g <- tryCatch(suppressMessages(readxl::read_excel(file_path, sheet = "Model_Games", n_max = 1)),
                       error = function(e) NULL)
         !is.null(g) && "lrel_h" %in% names(g)
       }

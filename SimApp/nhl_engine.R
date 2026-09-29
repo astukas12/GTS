@@ -39,9 +39,23 @@ local({
 read_nhl_input <- function(file_path) {
   sheets <- readxl::excel_sheets(file_path)
   rd <- function(s) data.table::as.data.table(suppressMessages(readxl::read_excel(file_path, sheet = s)))
-  for (s in c("Games", "Players", "Goalies"))
+  for (s in c("Games", "Players", "Goalies", "Model_Games", "Model_Players"))
     if (!s %in% sheets) stop("NHL workbook is missing the '", s, "' sheet")
-  games <- rd("Games"); players <- rd("Players"); goalies <- rd("Goalies")
+  # The readable tabs carry what a person reads; Model_* carry the builder's frame.
+  # Join them back into the one frame the model takes, in the readable tabs' order.
+  join_model <- function(x, m, by, what) {
+    out <- merge(x[, .ord := .I], m, by = by, all.x = TRUE, sort = FALSE)
+    if (nrow(out) != nrow(x)) stop("NHL: duplicate ", what, " rows on the Model tab")
+    setorder(out, .ord)[, .ord := NULL]
+  }
+  mp <- rd("Model_Players")
+  games   <- join_model(rd("Games"),   rd("Model_Games"), "gameId", "game")
+  players <- join_model(rd("Players"), mp, c("gameId", "playerId"), "player")
+  goalies <- join_model(rd("Goalies"), mp, c("gameId", "playerId"), "goalie")
+  gnm <- setdiff(names(mp), c("gameId", "playerId"))                      # skater-only columns on goalie rows
+  goalies[, names(which(vapply(goalies[, ..gnm], function(v) all(is.na(v)), TRUE))) := NULL]
+  if (anyNA(games$grid_lam_h) || anyNA(players$mu_es))
+    stop("NHL: a Games / Players row has no Model_Games / Model_Players row; rebuild the sheet")
   id_sheets <- grep("^IDs_[0-9]+$", sheets, value = TRUE)
   ids <- setNames(lapply(id_sheets, rd), sub("^IDs_", "", id_sheets))
 
