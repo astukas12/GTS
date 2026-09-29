@@ -1164,15 +1164,8 @@ server <- function(input, output, session) {
   # HELPER FUNCTIONS
   # ==========================================================================
   
-  prepare_optimization_data <- function(sim_results, metadata, platform) {
-    score_col  <- if (platform == "SD") "DKScore"              else paste0(platform, "Score")
-    salary_col <- if (platform == "SD") "SDSalary"             else paste0(platform, "Salary")
-    setDT(sim_results); setDT(metadata)
-    opt_data <- merge(sim_results, metadata[, .(Player, Salary=get(salary_col))], by="Player")
-    opt_data[, FantasyPoints := get(score_col)]
-    opt_data[Salary > 0 & !is.na(Salary)]
-  }
-  
+  # prepare_optimization_data() lives in portfolio_helpers_universal.R.
+
   create_display_table <- function(optimal_lineups, metadata, platform) {
     if ("Captain" %in% names(optimal_lineups) && "ACaptain" %in% names(optimal_lineups)) {
       player_cols <- c("Captain", "ACaptain", grep("^Util", names(optimal_lineups), value=TRUE))
@@ -3039,23 +3032,9 @@ server <- function(input, output, session) {
   # FILTERED LINEUPS
   # ==========================================================================
   
-  # Row masks for lock / exclude.
-  # The old implementation was apply(dt[, ..cols], 1, function(r) ...), which
-  # coerces the whole player block to a character MATRIX (a full copy of the
-  # pool) and then loops row-by-row in R. On a 100k-lineup pool that was the
-  # slowest step in the filter chain, and it reran on every slider tick and
-  # every lock change. These build the same mask with vectorised column
-  # comparisons: one pass per (player x column), no matrix, no R-level loop.
-  has_all_players <- function(dt, cols, players) {
-    if (!length(players) || !length(cols)) return(rep(TRUE, nrow(dt)))
-    Reduce(`&`, lapply(players, function(p)
-      Reduce(`|`, lapply(cols, function(cc) !is.na(dt[[cc]]) & dt[[cc]] == p))))
-  }
-  has_no_players <- function(dt, cols, players) {
-    if (!length(players) || !length(cols)) return(rep(TRUE, nrow(dt)))
-    !Reduce(`|`, lapply(players, function(p)
-      Reduce(`|`, lapply(cols, function(cc) !is.na(dt[[cc]]) & dt[[cc]] == p))))
-  }
+  # Row masks for lock / exclude (has_all_players / has_no_players) and the
+  # filter chain itself (portfolio_filter_pool) live in
+  # portfolio_helpers_universal.R, so the contest review runs the same code.
 
   make_filtered_lineups <- function(lp) {
     reactive({
@@ -3064,43 +3043,24 @@ server <- function(input, output, session) {
       # returns a NEW data.table rather than modifying in place, and the only
       # `:=` downstream (add_build) runs on a fresh sampled subset. Copying the
       # whole pool here cost a full deep copy on every single invalidation.
-      lineups <- optimal
       rate_pairs <- list(c("WinRate","win"),c("Top1Pct","top1"),c("Top5Pct","top5"),
                          c("Top10Pct","top10"),c("Top20Pct","top20"))
-      for (rp in rate_pairs) {
-        v <- input[[paste0(lp,"_min_",rp[2])]]
-        if (!is.null(v) && v > 0 && rp[1] %in% names(lineups))
-          lineups <- lineups[get(rp[1]) >= v]
-      }
+      min_rates <- setNames(lapply(rate_pairs, function(rp) input[[paste0(lp,"_min_",rp[2])]]),
+                            vapply(rate_pairs, `[`, "", 1))
+      # Slider ids carry the optimiser run's version. Shiny keeps an input's
+      # last value after its slider is gone, so portfolio_filter_pool() skips
+      # any column that does not vary in this pool (a showdown's AvgOwn is 0
+      # everywhere; a stale classic "AvgOwn >= 2.x" range once emptied it).
       slider_ver <- rv[[paste0(lp,"_slider_v")]]
-      # Only filter on a column make_range_sliders would actually draw a slider
-      # for. Every optimiser run resets the slider version to 0 and bumps it to
-      # 1, so slider ids repeat across runs, and Shiny keeps an input's last
-      # value after its slider is gone. A showdown slate has no ownership
-      # (AvgOwn is 0 on every lineup), so no Avg Own slider is drawn -- but the
-      # classic run's "dk_filter_AvgOwn_v1" range was still sitting in `input`
-      # and filtered AvgOwn >= 2.x, emptying the Portfolio Builder.
-      has_range <- function(col) {
-        x <- optimal[[col]]
-        mn <- suppressWarnings(min(x, na.rm=TRUE)); mx <- suppressWarnings(max(x, na.rm=TRUE))
-        is.finite(mn) && is.finite(mx) && mn != mx
-      }
+      ranges <- list()
       sv <- input[[paste0(lp,"_filter_TotalSalary_v",slider_ver)]]
-      if (!is.null(sv) && "TotalSalary" %in% names(lineups) && has_range("TotalSalary"))
-        lineups <- lineups[TotalSalary >= sv[1]*1000 & TotalSalary <= sv[2]*1000]
-      num_cols   <- names(lineups)[sapply(lineups, is.numeric)]
-      num_cols   <- setdiff(num_cols, grep("^Player|^Captain|^MVP",names(lineups),value=TRUE))
+      if (!is.null(sv)) ranges$TotalSalary <- sv * 1000        # slider is in $k
+      num_cols   <- names(optimal)[sapply(optimal, is.numeric)]
+      num_cols   <- setdiff(num_cols, grep("^Player|^Captain|^MVP",names(optimal),value=TRUE))
       range_cols <- setdiff(num_cols, c("WinRate","Top1Pct","Top5Pct","Top10Pct","Top20Pct","TotalSalary"))
-      for (col in range_cols) {
-        fv <- input[[paste0(lp,"_filter_",col,"_v",slider_ver)]]
-        if (is.null(fv) || !has_range(col)) next
-        # AvgOwn is a geometric mean, so ONE unowned player zeroes the whole
-        # lineup. 0 means "no ownership data", not "contrarian" -- always keep it.
-        lineups <- if (col == "AvgOwn")
-          lineups[AvgOwn == 0 | (AvgOwn >= fv[1] & AvgOwn <= fv[2])]
-        else lineups[get(col) >= fv[1] & get(col) <= fv[2]]
-      }
-      
+      for (col in range_cols) ranges[[col]] <- input[[paste0(lp,"_filter_",col,"_v",slider_ver)]]
+      lineups <- portfolio_filter_pool(optimal, min_rates = min_rates, ranges = ranges)
+
       if (isTRUE(rv$sport == "F1")) {
         cpt_cols  <- grep("^Captain",    names(lineups), value=TRUE)
         flex_cols <- grep("^Util[1-4]$", names(lineups), value=TRUE)
@@ -3127,23 +3087,11 @@ server <- function(input, output, session) {
         if (length(excl_con)   > 0 && length(con_cols) > 0)
           lineups <- lineups[has_no_players( lineups, con_cols,  excl_con)]
       } else {
-        locked   <- rv[[paste0(lp,"_lock_any")]]
-        excluded <- rv[[paste0(lp,"_excl_any")]]
-        pc <- grep("^Player|^Captain|^MVP|^Util",names(lineups),value=TRUE)
-        if (length(locked)   > 0) lineups <- lineups[has_all_players(lineups, pc, locked)]
-        if (length(excluded) > 0) lineups <- lineups[has_no_players( lineups, pc, excluded)]
-
-        # SHOWDOWN: captain and flex are separate roster spots, so they filter
-        # separately. A player locked at captain is a different constraint from
-        # the same player locked anywhere, and excluding him at captain while
-        # allowing him in flex is a normal thing to want. The CPT column in the
-        # exposure table drives these.
-        cap_cols <- grep("^Captain$|^MVP$", names(lineups), value = TRUE)
-        if (length(cap_cols)) {
-          lc <- rv[[paste0(lp,"_lock_cpt")]]; ec <- rv[[paste0(lp,"_excl_cpt")]]
-          if (length(lc)) lineups <- lineups[get(cap_cols[1]) %in% lc]
-          if (length(ec)) lineups <- lineups[!get(cap_cols[1]) %in% ec]
-        }
+        # Any-slot locks, then captain-slot locks (showdown: the CPT column in
+        # the exposure table drives these).
+        lineups <- portfolio_filter_pool(lineups,
+                                         lock = rv[[paste0(lp,"_lock_any")]], excl = rv[[paste0(lp,"_excl_any")]],
+                                         lock_cpt = rv[[paste0(lp,"_lock_cpt")]], excl_cpt = rv[[paste0(lp,"_excl_cpt")]])
 
         # TEAM-SPLIT pill filter (NFL showdown). Locked splits keep only those
         # rosters (OR across locks); excluded splits are dropped.
@@ -3655,8 +3603,8 @@ server <- function(input, output, session) {
       filtered <- switch(lp,"dk"=dk_filtered_lineups(),"fd"=fd_filtered_lineups(),"sd"=sd_filtered_lineups())
       req(filtered)
       n <- input[[paste0(lp,"_num_lineups")]]
-      if (nrow(filtered) < n) { showNotification(paste0("Only ",nrow(filtered)," available."),type="warning"); return() }
-      sampled <- filtered[sample(nrow(filtered),n)]
+      sampled <- portfolio_draw(filtered, n)
+      if (is.null(sampled)) { showNotification(paste0("Only ",nrow(filtered)," available."),type="warning"); return() }
       cnt <- paste0(lp,"_build_counter"); rv[[cnt]] <- rv[[cnt]] + 1
       raw <- input[[paste0(lp,"_build_label")]]
       lbl <- if (is.null(raw)||raw=="") paste0("Build ",rv[[cnt]]) else iconv(raw,to="UTF-8",sub="")

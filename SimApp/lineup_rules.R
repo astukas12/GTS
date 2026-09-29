@@ -101,7 +101,7 @@ lineup_rules <- function(config, metadata, platform = "DK", format = NULL,
             sal = .lr_map(meta, sal_col), fixed = list(), slots = NULL, pos = NULL,
             team = if ("Team" %in% nm) setNames(as.character(meta$Team), meta$Player) else NULL,
             game = NULL, min_teams = 0L, min_games = 0L, max_games = NA_integer_,
-            max_per_team = NA_integer_,
+            max_per_team = NA_integer_, team_skip_pos = NULL,
             max_per_game = NA_integer_, f1_stack = FALSE, type = NULL)
 
   # Game of each player: the games table where there is one (what
@@ -124,7 +124,8 @@ lineup_rules <- function(config, metadata, platform = "DK", format = NULL,
     if (is.null(R$pos)) R$slots <- list(list(NULL, roster))     # no position column: count only
     switch(sport,
       NFL_CLASSIC = , NFL_PRESEASON_CLASSIC = , CFB_CLASSIC = { R$min_teams <- 2L; R$min_games <- 2L },
-      NHL    = { R$min_teams <- 3L; R$min_games <- 2L },
+      NHL    = { R$min_teams <- 3L; R$min_games <- 2L
+                 R$team_skip_pos <- "G" },     # DK: 3 teams among the SKATERS; the goalie doesn't count
       NBA    = if (platform != "FD" && n_games >= 2L) R$max_per_game <- 7L,
       SOCCER = { if (n_games >= 2L) R$max_per_game <- 7L        # as the soccer LP: only with 2+ games,
                  if (n_teams >= 3L) { R$max_per_team <- 5L; R$min_teams <- 3L } },   # 3+ teams
@@ -256,7 +257,10 @@ lineup_legal <- function(M, R, check_positions = TRUE) {
 
   if (!is.null(R$team)) {
     TM <- matrix(R$team[M], n)
-    if (R$min_teams > 0L) keep <- fail(.lr_ndistinct(TM) >= R$min_teams, "teams")
+    TC <- TM
+    if (length(R$team_skip_pos) && !is.null(R$pos))
+      TC[matrix(vapply(M, function(p) any(R$pos[[p]] %in% R$team_skip_pos), logical(1)), n)] <- NA
+    if (R$min_teams > 0L) keep <- fail(.lr_ndistinct(TC) >= R$min_teams, "teams")
     if (!is.na(R$max_per_team)) keep <- fail(.lr_maxcount(TM) <= R$max_per_team, "per_team")
   }
   if (!is.null(R$game)) {
