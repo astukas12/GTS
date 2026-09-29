@@ -2325,7 +2325,13 @@ register_cash_game_observers <- function(input, output, session, rv) {
                     Player ~ SimID, value.var = score_col,
                     fun.aggregate = mean, fill = 0)
         sm <- as.matrix(sw[, -1, with = FALSE]); rownames(sm) <- sw$Player
-        
+        # mm's columns follow all_pl (sim order); dcast returns players
+        # ALPHABETICALLY. %*% matches by position, not name, so without this
+        # every median below was built from the wrong players' scores and the
+        # tab's 50 candidates were a random slice of the pool (CFB Sat 26 Sep:
+        # pool ranks 466-4,986 by true median). Found in the review, 29 Sep 2026.
+        sm <- sm[all_pl, , drop = FALSE]
+
         csz <- 500L; med <- numeric(n_gpp)
         for (ci in seq_len(ceiling(n_gpp / csz))) {
           i1 <- (ci - 1L) * csz + 1L; i2 <- min(ci * csz, n_gpp)
