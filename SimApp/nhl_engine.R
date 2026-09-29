@@ -440,7 +440,7 @@ find_optimal_lineups_nhl_classic <- function(sim_results, config, verbose = TRUE
   setorder(uni, -Top1Count, -AvgScore)
   if (!is.null(metadata)) {
     ok <- .nhl_classic_valid(as.matrix(uni[, ..pc]), metadata)
-    if (verbose && any(!ok)) cat(sprintf("  dropped %s lineup(s) with < 3 teams or < 2 games (before the cap)
+    if (verbose && any(!ok)) cat(sprintf("  dropped %s lineup(s) with skaters from < 3 teams or < 2 games (before the cap)
 ",
                                          format(sum(!ok), big.mark = ",")))
     uni <- uni[ok]
@@ -454,13 +454,16 @@ find_optimal_lineups_nhl_classic <- function(sim_results, config, verbose = TRUE
   list(unique_lineups = uni, n_sims = n_sims_full, config = config, mode = "nhl_classic")
 }
 
-# DK NHL classic: players from at least 3 teams, and at least 2 games.
+# DK NHL classic: SKATERS from at least 3 teams, and players from at least 2
+# games. The goalie does not count toward the 3 teams (DK rejected a BOS / EDM
+# skater stack with an MTL goalie, 29 Sep 2026), so his team is blanked first.
 .nhl_classic_valid <- function(M, metadata) {
   n_distinct <- function(X) {   # distinct values per row, vectorised: sort each row, count changes
     X <- t(apply(X, 1L, sort, na.last = TRUE))
     1L + rowSums(X[, -1L, drop = FALSE] != X[, -ncol(X), drop = FALSE], na.rm = TRUE)
   }
   tm <- matrix(metadata$Team[match(M, metadata$Player)], nrow(M))
+  if ("Pos" %in% names(metadata)) tm[matrix(metadata$Pos[match(M, metadata$Player)] %in% "G", nrow(M))] <- NA
   gm <- matrix(metadata$GameKey[match(M, metadata$Player)], nrow(M))
   n_distinct(tm) >= 3L & n_distinct(gm) >= 2L
 }
