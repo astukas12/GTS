@@ -103,7 +103,7 @@ nhl_player_table <- function(input_data, classic_dg = input_data$classic_dgs[1])
     fl <- getid(paste0("id_", dg))[r]; cp <- getid(paste0("cid_", dg))[r]
     T[r, `:=`(SDID = fl, SDCID = cp, SDSalary = sal_of(dg, fl), CPTSalary = sal_of(dg, cp))]
   }
-  T[, `:=`(PosGroup = Pos, DKOwn = NA_real_)]
+  T[, DKOwn := NA_real_]
   T[]
 }
 
@@ -145,7 +145,7 @@ run_nhl_simulation <- function(input_data, n_sims = 10000, config = NULL, progre
   sims <- sims[!is.na(Player), .(SimID, Player, DKScore)]
   setorder(sims, SimID, Player)
 
-  meta <- T[, .(Player, Team = team, Opp = opp, Pos, PosGroup, DKPos, Line = slot, PP = pp,
+  meta <- T[, .(Player, Team = team, Opp = opp, Pos, DKPos, Line = slot, PP = pp,
                 DKID, DKUID, DKSalary, DKOwn, SDID, SDCID, SDSalary, CPTSalary,
                 GameKey, ShowdownFile, playerId)]
   pr <- sims[, .(DKProj = mean(DKScore)), by = Player]

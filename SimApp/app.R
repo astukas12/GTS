@@ -681,6 +681,8 @@ server <- function(input, output, session) {
     rv$sport_visuals       <- NULL
     rv$full_sim_results    <- NULL
     rv$nhl_classic_dg      <- NULL   # a fresh NHL sim's metadata points at the main classic
+    rv$nhl_slate           <- NULL   # "C:<dg>" / "S:<dg>" -- NULL is the main classic
+    rv$sd_game_scored      <- NULL   # the showdown the SD pool was built for
     # Lineup Lab pools belong to the sim that produced them -- a new sim (or a
     # slate switch) invalidates them exactly like the main pool.
     rv$ll_results          <- NULL
@@ -1850,7 +1852,7 @@ server <- function(input, output, session) {
         # DK classic C C W W W D D G UTIL, $50k: find_optimal_lineups_nhl_classic
         # (nhl_engine.R) -- the NFL classic method with NHL's slot bounds -- then
         # DK's 3-team / 2-game rule. No NHL ownership source yet, so no AvgOwn.
-        # The classic is whichever one input$nhl_classic_select points
+        # The classic is whichever one the SLATE pill (input$nhl_slate_select) points
         # rv$sim_metadata at (the main classic by default).
         progress$set(message="Finding optimal DraftKings lineups...", value=0)
         opt_data <- prepare_optimization_data(rv$simulation_results, rv$sim_metadata, "DK")
@@ -2317,10 +2319,11 @@ server <- function(input, output, session) {
         # band is enumerated and ranked (enum_captain); Team rides along for
         # DK's both-teams rule.
         sd_meta <- copy(rv$sim_metadata); setDT(sd_meta)
-        selected_sd <- if (!is.null(input$sd_game_select)) input$sd_game_select else {
+        selected_sd <- if (startsWith(rv$nhl_slate %||% "", "S:")) sub("^S:", "", rv$nhl_slate) else {
           sdf <- unique(sd_meta[!is.na(ShowdownFile) & ShowdownFile != "", ShowdownFile])
           if (length(sdf)) sdf[1] else stop("No showdown game found on this slate.")
         }
+        rv$sd_game_scored <- selected_sd
         sd_meta <- sd_meta[!is.na(ShowdownFile) & ShowdownFile == selected_sd &
                            !is.na(SDID) & SDID != "" & !is.na(SDSalary)]
         if (nrow(sd_meta) == 0) stop(sprintf("No players found for showdown: %s", selected_sd))
@@ -2579,7 +2582,7 @@ server <- function(input, output, session) {
     # Gate the picker on available_platforms(), NOT config$platforms: the two
     # disagreeing is exactly what put a game picker on screen with no Score
     # Showdown button beside it.
-    sd_game_selector <- if (isTRUE(rv$sport %in% c("CBB","NBA","SOCCER","NFL_PRESEASON_CLASSIC","NHL")) && "SD" %in% available_platforms() &&
+    sd_game_selector <- if (isTRUE(rv$sport %in% c("CBB","NBA","SOCCER","NFL_PRESEASON_CLASSIC")) && "SD" %in% available_platforms() &&
                             !is.null(rv$input_data$games)) {
       games_with_sd <- rv$input_data$games[!is.na(ShowdownFile) & ShowdownFile != ""]
       if (nrow(games_with_sd) > 1) {
@@ -2601,35 +2604,48 @@ server <- function(input, output, session) {
         )
       }
     }
-    # NHL: one workbook serves every DK classic of the night (main + late).
-    # A pill re-points the metadata's classic ids / salaries; nothing re-sims.
-    nhl_classic_selector <- if (isTRUE(rv$sport == "NHL") && length(rv$input_data$classic_dgs) > 1) {
+    # NHL: one workbook serves every DK contest of the night -- each classic
+    # (main + late) and each game's showdown. As on NFL, one SLATE pill row
+    # picks the contest and a single Score DraftKings button scores it. A
+    # classic pick re-points the metadata's classic ids / salaries; nothing
+    # re-sims either way.
+    nhl_slate_selector <- NULL
+    if (isTRUE(rv$sport == "NHL") && !is.null(rv$input_data)) {
       dgs <- rv$input_data$classic_dgs
-      cur <- rv$nhl_classic_dg %||% dgs[1]
-      lab <- vapply(dgs, function(g) {
+      cl_lab <- vapply(dgs, function(g) {
         gi <- unique(rv$input_data$ids[[g]]$`Game Info`)
         tm <- sort(unique(sub("^.* ([0-9]{1,2}:[0-9]{2}[AP]M) ET$", "\\1", gi)))
-        sprintf("%s %d games, %s", if (g == dgs[1]) "MAIN" else "LATE", length(gi), tm[1])
+        sprintf("%s - %d game, %s", if (g == dgs[1]) "Main" else "Late", length(gi), tm[1])
       }, "")
-      div(id = "nhl_classic_pills", style = "margin-bottom:14px;",
+      sdg <- if (!is.null(rv$input_data$games))
+        rv$input_data$games[!is.na(ShowdownFile) & ShowdownFile != ""] else NULL
+      keys <- c(if (length(dgs)) paste0("C:", dgs), if (!is.null(sdg)) paste0("S:", sdg$ShowdownFile))
+      labs <- c(cl_lab, if (!is.null(sdg)) paste("Showdown -", sdg$GameKey))
+      cur  <- rv$nhl_slate %||% keys[1]
+      if (length(keys) > 1)
+        nhl_slate_selector <- div(id = "nhl_slate_pills", style = "margin-bottom:14px;",
           span(class = "gts-sr-label",
                style = "margin-right:10px;color:#FFE500;font-size:11px;font-weight:700;letter-spacing:.06em;",
-               "DK CLASSIC:"),
-          lapply(seq_along(dgs), function(i)
-            tags$button(class = paste("gts-pill", if (dgs[i] == cur) "active" else ""),
-                        onclick = sprintf("Shiny.setInputValue('nhl_classic_select','%s',{priority:'event'});", dgs[i]),
-                        lab[i])))
+               "SLATE:"),
+          lapply(seq_along(keys), function(i)
+            tags$button(class = paste("gts-pill", if (keys[i] == cur) "active" else ""),
+                        onclick = sprintf("Shiny.setInputValue('nhl_slate_select','%s',{priority:'event'});", keys[i]),
+                        labs[i])))
     }
     # Use available_platforms() so FD/SD are hidden when data is absent
     active_plats <- available_platforms()
+    # NHL: the slate pill decides which optimiser the one button runs.
+    if (isTRUE(rv$sport == "NHL"))
+      active_plats <- if (startsWith(rv$nhl_slate %||% "C:", "S:")) "SD" else "DK"
     fluidRow(box(title="Lineup Scoring", status="warning", solidHeader=TRUE, width=12,
                  p("Find and score optimal lineups across all platforms:"),
                  cfb_slate_selector,
                  nfl_slate_selector,
-                 nhl_classic_selector,
+                 nhl_slate_selector,
                  sd_game_selector,
                  fluidRow(lapply(active_plats, function(platform) {
                    pname <- switch(platform,"DK"="DraftKings","FD"="FanDuel","SD"="Showdown")
+                   if (isTRUE(rv$sport == "NHL")) pname <- "DraftKings"
                    column(6, actionButton(paste0("run_",tolower(platform),"_optimization"),
                                           paste("Score", pname), class="btn-warning btn-block",
                                           style="margin-bottom:10px;font-size:16px;padding:12px;"))
@@ -2642,19 +2658,25 @@ server <- function(input, output, session) {
     ))
   })
 
-  # NHL classic picker: same sim, the other contest's DK ids and salaries.
-  # Players not in that classic lose their DKID and drop out of the DK pool.
-  # The DK pool and portfolio belong to the old contest, so they go.
-  observeEvent(input$nhl_classic_select, {
+  # NHL slate picker. A classic: same sim, that contest's DK ids and salaries
+  # (players not in it lose their DKID and drop out of the DK pool); the DK
+  # pool and portfolio belong to the old contest, so they go. A showdown: the
+  # SD optimiser scores that game next; an SD pool from another game goes.
+  observeEvent(input$nhl_slate_select, {
     req(isTRUE(rv$sport == "NHL"), rv$sim_metadata, rv$input_data)
-    dg <- input$nhl_classic_select
-    if (identical(dg, rv$nhl_classic_dg %||% rv$input_data$classic_dgs[1])) return()
-    rv$sim_metadata <- nhl_metadata_for_classic(rv$sim_metadata, rv$input_data, dg)
-    rv$nhl_classic_dg <- dg
-    rv$dk_optimal_lineups <- NULL
-    rv$dk_portfolio <- NULL; rv$dk_builds <- list(); rv$dk_build_counter <- 0
-    showNotification(sprintf("DK classic set to %s: %d priced players. Score DraftKings again.",
-                             dg, rv$sim_metadata[!is.na(DKID), .N]), type = "message", duration = 5)
+    key <- input$nhl_slate_select
+    dg  <- sub("^[CS]:", "", key)
+    rv$nhl_slate <- key
+    if (startsWith(key, "C:")) {
+      if (identical(dg, rv$nhl_classic_dg %||% rv$input_data$classic_dgs[1])) return()
+      rv$sim_metadata <- nhl_metadata_for_classic(rv$sim_metadata, rv$input_data, dg)
+      rv$nhl_classic_dg <- dg
+      rv$dk_optimal_lineups <- NULL
+      rv$dk_portfolio <- NULL; rv$dk_builds <- list(); rv$dk_build_counter <- 0
+    } else if (!identical(dg, rv$sd_game_scored)) {
+      rv$sd_optimal_lineups <- NULL
+      rv$sd_portfolio <- NULL; rv$sd_builds <- list(); rv$sd_build_counter <- 0
+    }
   }, ignoreInit = TRUE)
 
   # Picking a contest on Tournament Lineups re-slices the ALREADY-SIMULATED
@@ -3226,7 +3248,7 @@ server <- function(input, output, session) {
       has_nfl_cptown <- is_nfl_sd && cptown_col %in% names(rv$sim_metadata) &&
                         any(rv$sim_metadata[[cptown_col]] > 0, na.rm = TRUE)
       split_own  <- (is_nba && is_sd) || is_cfb || has_nfl_cptown
-      salary_col <- if (is_sd) "DKSalary" else paste0(platform, "Salary")
+      salary_col <- if (is_sd) { if ("SDSalary" %in% names(rv$sim_metadata)) "SDSalary" else "DKSalary" } else paste0(platform, "Salary")
       own_col    <- if (is_sd) NULL        else paste0(platform, "Own")
       cpt_cols  <- grep("^Captain", names(filtered), value=TRUE)
       util_cols <- grep("^Util",    names(filtered), value=TRUE)
@@ -3236,11 +3258,7 @@ server <- function(input, output, session) {
       has_captain <- length(cpt_cols) > 0
       n_lineups  <- nrow(filtered)
       all_counts <- table(unlist(filtered[, ..all_pc]))
-      meta_players <- if (is_sd) {
-        rv$sim_metadata[!is.na(SDSalary) & SDSalary > 0, Player]
-      } else {
-        rv$sim_metadata$Player
-      }
+      meta_players <- slate_meta(tolower(platform))$Player
       # Vectorised count lookup. This was a for-loop doing `exp_tbl$col[i] <- ..`
       # per player, which reallocates the column on every iteration -- O(n^2)
       # copying on a 200+ player slate, three times over (total/cpt/util).
@@ -3805,7 +3823,7 @@ server <- function(input, output, session) {
       has_nfl_cptown <- is_nfl_sd && cptown_col %in% names(rv$sim_metadata) &&
                         any(rv$sim_metadata[[cptown_col]] > 0, na.rm = TRUE)
       split_own <- (is_nba && is_sd) || is_cfb || has_nfl_cptown
-      salary_col <- if (is_sd) "DKSalary" else paste0(platform, "Salary")
+      salary_col <- if (is_sd) { if ("SDSalary" %in% names(rv$sim_metadata)) "SDSalary" else "DKSalary" } else paste0(platform, "Salary")
       own_col    <- if (is_sd) NULL        else paste0(platform, "Own")
       cpt_cols  <- grep("^Captain", names(port), value=TRUE)
       util_cols <- grep("^Util",    names(port), value=TRUE)
@@ -3813,9 +3831,7 @@ server <- function(input, output, session) {
       if (is_nfl_sd && !length(util_cols)) util_cols <- grep("^Player[0-9]", names(port), value=TRUE)
       all_pc    <- grep("^Player|^Captain|^MVP|^Util|^G[1-4]$|^F[1-3]$|^C1$", names(port), value=TRUE)
       has_captain <- length(cpt_cols) > 0
-      meta_players <- if (is_sd) {
-        rv$sim_metadata[!is.na(SDSalary) & SDSalary > 0, Player]
-      } else rv$sim_metadata$Player
+      meta_players <- slate_meta(tolower(platform))$Player
       
       # Helper: compute per-player exposure % for a subset of lineups
       compute_exp <- function(sub_port) {
@@ -4203,7 +4219,7 @@ server <- function(input, output, session) {
       # show, rolled up by pos/team/game, over whatever the pill filter left.
       n <- nrow(port)
       cnt <- if (n && length(all_pc)) table(unlist(port[, ..all_pc])) else table(character(0))
-      meta_players <- rv$sim_metadata$Player
+      meta_players <- slate_meta(lp)$Player
       pct <- if (n) { v <- as.numeric(cnt[meta_players]); v[is.na(v)] <- 0; v / n * 100 }
              else rep(0, length(meta_players))
       mc  <- intersect(c("Player","Pos","PosGroup","DKPos","FDPos","Team"), names(rv$sim_metadata))
@@ -4243,7 +4259,7 @@ server <- function(input, output, session) {
                     # instead of the one each was built with.
     renderUI({
       req(rv$sim_metadata)
-      filter_pills_ui(prefix, rv$sim_metadata, exclude_lp = exclude_lp)
+      filter_pills_ui(prefix, slate_meta(sub("^.*_", "", prefix)), exclude_lp = exclude_lp)
     })
   }
   # EXCLUDE SELECTED: push every player the pill row currently matches (team,
@@ -4523,6 +4539,24 @@ server <- function(input, output, session) {
   # position) instead of clicking EXCL down a 20-player roster. NULL (the
   # projections-table filter row, which has no lock/excl concept) renders
   # the pill row exactly as before.
+  # The players on the slate a platform's pool was built for: priced on that
+  # platform, and on a showdown only the game that was scored. The exposure
+  # tables and their pills list these, not every player the sim drew -- a
+  # multi-contest sheet (NHL main + late, one game's showdown) sims the whole
+  # night, and a player who could never be rostered is not a 0% finding.
+  # Falls back to every player when the platform carries no salaries.
+  slate_meta <- function(lp) {
+    m <- rv$sim_metadata
+    if (is.null(m) || !nrow(m)) return(m)
+    m <- as.data.table(m)
+    sal <- if (identical(lp, "sd")) "SDSalary" else paste0(toupper(lp), "Salary")
+    if (sal %in% names(m) && any(m[[sal]] > 0, na.rm = TRUE))
+      m <- m[!is.na(get(sal)) & get(sal) > 0]
+    if (identical(lp, "sd") && !is.null(rv$sd_game_scored) && "ShowdownFile" %in% names(m))
+      m <- m[ShowdownFile %in% rv$sd_game_scored]
+    m
+  }
+
   filter_pills_ui <- function(prefix, meta, exclude_lp = NULL) {
     if (is.null(meta) || !nrow(meta)) return(NULL)
     meta <- as.data.table(meta)
@@ -4563,7 +4597,7 @@ server <- function(input, output, session) {
         pill_row("pos",  "POS",  pos_vals),
         pill_row("team", "TEAM", team_vals),
         pill_row("game", "GAME", game_vals,
-                 show = function(v) sub("\\s+", " @ ", v)),
+                 show = function(v) sub("\\s+(@\\s+)?", " @ ", v)),   # NHL keys already carry the @
         div(class = "gts-pf-row",
             span(class = "gts-pf-clear", onclick = clear_js, "✕ CLEAR"),
             excl_btn),
@@ -4647,7 +4681,7 @@ server <- function(input, output, session) {
       if (uniqueN(dg$GameKey) > 1) {
         t <- dg[, .(val = sum(get(value_col), na.rm = TRUE)), by = GameKey]
         game_tbl <- setnames(t, "GameKey", "key")[order(-val)]
-        game_tbl[, key := sub("\\s+", " @ ", key)]
+        game_tbl[, key := sub("\\s+(@\\s+)?", " @ ", key)]
       }
     }
     rows <- Filter(Negate(is.null), list(tile_row("POS", pos_tbl), tile_row("TEAM", team_tbl),

@@ -1802,7 +1802,7 @@ SPORT_CONFIGS <- list(
 
     metadata_columns = list(
       list(name = "Team",     label = "Team",     type = "text", display = TRUE,  filter = TRUE),
-      list(name = "PosGroup", label = "Position", type = "text", display = TRUE,  filter = TRUE),
+      list(name = "Pos",      label = "Position", type = "text", display = TRUE,  filter = TRUE),
       list(name = "GameKey",  label = "Game",     type = "text", display = FALSE, filter = FALSE)
     ),
 
