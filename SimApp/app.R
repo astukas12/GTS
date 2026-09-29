@@ -1865,7 +1865,7 @@ server <- function(input, output, session) {
                            candidate_top_n=rv$config$candidate_top_n %||% 40L,
                            use_parallel=TRUE)
         progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
-        lineup_data <- find_optimal_lineups_nhl_classic(opt_data, opt_config, verbose=TRUE)
+        lineup_data <- find_optimal_lineups_nhl_classic(opt_data, opt_config, verbose=TRUE, metadata=rv$sim_metadata)
         lineup_data <- nhl_drop_invalid_classic(lineup_data, rv$sim_metadata)
         progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
                                     format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)

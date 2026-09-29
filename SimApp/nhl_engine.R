@@ -343,7 +343,10 @@ NHL_CLASSIC_SLOTS <- c("C", "C", "W", "W", "W", "D", "D", "G", "UTIL")
   out[, .(SimID, Player, slot_i)]
 }
 
-find_optimal_lineups_nhl_classic <- function(sim_results, config, verbose = TRUE) {
+# `metadata` (Player / Team / GameKey), when given, applies DK's 3-team / 2-game
+# rule BEFORE the max_lineups cut, so the pool fills to the cap with legal
+# lineups instead of being cut first and thinned after.
+find_optimal_lineups_nhl_classic <- function(sim_results, config, verbose = TRUE, metadata = NULL) {
   setDT(sim_results)
   if (!"Pos" %in% names(sim_results)) stop("nhl_classic optimiser needs a Pos column on sim_results")
   if (!"StartOrder" %in% names(sim_results)) sim_results[, StartOrder := 1L]
@@ -421,6 +424,13 @@ find_optimal_lineups_nhl_classic <- function(sim_results, config, verbose = TRUE
   mu  <- setNames(pm$mu, pm$Player)
   uni[, AvgScore := rowSums(matrix(mu[unlist(.SD)], nrow = nrow(uni))), .SDcols = pc]
   setorder(uni, -Top1Count, -AvgScore)
+  if (!is.null(metadata)) {
+    ok <- .nhl_classic_valid(as.matrix(uni[, ..pc]), metadata)
+    if (verbose && any(!ok)) cat(sprintf("  dropped %s lineup(s) with < 3 teams or < 2 games (before the cap)
+",
+                                         format(sum(!ok), big.mark = ",")))
+    uni <- uni[ok]
+  }
   if (nrow(uni) > max_lineups) uni <- head(uni, max_lineups)
   sal <- setNames(pm$sal, pm$Player)
   uni[, TotalSalary := rowSums(matrix(sal[unlist(.SD)], nrow = nrow(uni))), .SDcols = pc]
@@ -431,13 +441,20 @@ find_optimal_lineups_nhl_classic <- function(sim_results, config, verbose = TRUE
 }
 
 # DK NHL classic: players from at least 3 teams, and at least 2 games.
+.nhl_classic_valid <- function(M, metadata) {
+  n_distinct <- function(X) {   # distinct values per row, vectorised: sort each row, count changes
+    X <- t(apply(X, 1L, sort, na.last = TRUE))
+    1L + rowSums(X[, -1L, drop = FALSE] != X[, -ncol(X), drop = FALSE], na.rm = TRUE)
+  }
+  tm <- matrix(metadata$Team[match(M, metadata$Player)], nrow(M))
+  gm <- matrix(metadata$GameKey[match(M, metadata$Player)], nrow(M))
+  n_distinct(tm) >= 3L & n_distinct(gm) >= 2L
+}
+
 nhl_drop_invalid_classic <- function(lineup_data, metadata) {
   ul <- lineup_data$unique_lineups; pc <- grep("^Player[0-9]+$", names(ul), value = TRUE)
   if (!nrow(ul)) return(lineup_data)
-  M <- as.matrix(ul[, ..pc])
-  tm <- matrix(metadata$Team[match(M, metadata$Player)], nrow(M))
-  gm <- matrix(metadata$GameKey[match(M, metadata$Player)], nrow(M))
-  ok <- apply(tm, 1L, function(r) length(unique(r)) >= 3L) & apply(gm, 1L, function(r) length(unique(r)) >= 2L)
+  ok <- .nhl_classic_valid(as.matrix(ul[, ..pc]), metadata)
   if (any(!ok)) cat(sprintf("  dropped %d lineup(s) with < 3 teams or < 2 games\n", sum(!ok)))
   lineup_data$unique_lineups <- ul[ok]
   lineup_data
