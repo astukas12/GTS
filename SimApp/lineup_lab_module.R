@@ -572,9 +572,9 @@ register_lineup_lab_observers <- function(input, output, session, rv, helpers) {
       }
       if (!nrow(fr)) stop("scoring returned nothing for the constrained pool")
       fr <- helpers$add_custom_metrics(fr, md, rv$config)
-      # No ownership on the sheet (NHL has no source yet): AvgOwn would read a
-      # flat 0, so it goes, as it does on that sport's main pool.
-      # (NHL carries DKOwn as an all-NA placeholder, so test the values.)
+      # No ownership on the sheet: AvgOwn would read a flat 0, so it goes, as
+      # it does on that sport's main pool. (An NHL sheet from before 30 Sep 2026
+      # carries DKOwn all NA, so test the values.)
       has_own <- own_col %in% names(md) && any(md[[own_col]] > 0, na.rm = TRUE)
       drop <- c("TotalEW", "Win6Pct", "Win5PlusPct", if (!has_own) "AvgOwn")
       for (wc in intersect(drop, names(fr)))

@@ -180,6 +180,20 @@ nfl_pool_matcher <- function() {
 NFL_EB_BWS         <- c(0.9, 1.1, 1.3, 1.6, 2.0, 2.5, 3.2)
 NFL_EB_YPC_ALPHA   <- 0.5
 NFL_RB_YPC_MIN_CAR <- 10L
+# THE RB RUSHING ASK (test 5, part 5): a fourth balancing group, each side's team
+# RB/FB rushing yards, exact, after YPC and the prop lines. Target = the lined RBs'
+# Pinnacle rushing-yard lines summed, x NFL_RUSH_MM (2021-25 RB mean/median, a
+# median line -> a mean), / the lined RBs' share of the side's RB carry_usage on
+# the sheet; under NFL_RUSH_MIN_COV of the carries lined, that side asks nothing.
+# Balanced path only, OFF by default: options(nfl.balanced_rush = TRUE), else the
+# environment variable GTS_NFL_BALANCED_RUSH (1/true/yes). Promote at |t| >= 2.
+NFL_RUSH_MM        <- 1.06
+NFL_RUSH_MIN_COV   <- 0.40
+nfl_balanced_rush <- function() {
+  o <- getOption("nfl.balanced_rush")
+  if (!is.null(o)) return(isTRUE(as.logical(o)))
+  tolower(Sys.getenv("GTS_NFL_BALANCED_RUSH", "")) %in% c("1", "true", "yes")
+}
 
 # Completion yardage bands + the league's own mix, era-adjusted pool.
 NFL_BAND_EDGES     <- c(-Inf, 2, 7, 15, 30, Inf)
@@ -345,7 +359,7 @@ nfl_pass_yard_props <- function() {
       data.table(matchup = x$id, desc = x$special$description,
                  over_id = ids[nms == "Over"][1])
     }))
-    props <- props[grepl(" Total (Passing Yards|Pass Completions)$", desc)]
+    props <- props[grepl(" Total (Passing Yards|Pass Completions|Rushing Yards)$", desc)]
     if (!nrow(props)) return(NULL)
     props[, `:=`(player = sub(" Total .*$", "", desc), stat = sub("^.* Total ", "", desc))]
     px <- rbindlist(lapply(Filter(function(x) x$period == 0 && x$key == "s;0;ou", mk), function(x)
@@ -359,16 +373,20 @@ nfl_pass_yard_props <- function() {
 
 # A prop TABLE (player, stat, line -- Pinnacle's stat names) -> the object the
 # engine takes as `.props`: the pass-yard lines, with the completions lines riding
-# along as attr "cmp". Kept as an attribute so every existing caller that reads
-# `props[player == qb, line]` for pass yards is unchanged. Shared by the SimApp
-# fetch above and the GTS/NFL review / TD-layer scripts (they read a saved board).
+# along as attr "cmp" and the rushing-yard lines as attr "rush" (the balanced
+# matcher's RB rushing ask, nfl_rush_target). Kept as attributes so every existing
+# caller that reads `props[player == qb, line]` for pass yards is unchanged. Shared
+# by the SimApp fetch above and the GTS/NFL review / TD-layer scripts (they read a
+# saved board).
 nfl_props_from_table <- function(tbl) {
   if (is.null(tbl) || !nrow(tbl)) return(NULL)
   tbl <- as.data.table(tbl)
   py <- unique(tbl[stat == "Passing Yards", .(player, line)], by = "player")
   cm <- unique(tbl[stat == "Pass Completions", .(player, line)], by = "player")
+  ry <- unique(tbl[stat == "Rushing Yards", .(player, line)], by = "player")
   if (!nrow(py) && !nrow(cm)) return(NULL)
   setattr(py, "cmp", if (nrow(cm)) cm else NULL)
+  setattr(py, "rush", if (nrow(ry)) ry else NULL)
   py
 }
 
@@ -729,7 +747,8 @@ nfl_rb_ypc_slate_prior <- function(TG, games, season, last_wt = 0.5) {
         by = c("team", "opp"), all.x = TRUE, sort = FALSE)
 }
 
-# pool rows' season-centred RB YPC per side, NA below 10 RB carries
+# pool rows' season-centred RB YPC per side, NA below 10 RB carries; plus the
+# side's RB/FB rushing yards (_rbyds, the rushing ask's column; no carry floor)
 nfl_pool_add_rb_ypc <- function(G, TG) {
   G <- copy(G); tk <- paste(TG$game_id, TG$team)          # row order kept: w aligns
   for (sd_ in c("f", "d")) {
@@ -738,8 +757,25 @@ nfl_pool_add_rb_ypc <- function(G, TG) {
     yc[is.na(car) | car < NFL_RB_YPC_MIN_CAR] <- NA_real_
     set(G, j = paste0(sd_, "_rbcar"), value = car)
     set(G, j = paste0(sd_, "_ypc_c"), value = yc)
+    set(G, j = paste0(sd_, "_rbyds"), value = TG$yds[j])
   }
   G
+}
+
+# one side's RB rushing target: c(target, coverage). `players` = the sheet's rows
+# (team, route_base, carry_usage, player); `lines` = attr(props, "rush"). NA target
+# when no RB is lined or the lined RBs carry under NFL_RUSH_MIN_COV of the side's
+# RB carry_usage. Names match on a suffix/punctuation-insensitive key.
+nfl_name_key <- function(x)
+  gsub("[^a-z]", "", sub("[[:space:]]+(jr|sr|ii|iii|iv|v)[.]?$", "", tolower(x)))
+nfl_rush_target <- function(tm, players, lines, mm = NFL_RUSH_MM, min_cov = NFL_RUSH_MIN_COV) {
+  if (is.null(players) || is.null(lines) || !nrow(lines)) return(c(NA_real_, 0))
+  P <- as.data.table(players)[team == tm & route_base == "RB" & carry_usage > 0,
+                              .(key = nfl_name_key(player), carry_usage)]
+  L <- merge(P, as.data.table(lines)[, .(key = nfl_name_key(player), line)], by = "key")
+  if (!nrow(L)) return(c(NA_real_, 0))
+  cov <- sum(L$carry_usage) / sum(P$carry_usage)
+  c(if (cov >= min_cov) sum(L$line) * mm / cov else NA_real_, cov)
 }
 
 # entropy balancing: w closest to q in KL with sum_j w_j G_j = 0 (damped Newton
@@ -804,7 +840,9 @@ nfl_eb_relax <- function(q, groups, sdv, floor_ess) {
 }
 
 # THE BALANCED MATCHER -- same return shape as nfl_pool_weights_guarded, plus
-# market_alpha, ypc_alpha, ypc_ask, ypc_pool and market_miss.
+# market_alpha, ypc_alpha, ypc_ask, ypc_pool, props_*, rush_* and market_miss.
+# rush = c(f = , d = ) the RB rushing-yard targets (nfl_rush_target; NA = that
+# side asks nothing), asked after YPC and the prop lines; NULL = no rushing ask.
 # Base: the 6-dim kernel at the game's own dims, no calibrate_target. Asks:
 # market exact, then RB YPC (ypc = c(f=, d=) matchup priors) at ypc_alpha.
 # RELAX OR REFUSE: narrowest base width (NFL_EB_BWS) that meets the market
@@ -812,10 +850,12 @@ nfl_eb_relax <- function(q, groups, sdv, floor_ess) {
 # widest base with the market only at the HARD floor, flagged; failing that,
 # stop(). It never returns a market it did not hit.
 nfl_pool_weights_balanced <- function(G, target, market, ypc = NULL, props = NULL,
+                                      rush = NULL,
                                       floor_ess = NFL_ESS_FLOOR,
                                       hard_ess  = NFL_ESS_HARDFLOOR,
                                       bws = NFL_EB_BWS, ypc_alpha = NFL_EB_YPC_ALPHA,
-                                      props_alpha = 1, ask_order = c("ypc", "props"),
+                                      props_alpha = 1, rush_alpha = 1,
+                                      ask_order = c("ypc", "props", "rush"),
                                       weights = NFL_POOL_W, exclude = NULL,
                                       verbose = TRUE) {
   groups <- list(market = list(X = cbind(G$pts_sum, G$margin),
@@ -834,6 +874,13 @@ nfl_pool_weights_balanced <- function(G, target, market, ypc = NULL, props = NUL
     extra$props <- list(X = as.matrix(G[, ..pc]),
                         t = unname(vapply(pc, function(k) props[k] %||% NA_real_, 0)),
                         amax = props_alpha)
+  }
+  # each side's RB/FB rushing yards from the board's RB lines, NA = no ask
+  if (!is.null(rush) && any(is.finite(rush))) {
+    if (!all(c("f_rbyds", "d_rbyds") %in% names(G)))
+      stop("nfl_pool_weights_balanced: G has no f_rbyds / d_rbyds (nfl_pool_add_rb_ypc)")
+    extra$rush <- list(X = cbind(G$f_rbyds, G$d_rbyds),
+                       t = unname(c(rush[["f"]], rush[["d"]])), amax = rush_alpha)
   }
   groups <- c(groups, extra[intersect(ask_order, names(extra))])
   sdv <- lapply(groups, function(g) apply(g$X, 2, sd, na.rm = TRUE))
@@ -858,6 +905,9 @@ nfl_pool_weights_balanced <- function(G, target, market, ypc = NULL, props = NUL
          ypc_pool = if (!is.null(ypc)) c(f = nfl_wmean(G$f_ypc_c, w), d = nfl_wmean(G$d_ypc_c, w)) else NULL,
          props_ask = if (!is.null(extra$props)) setNames(extra$props$t, names(pm)) else NULL,
          props_pool = pm,
+         rush_alpha = alpha_of(al, "rush"),
+         rush_ask  = if (!is.null(extra$rush)) c(f = rush[["f"]], d = rush[["d"]]) else NULL,
+         rush_pool = if (!is.null(extra$rush)) c(f = nfl_wmean(G$f_rbyds, w), d = nfl_wmean(G$d_rbyds, w)) else NULL,
          market_miss = c(total = tot - market$total, margin = mgn - market$margin))
   }
   tried <- list()
@@ -867,7 +917,8 @@ nfl_pool_weights_balanced <- function(G, target, market, ypc = NULL, props = NUL
     tried[[i]] <- data.table(rung = i - 1L, bw = bws[i], ess = nfl_ess(w),
                              market_alpha = r$alpha[1],
                              ypc_alpha = alpha_of(r$alpha, "ypc"),
-                             props_alpha = alpha_of(r$alpha, "props"))
+                             props_alpha = alpha_of(r$alpha, "props"),
+                             rush_alpha = alpha_of(r$alpha, "rush"))
     if (isTRUE(r$alpha[1] == 1)) {
       if (verbose && i > 1) cat(sprintf("[nfl] EB matcher: base width %.1f (rung %d) -- ESS %.0f\n",
                                         bws[i], i - 1L, nfl_ess(w)))
@@ -881,7 +932,7 @@ nfl_pool_weights_balanced <- function(G, target, market, ypc = NULL, props = NUL
   al <- c(r$alpha[1], rep(0, length(groups) - 1L))
   ladder <- rbind(rbindlist(tried), data.table(rung = length(bws), bw = b, ess = nfl_ess(w),
                   market_alpha = r$alpha[1], ypc_alpha = alpha_of(al, "ypc"),
-                  props_alpha = alpha_of(al, "props")))
+                  props_alpha = alpha_of(al, "props"), rush_alpha = alpha_of(al, "rush")))
   if (verbose) { cat("[nfl] EB matcher: floor not reached at any base width --\n"); print(ladder, digits = 4) }
   if (!isTRUE(r$alpha[1] == 1))
     stop(sprintf("REFUSED: NFL pool -- the widest base (%.1f) cannot hit the market at ESS %d. ", b, hard_ess),
@@ -895,8 +946,11 @@ nfl_pool_weights_balanced <- function(G, target, market, ypc = NULL, props = NUL
 # One entry point for run_nfl_simulation: the matcher the flag names.
 # kernel: the shipped path, untouched. balanced: B4 on the 6-dim base target
 # (the prop pass-yard / completion dims are kernel-only asks and are not used).
+# players / rush_lines (the sheet's rows, attr(props, "rush")) feed the RB rushing
+# ask when nfl_balanced_rush() is on; the kernel path never reads them.
 nfl_pool_match <- function(Gp, target, market, dims, weights, fav, dog,
-                           matcher = nfl_pool_matcher(), ...) {
+                           matcher = nfl_pool_matcher(), players = NULL,
+                           rush_lines = NULL, ...) {
   if (identical(matcher, "kernel"))
     return(c(list(Gp = Gp, matcher = "kernel"),
              nfl_pool_weights_guarded(Gp, target, market = market, dims = dims,
@@ -923,8 +977,18 @@ nfl_pool_match <- function(Gp, target, market, dims, weights, fav, dog,
                  function(k) market[[k]] %||% NA_real_, 0)
     if (any(is.finite(pv))) props <- pv
   }
-  c(list(Gp = Gb), nfl_pool_weights_balanced(Gb, base, mkt, ypc = ypc, props = props,
-                                             verbose = FALSE, ...))
+  # the RB rushing ask (test 5 part 5), off by default: each side's target from the
+  # board's RB lines over the sheet's RB carry_usage, in the sheet's own codes
+  rush <- NULL; rush_cov <- NULL
+  if (nfl_balanced_rush()) {
+    rf <- nfl_rush_target(fav, players, rush_lines)
+    rd <- nfl_rush_target(dog, players, rush_lines)
+    rush_cov <- c(f = rf[2], d = rd[2])
+    if (any(is.finite(c(rf[1], rd[1])))) rush <- c(f = rf[1], d = rd[1])
+  }
+  c(list(Gp = Gb, rush_cov = rush_cov),
+    nfl_pool_weights_balanced(Gb, base, mkt, ypc = ypc, props = props, rush = rush,
+                              verbose = FALSE, ...))
 }
 
 # =============================================================================
@@ -1518,13 +1582,21 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
     }
   }
 
-  r <- nfl_pool_match(Gp, target, market, dims, weights, fav, dog)
+  r <- nfl_pool_match(Gp, target, market, dims, weights, fav, dog,
+                      players = PL, rush_lines = attr(props, "rush"))
   Gp <- r$Gp                                    # the balanced path adds RB YPC columns
   if (identical(r$matcher, "balanced"))
     say(sprintf("pool matcher: balanced (B4) -- base width %.1f, market miss %+.2f / %+.2f, RB YPC alpha %s, prop lines alpha %s",
                 r$bw, r$market_miss[["total"]], r$market_miss[["margin"]],
                 if (is.finite(r$ypc_alpha)) sprintf("%.2f", r$ypc_alpha) else "n/a (no prior)",
                 if (is.finite(r$props_alpha)) sprintf("%.2f", r$props_alpha) else "n/a (no lines)"), 0.07)
+  if (identical(r$matcher, "balanced") && !is.null(r$rush_cov))
+    say(if (is.finite(r$rush_alpha))
+          sprintf("RB rushing ask: alpha %.2f -- ask f %s d %s, pool f %.1f d %.1f",
+                  r$rush_alpha, format(round(r$rush_ask[["f"]], 1)), format(round(r$rush_ask[["d"]], 1)),
+                  r$rush_pool[["f"]], r$rush_pool[["d"]])
+        else sprintf("RB rushing ask: none (lined RB coverage f %.2f d %.2f < %.2f)",
+                     r$rush_cov[["f"]], r$rush_cov[["d"]], NFL_RUSH_MIN_COV), 0.07)
   say(sprintf("pool calibrated: ESS %.0f%s, total %.1f, margin %.1f, pys f %.2f d %.2f%s",
               r$ess, if (r$relaxed) sprintf(" [relaxed to rung %d]", r$rung) else "",
               r$total, r$margin, pys_f, pys_d,

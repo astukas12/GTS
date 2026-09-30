@@ -118,7 +118,12 @@ nhl_player_table <- function(input_data, classic_dg = input_data$classic_dgs[1])
     fl <- getid(paste0("id_", dg))[r]; cp <- getid(paste0("cid_", dg))[r]
     T[r, `:=`(SDID = fl, SDCID = cp, SDSalary = sal_of(dg, fl), CPTSalary = sal_of(dg, cp))]
   }
-  T[, DKOwn := NA_real_]
+  # Projected main-classic ownership, % (build_slate.R `own` on Players /
+  # Goalies, RotoWire, from 30 Sep 2026). An older sheet has none: NA, and the
+  # app shows no AvgOwn / OwnProj / Leverage.
+  own <- rbind(P[, if ("own" %in% names(P)) .(playerId, own = as.numeric(own)) else .(playerId, own = NA_real_)],
+               GL[, if ("own" %in% names(GL)) .(playerId, own = as.numeric(own)) else .(playerId, own = NA_real_)])
+  T[, DKOwn := own$own[match(playerId, own$playerId)]]
   T[]
 }
 

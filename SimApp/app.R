@@ -1829,7 +1829,9 @@ server <- function(input, output, session) {
       } else if (rv$sport == "NHL") {
         # DK classic C C W W W D D G UTIL, $50k: find_optimal_lineups_nhl_classic
         # (nhl_engine.R) -- the NFL classic method with NHL's slot bounds -- then
-        # DK's 3-team / 2-game rule. No NHL ownership source yet, so no AvgOwn.
+        # DK's 3-team / 2-game rule. AvgOwn from the sheet's projected classic
+        # ownership (RotoWire, from 30 Sep 2026); an older sheet has none and
+        # the column is dropped, as before.
         # The classic is whichever one the SLATE pill (input$nhl_slate_select) points
         # rv$sim_metadata at (the main classic by default).
         progress$set(message="Finding optimal DraftKings lineups...", value=0)
@@ -1851,10 +1853,14 @@ server <- function(input, output, session) {
         # Lineup Lab's field, as on NFL classic (see that branch).
         rv$dk_field_ref <- field_reference(score_matrix, opt_config$percentiles)
         progress$set(detail="Phase 3: Calculating metrics...", value=0.70)
+        has_own <- any(rv$sim_metadata$DKOwn > 0, na.rm=TRUE)
+        own_data <- if (has_own) setnames(copy(rv$sim_metadata)[, .(Player, DKOwn)], "DKOwn", "Own")[, Own := Own / 100] else NULL
         final_results <- calculate_distribution_metrics(score_matrix, lineup_data, opt_config,
-                                                        ownership_data=NULL, verbose=TRUE)
-        for (wc in intersect(c("AvgOwn","TotalEW","Win6Pct","Win5PlusPct"), names(final_results)))
+                                                        ownership_data=own_data, verbose=TRUE)
+        drop_cols <- c(if (!has_own) "AvgOwn", "TotalEW","Win6Pct","Win5PlusPct")
+        for (wc in intersect(drop_cols, names(final_results)))
           final_results[, (wc) := NULL]
+        if ("AvgOwn" %in% names(final_results)) final_results[, AvgOwn := round(AvgOwn, 1)]
         rv$dk_optimal_lineups <- final_results
 
       } else if (rv$sport == "NFL_CLASSIC") {
