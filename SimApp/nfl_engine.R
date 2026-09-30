@@ -905,9 +905,12 @@ nfl_pool_match <- function(Gp, target, market, dims, weights, fav, dog,
     stop("nfl.pool_matcher must be \"kernel\" or \"balanced\", not ", matcher)
   TG  <- nfl_rb_ypc_team_games()
   Gb  <- nfl_pool_add_rb_ypc(Gp, TG)
-  pri <- nfl_rb_ypc_slate_prior(TG, data.table(team = c(fav, dog), opp = c(dog, fav)),
+  # sheet codes -> nflverse codes (the sheets say LAR, nflverse says LA; any
+  # other miss leaves ypc NULL, i.e. the market-only ask, below)
+  nv  <- function(x) ifelse(x == "LAR", "LA", x)
+  pri <- nfl_rb_ypc_slate_prior(TG, data.table(team = nv(c(fav, dog)), opp = nv(c(dog, fav))),
                                 season = max(TG$season))
-  ypc <- c(f = pri$prior[pri$team == fav], d = pri$prior[pri$team == dog])
+  ypc <- c(f = pri$prior[pri$team == nv(fav)], d = pri$prior[pri$team == nv(dog)])
   if (!all(is.finite(ypc))) ypc <- NULL      # an unknown team: market only (B1)
   base <- target[NFL_POOL_DIMS]
   mkt  <- market[c("total", "margin")]
