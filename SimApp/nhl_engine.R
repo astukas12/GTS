@@ -450,6 +450,18 @@ find_optimal_lineups_nhl_classic <- function(sim_results, config, verbose = TRUE
                                          format(sum(!ok), big.mark = ",")))
     uni <- uni[ok]
   }
+  # The cap (30 Sep 2026). Top1Count is 1 for nearly every lineup on a big
+  # classic, so the old order fell through to summed means and kept the 5,000
+  # most mean-heavy optima. Rank instead by each lineup's top-5% rate among ALL
+  # the distinct optima (ps_top_frac, OptimalLineups_Core.R; NFL/CFB classic's
+  # phase1_metric = "top5"). On the 30 Sep slate the capped pool's top-150 by
+  # Top1 then matched the uncapped pool's on 83 lineups (was 60); on the 29 Sep
+  # flagship its top-150 by Top1 cashed 19.3% (was 9.3%). "mean" restores the old cut.
+  if (nrow(uni) > max_lineups && !identical(config$phase1_metric, "mean")) {
+    t5 <- ps_top_frac(uni, pc, sim_results, "FantasyPoints", n_sims_use = 5000L, frac = 0.05)
+    if (!is.null(t5)) { uni[, top5 := t5]; setorder(uni, -top5, -AvgScore); uni[, top5 := NULL] }
+    else if (verbose) cat("  top5 ranking unavailable (Matrix / matrixStats): capping by mean\n")
+  }
   if (nrow(uni) > max_lineups) uni <- head(uni, max_lineups)
   sal <- setNames(pm$sal, pm$Player)
   uni[, TotalSalary := rowSums(matrix(sal[unlist(.SD)], nrow = nrow(uni))), .SDcols = pc]
