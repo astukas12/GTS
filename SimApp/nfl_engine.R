@@ -802,20 +802,31 @@ nfl_eb_relax <- function(q, groups, sdv, floor_ess) {
 # exactly at ESS >= floor, YPC alpha bisected within it; failing that, the
 # widest base with the market only at the HARD floor, flagged; failing that,
 # stop(). It never returns a market it did not hit.
-nfl_pool_weights_balanced <- function(G, target, market, ypc = NULL,
+nfl_pool_weights_balanced <- function(G, target, market, ypc = NULL, props = NULL,
                                       floor_ess = NFL_ESS_FLOOR,
                                       hard_ess  = NFL_ESS_HARDFLOOR,
                                       bws = NFL_EB_BWS, ypc_alpha = NFL_EB_YPC_ALPHA,
+                                      props_alpha = 1, ask_order = c("ypc", "props"),
                                       weights = NFL_POOL_W, exclude = NULL,
                                       verbose = TRUE) {
   groups <- list(market = list(X = cbind(G$pts_sum, G$margin),
                                t = c(market$total, market$margin), amax = 1))
+  extra <- list()
   if (!is.null(ypc)) {
     if (!all(c("f_ypc_c", "d_ypc_c") %in% names(G)))
       stop("nfl_pool_weights_balanced: G has no f_ypc_c / d_ypc_c (nfl_pool_add_rb_ypc)")
-    groups$ypc <- list(X = cbind(G$f_ypc_c, G$d_ypc_c),
-                       t = unname(c(ypc[["f"]], ypc[["d"]])), amax = ypc_alpha)
+    extra$ypc <- list(X = cbind(G$f_ypc_c, G$d_ypc_c),
+                      t = unname(c(ypc[["f"]], ypc[["d"]])), amax = ypc_alpha)
   }
+  # the QB prop lines: each side's pass yards and completions, NA = no line
+  # (that column drops out). Real market data, asked exactly unless ESS says no.
+  if (!is.null(props) && any(is.finite(props))) {
+    pc <- c("fpass_yds", "dpass_yds", "fcmp", "dcmp")
+    extra$props <- list(X = as.matrix(G[, ..pc]),
+                        t = unname(vapply(pc, function(k) props[k] %||% NA_real_, 0)),
+                        amax = props_alpha)
+  }
+  groups <- c(groups, extra[intersect(ask_order, names(extra))])
   sdv <- lapply(groups, function(g) apply(g$X, 2, sd, na.rm = TRUE))
   base <- function(b) {
     q <- nfl_pool_weights(G, target, bw = b, weights = weights)$w
@@ -823,14 +834,21 @@ nfl_pool_weights_balanced <- function(G, target, market, ypc = NULL,
     q
   }
   full <- function(r) { w <- numeric(nrow(G)); w[r$keep] <- r$w; w }
+  alpha_of <- function(al, g) { i <- match(g, names(groups)); if (is.na(i)) NA_real_ else al[i] }
   pack <- function(w, b, al, relaxed, rung, ladder) {
     tot <- nfl_wmean(G$pts_sum, w); mgn <- nfl_wmean(G$margin, w)
-    list(w = w, ess = nfl_ess(w), n = nrow(G), bw = b, target = target,
-         total = tot, margin = mgn, relaxed = relaxed, rung = rung, ladder = ladder,
+    pm <- if (!is.null(extra$props))
+      c(fpass_yds = nfl_wmean(G$fpass_yds, w), dpass_yds = nfl_wmean(G$dpass_yds, w),
+        fcmp = nfl_wmean(G$fcmp, w), dcmp = nfl_wmean(G$dcmp, w)) else NULL
+    list(w = w, ess = nfl_ess(w), n = nrow(G), bw = b, weights = weights,
+         target = target, total = tot, margin = mgn,
+         relaxed = relaxed, rung = rung, ladder = ladder,
          matcher = "balanced", market_alpha = al[1],
-         ypc_alpha = if (!is.null(ypc)) al[2] else NA_real_,
+         ypc_alpha = alpha_of(al, "ypc"), props_alpha = alpha_of(al, "props"),
          ypc_ask  = if (!is.null(ypc)) c(f = ypc[["f"]], d = ypc[["d"]]) else NULL,
          ypc_pool = if (!is.null(ypc)) c(f = nfl_wmean(G$f_ypc_c, w), d = nfl_wmean(G$d_ypc_c, w)) else NULL,
+         props_ask = if (!is.null(extra$props)) setNames(extra$props$t, names(pm)) else NULL,
+         props_pool = pm,
          market_miss = c(total = tot - market$total, margin = mgn - market$margin))
   }
   tried <- list()
@@ -839,32 +857,37 @@ nfl_pool_weights_balanced <- function(G, target, market, ypc = NULL,
     w <- full(r)
     tried[[i]] <- data.table(rung = i - 1L, bw = bws[i], ess = nfl_ess(w),
                              market_alpha = r$alpha[1],
-                             ypc_alpha = if (!is.null(ypc)) r$alpha[2] else NA_real_)
+                             ypc_alpha = alpha_of(r$alpha, "ypc"),
+                             props_alpha = alpha_of(r$alpha, "props"))
     if (isTRUE(r$alpha[1] == 1)) {
       if (verbose && i > 1) cat(sprintf("[nfl] EB matcher: base width %.1f (rung %d) -- ESS %.0f\n",
                                         bws[i], i - 1L, nfl_ess(w)))
       return(pack(w, bws[i], r$alpha, i > 1L, i - 1L, rbindlist(tried)))
     }
   }
+  # no width meets the market at the floor: widest base, market only, hard floor
   b <- tail(bws, 1)
   r <- nfl_eb_relax(base(b), groups["market"], sdv["market"], hard_ess)
   w <- full(r)
+  al <- c(r$alpha[1], rep(0, length(groups) - 1L))
   ladder <- rbind(rbindlist(tried), data.table(rung = length(bws), bw = b, ess = nfl_ess(w),
-                  market_alpha = r$alpha[1], ypc_alpha = if (!is.null(ypc)) 0 else NA_real_))
+                  market_alpha = r$alpha[1], ypc_alpha = alpha_of(al, "ypc"),
+                  props_alpha = alpha_of(al, "props")))
   if (verbose) { cat("[nfl] EB matcher: floor not reached at any base width --\n"); print(ladder, digits = 4) }
   if (!isTRUE(r$alpha[1] == 1))
-    stop(sprintf("REFUSED: NFL pool -- the widest base (%.1f) cannot hit the market at ESS %d. ",
-                 b, hard_ess),
+    stop(sprintf("REFUSED: NFL pool -- the widest base (%.1f) cannot hit the market at ESS %d. ", b, hard_ess),
          "No comparable game in the pool. Widen the output by hand or add the ",
          "2019-2020 low-weight tail (BUILD QUEUE part 4).")
-  pack(w, b, c(r$alpha[1], if (!is.null(ypc)) 0), TRUE, length(bws), ladder)
+  if (verbose) cat(sprintf("[nfl] EB matcher: market hit at ESS %.0f (< floor %d, >= hard %d); other asks dropped\n",
+                           nfl_ess(w), floor_ess, hard_ess))
+  pack(w, b, al, TRUE, length(bws), ladder)
 }
 
 # One entry point for run_nfl_simulation: the matcher the flag names.
 # kernel: the shipped path, untouched. balanced: B4 on the 6-dim base target
 # (the prop pass-yard / completion dims are kernel-only asks and are not used).
 nfl_pool_match <- function(Gp, target, market, dims, weights, fav, dog,
-                           matcher = getOption("nfl.pool_matcher", NFL_POOL_MATCHER)) {
+                           matcher = getOption("nfl.pool_matcher", NFL_POOL_MATCHER), ...) {
   if (identical(matcher, "kernel"))
     return(c(list(Gp = Gp, matcher = "kernel"),
              nfl_pool_weights_guarded(Gp, target, market = market, dims = dims,
@@ -879,7 +902,17 @@ nfl_pool_match <- function(Gp, target, market, dims, weights, fav, dog,
   if (!all(is.finite(ypc))) ypc <- NULL      # an unknown team: market only (B1)
   base <- target[NFL_POOL_DIMS]
   mkt  <- market[c("total", "margin")]
-  c(list(Gp = Gb), nfl_pool_weights_balanced(Gb, base, mkt, ypc = ypc, verbose = FALSE))
+  # the posted QB lines the kernel takes as dims (pass yards, and completions
+  # unless nfl.target_cmp is off) become a balancing group here: exact where
+  # posted. options(nfl.balanced_props = FALSE) asks market + YPC only (B4).
+  props <- NULL
+  if (isTRUE(getOption("nfl.balanced_props", TRUE))) {
+    pv <- vapply(c("fpass_yds", "dpass_yds", "fcmp", "dcmp"),
+                 function(k) market[[k]] %||% NA_real_, 0)
+    if (any(is.finite(pv))) props <- pv
+  }
+  c(list(Gp = Gb), nfl_pool_weights_balanced(Gb, base, mkt, ypc = ypc, props = props,
+                                             verbose = FALSE, ...))
 }
 
 # =============================================================================
@@ -1476,16 +1509,17 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
   r <- nfl_pool_match(Gp, target, market, dims, weights, fav, dog)
   Gp <- r$Gp                                    # the balanced path adds RB YPC columns
   if (identical(r$matcher, "balanced"))
-    say(sprintf("pool matcher: balanced (B4) -- base width %.1f, market miss %+.2f / %+.2f, RB YPC alpha %s",
+    say(sprintf("pool matcher: balanced (B4) -- base width %.1f, market miss %+.2f / %+.2f, RB YPC alpha %s, prop lines alpha %s",
                 r$bw, r$market_miss[["total"]], r$market_miss[["margin"]],
-                if (is.finite(r$ypc_alpha)) sprintf("%.2f", r$ypc_alpha) else "n/a (no prior)"), 0.07)
+                if (is.finite(r$ypc_alpha)) sprintf("%.2f", r$ypc_alpha) else "n/a (no prior)",
+                if (is.finite(r$props_alpha)) sprintf("%.2f", r$props_alpha) else "n/a (no lines)"), 0.07)
   say(sprintf("pool calibrated: ESS %.0f%s, total %.1f, margin %.1f, pys f %.2f d %.2f%s",
               r$ess, if (r$relaxed) sprintf(" [relaxed to rung %d]", r$rung) else "",
               r$total, r$margin, pys_f, pys_d,
-              paste0(if (r$matcher == "kernel" && (is.finite(pyds_f) || is.finite(pyds_d)))
+              paste0(if ((r$matcher == "kernel" || is.finite(r$props_alpha %||% NA)) && (is.finite(pyds_f) || is.finite(pyds_d)))
                 sprintf(", pyds f %s d %s", format(round(pyds_f,1)), format(round(pyds_d,1)))
               else "",
-              if (r$matcher == "kernel" && (is.finite(cmp_f) || is.finite(cmp_d)))
+              if ((r$matcher == "kernel" || is.finite(r$props_alpha %||% NA)) && (is.finite(cmp_f) || is.finite(cmp_d)))
                 sprintf(", cmp f %s d %s", format(round(cmp_f,1)), format(round(cmp_d,1)))
               else "")), 0.08)
 
