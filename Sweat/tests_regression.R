@@ -157,6 +157,22 @@ run("NFL Showdown (SEA@NE)",
     dims = c("Pos","Team","SalaryTier"),
     expect_sport = "Showdown", expect_key = "NFL-SD", expect_conserve = 600)
 
+nhl_xlsx <- "C:/Users/astuk/OneDrive/Documents/GTS/NHL/slates/2026-09-29/NHL_2026-09-29.xlsx"
+
+run("NHL Classic",
+    "C:/Users/astuk/Downloads/contest-standings-196200326.csv",
+    nhl_xlsx,
+    dims = c("Pos","Team","Game","SalaryTier"),
+    expect_sport = "NHL", expect_key = "NHL")
+    # No expect_conserve: this export was pulled 51% locked mid-slate, like the
+    # NFL mid-contest fixture above - the 900 invariant only holds unlocked.
+
+run("NHL Showdown",
+    "C:/Users/astuk/Downloads/contest-standings-196048641.csv",
+    nhl_xlsx,
+    dims = c("Pos","Team","SalaryTier"),
+    expect_sport = "Showdown", expect_key = "NHL-SD", expect_conserve = 600)
+
 # ---- targeted assertions ----
 say("\n===== targeted checks =====")
 shiny::testServer(server, {

@@ -17,7 +17,8 @@ Order of work, for context on why the code looks the way it does:
 1. Rebuilt the NFL sweat tool (`nflsweat/`) around a generic slot parser.
 2. Generalised that engine into `Sweat/app.r` as the main app, with a `SPORTS`
    adapter registry, and folded NFL in.
-3. Added NASCAR, then MMA classic, then MMA Showdown, then CFB.
+3. Added NASCAR, then MMA classic, then MMA Showdown, then CFB, then NFL-SD,
+   Soccer, and NHL classic / NHL Showdown.
 4. Added the Live Lineups tab (replacing the legacy Live Sweat).
 
 ## Status
@@ -40,6 +41,8 @@ Order of work, for context on why the code looks the way it does:
 | MMA | `only("F")` | opponent, weight class, salary, ML, de-vigged win prob, DKOwn | contest 193845215 + UFC 8-22 (26/26) |
 | MMA Showdown | `only("CPT","F")` | as MMA, but `SDSal`; proj. own deliberately dropped | contest 194181193 + UFC 8-22 (16/16) |
 | CFB Showdown | `{CPT,UTIL}` + CFB workbook | as CFB; `salary_util` is the showdown flex price, `salary_cpt` / `cpt_own` also carried | contest 195045051 + `2026-09-07_FSU_SMU.xlsx` (46/46) |
+| NHL Classic | `has("W")` | team, opponent, position, salary, sim proj, game/total — no proj. ownership in the workbook | contest 196200326 + `NHL_2026-09-29.xlsx` (76/90, rest unmodelled) |
+| NHL Showdown | `{CPT,FLEX}` + NHL workbook (`Goalies` sheet) | as NHL; `cpt_salary` is the Captain price | contest 196048641 + `NHL_2026-09-29.xlsx` (32/34) |
 
 Everything else (F1, NBA, CBB, Tennis, Golf, generic Showdown) parses and gives
 exposure / slots / combos / dupes, but has **no** `read_input`, so no metadata

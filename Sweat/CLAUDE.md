@@ -75,11 +75,31 @@ The app is a generic engine plus one adapter per sport.
    "rodr guez".
 
 Currently adapted: **NASCAR** (Driver sheet — team/org, car, salary, starting
-spot, DKOP projected ownership), **NFL** (IDs + Games + per-team depth sheets),
-**MMA** (Fights sheet — opponent, weight class, salary, DKOwn, de-vigged win
-probability), **MMA-SD** (captain mode) and **CFB**. Every other sport parses
-and produces exposure, slot, combo and dupe views, but has no metadata until
-someone writes its `read_input`.
+spot, DKOP projected ownership), **NFL** / **NFL-SD**, **MMA** (Fights sheet —
+opponent, weight class, salary, DKOwn, de-vigged win probability), **MMA-SD**
+(captain mode), **CFB** / **CFB-SD**, **Soccer** and **NHL** / **NHL-SD**.
+Every other sport parses and produces exposure, slot, combo and dupe views,
+but has no metadata until someone writes its `read_input`.
+
+### NHL
+
+`read_input_nhl()` reads a combined `Players` sheet (one row per skater across
+every game, keyed by `gameId`) plus a separate `Goalies` sheet, and stitches in
+`Game`/`Total` from the `Games` sheet the same way CFB stitches in its `game`
+sheet. `salary` is the classic price; `cpt_salary` prices the Captain slot for
+whichever single game carries a Showdown slate (`Games.showdown_dg`) and is NA
+everywhere else. There is no ownership-projection column anywhere in this
+workbook, for either format — `proj_own` is `NULL` on both adapters, same as
+NFL and MMA-SD.
+
+Detection: DK's `W` (wing) roster-slot label is unique to NHL Classic among
+every slot token this app knows, so `detect_sport()` matches on `has("W")`
+alone — safe even though the same lineup also carries `UTIL`, which would
+otherwise fall through to CBB. **NHL Showdown** (`CPT`/`FLEX`) is shape-
+identical to NFL and Soccer Showdown, so it resolves the same way CFB-SD does:
+`identify_workbook_family()` recognises the workbook via its `Goalies` sheet
+(unique to NHL) and `family_to_key()` upgrades to `NHL-SD` when the contest's
+slots include `CPT`.
 
 ### CFB
 

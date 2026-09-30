@@ -27,7 +27,7 @@ options(shiny.maxRequestSize = 100*1024^2)
 SLOT_TOKENS <- c("CNSTR", "CPT", "FLEX", "S-FLEX", "UTIL",
                  "QB", "RB", "WR", "TE", "DST", "K",
                  "PG", "SG", "SF", "PF", "C", "G", "F", "D", "P",
-                 "M", "GK")
+                 "M", "GK", "W")
 
 LOCKED_TOKEN <- "LOCKED"
 
@@ -559,6 +559,72 @@ read_input_nfl_sd <- function(path, sheets) {
   unique(m, by = "Key")
 }
 
+# --- NHL --------------------------------------------------------------
+# Slate workbook: a combined `Players` sheet (skaters, one row per player
+# across every game) plus a separate `Goalies` sheet, both keyed by gameId to
+# the `Games` sheet. `salary` is the classic price; `cpt_salary` is the
+# Showdown Captain price and is NA outside that slate's game. There is no
+# ownership-projection column in this workbook for either format.
+read_input_nhl <- function(path, sheets, showdown = FALSE) {
+  rd <- function(s) suppressMessages(as.data.table(readxl::read_excel(path, sheet = s)))
+  if (!"Players" %in% sheets) stop("NHL input needs a 'Players' sheet.")
+  if (!"Games" %in% sheets)   stop("NHL input needs a 'Games' sheet.")
+
+  num <- function(x, cl) if (cl %in% names(x)) suppressWarnings(as.numeric(x[[cl]]))
+                         else rep(NA_real_, nrow(x))
+  chr <- function(x, cl) if (cl %in% names(x)) trimws(as.character(x[[cl]]))
+                         else rep(NA_character_, nrow(x))
+
+  p <- rd("Players")
+  if (!"name" %in% names(p)) stop("'Players' sheet has no name column.")
+  skaters <- data.table(
+    Player    = trimws(as.character(p$name)),
+    Team      = toupper(chr(p, "team")),
+    Opp       = toupper(chr(p, "opp")),
+    Pos       = toupper(chr(p, "dk_pos")),
+    Salary    = num(p, "salary"),
+    SalaryCpt = num(p, "cpt_salary"),
+    Proj      = num(p, "sim_dk"),
+    Line      = chr(p, "slot")
+  )
+
+  goalies <- NULL
+  if ("Goalies" %in% sheets) {
+    g <- rd("Goalies")
+    goalies <- data.table(
+      Player    = trimws(as.character(g$name)),
+      Team      = toupper(chr(g, "team")),
+      Opp       = NA_character_,
+      Pos       = "G",
+      Salary    = num(g, "salary"),
+      SalaryCpt = rep(NA_real_, nrow(g)),
+      Proj      = num(g, "sim_dk"),
+      Line      = chr(g, "status")
+    )
+  }
+
+  m <- rbindlist(list(skaters, goalies), fill = TRUE)
+  m <- m[!is.na(Player) & nzchar(Player)]
+  if (!nrow(m)) stop("No player rows found in this workbook.")
+
+  gm <- rd("Games")
+  for (cl in c("away", "home")) if (!cl %in% names(gm)) stop("'Games' sheet has no ", cl, " column.")
+  gkey <- paste0(trimws(as.character(gm$away)), "@", trimws(as.character(gm$home)))
+  gl <- rbind(
+    data.table(Team = toupper(trimws(as.character(gm$away))), Game = gkey, Total = num(gm, "total")),
+    data.table(Team = toupper(trimws(as.character(gm$home))), Game = gkey, Total = num(gm, "total"))
+  )
+  m <- merge(m, unique(gl[!is.na(Team)], by = "Team"), by = "Team", all.x = TRUE)
+
+  if (!showdown) m[, SalaryCpt := NULL]
+
+  m[, SalaryTier := bucket_quantile(
+      Salary, 4,
+      fmt = function(v) paste0("$", formatC(round(v), format = "d", big.mark = ",")))]
+  m[, Key := norm_name(Player)]
+  unique(m, by = "Key")
+}
+
 SPORTS <- list(
   NASCAR = list(
     label      = "NASCAR",
@@ -626,6 +692,29 @@ SPORTS <- list(
     # Proj / Proj Own % / Proj CPT % render in their own section under the
     # exposure table, not inline - see the My Sweat projections block.
     proj_own   = "ProjOwn"
+  ),
+  NHL = list(
+    label      = "NHL Classic",
+    entity     = "Player",
+    slots      = c("C", "W", "D", "G", "UTIL"),
+    read_input = read_input_nhl,
+    input_hint = "slate workbook (Players + Goalies + Games sheets)",
+    group_dims = c("Position" = "Pos", "Team" = "Team", "Game" = "Game",
+                   "Salary Tier" = "SalaryTier"),
+    extra_cols = c("Pos" = "Pos", "Team" = "Team", "Game" = "Game",
+                   "Salary" = "Salary", "Proj" = "Proj"),
+    proj_own   = NULL
+  ),
+  `NHL-SD` = list(
+    label      = "NHL Showdown",
+    entity     = "Player",
+    slots      = c("CPT", "FLEX"),
+    read_input = function(path, sheets) read_input_nhl(path, sheets, showdown = TRUE),
+    input_hint = "the same slate workbook as classic (cpt_salary prices the Captain slot)",
+    group_dims = c("Position" = "Pos", "Team" = "Team", "Salary Tier" = "SalaryTier"),
+    extra_cols = c("Pos" = "Pos", "Team" = "Team", "Salary" = "Salary",
+                   "CPT Salary" = "SalaryCpt", "Proj" = "Proj"),
+    proj_own   = NULL
   ),
   NBA = list(
     label = "NBA", entity = "Player",
@@ -716,6 +805,9 @@ detect_sport <- function(slot_tokens) {
   if (has("GK"))                          return("Soccer")
   if (any(c("QB", "DST") %in% tk))        return("NFL")
   if (any(c("PG", "SG", "PF") %in% tk))   return("NBA")
+  # "W" (wing) is unique to NHL Classic (C/W/D/G/UTIL) among the slot tokens
+  # this app knows, so it is unambiguous even though the set also has UTIL.
+  if (has("W"))                           return("NHL")
   # MMA Showdown is "CPT <name> F <name> ..." - the F is what separates it
   # from CBB Showdown (CPT/UTIL) and from NFL/Soccer Showdown (CPT/FLEX).
   if (only("CPT", "F"))                   return("MMA-SD")
@@ -742,6 +834,7 @@ identify_workbook_family <- function(sheets) {
     return("CFB")
   }
   if ("fights" %in% low)                         return("MMA")
+  if ("goalies" %in% low)                        return("NHL")
   if ("ids" %in% low)                            return("NFL")
   if ("driver" %in% low)                         return("NASCAR")
   NA_character_
@@ -755,6 +848,7 @@ family_to_key <- function(family, showdown) {
   if (family == "CFB") return(if (showdown) "CFB-SD" else "CFB")
   if (family == "MMA") return(if (showdown) "MMA-SD" else "MMA")
   if (family == "NFL") return(if (showdown) "NFL-SD" else "NFL")
+  if (family == "NHL") return(if (showdown) "NHL-SD" else "NHL")
   family
 }
 
