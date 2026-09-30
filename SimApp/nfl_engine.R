@@ -168,6 +168,15 @@ NFL_ESS_HARDFLOOR  <- 60
 # options(nfl.pool_matcher = "balanced") switches one run; default stays kernel
 # until the build-side A/B says flip.
 NFL_POOL_MATCHER   <- "kernel"
+# which one a run uses: options(nfl.pool_matcher) first, then the environment
+# variable GTS_NFL_POOL_MATCHER (an operator's machine, e.g. ~/.Renviron -- the
+# app and the headless reviews then agree), then the shipped default.
+nfl_pool_matcher <- function() {
+  m <- getOption("nfl.pool_matcher")
+  if (is.null(m) || !nzchar(m)) m <- Sys.getenv("GTS_NFL_POOL_MATCHER", "")
+  if (!nzchar(m)) m <- NFL_POOL_MATCHER
+  m
+}
 NFL_EB_BWS         <- c(0.9, 1.1, 1.3, 1.6, 2.0, 2.5, 3.2)
 NFL_EB_YPC_ALPHA   <- 0.5
 NFL_RB_YPC_MIN_CAR <- 10L
@@ -887,7 +896,7 @@ nfl_pool_weights_balanced <- function(G, target, market, ypc = NULL, props = NUL
 # kernel: the shipped path, untouched. balanced: B4 on the 6-dim base target
 # (the prop pass-yard / completion dims are kernel-only asks and are not used).
 nfl_pool_match <- function(Gp, target, market, dims, weights, fav, dog,
-                           matcher = getOption("nfl.pool_matcher", NFL_POOL_MATCHER), ...) {
+                           matcher = nfl_pool_matcher(), ...) {
   if (identical(matcher, "kernel"))
     return(c(list(Gp = Gp, matcher = "kernel"),
              nfl_pool_weights_guarded(Gp, target, market = market, dims = dims,
