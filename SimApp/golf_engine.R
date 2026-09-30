@@ -208,7 +208,7 @@ simulate_golf_positions <- function(dist, n_sims) {
         n_cut <- sum(cut_makers)
         if (n_cut < 65) {
           mi      <- which(!cut_makers)
-          promote <- mi[order(mc_score[mi], decreasing = TRUE)[seq_len(min(65 - n_cut, length(mi)))]]
+          promote <- mi[order(mc_score[mi], decreasing = FALSE)[seq_len(min(65 - n_cut, length(mi)))]]
           cut_makers[promote] <- TRUE
           cm_score[promote]   <- cl - 5 + runif(length(promote), 0, 10)
           n_cut <- sum(cut_makers)
@@ -223,7 +223,7 @@ simulate_golf_positions <- function(dist, n_sims) {
         fp <- integer(n_p)
         if (n_cut > 0) fp[cut_makers]  <- as.integer(rank(cm_score[cut_makers],  ties.method = "random"))
         mc_idx <- which(!cut_makers)
-        if (length(mc_idx) > 0) fp[mc_idx] <- as.integer(rank(-mc_score[mc_idx], ties.method = "random")) + n_cut
+        if (length(mc_idx) > 0) fp[mc_idx] <- as.integer(rank(mc_score[mc_idx], ties.method = "random")) + n_cut
         pos_mat[, sim] <- fp
       }
     }
