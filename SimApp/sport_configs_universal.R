@@ -833,7 +833,7 @@ SPORT_CONFIGS <- list(
     # Phase 1 is the exact per-sim optimum (generate_golf_candidate_pool). Every
     # sim yields a distinct lineup; above this many the pool keeps the best by
     # top-5% rate among all the optima.
-    max_lineups      = 25000,
+    max_lineups      = 10000,
     
     standard_metrics = c(
       "WinRate", "Top1Pct", "Top5Pct", "Top10Pct", "Top20Pct",
