@@ -158,6 +158,19 @@ NFL_POOL_W_PYDS    <- c(NFL_POOL_W, 1.2, 1.2)
 # it off -- the path is then identical to before (the A/B switch).
 NFL_POOL_DIMS_CMP  <- c("fcmp", "dcmp")
 NFL_POOL_W_CMP     <- c(1.2, 1.2)
+# TEAM CARRIES (1 Oct 2026, TNF PIT@CLE). Completions did not make carries follow:
+# PIT still drew 26.4 team carries vs 21-23 real and ~22.5 board-implied, so Warren
+# ran 58% over his attempt line and Rodgers' TD passes sat at 33% vs 38%. The pool
+# already delivered PIT's attempts (34.8 vs a 34.6 ask) -- the surplus was PLAYS.
+# The sheet's game tab may carry car_target_away / car_target_home: the team's ALL
+# runs (designed + scrambles + kneels -- the pool's `carries`), from the board.
+# PER SIDE and OPT-IN: a dim is added only for a side with a target, so a sheet with
+# neither column runs exactly as before. Relaxed first on the ESS ladder (style
+# tier), ahead of total / spread / passing. Caution: fcarries and dcarries correlate
+# -0.54 in the pool, so a one-side ask moves the other side's carries the other way
+# (PIT 27 -> 24.5 took CLE 26.9 -> 28.7); asking both low on a low total can stall.
+# The balanced matcher builds its own asks and ignores these dims.
+NFL_POOL_W_CAR     <- 1.2
 NFL_ESS_FLOOR      <- 150
 NFL_ESS_HARDFLOOR  <- 60
 
@@ -508,6 +521,11 @@ nfl_calibrate_target <- function(G, target, market, bw = NFL_POOL_BW,
     deliver <- c(deliver, list(list(nm = "fcmp", mkt = "fcmp", col = "fcmp", tol = 0.1)))
   if (!is.null(market$dcmp))
     deliver <- c(deliver, list(list(nm = "dcmp", mkt = "dcmp", col = "dcmp", tol = 0.1)))
+  # team carries (NFL_POOL_W_CAR) -- only for a side the sheet gave a target
+  if (!is.null(market$fcarries))
+    deliver <- c(deliver, list(list(nm = "fcarries", mkt = "fcarries", col = "fcarries", tol = 0.2)))
+  if (!is.null(market$dcarries))
+    deliver <- c(deliver, list(list(nm = "dcarries", mkt = "dcarries", col = "dcarries", tol = 0.2)))
   bounds <- lapply(deliver, function(d) range(G[[d$col]], na.rm = TRUE))
 
   # fO_pr/dO_pr TRACK the pys kernel-centre via the pool's own pr~pys fit,
@@ -588,7 +606,8 @@ nfl_pool_weights_guarded <- function(G, target, market,
     for (nm in nms) { i <- match(nm, dims); if (!is.na(i)) base[i] <- w0[i] * factor }
     base
   }
-  style <- c("fO_pr", "fO_pys", "dO_pr", "dO_pys")
+  # carries ride the style tier: the first thing relaxed (absent dims are a no-op)
+  style <- c("fO_pr", "fO_pys", "dO_pr", "dO_pys", "fcarries", "dcarries")
   mkt   <- c("total", "absp", "fpass_yds", "dpass_yds", "fcmp", "dcmp")
 
   # is_tail: is the ASK itself far in the pool's own total/absp distribution,
@@ -1267,7 +1286,7 @@ read_nfl_input <- function(file_path, slate = NULL, game = NULL) {
   }
 
   # melt pys_target + derive the DST opponent from the (now possibly sliced) game tab
-  tt[, `:=`(pys_target = NA_real_, dst_opp = NA_character_, scr_rate = NA_real_)]
+  tt[, `:=`(pys_target = NA_real_, dst_opp = NA_character_, scr_rate = NA_real_, car_target = NA_real_)]
   for (i in seq_len(nrow(tt))) {
     tm <- tt$team[i]; row <- g[away == tm | home == tm][1]
     if (nrow(row)) {
@@ -1275,6 +1294,8 @@ read_nfl_input <- function(file_path, slate = NULL, game = NULL) {
                           else                          suppressWarnings(as.numeric(row$pys_target_home))
       side <- if (identical(row$away, tm)) "scr_rate_away" else "scr_rate_home"
       if (side %in% names(row)) tt$scr_rate[i] <- suppressWarnings(as.numeric(row[[side]]))
+      cside <- if (identical(row$away, tm)) "car_target_away" else "car_target_home"
+      if (cside %in% names(row)) tt$car_target[i] <- suppressWarnings(as.numeric(row[[cside]]))
       tt$dst_opp[i]    <- if (identical(row$away, tm)) row$home else row$away
     }
   }
@@ -1582,6 +1603,15 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
     }
   }
 
+  # Team carries (NFL_POOL_W_CAR) -- opt-in per side from the sheet's game tab.
+  car_t <- if ("car_target" %in% names(TT)) setNames(suppressWarnings(as.numeric(TT$car_target)), TT$team) else NULL
+  car_f <- if (!is.null(car_t) && fav %in% names(car_t)) car_t[[fav]] else NA_real_
+  car_d <- if (!is.null(car_t) && dog %in% names(car_t)) car_t[[dog]] else NA_real_
+  if (is.finite(car_f)) { dims <- c(dims, "fcarries"); weights <- c(weights, NFL_POOL_W_CAR)
+    target$fcarries <- car_f; market$fcarries <- car_f }
+  if (is.finite(car_d)) { dims <- c(dims, "dcarries"); weights <- c(weights, NFL_POOL_W_CAR)
+    target$dcarries <- car_d; market$dcarries <- car_d }
+
   r <- nfl_pool_match(Gp, target, market, dims, weights, fav, dog,
                       players = PL, rush_lines = attr(props, "rush"))
   Gp <- r$Gp                                    # the balanced path adds RB YPC columns
@@ -1606,6 +1636,11 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
               if ((r$matcher == "kernel" || is.finite(r$props_alpha %||% NA)) && (is.finite(cmp_f) || is.finite(cmp_d)))
                 sprintf(", cmp f %s d %s", format(round(cmp_f,1)), format(round(cmp_d,1)))
               else "")), 0.08)
+  if (is.finite(car_f) || is.finite(car_d))
+    say(sprintf("team carries: ask f %s d %s -> pool f %.1f d %.1f%s",
+                format(round(car_f, 1)), format(round(car_d, 1)),
+                nfl_wmean(Gp$fcarries, r$w), nfl_wmean(Gp$dcarries, r$w),
+                if (identical(r$matcher, "balanced")) " (balanced matcher: ask not applied)" else ""), 0.08)
 
   set.seed(if (is.null(seed) || is.na(seed))
              as.integer(Sys.time()) %% .Machine$integer.max else as.integer(seed))
