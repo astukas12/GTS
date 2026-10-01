@@ -1596,18 +1596,12 @@ server <- function(input, output, session) {
                            max_lineups=5000)
         opt_data   <- prepare_optimization_data(rv$simulation_results, rv$sim_metadata, "DK")
         
-        if (!no_cut) {
-          progress$set(detail="Phase 1: Building cut-optimized candidate pool...", value=0.1)
-          lineup_data <- generate_golf_candidate_pool(
-            sim_results=rv$simulation_results, sim_metadata=rv$sim_metadata,
-            config=dk_config, no_cut=FALSE,
-            n_sample=rv$config$phase1_n_sample, target_pool=rv$config$phase1_target, verbose=TRUE)
-        } else {
-          progress$set(detail="Phase 1: Finding optimal lineups...", value=0.1)
-          lineup_data <- find_optimal_lineups(opt_data, dk_opt_cfg, mode="standard", k=1, verbose=TRUE)
-        }
+        progress$set(detail="Phase 1: Exact optimal lineup per sim...", value=0.1)
+        lineup_data <- generate_golf_candidate_pool(
+          opt_data, rv$sim_metadata, config=dk_config, no_cut=no_cut,
+          max_lineups=rv$config$max_lineups, verbose=TRUE)
         progress$set(detail="Phase 2: Scoring lineups...", value=0.45)
-        score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
+        score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE, sims_per_batch=2000)   # pool ~ n_sims: 2k-sim batches keep scoring ~1.8 GB at 25k
         progress$set(detail="Phase 3: Calculating metrics...", value=0.75)
         own_data <- copy(rv$sim_metadata)
         if ("DKOwn" %in% names(own_data)) { setnames(own_data, "DKOwn", "Own"); if (max(own_data$Own, na.rm=TRUE) > 1) own_data[, Own := Own / 100] }
@@ -2048,19 +2042,13 @@ server <- function(input, output, session) {
                            percentiles=c(0.01,0.05,0.10,0.20), platform_col="FDScore",
                            max_lineups=5000)
         opt_data   <- prepare_optimization_data(rv$simulation_results, rv$sim_metadata, "FD")
-        if (!no_cut) {
-          progress$set(message="Finding optimal FD Golf lineups...", value=0,
-                       detail="Phase 1: Building cut-optimized pool...")
-          lineup_data <- generate_golf_candidate_pool(
-            sim_results=rv$simulation_results, sim_metadata=rv$sim_metadata,
-            config=fd_config, no_cut=FALSE,
-            n_sample=rv$config$phase1_n_sample, target_pool=rv$config$phase1_target, verbose=TRUE)
-        } else {
-          progress$set(message="Finding optimal FD Golf lineups...", value=0, detail="Phase 1...")
-          lineup_data <- find_optimal_lineups(opt_data, fd_opt_cfg, mode="standard", k=1, verbose=TRUE)
-        }
+        progress$set(message="Finding optimal FD Golf lineups...", value=0,
+                     detail="Phase 1: Exact optimal lineup per sim...")
+        lineup_data <- generate_golf_candidate_pool(
+          opt_data, rv$sim_metadata, config=fd_config, no_cut=no_cut,
+          max_lineups=rv$config$max_lineups, verbose=TRUE)
         progress$set(detail="Phase 2...", value=0.45)
-        score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE)
+        score_matrix <- score_all_lineups(lineup_data, opt_data, verbose=TRUE, sims_per_batch=2000)
         progress$set(detail="Phase 3...", value=0.75)
         own_data <- copy(rv$sim_metadata)
         if ("FDOwn" %in% names(own_data)) { setnames(own_data, "FDOwn", "Own"); if (max(own_data$Own, na.rm=TRUE) > 1) own_data[, Own := Own / 100] }
@@ -4745,7 +4733,7 @@ server <- function(input, output, session) {
     if ("Own" %in% names(proj))
       dt <- dt %>% formatString("Own", suffix = "%")
     if ("CutProb" %in% names(proj))
-      dt <- dt %>% formatRound("CutProb", 1) %>% formatString("CutProb", suffix = "%")
+      dt <- dt %>% formatPercentage("CutProb", digits = 1)   # 0-1 from the sim, like WinProb
     if ("WinProb" %in% names(proj))
       dt <- dt %>% formatPercentage("WinProb", digits = 1)
     
