@@ -316,3 +316,24 @@ A working launch config lives at `.claude/launch.json` in the repo root (name:
 `simapp`) — it starts SimApp on port 7788. Real input sheets for testing are in
 `Documents\GTS\<Sport>\`, with 72 older NASCAR ones in
 `Documents\GTS\Nascar\InputFiles\archive\`.
+
+## Golf engine v2 (`golf_engine_v2.R`, 30 Sep 2026) — round-score sim
+
+Design record: `GTS/Golf/ENGINE.md`. `golf_engine.R` keeps v1's reader and
+helpers, reads the optional `Event` tab (Par, Level, CutN, CutAfter, FieldSize),
+and sources `golf_engine_v2.R` at its end, which **redefines
+`run_golf_simulation()`**. v1 survives only as `run_golf_simulation_v1()` for
+the P4 bench — Andrew's call: v2 is the only engine customers run.
+
+Skill (one number per golfer) is fitted so the sim reproduces the sheet's
+W/T5..T40/Cut ladder (common random numbers, 25 probit steps, centred on the
+field); rounds are simulated with shared conditions, waves from tee times and
+skewed personal noise; each round's DK/FD points are a real round drawn at the
+same score to par (`golf/round_pool.rds`, `golf/noise_q.rds`, ~100 KB). The
+Event tab's CutN overrides the UI cut box; no Event tab = today's defaults.
+Tie for 1st = playoff. `CutProb` is the sim's own cut rate.
+`keep_rounds = TRUE` adds `round_results` (for showdown, P5) — off in the app,
+it is ~12M rows at 25k sims.
+
+Bank of Utah 2026, 10k sims: ladder RMS gap W .001 → T40 .024, cut .014;
+golfers tied at one finish differ by 4.95 DK (real 4.9; v1 0); 17 s.

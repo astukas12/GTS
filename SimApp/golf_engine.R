@@ -25,11 +25,13 @@ read_golf_input <- function(file_path) {
   player_raw <- as.data.table(read_excel(file_path, sheet = "Player"))
   dk_pts_raw <- as.data.table(read_excel(file_path, sheet = "DKPts"))
   fd_pts_raw <- if ("FDPts" %in% sheet_names) as.data.table(read_excel(file_path, sheet = "FDPts")) else NULL
+  event_raw  <- if ("Event" %in% sheet_names) as.data.table(read_excel(file_path, sheet = "Event")) else NULL
   
   list(
     player = player_raw,
     dk_pts = dk_pts_raw,
-    fd_pts = fd_pts_raw
+    fd_pts = fd_pts_raw,
+    event  = event_raw     # optional (engine v2): Par, Level, CutN, CutAfter, FieldSize
   )
 }
 
@@ -208,7 +210,7 @@ simulate_golf_positions <- function(dist, n_sims) {
         n_cut <- sum(cut_makers)
         if (n_cut < 65) {
           mi      <- which(!cut_makers)
-          promote <- mi[order(mc_score[mi], decreasing = TRUE)[seq_len(min(65 - n_cut, length(mi)))]]
+          promote <- mi[order(mc_score[mi], decreasing = FALSE)[seq_len(min(65 - n_cut, length(mi)))]]
           cut_makers[promote] <- TRUE
           cm_score[promote]   <- cl - 5 + runif(length(promote), 0, 10)
           n_cut <- sum(cut_makers)
@@ -223,7 +225,7 @@ simulate_golf_positions <- function(dist, n_sims) {
         fp <- integer(n_p)
         if (n_cut > 0) fp[cut_makers]  <- as.integer(rank(cm_score[cut_makers],  ties.method = "random"))
         mc_idx <- which(!cut_makers)
-        if (length(mc_idx) > 0) fp[mc_idx] <- as.integer(rank(-mc_score[mc_idx], ties.method = "random")) + n_cut
+        if (length(mc_idx) > 0) fp[mc_idx] <- as.integer(rank(mc_score[mc_idx], ties.method = "random")) + n_cut
         pos_mat[, sim] <- fp
       }
     }
@@ -262,7 +264,9 @@ lookup_points <- function(positions, cache) {
 # MAIN SIMULATION FUNCTION
 # ============================================================================
 
-run_golf_simulation <- function(input_data, n_sims = 10000,
+# v1, kept for the P4 bench only. The app runs v2 (golf_engine_v2.R, sourced at
+# the end of this file), which redefines run_golf_simulation().
+run_golf_simulation_v1 <- function(input_data, n_sims = 10000,
                                 cut_line = 65, no_cut = FALSE,
                                 progress_callback = NULL) {
   t0 <- Sys.time()
@@ -576,3 +580,13 @@ calculate_golf_lineup_metrics <- function(scored_lineups, sim_results,
   
   scored_lineups
 }
+
+# ---- engine v2 (round-score sim) replaces v1's run_golf_simulation --------
+# Found next to this file, so the app (wd SimApp/) and headless scripts that
+# source SimApp/golf_engine.R by full path both get it.
+local({
+  d <- "."
+  for (i in rev(seq_len(sys.nframe()))) { f <- sys.frame(i)$ofile; if (!is.null(f)) { d <- dirname(f); break } }
+  GOLF_ENGINE_DIR <<- normalizePath(d, winslash = "/")
+})
+source(file.path(GOLF_ENGINE_DIR, "golf_engine_v2.R"))
