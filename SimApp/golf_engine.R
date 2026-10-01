@@ -366,134 +366,67 @@ run_golf_simulation_v1 <- function(input_data, n_sims = 10000,
 }
 
 # ============================================================================
-# GOLF PHASE 1: CANDIDATE POOL (cut tournaments)
+# GOLF PHASE 1: CANDIDATE POOL (exact, 30 Sep 2026 -- PLAN.md P2)
 # ============================================================================
-# Returns a lineup_data list compatible with score_all_lineups() in
-# OptimalLineups_Core. For no_cut events the caller passes NULL and
-# uses the standard LP-per-sim path instead.
+# Every sim's exact optimal 6 under the cap, pooled. Golf is NASCAR's problem
+# (6 players, one cap, no positions), so this is NASCAR's knapsack DP
+# (find_optimal_lineups_combinatorial, OptimalLineups_Core.R) -- not a new
+# solver. Cut and no-cut events take the same path; the cut metrics are added
+# AFTER, as columns, and no longer choose the pool.
+#
+# Replaced a sampler: the 70 likeliest cut-makers, 25,000 random salary-valid
+# lineups, keep the 5,000 with the most expected cuts. On Bank of Utah (1k sims)
+# its best lineup hit the per-sim optimum in 0% of sims, a median 73.5 DK pts
+# (9.9%) short; Biltmore 10k: 10% short, and 57% of optima used a golfer it had
+# excluded. The no-cut path was per-sim lpSolve, which is not exact either
+# (lpsolve-not-exact).
+#
+# Every sim's optimum is a different lineup (1,000 sims -> 1,000 distinct), as
+# on NFL classic, so Top1Count is 1 everywhere and cannot rank the pool.
+# `max_lineups` caps it; at or above n_sims the pool holds every optimum.
+#
+# opt_data is prepare_optimization_data() output (SimID, Player, Salary,
+# FantasyPoints, ...). Returns lineup_data for score_all_lineups().
 
-generate_golf_candidate_pool <- function(sim_results, sim_metadata, config,
+generate_golf_candidate_pool <- function(opt_data, sim_metadata, config,
                                          no_cut      = FALSE,
-                                         n_sample    = 25000L,   # unused, kept for compat
-                                         target_pool = 10000L,
-                                         verbose     = TRUE) {
-  if (no_cut) return(NULL)
-  
-  platform    <- config$platform
-  salary_col  <- paste0(platform, "Salary")
-  salary_cap  <- config$salary_cap
-  salary_min  <- 48500L
+                                         max_lineups = 25000L,
+                                         verbose     = TRUE,
+                                         progress_callback = NULL) {
   roster_size <- config$roster_size
-  
-  # ------------------------------------------------------------------
-  # PRE-FILTER: determine eligible players
-  # If POOL column exists with Y values -> use only those players
-  # Otherwise -> top 70 by CutProb
-  # ------------------------------------------------------------------
-  has_pool <- "Pool" %in% names(sim_metadata) &&
-    any(sim_metadata$Pool == "Y", na.rm = TRUE)
-  
-  # Start with salary-feasible players (must be affordable in a 6-player lineup)
-  # Max individual salary = cap - (5 * min_salary_of_others), but simpler:
-  # just exclude anyone whose salary alone exceeds cap - (roster_size-1)*min_sal
-  all_valid <- sim_metadata[!is.na(get(salary_col)) & get(salary_col) > 0]
-  min_sal   <- min(all_valid[[salary_col]])
-  max_afford <- salary_cap - (roster_size - 1L) * min_sal
-  all_valid <- all_valid[get(salary_col) <= max_afford]
-  
-  if (has_pool) {
-    eligible <- all_valid[Pool == "Y"]
-    if (verbose) cat(sprintf("\nGolf Phase 1 [%s]: POOL filter -> %d players (after salary feasibility)\n",
-                             platform, nrow(eligible)))
-  } else {
-    eligible <- all_valid
-    if (verbose) cat(sprintf("\nGolf Phase 1 [%s]: No POOL — %d salary-feasible players\n",
-                             platform, nrow(eligible)))
+  opt_config  <- list(platform_col = paste0(config$platform, "Score"),
+                      roster_size  = roster_size,
+                      salary_cap   = config$salary_cap,
+                      max_lineups  = max_lineups)
+  # The sheet's POOL column: when any golfer is Y, lineups are built from the Y
+  # golfers only (N takes a golfer out of the optimal-lineup solve; he is still
+  # simulated, so the field and everyone's finishes are unchanged).
+  if ("Pool" %in% names(sim_metadata) && any(sim_metadata$Pool == "Y", na.rm = TRUE)) {
+    in_pool  <- sim_metadata[Pool == "Y", Player]
+    opt_data <- opt_data[Player %in% in_pool]
+    if (verbose) cat(sprintf("  POOL filter: %d golfers marked Y\n", length(in_pool)))
   }
-  
-  # Trim to top 70 by CutProb if still too large to enumerate
-  if (nrow(eligible) > 70L) {
-    setorder(eligible, -CutProb)
-    eligible <- eligible[1:70L]
-    if (verbose) cat(sprintf("  Trimmed to top 70 by CutProb: %.0f%% - %.0f%%\n",
-                             min(eligible$CutProb)*100, max(eligible$CutProb)*100))
+  ld <- find_optimal_lineups_combinatorial(opt_data, modifyList(opt_config, list(max_lineups = Inf)),
+                                           verbose = verbose, progress_callback = progress_callback)
+  lineup_dt <- ld$unique_lineups
+  # The cap ranks by each optimum's top-5% rate among ALL the distinct optima
+  # (ps_top_frac, as NHL / NFL / CFB classic), not Top1Count, which is 1 for all.
+  if (nrow(lineup_dt) > max_lineups) {
+    pc <- paste0("Player", seq_len(roster_size))
+    t5 <- ps_top_frac(lineup_dt, pc, opt_data, "FantasyPoints", n_sims_use = 5000L, frac = 0.05)
+    if (!is.null(t5)) { lineup_dt[, top5 := t5]; setorder(lineup_dt, -top5, -AvgScore); lineup_dt[, top5 := NULL] }
+    else { setorder(lineup_dt, -AvgScore)
+      if (verbose) cat("  top5 ranking unavailable (Matrix / matrixStats): capping by mean\n") }
+    lineup_dt <- head(lineup_dt, max_lineups)
+    if (verbose) cat(sprintf("  Capped to %s lineups by top-5%% rate\n", format(max_lineups, big.mark = ",")))
   }
-  
-  if (nrow(eligible) < roster_size)
-    stop("Not enough eligible players with ", salary_col, " to build lineups.")
-  
-  # ------------------------------------------------------------------
-  # SAMPLE valid salary combos — run until target_pool found or max_iter hit
-  # Much faster than enumerating 100M+ combos when salary window is tight
-  # ------------------------------------------------------------------
-  n_pool     <- nrow(eligible)
-  salaries   <- eligible[[salary_col]]
-  cut_probs  <- eligible$CutProb
-  players    <- eligible$Player
-  
-  if (verbose) cat(sprintf("  Sampling from %d players ($%.0fk-$%.0fk window)...\n",
-                           n_pool, salary_min/1000, salary_cap/1000))
-  
-  target_sample <- 25000L
-  max_iter      <- target_sample * 200L
-  found_idx     <- vector("list", target_sample)
-  found_sal     <- numeric(target_sample)
-  found_ec      <- numeric(target_sample)
-  n_found       <- 0L
-  
-  for (iter in seq_len(max_iter)) {
-    idx <- sample.int(n_pool, roster_size, replace = FALSE)
-    ts  <- sum(salaries[idx])
-    if (ts >= salary_min && ts <= salary_cap) {
-      n_found <- n_found + 1L
-      found_idx[[n_found]] <- sort(idx)
-      found_sal[n_found]   <- ts
-      found_ec[n_found]    <- sum(cut_probs[idx])
-      if (n_found >= target_sample) break
-    }
-  }
-  
-  if (n_found == 0) stop("No salary-valid lineups found. Check salary data and cap.")
-  
-  found_idx <- found_idx[seq_len(n_found)]
-  found_sal <- found_sal[seq_len(n_found)]
-  found_ec  <- found_ec[seq_len(n_found)]
-  
-  if (verbose) cat(sprintf("  Found %s valid combos\n", format(n_found, big.mark = ",")))
-  
-  # Build data.table, deduplicate, keep top by ExpectedCuts
-  player_mat <- do.call(rbind, lapply(found_idx, function(i) players[i]))
-  lineup_dt  <- as.data.table(player_mat)
-  setnames(lineup_dt, paste0("Player", seq_len(roster_size)))
-  lineup_dt[, TotalSalary  := found_sal]
-  lineup_dt[, ExpectedCuts := found_ec]
-  
-  key_cols  <- paste0("Player", seq_len(roster_size))
-  lineup_dt <- unique(lineup_dt, by = key_cols)
-  setorder(lineup_dt, -ExpectedCuts)
-  if (nrow(lineup_dt) > 5000L) lineup_dt <- lineup_dt[seq_len(5000L)]
-  
-  if (verbose)
-    cat(sprintf("  Candidate pool: %s lineups | ExpCuts %.2f - %.2f\n",
-                format(nrow(lineup_dt), big.mark = ","),
-                min(lineup_dt$ExpectedCuts), max(lineup_dt$ExpectedCuts)))
-  
-  # Add analytical cut probability metrics
-  lineup_dt <- add_golf_cut_metrics(lineup_dt, sim_metadata, roster_size)
-  
-  # Build opt_config in the format score_all_lineups() expects from lineup_data$config
-  opt_config <- list(
-    platform_col  = paste0(platform, "Score"),
-    roster_size   = roster_size,
-    salary_cap    = salary_cap
-  )
-  
-  # Return in format expected by score_all_lineups()
+  if (!no_cut) lineup_dt <- add_golf_cut_metrics(lineup_dt, sim_metadata, roster_size)
+
   list(
     unique_lineups = lineup_dt,
-    n_sims         = length(unique(sim_results$SimID)),
+    n_sims         = ld$n_sims,
     config         = opt_config,
-    mode           = "golf_cut",
+    mode           = "golf_exact",
     roster_size    = roster_size,
     player_cols    = paste0("Player", seq_len(roster_size))
   )
@@ -520,30 +453,27 @@ calculate_cut_distribution_dp <- function(cut_probs) {
   list(exact = dp, atleast = atleast)
 }
 
+# Same Poisson-binomial DP as calculate_cut_distribution_dp, run on every lineup
+# at once (one column per make-count) -- the exact pool is ~n_sims lineups, and
+# the row-by-row loop it replaces took minutes at that size.
 add_golf_cut_metrics <- function(lineup_dt, sim_metadata, roster_size) {
   cut_lookup  <- setNames(sim_metadata$CutProb, sim_metadata$Player)
   player_cols <- paste0("Player", seq_len(roster_size))
-  n           <- nrow(lineup_dt)
-  
-  at6 <- numeric(n)
-  at5 <- numeric(n)
-  ec  <- numeric(n)
-  
-  for (i in seq_len(n)) {
-    ps         <- unlist(lineup_dt[i, ..player_cols])
-    probs      <- cut_lookup[ps]
-    probs[is.na(probs)] <- 0.8
-    ec[i]  <- sum(probs)
-    d      <- calculate_cut_distribution_dp(probs)
-    at6[i] <- round(d$atleast[7L] * 100, 1)   # P(>=6) index 7 = atleast[6+1]
-    at5[i] <- round(d$atleast[6L] * 100, 1)   # P(>=5) index 6
+  P <- matrix(cut_lookup[as.matrix(lineup_dt[, ..player_cols])], ncol = roster_size)
+  P[is.na(P)] <- 0.8
+
+  dp <- matrix(0, nrow(P), roster_size + 1L); dp[, 1L] <- 1   # dp[, j+1] = P(exactly j)
+  for (i in seq_len(roster_size)) {
+    p  <- P[, i]
+    dp <- dp * (1 - p) + cbind(0, dp[, -(roster_size + 1L), drop = FALSE]) * p
   }
-  
-  lineup_dt[, ExpectedCuts := round(ec, 2)]
-  lineup_dt[, AtLeast6     := at6]
-  lineup_dt[, AtLeast5     := at5]
+
+  lineup_dt[, ExpectedCuts := round(rowSums(P), 2)]
+  lineup_dt[, AtLeast6     := round(dp[, roster_size + 1L] * 100, 1)]              # P(>= 6)
+  lineup_dt[, AtLeast5     := round((dp[, roster_size] + dp[, roster_size + 1L]) * 100, 1)]  # P(>= 5)
   lineup_dt
 }
+
 
 # ============================================================================
 # GOLF CUSTOM METRICS (called by app.R add_custom_metrics)
@@ -569,13 +499,8 @@ calculate_golf_lineup_metrics <- function(scored_lineups, sim_results,
   # Tee time EarlyLate count
   if ("TeeTimeGroup" %in% names(sim_metadata)) {
     tee_map <- setNames(sim_metadata$TeeTimeGroup, sim_metadata$Player)
-    el <- integer(nrow(scored_lineups))
-    for (i in seq_len(nrow(scored_lineups))) {
-      ps    <- unlist(scored_lineups[i, ..player_cols])
-      grps  <- tee_map[ps]
-      el[i] <- sum(grps == "EarlyLate", na.rm = TRUE)
-    }
-    scored_lineups[, EarlyLateCount := el]
+    grps <- matrix(tee_map[as.matrix(scored_lineups[, ..player_cols])], ncol = roster_size)
+    scored_lineups[, EarlyLateCount := as.integer(rowSums(grps == "EarlyLate", na.rm = TRUE))]
   }
   
   scored_lineups

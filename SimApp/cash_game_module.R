@@ -135,6 +135,15 @@ build_combo_matrix <- function(n_pool, roster_size, seed = 42L) {
   
   set.seed(seed)
   n_draw <- as.integer(MAX_COMBOS)
+  # Just over the cap (golf / NASCAR's 500-entry tier: C(40, 6) = 3.84M), the
+  # rejection sampler below needs ~all distinct combos and its repeated unique()
+  # took 494s. Enumerating and drawing rows is the same uniform sample in seconds.
+  if (is.finite(total) && total <= 4 * MAX_COMBOS) {
+    cat(sprintf("  [Field] Sampling %s of %s combos (enumerated)\n",
+                format(n_draw, big.mark = ","), format(total, big.mark = ",")))
+    cm <- combn(n_pool, roster_size)
+    return(t(cm[, sort(sample.int(ncol(cm), n_draw)), drop = FALSE]))
+  }
   cat(sprintf("  [Field] Sampling %s of %s combos\n",
               format(n_draw, big.mark = ","),
               format(total, big.mark = ", ", scientific = FALSE)))

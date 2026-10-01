@@ -830,10 +830,10 @@ SPORT_CONFIGS <- list(
     roster_sizes = list(DK = 6, FD = 6),
     salary_caps  = list(DK = 50000, FD = 60000),
     
-    # Golf-specific Phase 1 settings
-    phase1_n_sample  = 100000L,  # random salary-valid lineups to draw
-    max_lineups      = 5000,
-    phase1_target    = 5000L,    # top N by ExpectedCuts to keep
+    # Phase 1 is the exact per-sim optimum (generate_golf_candidate_pool). Every
+    # sim yields a distinct lineup; above this many the pool keeps the best by
+    # top-5% rate among all the optima.
+    max_lineups      = 25000,
     
     standard_metrics = c(
       "WinRate", "Top1Pct", "Top5Pct", "Top10Pct", "Top20Pct",
