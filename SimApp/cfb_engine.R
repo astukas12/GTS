@@ -61,8 +61,10 @@
 # and the sampling noise that makes up the rest is something the dealer already
 # reproduces. carry_usage alone delivers 96% of the true spread.
 #
-# DATA: cfb_data/ holds three files totalling 1.65MB, built by
-# CFB/R/build_templates.R out of 58.5MB of play-by-play that never ships.
+# DATA: cfb_data/ holds three files, built by CFB/R/build_templates.R out of
+# play-by-play that never ships. From 1 Oct 2026 the pool is 2023 onward (the
+# clock-rule era) plus the current season to date, refreshed weekly by
+# CFB/R/pool_refresh.R, with current-season rows at season weight 2 (`sw`).
 # =============================================================================
 
 CFB_DATA_DIR <- "cfb_data"
@@ -192,6 +194,12 @@ cfb_pool_weights <- function(P, target, bw = CFB_BW,
   Mz <- sweep(sweep(M, 2, mu, "-"), 2, sg, "/")
   d2 <- rowSums(sweep((sweep(Mz, 2, tz, "-"))^2, 2, wts, "*"))
   w  <- exp(-d2 / (2 * bw^2)); w[!is.finite(w)] <- 0
+  # SEASON WEIGHT (1 Oct 2026): the pool carries `sw`, 2 on current-season rows
+  # and 1 elsewhere, so a 2026 afternoon counts as two older ones. Measured in
+  # Review/engine/cfb_deep_dive.md s2.1: weight 2 beats 1 on points and pass
+  # yards (p .014 / .017) without thinning the worst game's ESS; 4 collapses
+  # the 28+ spreads. A pool without the column is the old unweighted kernel.
+  if ("sw" %in% names(P)) w <- w * P$sw
   w / sum(w)
 }
 
@@ -324,7 +332,14 @@ cfb_calibrate <- function(P, target, market, iters = 24, damp = 0.8, tol = 0.05,
     if (ess_of(tg) < mkt_floor) { st <- clip(st, mkt_slack[["total"]])
                                   sm <- clip(sm, mkt_slack[["absp"]]) }
     tg$total <- market$total  + st
-    tg$absp  <- max(0, market$margin + sm)
+    # NO FLOOR AT 0 (1 Oct 2026). absp is >= 0 in every pool row, so near a
+    # pick'em the kernel only has games on one side of the ask and returns a
+    # wider margin than asked. The fixed point corrects that by aiming BELOW
+    # the ask -- under 0 for a 1-3 point spread -- and the old max(0, .) refused
+    # to go there: spreads under 7 were delivered 1.9 points too wide
+    # (cfb_deep_dive.md s2.1). A negative target is fine for the kernel; it
+    # just leans harder on the closest-lined games.
+    tg$absp  <- market$margin + sm
 
     # pass-yard LEVEL: same damped fixed point as total/margin, on the pool's
     # own yardage columns. Market data, so it chases freely like the line does.

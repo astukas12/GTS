@@ -337,3 +337,10 @@ it is ~12M rows at 25k sims.
 
 Bank of Utah 2026, 10k sims: ladder RMS gap W .001 → T40 .024, cut .014;
 golfers tied at one finish differ by 4.95 DK (real 4.9; v1 0); 17 s.
+
+**Lineup pool (P2, 30 Sep 2026).** `generate_golf_candidate_pool()` pools every
+sim's exact optimal 6 (NASCAR's knapsack DP, `find_optimal_lineups_combinatorial`);
+cut and no-cut alike, POOL = Y restricts the solve. Every sim's optimum is
+distinct, so above `max_lineups` (10,000) it keeps the best by top-5% rate
+(`ps_top_frac`, as NHL/NFL classic). Cut metrics are columns, not the selection
+rule. Golf scores in 2,000-sim batches (`sims_per_batch`) to hold memory at 25k.
