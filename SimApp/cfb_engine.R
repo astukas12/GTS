@@ -28,7 +28,9 @@
 #   gl_share     P(handed a goal-line carry: ytg <= 3). Sums to 1. Blank means
 #                "same as carry_usage".
 #   kicker / punt_returner / kick_returner   one name each
-#   pys_target   the pass-yard share to ASK THE POOL FOR
+#   pys_target   the pass-yard share read. Since 1 Oct 2026 the pool is asked
+#                for 0.5 x this + 0.5 x the as-of regression (cfb_pys_reg_ask);
+#                blank means the regression alone
 #
 # WHAT COMES FROM THE DRAWN GAME AND TAKES NO INPUT: passing yards, attempts,
 # interceptions, sack yardage, field goal distances and results, extra points,
@@ -78,8 +80,11 @@ CFB_EVT_SACK <- 1L; CFB_EVT_FG <- 2L; CFB_EVT_RUN <- 3L; CFB_EVT_CMP <- 4L
 # beat a fourteen-dimension set on every target while returning twelve times
 # the effective sample. Explosiveness, success rate, drives, plays/drive and all
 # six defensive dimensions each made things WORSE.
+# The pys dims weigh .5, not 1.0 (1 Oct 2026, cfb_deep_dive.md s2.4): a wider
+# pys kernel scored better on pass yards (p .03-.05) at no ESS cost, and
+# narrower (2.0) was significantly worse. Per-game width added nothing on top.
 CFB_POOL_DIMS <- c("total", "absp", "fO_pr", "fO_pys", "dO_pr", "dO_pys")
-CFB_POOL_W    <- c(1.4, 1.4, 1.0, 1.0, 1.0, 1.0)
+CFB_POOL_W    <- c(1.4, 1.4, 1.0, 0.5, 1.0, 0.5)
 CFB_BW        <- 0.9
 # Pass-yard LEVEL delivery (optional, see cfb_calibrate): the weight the two
 # yardage dims carry and the widened bandwidth that pays for them. Grid-tested
@@ -238,6 +243,13 @@ cfb_pool_weights <- function(P, target, bw = CFB_BW,
 #     target moves freely and lands on the line as before.
 # cal$style_frozen is TRUE when style could not reach the ask. Normal slates hit
 # neither guard -- they land on the market with the full style match.
+# THE FLOORS STAY FIXED AT 100 / 55 on the smaller 2023+ pool -- measured, not
+# inherited (1 Oct 2026, Review/engine/cfb_pys_backtest.R re-run). Scaling them
+# to pool size (~45 / ~25) unfroze the style step in a fifth more games and made
+# every method score WORSE, paired by game on 2,104 games: the shipped ask
+# (regression, pys weight .5) +0.37 pass-yd CRPS (p .004), the as-of prior
+# +0.66 (p 2e-5). The floor is a useful brake on chasing the pys ask, not a
+# leftover. The option path passes its own pool-scaled floors.
 cfb_calibrate <- function(P, target, market, iters = 24, damp = 0.8, tol = 0.05,
                           style_damp = 0.6, style_tol = 0.01,
                           ess_floor = 100, mkt_floor = 55,
@@ -360,6 +372,64 @@ cfb_calibrate <- function(P, target, market, iters = 24, damp = 0.8, tol = 0.05,
        style_frozen = isTRUE(ess_limited),
        lvl_ask = if (have_lvl) c(f = market$fpass_yds, d = market$dpass_yds),
        lvl_got = if (have_lvl) c(f = wm(P$fpyds, w), d = wm(P$dpyds, w)))
+}
+
+# ---- the pys ask: as-of regression, blended with the sheet read ------------------
+# cfb_deep_dive.md s2.4 (1 Oct 2026). Replayed as of kickoff on every 2023-25 FBS
+# game and 2026 weeks 1-4, a regression on the team's season-to-date pys (+ last
+# season), the opponent's pys allowed, neutral-script pys, QB and head-coach
+# change, spread and home beat every mechanical prior on pys AND pass yards, with
+# nominal p5/p10/p90/p95 coverage. The sheet's typed read added nothing on its own
+# and tied the regression half-shrunk toward it, so the ask is 0.5 x read + 0.5 x
+# regression; a side with no read takes the regression, a side the regression
+# cannot price (school not in the table, file absent, option game) takes the read.
+#
+# cfb_data/cfb_pys_reg.rds is refit weekly by CFB/R/pys_reg.R: coefficients, each
+# school's as-of inputs, and the sheet-abbreviation -> school map.
+CFB_PYS_READ_W <- 0.5
+
+cfb_name_key <- function(x) {
+  x <- tolower(gsub("\\b(Jr|Sr|II|III|IV|V)\\.?$", "", trimws(x), ignore.case = TRUE))
+  p <- strsplit(trimws(gsub("[^a-z ]", "", gsub("[.'-]", "", x))), "\\s+")
+  vapply(p, function(v) if (length(v) < 2) paste(v, collapse = "") else paste(substr(v[1], 1, 1), v[length(v)]), "")
+}
+
+# Returns list(f =, d =) regression asks (NA where it cannot price a side), plus
+# the inputs it used, for the run log.
+cfb_pys_reg_ask <- function(RG, G, fav, dog, PL) {
+  na <- list(f = NA_real_, d = NA_real_, why = NULL)
+  if (is.null(RG)) return(modifyList(na, list(why = "no cfb_pys_reg.rds")))
+  sch <- function(a) { s <- unname(RG$abbr[a]); if (is.na(s)) a else s }
+  row <- function(a) { r <- RG$teams[RG$teams$school == sch(a), ]; if (nrow(r)) r[1, ] else NULL }
+  rf <- row(fav); rd <- row(dog)
+  neutral <- isTRUE(as.logical(G$neutral[1]))
+  qb_new <- function(a, r) {
+    q <- PL[PL$team == a & PL$pass_share > 0, ]
+    q <- q[order(-q$pass_share), ]
+    if (!nrow(q) || is.na(r$qb_prev_name)) return(1)
+    as.numeric(cfb_name_key(q$player[1]) != cfb_name_key(r$qb_prev_name))
+  }
+  pred <- function(a, r, ro, sp) {
+    if (is.null(r) || is.null(ro)) return(NA_real_)
+    x <- c(asofK = r$asofK, np_b = r$np_b, prior = r$prior, qb_new = qb_new(a, r),
+           hc_new = r$hc_new, oppd = ro$def_allowed, sp = sp, total = G$total[1],
+           home = if (neutral) 0 else if (a == G$home[1]) 1 else -1)
+    b <- RG$coef
+    terms <- vapply(strsplit(names(b), ":", fixed = TRUE), function(p)
+      if (identical(p, "(Intercept)")) 1 else prod(x[p]), numeric(1))
+    v <- sum(b * terms)
+    if (is.finite(v)) min(0.95, max(0.05, v)) else NA_real_
+  }
+  sp <- G$spread[1]
+  list(f = pred(fav, rf, rd, sp), d = pred(dog, rd, rf, -sp),
+       why = if (is.null(rf) || is.null(rd)) paste("not in table:",
+               paste(c(if (is.null(rf)) fav, if (is.null(rd)) dog), collapse = ", ")))
+}
+
+cfb_pys_blend <- function(read, reg, w = CFB_PYS_READ_W) {
+  read <- suppressWarnings(as.numeric(read))
+  if (is.finite(read) && is.finite(reg)) w * read + (1 - w) * reg
+  else if (is.finite(reg)) reg else read
 }
 
 # ---- reading the sheet -------------------------------------------------------
@@ -746,10 +816,6 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
   # unbiased across all 4,966 pool games. The style dimensions exist because the
   # market is SILENT on composition: it predicts the favourite's pass/rush split
   # at r = 0.111 and the underdog's at 0.010.
-  target <- list(total = G$total[1], absp = G$spread[1],
-                 fO_pr = 0.52, fO_pys = pys[[fav]],
-                 dO_pr = 0.52, dO_pys = pys[[dog]])
-
   # OPTIONAL POOL FILTER (game tab `pool_filter`). A triple-option service
   # academy is a different game type: its pool games pass for ~0.25 of their
   # yards against a pool centre of ~0.60, so the soft kernel alone keeps drawing
@@ -775,6 +841,26 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
     P <- P[!(fteam %in% CFB_OPTION_TEAMS | dteam %in% CFB_OPTION_TEAMS)]
     setkey(P, game_id)
   }
+
+  # the pys ask (see cfb_pys_reg_ask): an option game keeps the read -- the
+  # regression was fit on ordinary games only
+  pys_read <- c(f = pys[[fav]], d = pys[[dog]])
+  pys_ask  <- pys_read
+  if (!identical(pf, "option")) {
+    f_reg <- file.path(CFB_DATA_DIR, "cfb_pys_reg.rds")
+    rg <- cfb_pys_reg_ask(if (file.exists(f_reg)) readRDS(f_reg) else NULL, G, fav, dog, PL)
+    pys_ask <- c(f = cfb_pys_blend(pys_read[["f"]], rg$f), d = cfb_pys_blend(pys_read[["d"]], rg$d))
+    say(sprintf("pys ask: %s read %s reg %s -> %.3f | %s read %s reg %s -> %.3f%s",
+                fav, format(round(pys_read[["f"]], 3)), format(round(rg$f, 3)), pys_ask[["f"]],
+                dog, format(round(pys_read[["d"]], 3)), format(round(rg$d, 3)), pys_ask[["d"]],
+                if (is.null(rg$why)) "" else paste0(" (", rg$why, ")")), 0.03)
+  }
+  if (!all(is.finite(pys_ask)))
+    stop("CFB: no pys ask for ", paste(c(fav, dog)[!is.finite(pys_ask)], collapse = ", "),
+         " -- no pys_target on the sheet and no regression row")
+  target <- list(total = G$total[1], absp = G$spread[1],
+                 fO_pr = 0.52, fO_pys = pys_ask[["f"]],
+                 dO_pr = 0.52, dO_pys = pys_ask[["d"]])
   # OPTIONAL pass-yard lines off the game tab, FAVOURITE- and DOG-relative
   # (`fav_pass_yds` / `dog_pass_yds`) so the columns don't have to know which
   # side is home. Absent columns leave the six-dim kernel exactly as before.
