@@ -974,6 +974,15 @@ server <- function(input, output, session) {
   # ── Golf extra options (below bar, Golf only) ────────────────────────────
   output$golf_extra_ui <- renderUI({
     req(rv$sport == "GOLF")
+    # A sheet with an Event tab carries its own cut rule (engine v2 reads it and
+    # ignores the boxes), so the user has nothing to set: show the rule instead.
+    ev <- rv$input_data$event
+    if (!is.null(ev) && nrow(ev) > 0) {
+      ca <- suppressWarnings(as.integer(ev$CutAfter[1])); cn <- suppressWarnings(as.integer(ev$CutN[1]))
+      rule <- if (!is.na(ca) && ca == 0) "No cut" else
+        sprintf("Cut: top %s & ties after round %s", ifelse(is.na(cn), 65, cn), ifelse(is.na(ca), 2, ca))
+      return(div(class = "gts-golf-row", span(paste(rule, "(from the sheet)"))))
+    }
     div(class = "gts-golf-row",
         checkboxInput("golf_no_cut", "No-cut tournament", value = FALSE),
         conditionalPanel(
