@@ -89,6 +89,18 @@ share of DESIGNED runs. An old-contract sheet on tagged data gives the QB his
 scrambles twice (~+2.2 carries). Readbacks `car_qr` / `cyds_qr` in
 `sim_components`. Record: GTS/NFL/slates/review/2026-09-27_W3_SUN/KNEEL_FIX.md.
 
+## NFL team carries target (1 Oct 2026)
+
+The game tab may carry `car_target_away` / `car_target_home`: a team's ALL runs
+(designed + scrambles + kneels, the pool's `carries`), built from the board by
+`GTS/NFL/R/team_carries.R`. `nfl_engine.R` delivers it as a pool quantity like
+completions (`NFL_POOL_W_CAR`), per side, opt-in, relaxed first on the ESS ladder.
+Absent columns = bit-identical output. Why: the pool matched PIT's pass yards,
+completions and attempts yet dealt 26.4 carries vs 21-23 real (extra PLAYS), so
+Warren ran 58% over his attempt line and Rodgers' TD passes sat low. Caution: the
+pool's two sides' carries correlate -0.54 -- a one-side ask moves the other team
+the other way; both low on a low total can stall. The balanced matcher ignores it.
+
 ## Showdown optimizers guarantee ≥ 2 teams
 
 `find_optimal_lineups_combinatorial_captain` / `_combinatorial_mvp`
