@@ -175,6 +175,27 @@ run_nhl_simulation <- function(input_data, n_sims = 10000, config = NULL, progre
   # Never let a summary cost the sim: a failure here leaves the tab empty.
   vis <- tryCatch(nhl_sim_visuals(bx, sk, sims, G, T, input_data),
                   error = function(e) { warning("NHL visuals: ", conditionMessage(e)); NULL })
+  # Engine review (stat_quantiles.R): skater / goalie / team stat quantiles. Off unless the review's
+  # re-sim worker sets options(gts.stat_quantiles = TRUE); reads sk and bx, draws no random numbers.
+  if (exists("gts_stat_q_on") && gts_stat_q_on())
+    vis <- gts_stat_attach(vis, function() {
+      who <- T[Pos != "G", .(playerId, gameId, Player, Team = team)]
+      skq <- gts_stat_summ(sk, c(playerId = "playerId", game = "game"),
+               list(g = "g", a = "a", pts = quote(g + a), sog = "sog", blk = "blk", toi_min = quote(toi / 60),
+                    dk_fpts = "dk"), "player", list(sog = c(3, 5), blk = 3, pts = c(1, 3), g = c(1, 3)))
+      for (k in c("q", "ge")) if (nrow(skq[[k]])) {
+        skq[[k]][G, on = "game", gameId := i.gameId]
+        skq[[k]] <- merge(who, skq[[k]], by = c("playerId", "gameId"))[, game := NULL]
+      }
+      b <- bx[, .(game, sim, is_home, goals = goals + (end == "SO" & result == "W"), sog, s_sv, s_ga, s_dk)]
+      b[G, on = "game", Team := fifelse(is_home, i.home, i.away)]
+      tot <- b[, .(total_goals = sum(goals)), by = .(game, sim)]
+      tot[G, on = "game", Team := paste(i.away, "@", i.home)]
+      list(skq,
+           gts_stat_summ(b, c(Team = "Team"), list(saves = "s_sv", ga = "s_ga", dk_fpts = "s_dk"), "goalie", list(saves = 35)),
+           gts_stat_summ(b, c(Team = "Team"), list(goals = "goals", sog = "sog"), "team"),
+           gts_stat_summ(tot, c(Team = "Team"), list(total_goals = "total_goals"), "game"))
+    })
   pcb("Done", 1)
   list(sim_results = sims, metadata = meta, sport_visuals = vis)
 }
