@@ -356,3 +356,18 @@ cut and no-cut alike, POOL = Y restricts the solve. Every sim's optimum is
 distinct, so above `max_lineups` (10,000) it keeps the best by top-5% rate
 (`ps_top_frac`, as NHL/NFL classic). Cut metrics are columns, not the selection
 rule. Golf scores in 2,000-sim batches (`sims_per_batch`) to hold memory at 25k.
+
+## Engine-review stat quantiles (`stat_quantiles.R`, 2 Oct 2026)
+
+Off unless `options(gts.stat_quantiles = TRUE)`, which only the review's re-sim
+worker sets (`GTS/Common/contest_review_resim_worker.R`); the app never does.
+When on, NFL, CFB, NHL and tennis call `gts_stat_attach()` after their sims
+are scored and add `stat_quantiles` (mean, sd, p10/p25/p50/p75/p90, p_zero
+per player / team / goalie / game x stat) and `stat_thresholds` (P(stat >= k)
+for DK bonus lines) to `sport_visuals`. It reads draws the engine already
+holds and draws no random numbers, so every score is unchanged (checked seed
+for seed, off vs on vs the previous engine, 2 Oct 2026). The worker saves them
+as `units[[k]]$stats`; `GTS/Review/engine/ledger/build_ledger.R` joins them to
+box scores. MMA has no stat draws (scores are sampled from the sheet's
+quantiles), so it has none. Keep new engine stats in this shape rather than
+widening `sim_results`.

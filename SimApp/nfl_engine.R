@@ -1867,6 +1867,26 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
                         fcmp = draw$fcmp, dcmp = draw$dcmp,
                         frush_yds = draw$frush_yds, drush_yds = draw$drush_yds,
                         ptsF = draw$ptsF, ptsD = draw$ptsD)
+  # Engine review (stat_quantiles.R): per-player / per-team stat quantiles. Off unless the review's
+  # re-sim worker sets options(gts.stat_quantiles = TRUE); reads A and draw, draws no random numbers.
+  if (exists("gts_stat_q_on") && gts_stat_q_on())
+    sv <- gts_stat_attach(sv, function() {
+      tg <- A[is_dst == FALSE, .(rec = sum(rec), rec_yds = sum(ryds), car = sum(car), rush_yds = sum(cyds),
+                                 pass_yds = sum(pyds), pass_td = sum(ptd), off_td = sum(rtd) + sum(ctd)), by = .(SimID, team)]
+      pts <- data.table(SimID = seq_len(n_sims), f = draw$ptsF, d = draw$ptsD)
+      tg[pts, points := fifelse(team == fav, i.f, i.d), on = "SimID"]
+      list(gts_stat_summ(A[is_dst == FALSE], c(Player = "player", Team = "team"),
+             list(rec = "rec", rec_yds = "ryds", rec_td = "rtd", car = "car", rush_yds = "cyds", rush_td = "ctd",
+                  pass_yds = "pyds", pass_td = "ptd", int = "pint", fum = "fum", ret_td = "rettd", kick_pts = quote(fgp + xp),
+                  any_td = quote(rtd + ctd + rettd), dk_fpts = "DKScore"),
+             "player", list(rec_yds = 100, rush_yds = 100, pass_yds = 300, any_td = 1:2, rec = c(5, 8))),
+           gts_stat_summ(A[is_dst == TRUE], c(Player = "player", Team = "team"),
+             list(def_sacks = "def_sacks", def_int = "def_int", def_fum_rec = "def_fum_rec", def_td = "def_td",
+                  pa = "pa", dk_fpts = "DKScore"), "player"),
+           gts_stat_summ(tg, c(Team = "team"),
+             list(points = "points", rec = "rec", rec_yds = "rec_yds", car = "car", rush_yds = "rush_yds",
+                  pass_yds = "pass_yds", pass_td = "pass_td", off_td = "off_td"), "team"))
+    })
 
   say("done", 1)
   res <- list(sim_results = sim_results, metadata = meta, projections = projections,
@@ -2043,7 +2063,8 @@ run_nfl_classic_simulation <- function(input_data, n_sims = 10000, config = NULL
   metadata    <- metadata[!is.na(Player) & Player != ""]
   if (nrow(projections)) projections <- projections[!is.na(Player) & Player != ""]
 
-  vk <- c("stat_line", "dst_line", "team_line", "components", "rates", "team_spread", "score_dist")
+  vk <- c("stat_line", "dst_line", "team_line", "components", "rates", "team_spread", "score_dist",
+          if (exists("gts_stat_q_on") && gts_stat_q_on()) c("stat_quantiles", "stat_thresholds"))   # Engine review only
   sv <- list()
   for (k in vk)
     sv[[k]] <- rbindlist(lapply(seq_along(vis), function(j) {
