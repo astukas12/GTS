@@ -135,7 +135,7 @@ sim_team_players <- function(bx, ro, P3) {
     # the on-ice group
     grp_mask <- matrix(FALSE, K, P)
     if (cn == "es") {
-      unit_pick <- function(members_by, w_ind, mix, size, eligible, bt) {
+      unit_pick <- function(members_by, w_ind, mix, size, eligible, bt, part = 0) {
         units <- sort(unique(members_by[eligible & !is.na(members_by)]))
         wl <- sapply(units, function(u) { m <- eligible & members_by %in% u; mean(ro$mu_es[m]) * max(sum(inv_es[m]), 1e-6)^bt })
         intact <- runif(K) > mix
@@ -148,10 +148,21 @@ sim_team_players <- function(bx, ro, P3) {
         if (any(!intact)) {
           Lw <- matrix(ifelse(eligible, log(pmax(w_ind, 1e-9)), -Inf), sum(!intact), P, byrow = TRUE)
           M[!intact, ] <- topk_mask(Lw, size)
+          # partly intact (al$partial, 10 section 2): size - 1 of one unit, chosen as above, + one other
+          ni <- which(!intact); pt <- if (length(units) && part > 0) ni[runif(length(ni)) < part] else integer()
+          if (length(pt)) {
+            inU <- outer(units[sample.int(length(units), length(pt), replace = TRUE, prob = wl)], members_by, `==`)
+            inU[is.na(inU)] <- FALSE
+            lw <- matrix(ifelse(eligible, log(pmax(w_ind, 1e-9)), -Inf), length(pt), P, byrow = TRUE)
+            M[pt, ] <- topk_mask(ifelse(inU, lw, -Inf), size - 1L) | topk_mask(ifelse(inU, -Inf, lw), 1L)
+          }
         }
         M
       }
-      grp_mask <- unit_pick(ro$slot, ro$mu_es * pmax(inv_es, 1e-6)^(beta[["F_line"]] %||% 0), al$mix$F, 3L, isF, beta[["F_line"]] %||% 0) |
+      # unit rates (mix, partial) are measured against the SAME-NIGHT lines / pairs / PP units (10_goal_alloc.R):
+      # they assume the sheet carries the confirmed lines for the game, not last game's
+      grp_mask <- unit_pick(ro$slot, ro$mu_es * pmax(inv_es, 1e-6)^(beta[["F_line"]] %||% 0), al$mix$F, 3L, isF, beta[["F_line"]] %||% 0,
+                            al$partial$F2 %||% 0) |
                   unit_pick(ro$slot, ro$mu_es * pmax(inv_es, 1e-6)^(beta[["D_pair"]] %||% 0), al$mix$D, 2L, isD, beta[["D_pair"]] %||% 0)
     } else if (cn == "pp") {
       u <- runif(K); p1 <- al$mix$PP1; p2 <- al$mix$PP2
@@ -160,6 +171,16 @@ sim_team_players <- function(bx, ro, P3) {
       sel2 <- u >= p1 & u < p1 + p2; grp_mask[sel2, ] <- matrix(m2, sum(sel2), P, byrow = TRUE)
       rest <- u >= p1 + p2 | rowSums(grp_mask) == 0
       if (any(rest)) grp_mask[rest, ] <- topk_mask(matrix(log(pmax(ro$mu_pp, 1e-9)), sum(rest), P, byrow = TRUE), 5L)
+      # partly a unit (al$partial): 4 of PP1 / PP2 + one other skater
+      q1 <- al$partial$PP1_4 %||% 0; q2 <- al$partial$PP2_4 %||% 0
+      if (any(rest) && q1 + q2 > 0) {
+        ri <- which(rest); v <- runif(length(ri))
+        for (pu in list(list(m = m1, s = ri[v < q1]), list(m = m2, s = ri[v >= q1 & v < q1 + q2]))) {
+          if (!length(pu$s) || sum(pu$m) < 4L) next
+          lw <- matrix(log(pmax(ro$mu_pp, 1e-9)), length(pu$s), P, byrow = TRUE); inU <- matrix(pu$m, length(pu$s), P, byrow = TRUE)
+          grp_mask[pu$s, ] <- topk_mask(ifelse(inU, lw, -Inf), 4L) | topk_mask(ifelse(inU, -Inf, lw), 1L)
+        }
+      }
     } else {
       k <- c(pk = 4L, ot = 3L, pul = 6L, opul = 5L)[[cn]]
       grp_mask <- topk_mask(matrix(log(pmax(ro[[paste0("mu_", cn)]], 1e-9)), K, P, byrow = TRUE), k)
