@@ -83,6 +83,10 @@ topk_mask <- function(L, k) {
 # ---- one team, N sims ------------------------------------------------------------------------------
 sim_team_players <- function(bx, ro, P3) {
   N <- nrow(bx); P <- nrow(ro)
+  # PP1 D play more ES / PP time than their slot's share gives them (roles$pp1_d_mult, 08_roles_toi.R; none = as before)
+  m1d <- P3$roles$pp1_d_mult
+  if (!is.null(m1d)) { d1 <- ro$grp == "D" & ro$pp %in% 1L
+    ro <- copy(ro); ro[d1, `:=`(mu_es = mu_es * m1d[["es"]], mu_pp = mu_pp * m1d[["pp"]])] }
   al <- P3$alloc; sb <- P3$sb; isD <- ro$grp == "D"; isF <- !isD
   sec <- list(es = pmax(bx$sec_5v5 + bx$sec_eo - bx$sec_ot, 0), pp = bx$sec_pp, pk = bx$sec_pk, ot = bx$sec_ot,
               pul = bx$sec_pulled, opul = bx$sec_opp_pulled)
