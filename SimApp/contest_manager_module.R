@@ -598,10 +598,15 @@ register_contest_manager_observers <- function(input, output, session, rv, uploa
                        style = "font-weight:700;"),
           downloadButton("cm_download_upload", "Download DK Upload File", class = "btn-success",
                          style = "font-weight:700;")),
-      if (length(cm_rv$messages))
-        div(style = "color:#e0a84a;font-size:11px;margin-top:8px;",
-            lapply(cm_rv$messages, div))
+      uiOutput("cm_fill_messages")
     )
+  })
+
+  # Separate output so a fill's messages don't re-render (and reset) the
+  # build pickers above.
+  output$cm_fill_messages <- renderUI({
+    if (!length(cm_rv$messages)) return(NULL)
+    div(style = "color:#e0a84a;font-size:11px;margin-top:8px;", lapply(cm_rv$messages, div))
   })
 
   observeEvent(input$cm_fill, {
