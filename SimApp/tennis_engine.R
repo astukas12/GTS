@@ -332,9 +332,14 @@ run_tennis_engine <- function(input_data, n_sims, config, progress_callback = NU
     v_ace <- if (bo5) 0.25 else 0.4; thr <- if (bo5) 15 else 10; nodf <- if (bo5) 5 else 2.5
     out <- v_ace * (a2 - ace) - (d2 - df) + 2 * ((a2 >= thr) - (ace >= thr)) + nodf * ((d2 == 0) - (df == 0))
     out[is.na(out)] <- 0
+    if (stat_on) { attr(out, "ace") <- a2; attr(out, "df") <- d2 }   # Engine review only: the rebuilt counts
     out
   }
   serve_acc <- list()
+  # Engine review (stat_quantiles.R): each player's aces / double faults / games per sim, summarised after the
+  # loop. Off unless the review's re-sim worker sets options(gts.stat_quantiles = TRUE); draws no random numbers.
+  stat_on <- exists("gts_stat_q_on") && gts_stat_q_on()
+  stat_draws <- list()
   all_results <- vector("list", length(match_cache))
   result_idx  <- 0L
   
@@ -366,6 +371,7 @@ run_tennis_engine <- function(input_data, n_sims, config, progress_callback = NU
     winner_scores <- numeric(n_sims)
     loser_scores  <- numeric(n_sims)
     w_ace_s <- w_df_s <- l_ace_s <- l_df_s <- g_s <- rep(NA_real_, n_sims)
+    if (stat_on) wg_s <- lg_s <- rep(NA_real_, n_sims)
     
     for (bucket in 1:4) {
       idx  <- which(outcome_idx == bucket)
@@ -386,6 +392,7 @@ run_tennis_engine <- function(input_data, n_sims, config, progress_callback = NU
         w_ace_s[idx] <- pool$w_ace[drawn]; w_df_s[idx] <- pool$w_df[drawn]
         l_ace_s[idx] <- pool$l_ace[drawn]; l_df_s[idx] <- pool$l_df[drawn]
         g_s[idx]     <- pool$w_games_won[drawn] + pool$l_games_won[drawn]
+        if (stat_on) { wg_s[idx] <- pool$w_games_won[drawn]; lg_s[idx] <- pool$l_games_won[drawn] }
       }
     }
 
@@ -400,9 +407,18 @@ run_tennis_engine <- function(input_data, n_sims, config, progress_callback = NU
         winner_scores[iw] <- winner_scores[iw] + dw
         loser_scores[il]  <- loser_scores[il]  + dl
         serve_acc[[pn]] <- (sum(dw) + sum(dl)) / n_sims
+        if (stat_on) {
+          if (!is.null(attr(dw, "ace"))) { w_ace_s[iw] <- attr(dw, "ace"); w_df_s[iw] <- attr(dw, "df") }
+          if (!is.null(attr(dl, "ace"))) { l_ace_s[il] <- attr(dl, "ace"); l_df_s[il] <- attr(dl, "df") }
+        }
       }
     }
-    
+    if (stat_on)
+      stat_draws[[length(stat_draws) + 1L]] <- data.table(
+        Player = c(winner_vec, loser_vec), Win = c(rep(1L, n_sims), rep(0L, n_sims)),
+        ace = c(w_ace_s, l_ace_s), df = c(w_df_s, l_df_s), games = c(wg_s, lg_s),
+        straight = c(as.integer(out_type == "SS"), rep(0L, n_sims)), dk = c(winner_scores, loser_scores))
+
     all_results[[result_idx]] <- data.table(
       SimID   = c(seq_len(n_sims),   seq_len(n_sims)),
       Player  = c(winner_vec,        loser_vec),
@@ -534,7 +550,27 @@ run_tennis_engine <- function(input_data, n_sims, config, progress_callback = NU
   }
   
   cb(1.0, "Tennis simulation complete!")
-  
+
+  sport_visuals <- list(
+    match_analysis = rbindlist(match_analysis_data),
+    score_distributions = list(
+      all_wins = sim_results[Result == "Winner",
+                             .(Player, SimID, Score = DKScore, Outcome)],
+      ss_wins  = sim_results[Result == "Winner" & Outcome == "SS",
+                             .(Player, SimID, Score = DKScore)],
+      nss_wins = sim_results[Result == "Winner" & Outcome == "NSS",
+                             .(Player, SimID, Score = DKScore)]
+    ),
+    player_data = player_data
+  )
+  if (stat_on)
+    sport_visuals <- gts_stat_attach(sport_visuals, function() {
+      SD <- rbindlist(stat_draws)
+      list(gts_stat_summ(SD, c(Player = "Player"),
+             list(win = "Win", straight_sets_win = "straight", aces = "ace", double_faults = "df", games_won = "games",
+                  dk_fpts = "dk"), "player", list(aces = c(10, 15), games_won = c(12, 18))))
+    })
+
   list(
     dropped_matches = dropped_matches,
     serve_shift  = serve_shift,
@@ -542,18 +578,7 @@ run_tennis_engine <- function(input_data, n_sims, config, progress_callback = NU
     metadata     = metadata,
     projections  = projections,
     full_results = sim_results,
-    sport_visuals = list(
-      match_analysis = rbindlist(match_analysis_data),
-      score_distributions = list(
-        all_wins = sim_results[Result == "Winner",
-                               .(Player, SimID, Score = DKScore, Outcome)],
-        ss_wins  = sim_results[Result == "Winner" & Outcome == "SS",
-                               .(Player, SimID, Score = DKScore)],
-        nss_wins = sim_results[Result == "Winner" & Outcome == "NSS",
-                               .(Player, SimID, Score = DKScore)]
-      ),
-      player_data = player_data
-    )
+    sport_visuals = sport_visuals
   )
 }
 
