@@ -1,13 +1,13 @@
 # GTS
 
-Three R/Shiny apps for Golden Ticket Sims, a daily-fantasy sports simulation
+R/Shiny apps for Golden Ticket Sims, a daily-fantasy sports simulation
 operation. Solo-maintained.
 
 | App | What it is | How it reaches users |
 | --- | --- | --- |
 | `SimApp/` | The simulator. 10 sport engines behind one dashboard. | `runGitHub` off `main` — see below |
-| `AuctionDraft/` | Status unknown — do not assume it is live. | — |
-| `OhHell/` | Status unknown — do not assume it is live. | — |
+
+`AuctionDraft/` and `OhHell/` (personal, not GTS) moved to `Documents\Personal\` on 2 Oct 2026.
 
 `TheLab/` (NASCAR research + input-sheet builder) was retired on 22 Sep 2026.
 Nobody used the deployed app, and the scripted sheet build and reports in
