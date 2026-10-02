@@ -14,6 +14,7 @@ source("portfolio_helpers_universal.R")
 source("lineup_rules.R")
 source("cash_game_module.R")
 source("lineup_lab_module.R")
+source("contest_manager_module.R")
 
 # Source all sport engines once at startup.
 # Never re-source inside reactive observers — re-sourcing re-executes all
@@ -172,7 +173,8 @@ ui <- dashboardPage(
       menuItem("Tournament Lineups", tabName = "scoring",     icon = icon("trophy")),
       menuItem("Cash Games",         tabName = "cash_games",  icon = icon("coins")),
       menuItem("Portfolio Builder",  tabName = "portfolio",   icon = icon("layer-group")),
-      menuItem("Lineup Lab",         tabName = "lineup_lab",  icon = icon("flask"))
+      menuItem("Lineup Lab",         tabName = "lineup_lab",  icon = icon("flask")),
+      menuItem("Contest Entries",    tabName = "contest_entries", icon = icon("file-csv"))
     )
   ),
   
@@ -649,7 +651,12 @@ ui <- dashboardPage(
       # ======================================================================
       # TAB 6: LINEUP LAB -- re-solve a finished sim under a user lock
       # ======================================================================
-      tabItem(tabName = "lineup_lab", render_lineup_lab_tab_ui())
+      tabItem(tabName = "lineup_lab", render_lineup_lab_tab_ui()),
+
+      # ======================================================================
+      # TAB 7: CONTEST ENTRIES -- fill a DK entries CSV from the portfolio
+      # ======================================================================
+      tabItem(tabName = "contest_entries", render_contest_manager_ui())
     )
   )
 )
@@ -4233,34 +4240,41 @@ server <- function(input, output, session) {
   # PORTFOLIO DOWNLOADS
   # ==========================================================================
   
+  # The DK/FD upload table for a portfolio: cells "Name (ID)" in each sport's
+  # slot layout. Shared by DOWNLOAD PORTFOLIO and the Contest Entries tab.
+  portfolio_upload_table <- function(port, platform) {
+    dl <- copy(port)
+    id_col <- paste0(platform,"ID")
+    if ("Captain" %in% names(dl) && isTRUE(rv$sport == "F1")) {
+      dl <- create_download_f1(dl, rv$sim_metadata)
+    } else if ("Captain" %in% names(dl) && isTRUE(rv$sport == "TENNIS_SHOWDOWN")) {
+      dl <- create_download_tennis_showdown(dl, rv$sim_metadata)
+    } else if ("Captain" %in% names(dl)) {
+      dl <- create_download_showdown(dl, rv$sim_metadata)
+    } else if ("MVP" %in% names(dl)) {
+      dl <- create_download_mvp(dl, rv$sim_metadata)
+    } else if (isTRUE(rv$sport == "NHL")) {
+      dl <- nhl_classic_download(dl, rv$sim_metadata)   # UTIL takes its own DK id
+    } else if (isTRUE(rv$sport == "CBB")) {
+      dl <- if (rv$sport == "NBA") create_download_nba(dl, rv$sim_metadata, platform) else create_download_cbb(dl, rv$sim_metadata, platform)
+    } else if (id_col %in% names(rv$sim_metadata)) {
+      for (col in grep("^Player",names(dl),value=TRUE)) {
+        ids <- rv$sim_metadata[match(dl[[col]],rv$sim_metadata$Player), get(id_col)]
+        dl[[col]] <- if(platform=="DK") paste0(dl[[col]]," (",ids,")") else paste0(ids,":",dl[[col]])
+      }
+      if (isTRUE(rv$sport == "NFL_PRESEASON_CLASSIC")) dl <- ps_classic_headers(dl, platform)
+      if (isTRUE(rv$sport == "NFL_CLASSIC"))           dl <- ps_classic_headers(dl, platform)
+      if (isTRUE(rv$sport == "CFB_CLASSIC"))           dl <- cfb_classic_headers(dl, platform)
+    }
+    dl
+  }
+
   make_portfolio_download <- function(lp, platform) {
     downloadHandler(
       filename=function() paste0(platform,"_Portfolio_",format(Sys.Date(),"%Y%m%d"),".csv"),
       content=function(file) {
         port <- rv[[paste0(lp,"_portfolio")]]; req(port)
-        dl <- copy(port)[sample(nrow(port))]
-        id_col <- paste0(platform,"ID")
-        if ("Captain" %in% names(dl) && isTRUE(rv$sport == "F1")) {
-          dl <- create_download_f1(dl, rv$sim_metadata)
-        } else if ("Captain" %in% names(dl) && isTRUE(rv$sport == "TENNIS_SHOWDOWN")) {
-          dl <- create_download_tennis_showdown(dl, rv$sim_metadata)
-        } else if ("Captain" %in% names(dl)) {
-          dl <- create_download_showdown(dl, rv$sim_metadata)
-        } else if ("MVP" %in% names(dl)) {
-          dl <- create_download_mvp(dl, rv$sim_metadata)
-        } else if (isTRUE(rv$sport == "NHL")) {
-          dl <- nhl_classic_download(dl, rv$sim_metadata)   # UTIL takes its own DK id
-        } else if (isTRUE(rv$sport == "CBB")) {
-          dl <- if (rv$sport == "NBA") create_download_nba(dl, rv$sim_metadata, platform) else create_download_cbb(dl, rv$sim_metadata, platform)
-        } else if (id_col %in% names(rv$sim_metadata)) {
-          for (col in grep("^Player",names(dl),value=TRUE)) {
-            ids <- rv$sim_metadata[match(dl[[col]],rv$sim_metadata$Player), get(id_col)]
-            dl[[col]] <- if(platform=="DK") paste0(dl[[col]]," (",ids,")") else paste0(ids,":",dl[[col]])
-          }
-          if (isTRUE(rv$sport == "NFL_PRESEASON_CLASSIC")) dl <- ps_classic_headers(dl, platform)
-          if (isTRUE(rv$sport == "NFL_CLASSIC"))           dl <- ps_classic_headers(dl, platform)
-          if (isTRUE(rv$sport == "CFB_CLASSIC"))           dl <- cfb_classic_headers(dl, platform)
-        }
+        dl <- portfolio_upload_table(port[sample(nrow(port))], platform)
         fwrite(dl, file)
       }
     )
@@ -6955,6 +6969,11 @@ server <- function(input, output, session) {
     helpers = list(prepare_optimization_data = prepare_optimization_data,
                    drop_invalid_classic      = drop_invalid_classic,
                    add_custom_metrics        = add_custom_metrics))
+
+  # Contest Entries fills a DK entries CSV from the portfolio, using the same
+  # upload table DOWNLOAD PORTFOLIO writes (see contest_manager_module.R).
+  register_contest_manager_observers(input, output, session, rv,
+                                     upload_table = portfolio_upload_table)
   
   
 }
