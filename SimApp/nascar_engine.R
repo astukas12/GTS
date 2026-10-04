@@ -1720,6 +1720,9 @@ assign_dominator_points_from_profiles_optimized <- function(race_result, race_we
   # Use set() instead of [[ to avoid allocation issues
   col_name <- paste0(platform, "DominatorPoints")
   set(race_result, j = col_name, value = dom_points)
+  # which real line each car got (row of the drawn race's profiles; NA = none), read by
+  # nascar_assign_race_level() for the sim review's stage split
+  setattr(race_result, "dom_assigned", list(race_id = race_id, profile = assigned_profiles))
 
   return(race_result)
 }
@@ -1915,8 +1918,11 @@ prepare_stage_dominator_data <- function(race_profiles, driver_data = NULL) {
   # against a real best of 76.75). The excess passes down like a DKMax excess.
   cap <- list(DK = max(vapply(races, function(r) max(rowSums(r$DK)), 0)),
               FD = max(vapply(races, function(r) max(rowSums(r$FD)), 0)))
+  # whole-race lines for NASCAR_DOM_MODE = "race" (the matcher's own input format)
+  rdd <- lapply(split(rp, by = "RaceID"), function(p)
+    list(profiles = p, profile_finishes = p$FinPos, profile_starts = p$StartPos, n_profiles = nrow(p)))
   list(races = races, theta = params$theta, kappa = params$kappa, cap = cap, q_on = q_on, f_q = f_q,
-       metric_grid = metric_grid, late_q = late_q, s1_fin = s1_fin)
+       metric_grid = metric_grid, late_q = late_q, s1_fin = s1_fin, rdd = rdd)
 }
 
 # One drawn race's stage lines dealt to one field. Pure: no data.table, no
@@ -1993,7 +1999,36 @@ nascar_stage_deal <- function(f_start, f_fin, room, l_start, l_fin, val, theta, 
   list(pts = pts, owner = owner, stage = stage, line = line)
 }
 
+# Dominator mode (4 Oct 2026, Cup Las Vegas, Andrew). "race": each car gets one real car's WHOLE-race line
+# (assign_dominator_points_from_profiles_optimized: biggest lines first, nearest car by start and finish,
+# DKMax-aware, front-starter boost). "stage": the stage-by-stage dealer below (17 Sep - 4 Oct).
+# Tested on the Vegas Cup sheet, 5,000 sims, against the 19-race Vegas/Kansas dominator pool:
+#   biggest single line   stage 39.6 / race 52.9 / pool 53.8
+#   top dominator share   stage 0.24 / race 0.32 / pool 0.32
+# The stage dealer splits one real day across several cars, so the big favourite's big day never
+# happens. Its gain -- the pole is never blanked (race: 13% of sims) -- is the open item for a hybrid.
+# options(nascar.dom_mode = "stage") restores the stage dealer.
+NASCAR_DOM_MODE <- "race"
+
+nascar_assign_race_level <- function(race_result, race_weights, stage_data, platform) {
+  race_result <- assign_dominator_points_from_profiles_optimized(race_result, race_weights, stage_data$rdd, platform)
+  if (!is.null(h <- getOption("nascar.dom_hook"))) {
+    # sim review capture: each car's points split by stage in the proportions of the real line it got
+    a <- attr(race_result, "dom_assigned"); pts <- race_result[[paste0(platform, "DominatorPoints")]]
+    n <- length(pts); stage <- matrix(0, n, 3)
+    rd <- if (!is.null(a)) stage_data$races[[as.character(a$race_id)]] else NULL
+    if (!is.null(rd)) for (i in which(!is.na(a$profile) & pts > 0)) {
+      v <- rd[[platform]][a$profile[i], ]; if (sum(v) > 0) stage[i, ] <- pts[i] * v / sum(v) else stage[i, 1] <- pts[i]
+    }
+    h(race_result$SimID[1], if (is.null(a)) NA else a$race_id,
+      list(pts = pts, stage = stage, line = stage), race_result$Name, platform)
+  }
+  race_result
+}
+
 assign_dominator_points_stagewise <- function(race_result, race_weights, stage_data, platform) {
+  if (identical(getOption("nascar.dom_mode", NASCAR_DOM_MODE), "race"))
+    return(nascar_assign_race_level(race_result, race_weights, stage_data, platform))
   setalloccol(race_result)
   if (nrow(race_weights) == 0) stop("race_weights is empty")
   if (sum(race_weights$Weight) == 0) stop("All race weights are 0")
