@@ -40,19 +40,36 @@ golf_v2_noise <- function(n) {
   q[pmin(length(q), as.integer(runif(n) * (length(q) - 1)) + 1L)] + rnorm(n, 0, 0.004)
 }
 
-# Event settings: the sheet's Event tab, else the UI boxes (today's behaviour).
-# The field is the sheet's golfers (5 Oct 2026): FieldSize no longer adds
-# unnamed fillers. LevelSD (optional) replaces the Lev shock sd for the event.
-golf_v2_event <- function(event_dt, n_pool, cut_line, no_cut) {
+# Event settings come from the sheet's Event tab only (5 Oct 2026: the app's
+# cut boxes are gone). The field is the sheet's golfers (5 Oct 2026):
+# FieldSize no longer adds unnamed fillers. LevelSD (optional) replaces the Lev
+# shock sd for the event.
+# Cut: CutN = top N and ties, CutAfter = 2 (36-hole), 3 (54-hole), 0 (no cut).
+# Fallback when the Event tab or a cut cell is missing (older sheets): CutN 65
+# with more than 100 golfers, else 50; CutAfter 2. `cut_note` says so, and the
+# app shows it in the sim status.
+golf_v2_cut_fallback <- function(n_pool) list(cut_n = if (n_pool > 100) 65L else 50L, cut_after = 2L)
+
+golf_v2_event <- function(event_dt, n_pool) {
   ev <- if (!is.null(event_dt) && nrow(event_dt)) as.list(event_dt[1]) else list()
   num <- function(x, d) { v <- suppressWarnings(as.numeric(x)); if (length(v) && !is.na(v[1])) v[1] else d }
-  cut_after <- num(ev$CutAfter, 2)
-  if (isTRUE(no_cut)) cut_after <- 0
+  fb  <- golf_v2_cut_fallback(n_pool)
+  ca  <- num(ev$CutAfter, NA); cn <- num(ev$CutN, NA)
+  miss <- c(if (is.na(ca)) "CutAfter", if (is.na(cn) && !identical(ca, 0)) "CutN")
+  cut_after <- as.integer(if (is.na(ca)) fb$cut_after else ca)
+  cut_n     <- as.integer(if (is.na(cn)) fb$cut_n else cn)
+  note <- if (length(miss)) sprintf("Cut fallback: the sheet has no %s%s, so the sim used top %d & ties after R%d (%d golfers)",
+                                    paste(miss, collapse = "/"), if (length(ev)) "" else " (no Event tab)",
+                                    cut_n, cut_after, n_pool) else NULL
   list(par = num(ev$Par, 72), level = num(ev$Level, -0.5),
        lev_sd = num(ev$LevelSD, GOLF_V2$pars$lev_sd),
-       cut_n = as.integer(num(ev$CutN, cut_line)), cut_after = as.integer(cut_after),
+       cut_n = cut_n, cut_after = cut_after, cut_note = note,
        field = n_pool, from_sheet = length(ev) > 0)
 }
+
+# One-line description of the cut rule, for the app and logs.
+golf_v2_cut_label <- function(ev)
+  if (ev$cut_after == 0) "No cut" else sprintf("Cut: top %d & ties after round %d", ev$cut_n, ev$cut_after)
 
 # R1/R2 wave from tee times: TRUE = early. Split at the biggest gap in the
 # day's tee sheet (morning vs afternoon); NA when unknown -> no wave term.
@@ -184,7 +201,6 @@ golf_v2_fd_finish <- function(p) {
 }
 
 run_golf_simulation <- function(input_data, n_sims = 10000,
-                                cut_line = 65, no_cut = FALSE,
                                 progress_callback = NULL, keep_rounds = FALSE,
                                 fit_sims = 2000L, batch = 2500L) {
   t0 <- Sys.time()
@@ -192,14 +208,15 @@ run_golf_simulation <- function(input_data, n_sims = 10000,
   has_dk <- "DKSalary" %in% names(players_dt) && any(!is.na(players_dt$DKSalary))
   has_fd <- "FDSalary" %in% names(players_dt) && any(!is.na(players_dt$FDSalary))
   n_p <- nrow(players_dt)
-  ev  <- golf_v2_event(input_data$event, n_p, cut_line, no_cut)
+  ev  <- golf_v2_event(input_data$event, n_p)
   n   <- ev$field                                  # the sheet's golfers
   cb  <- if (is.null(progress_callback)) function(v, m) invisible() else progress_callback
 
   cat(sprintf("Golf sim v2 | %d golfers | %d sims | level %+.2f (sd %.2f) par %g | cut %s\n",
               n_p, n_sims, ev$level, ev$lev_sd, ev$par,
               if (ev$cut_after == 0) "none" else sprintf("top %d & ties after R%d", ev$cut_n, ev$cut_after)))
-  if (!ev$from_sheet) cat("  No Event tab: level/par defaults, cut from the UI box\n")
+  if (!ev$from_sheet) cat("  No Event tab: level/par defaults\n")
+  if (!is.null(ev$cut_note)) cat("  ", ev$cut_note, "\n", sep = "")
 
   rn <- c(names(GOLF_V2$rungs), "Cut")
   mk <- matrix(NA_real_, n, length(rn), dimnames = list(NULL, rn))
@@ -290,7 +307,8 @@ run_golf_simulation <- function(input_data, n_sims = 10000,
   cb(1.0, "Simulation complete!")
   list(sim_results = sim_results, sim_metadata = sim_metadata,
        has_dk = has_dk, has_fd = has_fd,
-       no_cut = ev$cut_after == 0, cut_line = ev$cut_n, n_sims = n_sims,
+       no_cut = ev$cut_after == 0, cut_line = ev$cut_n, cut_after = ev$cut_after,
+       cut_note = ev$cut_note, n_sims = n_sims,
        skill = data.table(Player = players_dt$Name, mu = mu[seq_len(n_p)]),
        round_results = if (keep_rounds) rbindlist(rr_l) else NULL)
 }

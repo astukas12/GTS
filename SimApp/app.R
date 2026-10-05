@@ -775,8 +775,9 @@ server <- function(input, output, session) {
     dk_selected_builds      = character(0),
     fd_selected_builds      = character(0),
     sd_selected_builds      = character(0),
-    golf_no_cut        = FALSE,
-    golf_cut_line      = 65,
+    golf_no_cut        = FALSE,   # set from the engine result (the sheet's
+    golf_cut_line      = 65,      #   Event tab, or the documented fallback)
+    golf_cut_note      = NULL,
     has_fd             = TRUE,
     has_sd             = TRUE,
     has_dk             = TRUE,
@@ -971,26 +972,18 @@ server <- function(input, output, session) {
   })
 
 
-  # ── Golf extra options (below bar, Golf only) ────────────────────────────
+  # ── Golf cut rule (below bar, Golf only) ─────────────────────────────────
+  # The cut comes from the sheet's Event tab (CutN, CutAfter); there are no cut
+  # controls in the app. Older sheets without it get the engine's documented
+  # fallback, and this line says so.
   output$golf_extra_ui <- renderUI({
-    req(rv$sport == "GOLF")
-    # A sheet with an Event tab carries its own cut rule (engine v2 reads it and
-    # ignores the boxes), so the user has nothing to set: show the rule instead.
-    ev <- rv$input_data$event
-    if (!is.null(ev) && nrow(ev) > 0) {
-      ca <- suppressWarnings(as.integer(ev$CutAfter[1])); cn <- suppressWarnings(as.integer(ev$CutN[1]))
-      rule <- if (!is.na(ca) && ca == 0) "No cut" else
-        sprintf("Cut: top %s & ties after round %s", ifelse(is.na(cn), 65, cn), ifelse(is.na(ca), 2, ca))
-      return(div(class = "gts-golf-row", span(paste(rule, "(from the sheet)"))))
-    }
+    req(rv$sport == "GOLF", rv$input_data)
+    n_p <- if (!is.null(rv$input_data$player)) nrow(rv$input_data$player) else 0L
+    ev  <- golf_v2_event(rv$input_data$event, n_p)
+    if (is.null(ev$cut_note))
+      return(div(class = "gts-golf-row", span(paste(golf_v2_cut_label(ev), "(from the sheet)"))))
     div(class = "gts-golf-row",
-        checkboxInput("golf_no_cut", "No-cut tournament", value = FALSE),
-        conditionalPanel(
-          condition = "!input.golf_no_cut",
-          numericInput("golf_cut_line", "Cut line (+ ties):",
-                       value = 65, min = 50, max = 85, step = 5, width = "130px")
-        )
-    )
+        span(style = "color:#b45309;", icon("exclamation-triangle"), " ", ev$cut_note))
   })
   
   
@@ -1064,19 +1057,16 @@ server <- function(input, output, session) {
     
     tryCatch({
       if (rv$sport == "GOLF") {
-        no_cut   <- if (!is.null(input$golf_no_cut))   input$golf_no_cut   else FALSE
-        cut_line <- if (!is.null(input$golf_cut_line)) input$golf_cut_line else 65
-        result   <- run_golf_simulation(
+        result   <- run_golf_simulation(          # cut rule from the sheet's Event tab
           input_data        = rv$input_data,
           n_sims            = input$n_sims,
-          cut_line          = cut_line,
-          no_cut            = no_cut,
           progress_callback = function(v, m) progress$set(value = v, detail = m)
         )
         rv$simulation_results <- result$sim_results
         rv$sim_metadata       <- result$sim_metadata
         rv$golf_no_cut        <- result$no_cut
         rv$golf_cut_line      <- result$cut_line
+        rv$golf_cut_note      <- result$cut_note
         rv$has_fd             <- isTRUE(result$has_fd)
         rv$sport_visuals      <- NULL
         rv$full_sim_results   <- NULL
@@ -1136,15 +1126,18 @@ server <- function(input, output, session) {
       }
       
       # ── Post-sim status strip ────────────────────────────────────────────
+      golf_note <- if (isTRUE(rv$sport == "GOLF")) rv$golf_cut_note else NULL
       output$sim_complete_message <- renderUI({
         div(class = "gts-sim-done",
             icon("check-circle"),
             sprintf("Simulation complete — %s sims | %s %s",
                     format(input$n_sims, big.mark = ","),
                     nrow(rv$sim_metadata),
-                    tolower(rv$config$player_label_plural))
+                    tolower(rv$config$player_label_plural)),
+            if (!is.null(golf_note)) div(style = "color:#b45309;", icon("exclamation-triangle"), " ", golf_note)
         )
       })
+      if (!is.null(golf_note)) showNotification(golf_note, type = "warning", duration = 10)
       session$sendCustomMessage("gts_toast", list(
         title    = "Simulation Complete",
         sub      = paste0(format(input$n_sims, big.mark = ","), " sims | ",
