@@ -10,11 +10,13 @@
 #     mu    skill vs the field, fitted so the sim reproduces the market ladder
 #     u     this golfer this week, N(0, 0.55), same all four rounds
 #     C     round conditions shared by the field, N(0, 0.75)
-#     Lev   event scoring shock, N(0, 0.87)
+#     Lev   event scoring shock, N(0, LevelSD): the Event tab's LevelSD (the
+#           sheet's Level miss for its source), else 0.87
 #     wave  R1-R2: early minus late ~ N(-0.24, 0.59), half to each side
 #     eps   empirical right-skewed shape (golf/noise_q.rds), sd 2.64 + 0.055 mu
 # Integer strokes by unbiased stochastic rounding. Cut = top CutN and ties
-# after CutAfter rounds. Finish = 72-hole rank with real ties, except a tie
+# after CutAfter rounds. The field is the sheet's golfers (Event FieldSize is
+# ignored: no unnamed fillers). Finish = 72-hole rank with real ties, except a tie
 # for 1st is a playoff: one winner, the rest share 2nd.
 #
 # Points: each simulated round takes a REAL round's DK and FD points drawn
@@ -39,15 +41,17 @@ golf_v2_noise <- function(n) {
 }
 
 # Event settings: the sheet's Event tab, else the UI boxes (today's behaviour).
+# The field is the sheet's golfers (5 Oct 2026): FieldSize no longer adds
+# unnamed fillers. LevelSD (optional) replaces the Lev shock sd for the event.
 golf_v2_event <- function(event_dt, n_pool, cut_line, no_cut) {
   ev <- if (!is.null(event_dt) && nrow(event_dt)) as.list(event_dt[1]) else list()
   num <- function(x, d) { v <- suppressWarnings(as.numeric(x)); if (length(v) && !is.na(v[1])) v[1] else d }
   cut_after <- num(ev$CutAfter, 2)
   if (isTRUE(no_cut)) cut_after <- 0
   list(par = num(ev$Par, 72), level = num(ev$Level, -0.5),
+       lev_sd = num(ev$LevelSD, GOLF_V2$pars$lev_sd),
        cut_n = as.integer(num(ev$CutN, cut_line)), cut_after = as.integer(cut_after),
-       field = max(n_pool, as.integer(num(ev$FieldSize, n_pool))),
-       from_sheet = length(ev) > 0)
+       field = n_pool, from_sheet = length(ev) > 0)
 }
 
 # R1/R2 wave from tee times: TRUE = early. Split at the biggest gap in the
@@ -100,7 +104,7 @@ golf_v2_sim <- function(mu, early, dr, ev, pars = GOLF_V2$pars) {
   cut_tot <- NULL
   for (r in 1:4) {
     x <- ev$level + muM + pars$s_u * dr$u + sig * dr$eps[, , r] + pars$C_sd * dr$C[, r] +
-         pars$lev_sd * dr$lev
+         (ev$lev_sd %||% pars$lev_sd) * dr$lev
     if (r <= 2) {
       e <- early[, r]
       if (any(!is.na(e))) {
@@ -134,7 +138,7 @@ golf_v2_rung_probs <- function(sim, K = GOLF_V2$rungs) {
 
 # Fit mu so the sim reproduces the market ladder mk (n x rungs; NA / 0 / 1 =
 # not used). Probit-gap steps, damped, centred on the field every iteration.
-# Golfers with no usable rung (fillers, never priced) sit at the field bottom.
+# Golfers with no usable rung (never priced) sit at the field bottom.
 golf_v2_fit <- function(mk, early, ev, S = 2000L, iters = 25L, step = 0.8, cb = NULL) {
   n <- nrow(mk); rungs <- colnames(mk)
   slope <- ifelse(rungs == "Cut", 0.5, 0.7)
@@ -189,11 +193,11 @@ run_golf_simulation <- function(input_data, n_sims = 10000,
   has_fd <- "FDSalary" %in% names(players_dt) && any(!is.na(players_dt$FDSalary))
   n_p <- nrow(players_dt)
   ev  <- golf_v2_event(input_data$event, n_p, cut_line, no_cut)
-  n   <- ev$field                                  # pool + unnamed fillers
+  n   <- ev$field                                  # the sheet's golfers
   cb  <- if (is.null(progress_callback)) function(v, m) invisible() else progress_callback
 
-  cat(sprintf("Golf sim v2 | %d golfers (+%d field fill) | %d sims | level %+.2f par %g | cut %s\n",
-              n_p, n - n_p, n_sims, ev$level, ev$par,
+  cat(sprintf("Golf sim v2 | %d golfers | %d sims | level %+.2f (sd %.2f) par %g | cut %s\n",
+              n_p, n_sims, ev$level, ev$lev_sd, ev$par,
               if (ev$cut_after == 0) "none" else sprintf("top %d & ties after R%d", ev$cut_n, ev$cut_after)))
   if (!ev$from_sheet) cat("  No Event tab: level/par defaults, cut from the UI box\n")
 
@@ -201,12 +205,12 @@ run_golf_simulation <- function(input_data, n_sims = 10000,
   mk <- matrix(NA_real_, n, length(rn), dimnames = list(NULL, rn))
   for (r in intersect(rn, names(players_dt))) mk[seq_len(n_p), r] <- as.numeric(players_dt[[r]])
   if (ev$cut_after == 0) mk[, "Cut"] <- NA
-  early <- rbind(golf_v2_waves(players_dt), matrix(NA, n - n_p, 2))
+  early <- golf_v2_waves(players_dt)
 
   mu <- golf_v2_fit(mk, early, ev, S = fit_sims, cb = cb)
 
   n_b  <- ceiling(n_sims / batch)
-  dk_l <- vector("list", n_b); fd_l <- dk_l; pos_l <- dk_l; rr_l <- dk_l
+  dk_l <- vector("list", n_b); fd_l <- dk_l; pos_l <- dk_l; rr_l <- dk_l; mc_l <- dk_l
   made_sum <- numeric(n_p)
   for (b in seq_len(n_b)) {
     S  <- min(batch, n_sims - (b - 1L) * batch)
@@ -245,12 +249,13 @@ run_golf_simulation <- function(input_data, n_sims = 10000,
     dk <- dk + matrix(golf_v2_dk_finish(as.integer(pos)), S, n_p) + 5 * sub70
     fd <- fd + matrix(golf_v2_fd_finish(as.integer(pos)), S, n_p)
 
-    dk_l[[b]] <- t(dk); fd_l[[b]] <- t(fd); pos_l[[b]] <- t(fp)
+    dk_l[[b]] <- t(dk); fd_l[[b]] <- t(fd); pos_l[[b]] <- t(fp); mc_l[[b]] <- t(made)
     if (keep_rounds) rr_l[[b]] <- rbindlist(rounds)
     cb(0.40 + 0.45 * b / n_b, sprintf("Simulating rounds (%d/%d)...", b, n_b))
   }
   dk_mat <- do.call(cbind, dk_l); fd_mat <- do.call(cbind, fd_l); pos_mat <- do.call(cbind, pos_l)
-  rm(dk_l, fd_l, pos_l)
+  made_mat <- do.call(cbind, mc_l)
+  rm(dk_l, fd_l, pos_l, mc_l)
 
   cb(0.88, "Building output tables...")
   sim_results <- data.table(
@@ -258,6 +263,7 @@ run_golf_simulation <- function(input_data, n_sims = 10000,
     Player         = rep(players_dt$Name, times = n_sims),
     Pool           = rep(players_dt$Pool, times = n_sims),
     FinishPosition = as.integer(as.vector(pos_mat)),
+    MadeCut        = as.integer(as.vector(made_mat)),   # 1 = played the weekend (all 1 with no cut)
     DKScore        = if (has_dk) as.vector(dk_mat) else 0,
     FDScore        = if (has_fd) as.vector(fd_mat) else 0
   )
