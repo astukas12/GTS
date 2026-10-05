@@ -89,7 +89,7 @@
 
 suppressPackageStartupMessages({
   library(data.table)
-  library(curl); library(jsonlite)   # real QB passing-yard props, see nfl_pass_yard_props()
+  library(jsonlite)
 })
 
 # ---- where the pool lives ---------------------------------------------------
@@ -139,7 +139,7 @@ NFL_POOL_DIMS      <- c("total", "absp", "fO_pr", "fO_pys", "dO_pr", "dO_pys")
 NFL_POOL_W         <- c(1.5, 1.5, 0.7, 0.7, 0.7, 0.7)
 NFL_POOL_BW        <- 0.9
 
-# The two REAL pass-yard dims (nfl_pass_yard_props()), appended when at least
+# The two REAL pass-yard dims (the QB lines on the sheet's game tab), appended when at least
 # one side of a game has a posted line -- see run_nfl_simulation. Weighted
 # like total/absp (real market data), not like the 0.7 style dims. Measured
 # on the W1 Sunday 24-QB check: delivers the ask within ~1-2 yards on normal
@@ -326,63 +326,14 @@ nfl_dirichlet_winners <- function(sim_idx, base_p, a0, n_sims) {
 }
 
 # =============================================================================
-# REAL QB PASSING-YARD PROPS  (inlined from GTS/NFL/R/fetch_props_pinnacle.R)
+# QB PROP LINES -- FROM THE SHEET ONLY (5 Oct 2026)
 # -----------------------------------------------------------------------------
-# The pool target for team pass-yard LEVEL (fpass_yds/dpass_yds, see
-# nfl_calibrate_target) is sourced from Pinnacle's real no-vig prop board, not
-# an estimate -- "real lines always" (README/BUILD_QUEUE). One GET for the
-# board + one for prices, ~750 Week-1 player props across every game. Wrapped
-# in try/catch throughout: a network failure, a 401 (Pinnacle's public site
-# key rotated), or a missing line for one QB must degrade to "no yards-level
-# delivery for that side" -- never abort the sim.
+# The pool target for team pass-yard LEVEL and completions (fpass_yds / dpass_yds, fcmp / dcmp, see
+# nfl_calibrate_target) is the QB's Pinnacle line, written onto the game tab by the build
+# (pyds_line_* / cmp_line_* / props_source; GTS/NFL/R/props_on_sheet.R). The live Pinnacle fetch that used
+# to live here is gone: it made a re-sim depend on when it ran. nfl_props_from_table() below stays for
+# GTS scripts that hand the engine a saved board (RB rushing lines for the balanced matcher).
 # =============================================================================
-PINN_NFL_BASE   <- "https://guest.api.arcadia.pinnacle.com/0.1"
-PINN_NFL_LEAGUE <- 889L
-PINN_NFL_HEADERS <- c(
-  "user-agent" = paste("Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-                       "AppleWebKit/537.36 (KHTML, like Gecko)",
-                       "Chrome/128.0.0.0 Safari/537.36"),
-  "accept"    = "application/json",
-  "referer"   = "https://www.pinnacle.com/",
-  "x-api-key" = "CmX2KcMrXuFmNg6YFbmTxE0y9CIrOi0R")
-
-nfl_pinn_get <- function(path, tries = 3) {
-  for (i in seq_len(tries)) {
-    h <- curl::new_handle(); curl::handle_setheaders(h, .list = as.list(PINN_NFL_HEADERS))
-    r <- tryCatch(curl::curl_fetch_memory(paste0(PINN_NFL_BASE, path), handle = h),
-                  error = function(e) NULL)
-    if (!is.null(r) && r$status_code == 200)
-      return(jsonlite::fromJSON(rawToChar(r$content), simplifyVector = FALSE))
-    Sys.sleep(1.5 * i)
-  }
-  NULL   # caller degrades gracefully -- never stop() on a fetch failure
-}
-
-# One row per player passing-yard prop: player, line. NULL (not an error) if
-# Pinnacle is unreachable or the board carries no passing-yard props right now.
-nfl_pass_yard_props <- function() {
-  tryCatch({
-    m  <- nfl_pinn_get(sprintf("/leagues/%d/matchups", PINN_NFL_LEAGUE))
-    mk <- nfl_pinn_get(sprintf("/leagues/%d/markets/straight", PINN_NFL_LEAGUE))
-    if (is.null(m) || is.null(mk)) return(NULL)
-    sp <- Filter(function(x) identical(x$type, "special") &&
-                   identical(x$special$category, "Player Props"), m)
-    props <- rbindlist(lapply(sp, function(x) {
-      ids <- sapply(x$participants, `[[`, "id"); nms <- sapply(x$participants, `[[`, "name")
-      data.table(matchup = x$id, desc = x$special$description,
-                 over_id = ids[nms == "Over"][1])
-    }))
-    props <- props[grepl(" Total (Passing Yards|Pass Completions|Rushing Yards)$", desc)]
-    if (!nrow(props)) return(NULL)
-    props[, `:=`(player = sub(" Total .*$", "", desc), stat = sub("^.* Total ", "", desc))]
-    px <- rbindlist(lapply(Filter(function(x) x$period == 0 && x$key == "s;0;ou", mk), function(x)
-      rbindlist(lapply(x$prices, function(p)
-        data.table(matchup = x$matchupId, pid = p$participantId, points = p$points %||% NA_real_)))))
-    props <- merge(props, px[, .(matchup, over_id = pid, line = points)],
-                   by = c("matchup", "over_id"))
-    nfl_props_from_table(props[!is.na(line)])
-  }, error = function(e) NULL)
-}
 
 # A prop TABLE (player, stat, line -- Pinnacle's stat names) -> the object the
 # engine takes as `.props`: the pass-yard lines, with the completions lines riding
@@ -416,8 +367,9 @@ nfl_qb_pass_line <- function(qb, props) {
   if (is.null(props) || is.na(qb) || !nzchar(qb)) return(NA_real_)
   hit <- props[player == qb, line]
   if (length(hit)) return(hit[1])
-  norm <- function(x) tolower(trimws(gsub("[^A-Za-z]", "", x)))
-  hit <- props[norm(player) == norm(qb), line]
+  # suffix-blind too (5 Oct 2026): Pinnacle "Michael Penix" vs the sheet's "Michael Penix Jr." missed, and ATL's
+  # pass-yard / completions asks went NA. nfl_name_key is the key the RB rushing match already uses.
+  hit <- props[nfl_name_key(player) == nfl_name_key(qb), line]
   if (length(hit)) hit[1] else NA_real_
 }
 
@@ -1576,11 +1528,21 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
   # authoritative: retrying per-game would mean up to 12 redundant round-trips
   # to a board that's already down. Only fetch here for a standalone
   # (showdown) call, where .slate_type is unset and nobody fetched yet.
-  props <- if (is.null(.props) && is.null(.slate_type)) nfl_pass_yard_props() else .props
-  qb_of <- function(tm) { P <- PL[team == tm & pass_share > 0]
-    if (nrow(P)) P$player[which.max(P$pass_share)] else NA_character_ }
-  pyds_f <- nfl_qb_pass_line(qb_of(fav), props)
-  pyds_d <- nfl_qb_pass_line(qb_of(dog), props)
+  # QB LINES COME FROM THE SHEET ONLY (Andrew, 5 Oct 2026). The engine used to fetch Pinnacle live and match the
+  # lines to the sheet's QB by name, so a sheet's result depended on when it was run: after kickoff the lines are
+  # gone, and days later the QB's NEXT game's line could be picked up. The game tab carries what the build pulled:
+  # pyds_line_away / _home, cmp_line_away / _home, props_source. A sheet without them runs with no QB anchor.
+  # `.props` (a caller's saved board) now only feeds the RB rushing lines of the opt-in balanced matcher.
+  sheet_line <- function(stem, tm) {
+    cl <- paste0(stem, if (identical(tm, away)) "_away" else "_home")
+    if (cl %in% names(G)) suppressWarnings(as.numeric(G[[cl]][1])) else NA_real_
+  }
+  props <- .props
+  pyds_f <- sheet_line("pyds_line", fav); pyds_d <- sheet_line("pyds_line", dog)
+  say(if (any(is.finite(c(pyds_f, pyds_d, sheet_line("cmp_line", fav), sheet_line("cmp_line", dog)))))
+        sprintf("QB lines: from the sheet (%s)",
+                if ("props_source" %in% names(G) && !is.na(G$props_source[1])) G$props_source[1] else "no source noted")
+      else "QB lines: none on sheet -- pass-yard / completions anchor off", 0.04)
   dims <- NFL_POOL_DIMS; weights <- NFL_POOL_W
   if (is.finite(pyds_f) || is.finite(pyds_d)) {
     dims <- NFL_POOL_DIMS_PYDS; weights <- NFL_POOL_W_PYDS
@@ -1592,8 +1554,8 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
   # Team completions (NFL_POOL_DIMS_CMP) -- same per-side rules as pass yards.
   cmp_f <- cmp_d <- NA_real_
   if (isTRUE(getOption("nfl.target_cmp", TRUE))) {
-    cmp_f <- nfl_qb_cmp_line(qb_of(fav), props)
-    cmp_d <- nfl_qb_cmp_line(qb_of(dog), props)
+    cmp_f <- sheet_line("cmp_line", fav)
+    cmp_d <- sheet_line("cmp_line", dog)
     if (is.finite(cmp_f) || is.finite(cmp_d)) {
       dims <- c(dims, NFL_POOL_DIMS_CMP); weights <- c(weights, NFL_POOL_W_CMP)
       target$fcmp <- if (is.finite(cmp_f)) cmp_f else stats::median(Gp$fcmp)
@@ -2010,8 +1972,8 @@ run_nfl_classic_simulation <- function(input_data, n_sims = 10000, config = NULL
 
   # One fetch for the whole card, not one per game -- Pinnacle's board covers
   # every game at once, so 12 calls would be 11 wasted round-trips.
-  say("fetching passing-yard props", 0.01)
-  props <- nfl_pass_yard_props()
+  # QB lines come from each game's row on the sheet (run_nfl_simulation); no live fetch (5 Oct 2026).
+  props <- NULL
 
   for (i in seq_len(ng)) {
     gi  <- G[i]; tms <- c(gi$away, gi$home); gkey <- paste(gi$away, gi$home)
