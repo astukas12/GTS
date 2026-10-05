@@ -332,7 +332,7 @@ A working launch config lives at `.claude/launch.json` in the repo root (name:
 ## Golf engine v2 (`golf_engine_v2.R`, 30 Sep 2026) — round-score sim
 
 Design record: `GTS/Golf/ENGINE.md`. `golf_engine.R` keeps v1's reader and
-helpers, reads the optional `Event` tab (Par, Level, CutN, CutAfter, FieldSize),
+helpers, reads the optional `Event` tab (Par, Level, LevelSD, CutN, CutAfter),
 and sources `golf_engine_v2.R` at its end, which **redefines
 `run_golf_simulation()`**. v1 survives only as `run_golf_simulation_v1()` for
 the P4 bench — Andrew's call: v2 is the only engine customers run.
@@ -341,9 +341,22 @@ Skill (one number per golfer) is fitted so the sim reproduces the sheet's
 W/T5..T40/Cut ladder (common random numbers, 25 probit steps, centred on the
 field); rounds are simulated with shared conditions, waves from tee times and
 skewed personal noise; each round's DK/FD points are a real round drawn at the
-same score to par (`golf/round_pool.rds`, `golf/noise_q.rds`, ~100 KB). The
-Event tab's CutN overrides the UI cut box; no Event tab = today's defaults.
-Tie for 1st = playoff. `CutProb` is the sim's own cut rate.
+same score to par (`golf/round_pool.rds`, `golf/noise_q.rds`, ~100 KB).
+Tie for 1st = playoff.
+
+**Field, Level spread and cut (5 Oct 2026, branch golf-engine-v2-review).**
+The field is the sheet's golfers: Event `FieldSize` is ignored and there are no
+unnamed fillers. `LevelSD` on the Event tab sets the sd of the event-level shock
+(BuildSheet writes sqrt(0.308 + 0.487 / editions) from course history, 1.90 for
+comps; 0.87 if absent). The cut comes **only** from the Event tab's CutN /
+CutAfter, which `BuildSheet_Golf.R`'s `golf_cut_rule()` writes per event (majors,
+54-hole pro-ams, no-cut events, else 65 above 100 golfers, 50 at 100 or fewer).
+The app has no cut controls; it shows the rule with "(from the sheet)". An older
+sheet without the Event tab or a cut cell falls back to top 65 & ties after R2
+with more than 100 golfers, else top 50 (`golf_v2_cut_fallback()`), and the app
+shows an amber note under the bar, in the sim status strip and as a warning
+toast. The fallback does not know majors: an old US Open sheet gets 65, not 60.
+`sim_results` carries `MadeCut` (1 = played the weekend). `CutProb` is the sim's own cut rate.
 `keep_rounds = TRUE` adds `round_results` (for showdown, P5) — off in the app,
 it is ~12M rows at 25k sims.
 
