@@ -1161,13 +1161,9 @@ find_optimal_lineups_enum_captain <- function(sim_results, config, verbose = TRU
   if (!length(cap_parts)) stop("enum_captain: no lineup in the salary band -- check salaries / cap")
   E <- do.call(cbind, cap_parts)                            # (n_flex+2) x M
   band_sport <- isTRUE(config$sport %in% ENUM_BAND_TARGET_SPORTS)
-  # Per-sport override (6 Oct 2026, CFB): sport config `enum_band_target`. CFB showdown back-test on
-  # 154 contests (gts-loop/contest-review/cfb/sd_pool_size): a 10k band + enum_keep 2000 lifted whole-pool
-  # cash 21.7% -> 26.5% vs 100k + 10k. NFL/NHL keep the 100k default until tested.
-  band_target <- if (is.null(config$enum_band_target)) ENUM_BAND_TARGET else as.integer(config$enum_band_target)
-  # Re-entered at 0.75*cap below: cut back to the top band_target by salary.
-  if (band_sport && isTRUE(config$.band_cut) && ncol(E) > band_target) {
-    thr <- sort(E[n_flex + 2L, ], decreasing = TRUE)[band_target]
+  # Re-entered at 0.75*cap below: cut back to the top ENUM_BAND_TARGET by salary.
+  if (band_sport && isTRUE(config$.band_cut) && ncol(E) > ENUM_BAND_TARGET) {
+    thr <- sort(E[n_flex + 2L, ], decreasing = TRUE)[ENUM_BAND_TARGET]
     E   <- E[, E[n_flex + 2L, ] >= thr, drop = FALSE]
     sal_floor <- thr
   }
@@ -1176,11 +1172,12 @@ find_optimal_lineups_enum_captain <- function(sim_results, config, verbose = TRU
   lsal_v <- E[n_flex + 2L, ]
   M <- length(cpt_v)
 
-  if (band_sport && M < band_target && floor_frac > 0.75) {
+  if (band_sport && M < ENUM_BAND_TARGET && floor_frac > 0.75) {
     if (verbose) cat(sprintf("  only %s lineups in band -- lowering the floor to take the top %s by salary\n",
-                             format(M, big.mark = ","), format(band_target, big.mark = ",")))
+                             format(M, big.mark = ","), format(ENUM_BAND_TARGET, big.mark = ",")))
     return(find_optimal_lineups_enum_captain(
-      sim_results, modifyList(config, list(enum_salary_floor_frac = 0.75, .band_cut = TRUE)), verbose))
+      sim_results, modifyList(config, list(enum_salary_floor_frac = 0.75, .band_cut = TRUE,
+                                           .orig_floor_frac = floor_frac)), verbose))
   }
   if (!band_sport && M < 2L * enum_keep && floor_frac > 0.75) {
     if (verbose) cat(sprintf("  only %s lineups in band -- widening floor to 0.75*cap and re-enumerating\n",
@@ -1274,8 +1271,24 @@ find_optimal_lineups_enum_captain <- function(sim_results, config, verbose = TRU
   # sim's player-score vector (no M x n_players incidence matrix, no M x n_sims
   # score matrix -- both would be tens of GB). A player is never captain and
   # flex in the same lineup, so the gathers are disjoint by construction.
-  n_flag    <- max(1L, as.integer(round(M * win_pct)))
-  kth       <- M - n_flag + 1L
+  # GPP sub-band (6 Oct 2026, CFB): sport config `enum_band_target` ranks only the top N rosters by
+  # salary (all of them at the sport's own floor when that already holds N), while the Cash ladder
+  # above keeps the full band. CFB showdown back-test, 154 contests (gts-loop/contest-review/cfb/
+  # sd_pool_size): a 10k sub-band + enum_keep 2000 lifted GPP whole-pool cash 18.4% -> 22.8%, ROI
+  # -22% -> +7% vs 100k + 10k. Unset (NFL, NHL, every other sport): hit counts span the whole band.
+  gidx <- NULL
+  gpp_band <- if (is.null(config$enum_band_target)) NA_integer_ else as.integer(config$enum_band_target)
+  if (!is.na(gpp_band) && gpp_band < M) {
+    own_floor <- (if (is.null(config$.orig_floor_frac)) floor_frac else config$.orig_floor_frac) * salary_cap
+    gthr <- min(own_floor, sort(lsal_v, decreasing = TRUE)[gpp_band])
+    gidx <- which(lsal_v >= gthr)
+    if (verbose) cat(sprintf("  GPP sub-band: top %s by salary ($%s+) of %s rank by winning script; cash ladder keeps all\n",
+                             format(length(gidx), big.mark = ","), format(round(gthr), big.mark = ","),
+                             format(M, big.mark = ",")))
+  }
+  Mg        <- if (is.null(gidx)) M else length(gidx)
+  n_flag    <- max(1L, as.integer(round(Mg * win_pct)))
+  kth       <- Mg - n_flag + 1L
   hit_count <- integer(M)
   cnt_all   <- if (has_lad) integer(n_cash * (K + 1L)) else NULL
   fcn_all   <- if (has_lad) integer(n_fl * (K + 1L)) else NULL
@@ -1310,11 +1323,17 @@ find_optimal_lineups_enum_captain <- function(sim_results, config, verbose = TRU
       sc <- score_mat[, s]
       ls <- cpt_multiplier * sc[cpt_v]
       for (r in seq_len(n_flex)) ls <- ls + sc[flex_m[r, ]]
-      thr <- sort(ls, partial = kth)[kth]
       # `hit_count[ls >= thr] <- hit_count[ls >= thr] + 1L` evaluated the
       # comparison twice and built two length-M index vectors per sim. One
       # vectorised add over the logical is the same answer for less work.
-      hc <- hc + (ls >= thr)
+      if (is.null(gidx)) {
+        thr <- sort(ls, partial = kth)[kth]
+        hc <- hc + (ls >= thr)
+      } else {
+        lg  <- ls[gidx]
+        thr <- sort(lg, partial = kth)[kth]
+        hc[gidx] <- hc[gidx] + (lg >= thr)
+      }
 
       if (has_lad) {
         # The field, in this sim, sorted best first; cumsum the entry weights
@@ -1372,7 +1391,7 @@ find_optimal_lineups_enum_captain <- function(sim_results, config, verbose = TRU
     on.exit(try(parallel::stopCluster(cl), silent = TRUE), add = TRUE)
     parallel::clusterExport(
       cl,
-      c("score_mat", "cpt_v", "flex_m", "cpt_multiplier", "n_flex", "kth", "M",
+      c("score_mat", "cpt_v", "flex_m", "cpt_multiplier", "n_flex", "kth", "M", "gidx",
         "has_lad", if (has_lad) c("f_cpt", "f_flex", "fw", "cutw", "K",
                                   "off_m", "off_f", "n_fl", "cidx",
                                   "n_cash") else NULL),
