@@ -575,6 +575,19 @@ read_cfb_input <- function(file_path, slate = NULL, game = NULL) {
       po <- merge(po, unique(prj[, .(player, own = suppressWarnings(as.numeric(own)))],
                              by = "player"), by = "player", all.x = TRUE)
     else po[, own := NA_real_]
+    # SHOWDOWN OWNERSHIP (fixed 6 Oct 2026). The sheet carries a showdown's
+    # ownership as `flex_own` / `cpt_own` on its SD rows, with `own` left at 0
+    # (CFB/R/slate_sheet.R). Only `own` used to survive this rebuild, so every
+    # showdown on a multi-game card reached the sim with DKOwn = CPTOwn = 0 and
+    # Top1%/Win%/leverage ran against a field with no ownership. Carry both
+    # through for the SD slice; cfb_build_meta() already prefers them.
+    if (identical(prj_slate, "SD") && !is.null(prj)) {
+      for (oc in intersect(c("flex_own", "cpt_own"), names(prj))) {
+        ov <- unique(prj[, .(player, v = suppressWarnings(as.numeric(get(oc))))], by = "player")
+        setnames(ov, "v", oc)
+        po <- merge(po, ov, by = "player", all.x = TRUE)
+      }
+    }
     prj <- po
   } else if (!is.null(etr_raw) && "etr" %in% names(etr_raw)) {
     # SINGLE-SLATE SHEETS NEED THE SAME JOIN (fixed 17 Sep 2026). A standalone
