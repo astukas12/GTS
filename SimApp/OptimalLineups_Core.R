@@ -1139,6 +1139,14 @@ find_optimal_lineups_enum_captain <- function(sim_results, config, verbose = TRU
   mu <- rowMeans(score_mat)
 
   sal_floor <- floor_frac * salary_cap
+  # HARD SALARY FLOOR (6 Oct 2026, CFB contest review). `enum_min_salary` ($,
+  # NULL = off) is a floor the band-by-count logic below can never go under.
+  # Without it a small CFB showdown (~22-27 men) fills its 100k band by dropping
+  # to $40-44k, and hit_count then keeps plenty of those rosters: 46% of the
+  # 19 Sep-3 Oct CFB SD pools were under $47k, and the pool cashed 0.7x the
+  # field. Back-test (117 SD contests): $49k floor took pool cash 19.7% -> 23.4%.
+  min_sal <- if (is.null(config$enum_min_salary)) NA_real_ else suppressWarnings(as.numeric(config$enum_min_salary))[1]
+  if (!is.na(min_sal) && min_sal > 0) sal_floor <- max(sal_floor, min(min_sal, salary_cap))
 
   # ---- 1-2. enumerate CPT + 5-flex, keep salary-band & >=2-team survivors ----
   cap_parts <- vector("list", n_players)
@@ -1172,7 +1180,8 @@ find_optimal_lineups_enum_captain <- function(sim_results, config, verbose = TRU
   lsal_v <- E[n_flex + 2L, ]
   M <- length(cpt_v)
 
-  if (band_sport && M < ENUM_BAND_TARGET && floor_frac > 0.75) {
+  floor_binds <- !is.na(min_sal) && min_sal > 0 && min_sal >= 0.75 * salary_cap
+  if (band_sport && M < ENUM_BAND_TARGET && floor_frac > 0.75 && !floor_binds) {
     if (verbose) cat(sprintf("  only %s lineups in band -- lowering the floor to take the top %s by salary\n",
                              format(M, big.mark = ","), format(ENUM_BAND_TARGET, big.mark = ",")))
     return(find_optimal_lineups_enum_captain(
