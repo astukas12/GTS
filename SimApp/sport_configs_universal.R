@@ -1583,8 +1583,10 @@ SPORT_CONFIGS <- list(
     # 6 Oct 2026 back-test (154 CFB showdown contests, 13 slates; gts-loop/contest-review/cfb/sd_pool_size):
     # band of the top 10k rosters by salary + keep the top 1,000 by winning-script hits beat 100k/10k on
     # whole-pool cash (+6.3 pts) and ROI (+31 pts), 12 of 13 slates; top-150 sorted picks unchanged.
+    # Keep 2,000, not 1,000 (Andrew: 1k too concentrated): 28 of 29 players and ~17 captains used vs 26
+    # and 14 at 1k; pool holds a winning-score lineup in 95% of contests (1k 91%, today 97%); cash 26.5%.
     enum_band_target       = 10000L,
-    enum_keep              = 1000L,
+    enum_keep              = 2000L,
     default_n_sims         = 25000L,
 
     showdown_config = list(
