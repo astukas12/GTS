@@ -1162,8 +1162,8 @@ find_optimal_lineups_enum_captain <- function(sim_results, config, verbose = TRU
   E <- do.call(cbind, cap_parts)                            # (n_flex+2) x M
   band_sport <- isTRUE(config$sport %in% ENUM_BAND_TARGET_SPORTS)
   # Per-sport override (6 Oct 2026, CFB): sport config `enum_band_target`. CFB showdown back-test on
-  # 154 contests (gts-loop/contest-review/cfb/sd_pool_size): a 10k band + enum_keep 1000 lifted whole-pool
-  # cash 21.7% -> 28.0% vs 100k + 10k. NFL/NHL keep the 100k default until tested.
+  # 154 contests (gts-loop/contest-review/cfb/sd_pool_size): a 10k band + enum_keep 2000 lifted whole-pool
+  # cash 21.7% -> 26.5% vs 100k + 10k. NFL/NHL keep the 100k default until tested.
   band_target <- if (is.null(config$enum_band_target)) ENUM_BAND_TARGET else as.integer(config$enum_band_target)
   # Re-entered at 0.75*cap below: cut back to the top band_target by salary.
   if (band_sport && isTRUE(config$.band_cut) && ncol(E) > band_target) {
