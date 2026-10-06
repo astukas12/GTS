@@ -1161,9 +1161,13 @@ find_optimal_lineups_enum_captain <- function(sim_results, config, verbose = TRU
   if (!length(cap_parts)) stop("enum_captain: no lineup in the salary band -- check salaries / cap")
   E <- do.call(cbind, cap_parts)                            # (n_flex+2) x M
   band_sport <- isTRUE(config$sport %in% ENUM_BAND_TARGET_SPORTS)
-  # Re-entered at 0.75*cap below: cut back to the top ENUM_BAND_TARGET by salary.
-  if (band_sport && isTRUE(config$.band_cut) && ncol(E) > ENUM_BAND_TARGET) {
-    thr <- sort(E[n_flex + 2L, ], decreasing = TRUE)[ENUM_BAND_TARGET]
+  # Per-sport override (6 Oct 2026, CFB): sport config `enum_band_target`. CFB showdown back-test on
+  # 154 contests (gts-loop/contest-review/cfb/sd_pool_size): a 10k band + enum_keep 1000 lifted whole-pool
+  # cash 21.7% -> 28.0% vs 100k + 10k. NFL/NHL keep the 100k default until tested.
+  band_target <- if (is.null(config$enum_band_target)) ENUM_BAND_TARGET else as.integer(config$enum_band_target)
+  # Re-entered at 0.75*cap below: cut back to the top band_target by salary.
+  if (band_sport && isTRUE(config$.band_cut) && ncol(E) > band_target) {
+    thr <- sort(E[n_flex + 2L, ], decreasing = TRUE)[band_target]
     E   <- E[, E[n_flex + 2L, ] >= thr, drop = FALSE]
     sal_floor <- thr
   }
@@ -1172,9 +1176,9 @@ find_optimal_lineups_enum_captain <- function(sim_results, config, verbose = TRU
   lsal_v <- E[n_flex + 2L, ]
   M <- length(cpt_v)
 
-  if (band_sport && M < ENUM_BAND_TARGET && floor_frac > 0.75) {
+  if (band_sport && M < band_target && floor_frac > 0.75) {
     if (verbose) cat(sprintf("  only %s lineups in band -- lowering the floor to take the top %s by salary\n",
-                             format(M, big.mark = ","), format(ENUM_BAND_TARGET, big.mark = ",")))
+                             format(M, big.mark = ","), format(band_target, big.mark = ",")))
     return(find_optimal_lineups_enum_captain(
       sim_results, modifyList(config, list(enum_salary_floor_frac = 0.75, .band_cut = TRUE)), verbose))
   }
