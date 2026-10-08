@@ -183,12 +183,19 @@ precompute_f1_data <- function(drivers, ll_data, fl_probs, classification,
 # sequential Plackett-Luce for 22 drivers.
 sim_finish_positions <- function(prob_mat, n, cdf = NULL, team_pairs = NULL,
                                  team_corr = 0) {
-  if (is.null(cdf) || team_corr <= 0 || length(team_pairs) == 0L) {
+  # Returns the finish order AND each driver's uniform draw, because the draw is
+  # also what says whether the car retired -- see apply_dnfs_fast().
+  if (is.null(cdf)) {
     raw <- integer(n)
     for (i in seq_len(n)) raw[i] <- sample.int(22L, 1L, prob = prob_mat[i, ])
     # rank() with tiny random jitter avoids ties without another loop
-    return(as.integer(rank(raw + runif(n) * 0.001, ties.method = "first")))
+    return(list(pos = as.integer(rank(raw + runif(n) * 0.001, ties.method = "first")),
+                u = NULL))
   }
+  # A sheet without TeamCorr (or a field with no pairs) takes the same
+  # continuous draw with no shared component, so every sheet has a uniform per
+  # driver for the retirement step.
+  if (team_corr <= 0 || length(team_pairs) == 0L) team_corr <- 0
 
   # Correlated teammates, via a Gaussian copula.
   #
@@ -218,7 +225,7 @@ sim_finish_positions <- function(prob_mat, n, cdf = NULL, team_pairs = NULL,
   # strict permutation with no ties to break.
   z  <- rnorm(n) * sqrt(1 - team_corr)
   sc <- sqrt(team_corr)
-  for (p in team_pairs) z[p] <- z[p] + rnorm(1L) * sc
+  if (sc > 0) for (p in team_pairs) z[p] <- z[p] + rnorm(1L) * sc
   u <- pnorm(z)
   q <- numeric(n)
   for (i in seq_len(n)) {
@@ -226,24 +233,41 @@ sim_finish_positions <- function(prob_mat, n, cdf = NULL, team_pairs = NULL,
     lo    <- if (j > 1L) cdf[i, j - 1L] else 0
     q[i]  <- (j - 1L) + (u[i] - lo) / max(prob_mat[i, j], 1e-12)
   }
-  as.integer(rank(q, ties.method = "first"))
+  list(pos = as.integer(rank(q, ties.method = "first")), u = u)
 }
 
-# DNFs: the sheet's matrix is the whole result, so the BOTTOM n_dnf of the
-# sampled order are the retirements.
+# DNFs: the sheet's matrix is the whole result, and the tail of each row is
+# that car's retirement.
 #
-# This used to draw the DNFs separately, weighted by 1 - ClassPct and
-# independent of where the car had been sampled to finish, then re-rank. Against
-# any sheet whose rows already carry attrition in their tail that counts it
-# twice: a front-runner sampled to P20 by his own DNF mass could come back
-# classified, while a car sampled to P3 was marked retired and dropped to the
-# back. Finish points and grid-differential points were both scrambled, and
-# exactly for the drivers the sheet had said the most about.
+# The sheet builds its rows by ranking retired cars behind every classified car,
+# so the top (1 - ClassPct) of a driver's own distribution IS his retirement
+# mass. The draw that placed him already says whether he landed there: a
+# uniform above his ClassPct is a retirement. That keeps his row exactly (same
+# draw, no second coin) and gives each car its own retirement rate, with
+# teammates' retirements correlated through the same shared shock that
+# correlates their finishes.
 #
-# ClassPct is now a QA output of the sheet rather than an input to the draw. The
-# one thing it still does is the hard case: ClassPct = 0 means the car does not
-# see the flag whatever the field does, so those are pushed to the back first.
-apply_dnfs_fast <- function(finish_pos, cls_pct, n_dnf, n) {
+# Until 8 Oct 2026 this took the BOTTOM n_dnf of the sampled order as the
+# retirements, with n_dnf drawn from the Classification tab. That kept the
+# race's DNF count but moved the risk to the back: a front-runner whose draw
+# fell in his retirement tail sampled to about P19, behind which sat
+# backmarkers sampled to P20-22 as classified finishes, so he came back
+# classified. On Sepang 2026 grid 1-12 retired 0.59 cars per race in the sim
+# against 1.23 on the sheet; Baku and Sepang had 5 real top-12 DNFs against 1.2
+# simmed (engine review W41, F1-T01).
+#
+# Before that (22 Sep) it drew the DNFs separately, weighted by 1 - ClassPct
+# and independent of where the car had been sampled to finish, which counted
+# attrition twice. Reading it off the same uniform avoids both.
+#
+# ClassPct = 0 still means the car does not see the flag whatever the field
+# does. A sheet with no ClassPct at all keeps the old bottom-of-order rule.
+apply_dnfs_fast <- function(finish_pos, cls_pct, n_dnf, n, u = NULL) {
+  if (!is.null(u) && !all(is.na(cls_pct))) {
+    ret <- is.na(cls_pct) | cls_pct <= 0 | u > cls_pct
+    pos <- as.integer(rank(finish_pos + ret * n, ties.method = "first"))
+    return(list(pos = pos, classified = !ret))
+  }
   hard <- which(cls_pct == 0 | is.na(cls_pct))
   key  <- finish_pos
   if (length(hard)) key[hard] <- key[hard] + n      # behind every running car
@@ -354,12 +378,13 @@ simulate_f1_chunk <- function(pc, drivers, constructors, chunk_sims, start_id) {
     cs     <- (s - 1L) * n_cnstr + 1L
     
     # 1. Finish positions
-    raw_pos <- sim_finish_positions(pc$prob_mat, n_drv, pc$cdf,
+    draw    <- sim_finish_positions(pc$prob_mat, n_drv, pc$cdf,
                                     pc$team_pairs, pc$team_corr)
+    raw_pos <- draw$pos
     
     # 2. DNFs
     n_dnf   <- n_drv - sample(pc$cls_n, 1L, prob = pc$cls_prob)
-    dnf_res <- apply_dnfs_fast(raw_pos, pc$cls_pct, n_dnf, n_drv)
+    dnf_res <- apply_dnfs_fast(raw_pos, pc$cls_pct, n_dnf, n_drv, draw$u)
     fin_pos <- dnf_res$pos
     is_cls  <- dnf_res$classified
     
