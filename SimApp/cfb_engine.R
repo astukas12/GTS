@@ -374,6 +374,61 @@ cfb_calibrate <- function(P, target, market, iters = 24, damp = 0.8, tol = 0.05,
        lvl_got = if (have_lvl) c(f = wm(P$fpyds, w), d = wm(P$dpyds, w)))
 }
 
+# ---- STYLE HOLD: deal a flagged team's own style (10 Oct 2026, branch cfb-style-hold; Andrew on WVU) --------------
+# The game draw (cfb_calibrate) fits the market but can only reach styles that exist at that total: WVU 2026 (pys .38,
+# 17.6 att / 53 car a game) at a 61 total has ~17 pool comparables, so the draw freezes near .54. For a team whose
+# team-tab `style_hold` is non-empty (the reason), each sim keeps the drawn game for the OTHER side and the market, and
+# deals the flagged side from a TEAM-game: its own current-season games (half the weight) plus look-alike team-games by
+# realised pys / pass-rate (half), picked per sim with points near the drawn side's points (sd 7) so the score holds.
+# A whole team-game is dealt (events, pass line, TDs, fumbles), so its own ratios stay real. Unflagged teams never
+# reach this code and are byte-identical. Returns list(f =, d =) of per-sim team-game rows, NULL for an unflagged side.
+cfb_style_hold <- function(P, draw, TT, fav, dog, n_sims, say = function(...) NULL, pts_sd = 7) {
+  out <- list()
+  if (!"style_hold" %in% names(TT)) return(out)
+  h <- setNames(trimws(as.character(TT$style_hold)), TT$team)
+  h <- h[!is.na(h) & nzchar(h) & !toupper(h) %in% c("FALSE", "NO", "0")]
+  h <- h[names(h) %in% c(fav, dog)]
+  if (!length(h)) return(out)
+  abbr <- tryCatch(readRDS(file.path(CFB_DATA_DIR, "cfb_pys_reg.rds"))$abbr, error = function(e) NULL)
+  TG <- rbind(P[, .(game_id, season, team = fteam, pts = ptsF, pyds = fpyds, ptd = fptd, pint = fpint,
+                    pys = fO_pys_out, pr = fO_pr_out, sw)],
+              P[, .(game_id, season, team = dteam, pts = ptsD, pyds = dpyds, ptd = dptd, pint = dpint,
+                    pys = dO_pys_out, pr = dO_pr_out, sw)])
+  TG <- TG[is.finite(pys) & is.finite(pr) & is.finite(pyds) & is.finite(ptd) & is.finite(pint)]
+  cur <- max(P$season)
+  for (tm in names(h)) {
+    sch <- if (!is.null(abbr) && tm %in% names(abbr)) abbr[[tm]] else tm
+    is_own <- TG$team == sch & TG$season == cur
+    if (sum(is_own) < 2) { say(sprintf("style hold %s: under 2 own %d games in the pool -- skipped", tm, cur), 0.12); next }
+    mp <- mean(TG$pys[is_own]); mr <- mean(TG$pr[is_own])
+    sp <- max(.25 * stats::sd(TG$pys), .03); sr <- max(.25 * stats::sd(TG$pr), .03)
+    wl <- exp(-((TG$pys - mp)^2 / (2 * sp^2) + (TG$pr - mr)^2 / (2 * sr^2))) * TG$sw
+    wl[is_own] <- 0
+    ws <- .5 * wl / sum(wl) + .5 * is_own / sum(is_own)
+    keep <- which(ws > 1e-6 * max(ws)); S <- TG[keep]; ws <- ws[keep]
+    side <- if (tm == fav) "f" else "d"
+    p_draw <- draw[[if (side == "f") "ptsF" else "ptsD"]]
+    pick <- integer(n_sims)
+    for (pv in sort(unique(p_draw))) {
+      ii <- which(p_draw == pv)
+      pick[ii] <- sample.int(nrow(S), length(ii), TRUE, prob = ws * exp(-(S$pts - pv)^2 / (2 * pts_sd^2)))
+    }
+    X <- S[pick]
+    hw <- if ("style_hold_w" %in% names(TT)) suppressWarnings(as.numeric(TT[team == tm, style_hold_w][1])) else NA_real_
+    if (is.finite(hw) && hw < 1) {
+      # PARTIAL HOLD: a sim keeps the drawn game's own side with prob 1 - w
+      keep <- stats::runif(n_sims) >= max(0, hw)
+      X[keep, `:=`(game_id = draw$game_id[keep], team = draw[[if (side == "f") "fteam" else "dteam"]][keep],
+                   pts = p_draw[keep], pyds = draw[[paste0(side, "pyds")]][keep],
+                   ptd = draw[[paste0(side, "ptd")]][keep], pint = draw[[paste0(side, "pint")]][keep])]
+    }
+    out[[side]] <- X
+    say(sprintf("style hold %s (%s): w %s, %d own + look-alike team-games, ESS %.0f, own pys %.2f pr %.2f",
+                tm, h[[tm]], if (is.finite(hw)) format(hw) else "1", sum(is_own), cfb_ess(ws), mp, mr), 0.12)
+  }
+  out
+}
+
 # ---- the pys ask: as-of regression, blended with the sheet read ------------------
 # cfb_deep_dive.md s2.4 (1 Oct 2026). Replayed as of kickoff on every 2023-25 FBS
 # game and 2026 weeks 1-4, a regression on the team's season-to-date pys (+ last
@@ -489,7 +544,11 @@ read_cfb_input <- function(file_path, slate = NULL, game = NULL) {
                kicker = o$kicker %||% NA_character_,
                punt_returner = o$punt_returner %||% NA_character_,
                kick_returner = o$kick_returner %||% NA_character_,
-               pys_target = as.numeric(o$pys_target %||% NA))
+               pys_target = as.numeric(o$pys_target %||% NA),
+               # STYLE HOLD (10 Oct 2026): non-empty = this team's own style is dealt (see cfb_style_hold below)
+               style_hold = as.character(o$style_hold %||% NA_character_),
+               # share of sims dealt from the style pool (blank = 1); 10 Oct replay favours ~.5 (ab_style_hold/REPLAY.md)
+               style_hold_w = as.numeric(o$style_hold_w %||% NA))
   }), fill = TRUE)
 
   # OPTIONAL `projections` / `etr` tabs, read raw. `projections` carries the
@@ -895,6 +954,7 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
     if (cl %in% names(P)) wdeal[!is.finite(P[[cl]])] <- 0
   idx <- sample.int(nrow(P), n_sims, TRUE, prob = wdeal)
   draw <- P[idx]
+  SWAP <- cfb_style_hold(P, draw, TT, fav, dog, n_sims, say)
 
   # ---- per-team setup --------------------------------------------------------
   setup <- lapply(c(fav, dog), function(tm) {
@@ -956,13 +1016,15 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
     miss <- setdiff(cf$who, names(pos)); if (length(miss)) pos[miss] <- "WR"
     who <- cf$who; nW <- length(who)
 
-    v_pyds <- draw[[paste0(cf$side, "pyds")]]
-    v_ptd  <- draw[[paste0(cf$side, "ptd")]]
-    v_pint <- draw[[paste0(cf$side, "pint")]]
-    tcol   <- draw[[if (cf$side == "f") "fteam" else "dteam"]]
+    sw_ <- SWAP[[cf$side]]
+    gid    <- if (is.null(sw_)) draw$game_id else sw_$game_id
+    v_pyds <- if (is.null(sw_)) draw[[paste0(cf$side, "pyds")]] else sw_$pyds
+    v_ptd  <- if (is.null(sw_)) draw[[paste0(cf$side, "ptd")]]  else sw_$ptd
+    v_pint <- if (is.null(sw_)) draw[[paste0(cf$side, "pint")]] else sw_$pint
+    tcol   <- if (is.null(sw_)) draw[[if (cf$side == "f") "fteam" else "dteam"]] else sw_$team
 
     # ---- gather every drawn game's events in one shot ------------------------
-    sel <- BLK[data.table(sim = seq_len(n_sims), game_id = draw$game_id,
+    sel <- BLK[data.table(sim = seq_len(n_sims), game_id = gid,
                           pos_team = tcol), on = .(game_id, pos_team)]
     sel[is.na(s), `:=`(s = 1L, e = 0L)]
     lens <- pmax(sel$e - sel$s + 1L, 0L)
@@ -1092,7 +1154,7 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
     if (!is.na(cf$qb)) D[player == cf$qb, tch := tch + 25]
     D[, fwt := tch * unname(CFB_FUM_RATE[pos[player]])]
     D[is.na(fwt), fwt := 0]
-    fl <- FUM[data.table(game_id = draw$game_id, team = tcol),
+    fl <- FUM[data.table(game_id = gid, team = tcol),
               on = .(game_id, team)]$fl
     naf <- is.na(fl)
     if (any(naf)) fl[naf] <- sample(0:4, sum(naf), TRUE, prob = CFB_FUM_DIST)
@@ -1264,7 +1326,8 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
   # so listing both invites reading one as a check on the other. RECEPTIONS are
   # a different quantity and do belong: full PPR means the catch count is a
   # scoring line in its own right, and it is what the usage vector is dealing.
-  ptsv <- data.table(SimID = seq_len(n_sims), f = draw$ptsF, d = draw$ptsD)
+  ptsv <- data.table(SimID = seq_len(n_sims), f = if (is.null(SWAP$f)) draw$ptsF else SWAP$f$pts,
+                     d = if (is.null(SWAP$d)) draw$ptsD else SWAP$d$pts)
   tg <- A[, .(PassYds = sum(pyds), RushYds = sum(cyds), Rec = sum(rec),
               PassTD = sum(ptd), RushTD = sum(ctd), RecTD = sum(rtd),
               TotalTD = sum(rtd) + sum(ctd)),
