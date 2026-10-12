@@ -325,6 +325,44 @@ nfl_dirichlet_winners <- function(sim_idx, base_p, a0, n_sims) {
   wv
 }
 
+# PER-BACK YARDS PER CARRY (5 Oct 2026). Without it every back is dealt the same mix of real runs, so every back
+# averages the team's yards per carry. The sheet's optional player column `ypc_target` (the book's yards / attempts,
+# written by the build) leans the ordinary runs: a back above the team's level is a bit more likely to be handed
+# the longer ones. Team yards cannot change -- every run is still dealt exactly once to someone -- and each back's
+# lean is normalised so his carry count stays put. Damped: each back moves NFL_YPC_DAMP of the way from the team's
+# level to his target. Single-game swings stay real: the runs are the drawn game's own. A back with no target
+# (blank) has no lean; a team with no targets never reaches this function.
+NFL_YPC_DAMP <- 0.7
+nfl_tilted_winners <- function(sim_idx, yds, base_p, a0, n_sims, ypc, ref, damp = NFL_YPC_DAMP) {
+  nP <- length(base_p)
+  if (nP == 1L || !length(sim_idx)) return(nfl_dirichlet_winners(sim_idx, base_p, a0, n_sims))
+  y  <- as.numeric(yds); y[!is.finite(y)] <- 0
+  ez <- pmin(pmax(y, -5), 25); ez <- ez - mean(ez)      # winsorised: a 70-yard run must not dominate the lean
+  mu <- mean(y)
+  ok <- is.finite(ypc) & ypc > 0 & is.finite(ref) & ref > 0
+  tgt <- mu * ifelse(ok, 1 + damp * (ypc / ref - 1), 1)
+  lam <- vapply(seq_len(nP), function(j) {
+    if (!ok[j]) return(0)
+    f <- function(l) { e <- exp(l * ez); sum(y * e) / sum(e) - tgt[j] }
+    lo <- -0.4; hi <- 0.4
+    if (f(lo) * f(hi) > 0) return(if (abs(f(lo)) < abs(f(hi))) lo else hi)
+    stats::uniroot(f, c(lo, hi), tol = 1e-7)$root
+  }, numeric(1))
+  M <- vapply(lam, function(l) mean(exp(l * ez)), numeric(1))
+  g <- if (is.finite(a0)) {
+    gg <- matrix(stats::rgamma(n_sims * nP, shape = rep(pmax(a0 * base_p, 1e-6), each = n_sims)),
+                 nrow = n_sims, ncol = nP)
+    gg / rowSums(gg)
+  } else matrix(base_p / sum(base_p), n_sims, nP, byrow = TRUE)
+  W <- g[sim_idx, , drop = FALSE] * exp(outer(ez, lam)) / rep(M, each = length(sim_idx))
+  W <- W / rowSums(W)
+  for (j in 2:nP) W[, j] <- W[, j - 1L] + W[, j]
+  u <- stats::runif(length(sim_idx))
+  wv <- rep(1L, length(sim_idx))
+  for (j in seq_len(nP - 1L)) wv <- wv + (W[, j] < u)
+  wv
+}
+
 # =============================================================================
 # QB PROP LINES -- FROM THE SHEET ONLY (5 Oct 2026)
 # -----------------------------------------------------------------------------
@@ -919,6 +957,30 @@ nfl_pool_weights_balanced <- function(G, target, market, ypc = NULL, props = NUL
 # (the prop pass-yard / completion dims are kernel-only asks and are not used).
 # players / rush_lines (the sheet's rows, attr(props, "rush")) feed the RB rushing
 # ask when nfl_balanced_rush() is on; the kernel path never reads them.
+# TILT MODE (opt-in, 12 Oct 2026, BUF@LAR 54.5-total MNF). An extreme-total ask has almost no close comparables, so the
+# kernel ladder ends by discounting the market weight and delivers ~51 points on a 54.5 total. Tilt mode instead takes the
+# pool's real comparables (total within 3 of the ask, spread within -2/+2.5 of it) and reweights them smoothly (exponential
+# tilt, light ridge) so their average ACTUAL points, margin, both teams' pass yards, completions and carries land on the
+# asks together. The pool is thin (ESS ~40) by design; the player-level draws add their own variance. Turned on by the game
+# tab's pool_mode = "tilt" (or options(nfl.pool_tilt = TRUE)); anything else runs the kernel ladder exactly as before.
+# Returns NULL (-> the kernel path) when fewer than 40 comparables exist.
+nfl_pool_tilt <- function(Gp, target, market, min_n = 40L, ridge = 0.03) {
+  sub <- Gp[total >= market[["total"]] - 3 & absp >= market[["margin"]] - 2 & absp <= market[["margin"]] + 2.5]
+  if (nrow(sub) < min_n) { message("[nfl] tilt mode: only ", nrow(sub), " comparable games -- using the kernel ladder"); return(NULL) }
+  tg <- c(pts_sum = market[["total"]], margin = market[["margin"]])
+  for (nm in c("fpass_yds", "dpass_yds", "fcmp", "dcmp", "fcarries", "dcarries"))
+    if (!is.null(target[[nm]]) && is.finite(target[[nm]]) && nm %in% names(sub) && stats::sd(sub[[nm]], na.rm = TRUE) > 0) tg[nm] <- target[[nm]]
+  tcols <- names(tg); sub <- sub[complete.cases(sub[, ..tcols])]
+  if (nrow(sub) < min_n) return(NULL)
+  X <- sapply(names(tg), function(nm) (sub[[nm]] - tg[[nm]]) / stats::sd(sub[[nm]]))
+  f  <- function(l) { z <- as.vector(X %*% l); m <- max(z); m + log(sum(exp(z - m))) - log(nrow(X)) + 0.5 * ridge * sum(l^2) }
+  gr <- function(l) { z <- as.vector(X %*% l); w <- exp(z - max(z)); w <- w / sum(w); as.vector(crossprod(X, w)) + ridge * l }
+  o <- stats::optim(rep(0, ncol(X)), f, gr, method = "BFGS", control = list(maxit = 500))
+  z <- as.vector(X %*% o$par); w <- exp(z - max(z)); w <- w / sum(w)
+  list(Gp = sub, matcher = "kernel", w = w, ess = nfl_ess(w), n = nrow(sub), bw = NA_real_, target = target,
+       total = sum(w * sub$pts_sum), margin = sum(w * sub$margin), relaxed = TRUE, rung = 98L, ladder = NULL)
+}
+
 nfl_pool_match <- function(Gp, target, market, dims, weights, fav, dog,
                            matcher = nfl_pool_matcher(), players = NULL,
                            rush_lines = NULL, ...) {
@@ -1065,7 +1127,7 @@ nfl_deal_receiving <- function(events, pb, pb_rz, players, a0 = NFL_CATCH_A0, n_
 # no `qr` column or no `qb`, every run is dealt by share (the pre-tag behaviour).
 # Returns per (sim, player): car, cyds, ctd, and the QB-routed part car_qr, cyds_qr.
 nfl_deal_rushing <- function(events, shares, players, a0 = NFL_CARRY_A0, n_sims,
-                             qb = NA_character_, qb_scr = NA_real_) {
+                             qb = NA_character_, qb_scr = NA_real_, ypc = NULL) {
   nP <- length(players)
   E <- data.table::as.data.table(events)
   empty <- data.table(sim = integer(0), player = character(0), car = integer(0),
@@ -1102,8 +1164,14 @@ nfl_deal_rushing <- function(events, shares, players, a0 = NFL_CARRY_A0, n_sims,
                                              prob = if (q == 2L) P$sy else P$gl))
   }
   ii <- which(E$sit == 1L)
-  if (length(ii))
-    data.table::set(E, ii, "w", nfl_dirichlet_winners(E$sim[ii], P$normal, a0, n_sims))
+  yt <- if (is.null(ypc)) NULL else suppressWarnings(as.numeric(ypc))
+  if (length(ii)) {
+    if (!is.null(yt) && any(is.finite(yt) & yt > 0)) {
+      ref <- mean(E$yds[is.finite(E$yds)])           # the drawn games' level, every dealt run of this side
+      data.table::set(E, ii, "w", nfl_tilted_winners(E$sim[ii], E$yds[ii], P$normal, a0, n_sims, yt, ref))
+    } else
+      data.table::set(E, ii, "w", nfl_dirichlet_winners(E$sim[ii], P$normal, a0, n_sims))
+  }
   out <- E[, .(car = .N, cyds = sum(yds), ctd = sum(td == 1L, na.rm = TRUE)), by = .(sim, w)]
   out[, player := players[w]][, w := NULL][, `:=`(car_qr = 0L, cyds_qr = 0)]
   if (!nrow(routed)) return(out[])
@@ -1574,6 +1642,10 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
   if (is.finite(car_d)) { dims <- c(dims, "dcarries"); weights <- c(weights, NFL_POOL_W_CAR)
     target$dcarries <- car_d; market$dcarries <- car_d }
 
+  tilt_on <- isTRUE(getOption("nfl.pool_tilt", FALSE)) ||
+    ("pool_mode" %in% names(G) && identical(tolower(trimws(as.character(G$pool_mode[1]))), "tilt"))
+  r <- if (tilt_on) nfl_pool_tilt(Gp, target, market) else NULL
+  if (is.null(r))
   r <- nfl_pool_match(Gp, target, market, dims, weights, fav, dog,
                       players = PL, rush_lines = attr(props, "rush"))
   Gp <- r$Gp                                    # the balanced path adds RB YPC columns
@@ -1708,7 +1780,8 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
     qb_rt <- if (qb_routing) cf$qb else NA_character_
     rsh <- if (nS || !is.na(qb_rt))
       nfl_deal_rushing(runE, S[, .(carry_usage, sy_share, gl_share)], S$player, n_sims = n_sims,
-                       qb = qb_rt, qb_scr = cf$scr) else NULL
+                       qb = qb_rt, qb_scr = cf$scr,
+                       ypc = if ("ypc_target" %in% names(S)) S$ypc_target else NULL) else NULL
 
     # ---- assemble the (sim x player) grid --------------------------------
     D <- CJ(sim = seq_len(n_sims), player = cf$who, sorted = FALSE)
