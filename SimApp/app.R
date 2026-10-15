@@ -8,6 +8,10 @@ library(readxl)
 library(plotly)
 library(ggplot2)
 
+# Input sheets can carry their engine data (NFL: ~10 MB). Shiny's default upload limit is 5 MB, which silently rejected such
+# a file (15 Oct 2026): raise it to 100 MB. Set before the UI is built.
+options(shiny.maxRequestSize = 100 * 1024^2)
+
 source("sport_configs_universal.R")
 source("OptimalLineups_Core.R")
 source("portfolio_helpers_universal.R")
