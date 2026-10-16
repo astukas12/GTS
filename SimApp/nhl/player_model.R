@@ -111,7 +111,10 @@ sim_team_players <- function(bx, ro, P3) {
   rB <- list(es = ro$r_blk_es, pp = ro$r_blk_es * gm("blk", "pp"), pk = ro$r_blk_pk, ot = ro$r_blk_es * gm("blk", "ot"),
              pul = ro$r_blk_es * gm("blk", "pul"), opul = ro$r_blk_es * gm("blk", "opul"))
   sweep_r <- function(Tm, r) Tm * matrix(r, N, P, byrow = TRUE)
-  Gam <- if (!is.null(sb$alpha)) matrix(rgamma(N * P, sb$alpha, sb$alpha), N, P) else matrix(1, N, P)
+  # per-player SOG shape (7 Oct 2026): the sheet's Model_Players sog_alpha (fitted from the DK SOG ladder by
+  # build_slate.R) replaces the league alpha where present; absent or NA = the league alpha, as before
+  a_sog <- if (!is.null(sb$alpha)) { a0 <- sb$alpha; if ("sog_alpha" %in% names(ro)) fcoalesce(as.numeric(ro$sog_alpha), a0) else rep(a0, P) }
+  Gam <- if (!is.null(sb$alpha)) matrix(rgamma(N * P, rep(a_sog, each = N), rep(a_sog, each = N)), N, P) else matrix(1, N, P)
   # the team's NON-goal SOG: each state's SOG rate x (1 - his chance a SOG is a goal).
   # D convert under half as often as F, so without this D get ~5% too few (validate_p3,
   # first run). A SOG at an empty net is always a goal: no non-goal share in opul.
