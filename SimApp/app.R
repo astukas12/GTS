@@ -944,7 +944,19 @@ server <- function(input, output, session) {
     div(class = "gts-ctrl-seg gts-sims-seg",
         span(class = "gts-seg-label", "Sims to Run: "),
         numericInput("n_sims", NULL, value = rv$config$default_n_sims %||% 50000,
-                     min = 1000, max = 150000, step = 1000, width = "80px")
+                     min = 1000, max = 150000, step = 1000, width = "80px"),
+        # Showdown salary floor (6 Oct 2026, CFB contest review): off by
+        # default. Ticked, the showdown pool never takes a roster under this
+        # salary (enum_captain's enum_min_salary).
+        if (identical(rv$config$optimization_modes$DK, "enum_captain") ||
+            identical(rv$config$optimization_modes$SD, "enum_captain"))
+          tagList(
+            tags$span(style = "width:12px;display:inline-block;"),
+            span(class = "gts-seg-label", "SD salary floor: "),
+            div(style = "display:inline-block;vertical-align:middle;",
+                checkboxInput("sd_salary_floor_on", NULL, value = FALSE, width = "24px")),
+            numericInput("sd_salary_floor", NULL, value = 49000,
+                         min = 30000, max = 50000, step = 500, width = "80px"))
     )
   })
   
@@ -1948,6 +1960,12 @@ server <- function(input, output, session) {
                            # never arrived, so every sport ran the 0.88 default.
                            enum_salary_floor_frac=rv$config$enum_salary_floor_frac %||% 0.88,
                            enum_win_pct=rv$config$enum_win_pct %||% 0.01,
+                           # hard showdown salary floor (OFF unless the box
+                           # under Sims to Run is ticked or the sport config
+                           # sets enum_min_salary) -- see enum_captain
+                           enum_min_salary=if (isTRUE(input$sd_salary_floor_on))
+                                             input$sd_salary_floor %||% 49000
+                                           else rv$config$enum_min_salary,
                            # opt_config is a FRESH list, not rv$config, so
                            # anything the optimiser reads has to be copied in
                            # explicitly -- pool_spread was set in the sport
