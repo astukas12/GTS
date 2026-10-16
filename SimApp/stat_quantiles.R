@@ -17,14 +17,15 @@
 
 gts_stat_q_on <- function() isTRUE(getOption("gts.stat_quantiles"))
 
-GTS_STAT_PROBS <- c(.1, .25, .5, .75, .9)
+GTS_STAT_PROBS <- c(.05, .1, .25, .5, .75, .9, .95, .99)   # 16 Oct: p05/p95/p99 added for PIT and tails (SIM_RECORD_STANDARD)
 
 gts_q1 <- function(x) {
   x <- as.numeric(x); x <- x[!is.na(x)]
   if (!length(x)) return(NULL)
   q <- stats::quantile(x, GTS_STAT_PROBS, names = FALSE)
   list(n = length(x), mean = mean(x), sd = if (length(x) > 1) stats::sd(x) else NA_real_,
-       p10 = q[1], p25 = q[2], p50 = q[3], p75 = q[4], p90 = q[5], p_zero = mean(x == 0))
+       p05 = q[1], p10 = q[2], p25 = q[3], p50 = q[4], p75 = q[5], p90 = q[6], p95 = q[7], p99 = q[8],
+       p_zero = mean(x == 0))
 }
 gts_ge1 <- function(x, thr) {
   x <- as.numeric(x); x <- x[!is.na(x)]
