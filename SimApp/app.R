@@ -14,6 +14,7 @@ source("portfolio_helpers_universal.R")
 source("lineup_rules.R")
 source("cash_game_module.R")
 source("lineup_lab_module.R")
+source("stat_quantiles.R")   # Engine review stat quantiles; inert unless options(gts.stat_quantiles = TRUE)
 
 # Source all sport engines once at startup.
 # Never re-source inside reactive observers — re-sourcing re-executes all

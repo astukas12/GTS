@@ -1348,6 +1348,23 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
     market = sprintf("%s -%.1f, total %.1f", fav, G$spread[1], G$total[1]),
     pool_total = round(cal$total, 1), pool_margin = round(cal$margin, 1),
     asked_total = round(cal$target$total, 2))
+  # Engine review (stat_quantiles.R): per-player / per-team stat quantiles. Off unless the review's
+  # re-sim worker sets options(gts.stat_quantiles = TRUE); reads A and draw, draws no random numbers.
+  if (exists("gts_stat_q_on") && gts_stat_q_on())
+    sport_visuals <- gts_stat_attach(sport_visuals, function() {
+      tq <- A[, .(rec = sum(rec), rec_yds = sum(ryds), car = sum(car), rush_yds = sum(cyds),
+                  pass_yds = sum(pyds), pass_td = sum(ptd), off_td = sum(rtd) + sum(ctd)), by = .(SimID, team)]
+      pts <- data.table(SimID = seq_len(n_sims), f = draw$ptsF, d = draw$ptsD)
+      tq[pts, points := fifelse(team == fav, i.f, i.d), on = "SimID"]
+      list(gts_stat_summ(A, c(Player = "player", Team = "team"),
+             list(rec = "rec", rec_yds = "ryds", rec_td = "rtd", car = "car", rush_yds = "cyds", rush_td = "ctd",
+                  pass_yds = "pyds", pass_td = "ptd", int = "pint", fum = "fum", ret_td = "rettd", kick_pts = quote(fgp + xp),
+                  any_td = quote(rtd + ctd + rettd), dk_fpts = "dk"),
+             "player", list(rec_yds = 100, rush_yds = 100, pass_yds = 300, any_td = 1:2, rec = c(5, 8))),
+           gts_stat_summ(tq, c(Team = "team"),
+             list(points = "points", rec = "rec", rec_yds = "rec_yds", car = "car", rush_yds = "rush_yds",
+                  pass_yds = "pass_yds", pass_td = "pass_td", off_td = "off_td"), "team"))
+    })
 
   say("done", 1)
   out <- list(sim_results = sim_results, metadata = meta, projections = projections,
@@ -1450,7 +1467,8 @@ run_cfb_classic_simulation <- function(input_data, n_sims = 10000,
   # game they came from); the per-game scalars cannot, so they collapse to
   # slate-level summaries.
   vk <- c("score_dist", "stat_line", "dist_sample", "components", "rates",
-          "team_dist", "team_spread", "team_line", "validation")
+          "team_dist", "team_spread", "team_line", "validation",
+          if (exists("gts_stat_q_on") && gts_stat_q_on()) c("stat_quantiles", "stat_thresholds"))   # Engine review only
   sv <- list()
   for (k in vk)
     sv[[k]] <- rbindlist(lapply(seq_along(vis), function(j) {
