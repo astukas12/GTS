@@ -1921,8 +1921,12 @@ prepare_stage_dominator_data <- function(race_profiles, driver_data = NULL) {
   # whole-race lines for NASCAR_DOM_MODE = "race" (the matcher's own input format)
   rdd <- lapply(split(rp, by = "RaceID"), function(p)
     list(profiles = p, profile_finishes = p$FinPos, profile_starts = p$StartPos, n_profiles = nrow(p)))
+  # Stage dealing defaults (18 Oct 2026, Cup Phoenix, Andrew): stages 2 and 3 pull fully toward the car that held the same real driver's earlier-stage line
+  # (kappa 1, where the fit said .75-.97), so a real driver's whole day stays with one car, and the stage-1 start gap carries noise (NASCAR_STAGE1_JITTER
+  # grid places), so the biggest stage-1 line goes to the nearest start slot most of the time, not always.
+  params$kappa[2:3] <- NASCAR_STAGE_KAPPA23
   list(races = races, theta = params$theta, kappa = params$kappa, cap = cap, q_on = q_on, f_q = f_q,
-       metric_grid = metric_grid, late_q = late_q, s1_fin = s1_fin, rdd = rdd)
+       metric_grid = metric_grid, late_q = late_q, s1_fin = s1_fin, rdd = rdd, s1_jit = NASCAR_STAGE1_JITTER)
 }
 
 # One drawn race's stage lines dealt to one field. Pure: no data.table, no
@@ -1950,7 +1954,7 @@ prepare_stage_dominator_data <- function(race_profiles, driver_data = NULL) {
 # ~2% of points). Tried and rejected the same day: sharing in proportion to
 # each leader's own line (piles it on the #2 car).
 nascar_stage_deal <- function(f_start, f_fin, room, l_start, l_fin, val, theta, kappa,
-                              f_q = NULL, l_q = NULL, late_q = 0, s1_fin = 0) {
+                              f_q = NULL, l_q = NULL, late_q = 0, s1_fin = 0, s1_jit = 0) {
   n <- length(f_start)
   pts <- numeric(n)
   owner <- matrix(NA_integer_, nrow(val), 3)
@@ -1968,6 +1972,7 @@ nascar_stage_deal <- function(f_start, f_fin, room, l_start, l_fin, val, theta, 
                 else if (use_q && late_q > 0) sqrt((1 - late_q) * (f_fin - l_fin[j])^2 + late_q * (f_q - match(j, lines))^2)
                 else (f_fin - l_fin[j])
       d <- sqrt(theta[s] * (f_start - l_start[j])^2 + (1 - theta[s]) * second^2)
+      if (s == 1 && s1_jit > 0) d <- pmax(d + rnorm(n, 0, s1_jit), 0)   # Stage1Jitter: the grid is the likeliest owner of the stage-1 line, not the only one
       if (s > 1 && kappa[s] > 0) {
         held <- seq_len(n) %in% owner[j, seq_len(s - 1)]
         d <- d * (1 - kappa[s] * held)
@@ -2008,7 +2013,14 @@ nascar_stage_deal <- function(f_start, f_fin, room, l_start, l_fin, val, theta, 
 # The stage dealer splits one real day across several cars, so the big favourite's big day never
 # happens. Its gain -- the pole is never blanked (race: 13% of sims) -- is the open item for a hybrid.
 # options(nascar.dom_mode = "stage") restores the stage dealer.
-NASCAR_DOM_MODE <- "race"
+#
+# 18 Oct 2026 (Cup Phoenix, Andrew): the default is now "stage", with full carry-over between stages, noise on the stage-1 start gap and a DKMax floor.
+# Tested on the 18-race Phoenix pool, 3,000 sims, average error across nine field-shape checks: race 36%, stage as fitted 22.5%, stage + DKMax floor 30 20.6%,
+# stage + full carry-over + DKMax floor 16.7%. options(nascar.dom_mode = "race") restores the whole-race dealer.
+NASCAR_DOM_MODE <- "stage"
+NASCAR_STAGE_KAPPA23 <- 1        # stage 2-3 pull toward the car that held the same real driver's earlier line
+NASCAR_STAGE1_JITTER <- 2.5      # noise on the stage-1 start gap, in grid places
+NASCAR_DKMAX_FLOOR <- 30         # every car with a DKMax above 0 gets at least this much room
 
 nascar_assign_race_level <- function(race_result, race_weights, stage_data, platform) {
   race_result <- assign_dominator_points_from_profiles_optimized(race_result, race_weights, stage_data$rdd, platform)
@@ -2043,6 +2055,7 @@ assign_dominator_points_stagewise <- function(race_result, race_weights, stage_d
   }
   room <- as.numeric(race_result[[paste0(platform, "Max")]])
   room[is.na(room)] <- Inf
+  room[room > 0 & room < NASCAR_DKMAX_FLOOR] <- NASCAR_DKMAX_FLOOR      # a 0 stays 0 (start-and-park, zeroed by hand)
   room <- pmin(room, stage_data$cap[[platform]])
   # race_result rows are in driver_data order, the order f_q was ranked in
   deal <- nascar_stage_deal(race_result$Starting, race_result$FinishPosition, room,
@@ -2050,7 +2063,8 @@ assign_dominator_points_stagewise <- function(race_result, race_weights, stage_d
                             f_q = if (isTRUE(stage_data$q_on)) stage_data$f_q else NULL,
                             l_q = if (isTRUE(stage_data$q_on)) rd$q else NULL,
                             late_q = if (is.null(stage_data$late_q)) 0 else stage_data$late_q,
-                            s1_fin = if (is.null(stage_data$s1_fin)) 0 else stage_data$s1_fin)
+                            s1_fin = if (is.null(stage_data$s1_fin)) 0 else stage_data$s1_fin,
+                            s1_jit = if (is.null(stage_data$s1_jit)) 0 else stage_data$s1_jit)
   set(race_result, j = col_name, value = deal$pts)
   # Sim review capture (GTS/Common/SIM_REVIEW_PLAN.md): unset for customers, set only by the re-sim worker
   if (!is.null(h <- getOption("nascar.dom_hook"))) h(race_result$SimID[1], race_id, deal, race_result$Name, platform)
