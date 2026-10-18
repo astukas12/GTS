@@ -1864,6 +1864,7 @@ prepare_stage_dominator_data <- function(race_profiles, driver_data = NULL) {
          ". The NASCAR engine deals dominator points stage by stage and needs the ",
          "per-stage profile columns - rebuild the sheet with the current sheet builder.")
   rp <- as.data.table(race_profiles)
+  rp <- rp[!is.na(RaceID)]       # readxl keeps the formatted blank rows under the data (openxlsx drops them); they carry no race
   for (v in need[-c(10, 11)]) set(rp, j = v, value = as.numeric(rp[[v]]))
   for (v in need[4:9]) set(rp, j = v, value = fifelse(is.na(rp[[v]]), 0, rp[[v]]))
   params <- nascar_stage_dom_params(rp$Series[1], rp$TrackType[1])
