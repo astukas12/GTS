@@ -694,7 +694,8 @@ run_nba_simulation_v2 <- function(input_data, n_sims = 10000, config = NULL, pro
     rp <- rk_ratio[[slate$GameKey[i]]]
     if (!is.null(rp) && slate$rk[i] <= 10) { pr <- if (slate$Team[i] == rp$home_team) rp$home[, slate$rk[i]] else rp$away[, slate$rk[i]]; ratio <- ifelse(is.na(pr), ratio, pr) }
     mins <- pmin(slate$Mins[i] * ratio, 48)
-    sc <- mins / h$min[j] * rscale * exp(rnorm(n_sims, 0, sg) - sg^2 / 2)
+    ra <- if ("RateAdj" %in% names(slate)) slate$RateAdj[i] else 1; if (is.na(ra)) ra <- 1   # optional per-player rate multiplier (Players tab RateAdj; 1 = none)
+    sc <- mins / h$min[j] * rscale * ra * exp(rnorm(n_sims, 0, sg) - sg^2 / 2)
     cft <- cf[[slate$Team[i]]]; if (is.null(cft) || is.na(cft)) cft <- 1
     for (s in stats) M[[s]][i, ] <- rr(h[[s]][j] * sc * (if (s %in% c("pts", "fgm", "tpm", "ftm")) cft else 1))
     if (n_sims >= 1000 && i %% 25 == 0) cb(sprintf("Drawing player scenarios (%d/%d)...", i, n_p), 0.05 + 0.8 * i / n_p)
