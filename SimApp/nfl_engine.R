@@ -1193,6 +1193,41 @@ NFL_TEAM_FIELDS <- c("kicker", "punt_returner", "kick_returner", "dst", "notes")
 NFL_NUM_COLS    <- c("pass_share", NFL_BAND_COLS, "rz_tgt_share",
                      "carry_usage", "sy_share", "gl_share")
 
+# ---- engine data carried by the workbook (15 Oct 2026) -----------------------
+# GTS/NFL/R/embed_data.R writes veryHidden tabs ed_meta / ed_events / ed_profiles / ed_dst / ed_posmap holding, as plain cells,
+# the tables this engine reads from nfl_data/. This function rebuilds them from the cells (NO unserialize of anything inside the
+# workbook), writes its OWN rds files to a temp folder keyed by the sheet's data stamp, and returns that folder. NULL when the
+# sheet has no such tabs or they fail the row-count check: the caller then uses nfl_data_dir() exactly as before.
+nfl_sheet_data_dir <- function(file_path) {
+  tryCatch({
+    sh <- readxl::excel_sheets(file_path)
+    if (!"ed_meta" %in% sh) return(NULL)
+    meta <- as.data.table(readxl::read_excel(file_path, sheet = "ed_meta", col_types = "text"))
+    stamp <- meta[table == "_stamp", column][1]
+    dir <- file.path(tempdir(), paste0("nfl_sheetdata_", gsub("[^A-Za-z0-9]", "", stamp)))
+    if (!file.exists(file.path(dir, "DONE"))) {
+      dir.create(dir, recursive = TRUE, showWarnings = FALSE)
+      rd <- function(tb) {
+        m <- meta[table == tb & column != "__nrow__"]
+        ct <- c(character = "text", integer = "numeric", numeric = "numeric", logical = "logical")[m$class]
+        ct[is.na(ct)] <- "text"
+        x <- as.data.table(readxl::read_excel(file_path, sheet = tb, col_types = unname(ct)))
+        stopifnot(nrow(x) == as.integer(meta[table == tb & column == "__nrow__", class]), identical(names(x), m$column))
+        for (j in seq_along(m$column)) if (m$class[j] == "integer") set(x, j = j, value = as.integer(x[[j]]))
+        x
+      }
+      EV <- rd("ed_events")
+      for (y in sort(unique(EV$season))) saveRDS(EV[season == y], file.path(dir, sprintf("slim_%d_era.rds", y)))
+      saveRDS(rd("ed_profiles"), file.path(dir, "nfl_profiles_with_priors.rds"))
+      saveRDS(rd("ed_dst"),      file.path(dir, "nfl_dst_box.rds"))
+      saveRDS(rd("ed_posmap"),   file.path(dir, "position_map.rds"))
+      writeLines(stamp, file.path(dir, "DONE"))
+    }
+    attr(dir, "stamp") <- stamp
+    dir
+  }, error = function(e) { warning("sheet engine data not used (", conditionMessage(e), ") -- falling back to nfl_data"); NULL })
+}
+
 read_nfl_input <- function(file_path, slate = NULL, game = NULL) {
   sh <- readxl::excel_sheets(file_path)
   gtab <- sh[tolower(sh) == "game"]
@@ -1338,7 +1373,7 @@ read_nfl_input <- function(file_path, slate = NULL, game = NULL) {
       pl[availability == "out", (cl) := 0]
   }
 
-  list(game = g, team = tt, players = pl, projections = prj)
+  list(game = g, team = tt, players = pl, projections = prj, engine_data_dir = nfl_sheet_data_dir(file_path))
 }
 
 # One row per contest on a multi-slate workbook, for a slate-picker UI. A
@@ -1547,6 +1582,12 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
   }
   if (is.null(n_sims) || is.na(n_sims)) n_sims <- 10000
   n_sims <- as.integer(n_sims)
+  # the pool data carried in the sheet (if any) wins over nfl_data/ for this run only
+  if (!is.null(input_data$engine_data_dir) && dir.exists(input_data$engine_data_dir)) {
+    .nfl_opt <- options(nfl.data_dir = input_data$engine_data_dir, nfl.db_dir = input_data$engine_data_dir)
+    on.exit(options(.nfl_opt), add = TRUE)
+    say(paste0("engine data: from the sheet (", attr(input_data$engine_data_dir, "stamp"), ")"))
+  }
 
   G  <- as.data.table(input_data$game)
   TT <- as.data.table(input_data$team)
@@ -2027,6 +2068,11 @@ run_nfl_classic_simulation <- function(input_data, n_sims = 10000, config = NULL
                                        progress_callback = NULL, keep_components = FALSE,
                                        seed = NULL) {
   if (is.null(n_sims) || is.na(n_sims)) n_sims <- 10000
+  # the pool data carried in the sheet (if any) wins over nfl_data/ for this run only
+  if (!is.null(input_data$engine_data_dir) && dir.exists(input_data$engine_data_dir)) {
+    .nfl_opt <- options(nfl.data_dir = input_data$engine_data_dir, nfl.db_dir = input_data$engine_data_dir)
+    on.exit(options(.nfl_opt), add = TRUE)
+  }
   G   <- copy(as.data.table(input_data$game))
   TT  <- as.data.table(input_data$team)
   PL  <- copy(as.data.table(input_data$players))
