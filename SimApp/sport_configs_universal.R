@@ -1329,8 +1329,8 @@ SPORT_CONFIGS <- list(
       # NBA input: IDs + Games + at least one Sim_ sheet
       # Distinguished from CBB by presence of OverUnder / HomeSpread in Games tab
       custom_detect = function(sheets, file_path = NULL) {
-        has_sim   <- any(grepl("^Sim_", sheets))
-        has_ids   <- "IDs" %in% sheets
+        has_sim   <- any(grepl("^Sim_", sheets)) || "Profiles" %in% sheets   # v2 workbooks carry Profiles instead
+        has_ids   <- "IDs" %in% sheets || "Players" %in% sheets
         has_games <- "Games" %in% sheets
         if (!has_sim || !has_ids || !has_games) return(FALSE)
         # Confirm NBA (not CBB) by checking for OverUnder in Games sheet

@@ -687,6 +687,8 @@ server <- function(input, output, session) {
     rv$full_sim_results    <- NULL
     rv$nhl_classic_dg      <- NULL   # a fresh NHL sim's metadata points at the main classic
     rv$nhl_slate           <- NULL   # "C:<dg>" / "S:<dg>" -- NULL is the main classic
+    rv$nba_classic         <- NULL   # NBA SLATE picker: "main" or a draft group id; NULL is the main classic
+    rv$nba_meta_main       <- NULL   # the main classic's DKID / DKSalary / DKPos, kept while another classic is picked
     rv$sd_game_scored      <- NULL   # the showdown the SD pool was built for
     # Lineup Lab pools belong to the sim that produced them -- a new sim (or a
     # slate switch) invalidates them exactly like the main pool.
@@ -2613,6 +2615,30 @@ server <- function(input, output, session) {
                         onclick = sprintf("Shiny.setInputValue('nhl_slate_select','%s',{priority:'event'});", keys[i]),
                         labs[i])))
     }
+    # NBA: one workbook can carry the ids of every classic draft group of the night (DKID_<dg>, DKSalary_<dg>,
+    # DKPos_<dg> on the Players tab). One SLATE pill row picks the classic; the sim is the same (20 Oct 2026).
+    nba_slate_selector <- NULL
+    if (isTRUE(rv$sport == "NBA") && !is.null(rv$sim_metadata)) {
+      alt <- sub("^DKID_", "", grep("^DKID_[0-9]+$", names(rv$sim_metadata), value = TRUE))
+      if (length(alt)) {
+        base <- rv$nba_meta_main %||% rv$sim_metadata
+        n_g  <- function(ids) length(unique(base$GameKey[!is.na(ids) & ids != "NA" & ids != ""]))
+        keys <- c("main", alt)
+        labs <- c(sprintf("Main classic - %d games", n_g(base$DKID)),
+                  vapply(alt, function(g) sprintf("Late classic %s - %d games", g, n_g(base[[paste0("DKID_", g)]])), ""))
+        cur <- rv$nba_classic %||% "main"
+        nba_slate_selector <- div(id = "nba_slate_pills", style = "margin-bottom:14px;",
+          span(class = "gts-sr-label",
+               style = "margin-right:10px;color:#FFE500;font-size:11px;font-weight:700;letter-spacing:.06em;",
+               "SLATE:"),
+          lapply(seq_along(keys), function(i)
+            tags$button(class = paste("gts-pill", if (keys[i] == cur) "active" else ""),
+                        onclick = sprintf("Shiny.setInputValue('nba_slate_select','%s',{priority:'event'});
+                           document.querySelectorAll('#nba_slate_pills .gts-pill').forEach(function(b){b.classList.remove('active')});
+                           this.classList.add('active')", keys[i]),
+                        labs[i])))
+      }
+    }
     # Use available_platforms() so FD/SD are hidden when data is absent
     active_plats <- available_platforms()
     # NHL: the slate pill decides which optimiser the one button runs.
@@ -2623,6 +2649,7 @@ server <- function(input, output, session) {
                  cfb_slate_selector,
                  nfl_slate_selector,
                  nhl_slate_selector,
+                 nba_slate_selector,
                  sd_game_selector,
                  fluidRow(lapply(active_plats, function(platform) {
                    pname <- switch(platform,"DK"="DraftKings","FD"="FanDuel","SD"="Showdown")
@@ -2661,6 +2688,28 @@ server <- function(input, output, session) {
       rv$sd_optimal_lineups <- NULL
       rv$sd_portfolio <- NULL; rv$sd_builds <- list(); rv$sd_build_counter <- 0
     }
+  }, ignoreInit = TRUE)
+
+  # NBA slate picker (20 Oct 2026). A classic: same sim, that contest's DK ids / salaries / positions (players not in it
+  # lose their salary and drop out of the DK pool). The old contest's DK pool and portfolio go.
+  observeEvent(input$nba_slate_select, {
+    req(isTRUE(rv$sport == "NBA"), rv$sim_metadata)
+    key <- input$nba_slate_select
+    if (identical(key, rv$nba_classic %||% "main")) return()
+    if (is.null(rv$nba_meta_main)) rv$nba_meta_main <- copy(rv$sim_metadata)
+    m <- copy(rv$nba_meta_main)
+    if (!identical(key, "main")) {
+      for (cc in c("DKID", "DKSalary", "DKPos")) {
+        src <- paste0(cc, "_", key)
+        if (src %in% names(m)) set(m, j = cc, value = m[[src]])
+      }
+    }
+    rv$sim_metadata <- m
+    rv$nba_classic  <- key
+    rv$dk_optimal_lineups <- NULL
+    rv$dk_portfolio <- NULL; rv$dk_builds <- list(); rv$dk_build_counter <- 0
+    rv$dk_field_ref <- NULL; rv$ll_results <- NULL; rv$ll_info <- NULL
+    rv$ll_lock_set <- character(0); rv$ll_excl_set <- character(0)
   }, ignoreInit = TRUE)
 
   # Picking a contest on Tournament Lineups re-slices the ALREADY-SIMULATED

@@ -12,6 +12,7 @@ library(data.table); library(readxl); library(lpSolve)
 
 read_nba_input <- function(file_path) {
   sheets <- excel_sheets(file_path)
+  if ("Profiles" %in% sheets) return(read_nba_input_v2(file_path, sheets))   # v2 workbook (18 Oct 2026)
   
   # IDs and Games tabs are optional -- SD-only input files omit them.
   # When absent, slate and game context are derived from team tabs + sim sheet names.
@@ -68,6 +69,7 @@ draw_negbin <- function(mu,phi,n) as.integer(rnbinom(n,size=max(phi,0.5),mu=max(
 # ── MAIN SIMULATION ───────────────────────────────────────────────────────────
 
 run_nba_simulation <- function(input_data, n_sims=10000, config=NULL, progress_callback=NULL) {
+  if (!is.null(input_data$v2)) return(run_nba_simulation_v2(input_data, n_sims, config, progress_callback))
   
   slate<-input_data$slate; sim_games<-input_data$sim_games; team_data<-input_data$team_data
   cb<-function(d,v){if(!is.null(progress_callback))progress_callback(d,v)
@@ -620,4 +622,137 @@ find_optimal_lineups_nba_sd <- function(sim_results, metadata, config, verbose=T
 
 calculate_nba_lineup_metrics <- function(scored_lineups, sim_results, metadata) {
   scored_lineups
+}
+
+# ============================================================================
+# NBA ENGINE v2 (18 Oct 2026) -- bootstrap of the player's own recent games
+# ============================================================================
+# Workbook layout (one sheet per day, every subset runs off it):
+#   Players   Name, Team, Opp, GameKey, DKID, FDID, DKSalary, FDSalary, DKPos, FDPos, DKOwn, FDOwn,
+#             Mins (the outside source's minutes: the ONLY outside number the sim uses), ETRProj (a check, never read here)
+#   Games     GameKey, HomeTeam, AwayTeam, GameTime, GameRank, OverUnder, HomeSpread, ShowdownFile
+#   Profiles  Name, Team, w (recency weight), min, pts, tpm, fgm, ftm, reb, ast, stl, blk, tov   (one row per past game)
+#   MinPool   bucket, lo, hi, ratio   (real actual/expected minutes ratios, by expected-minutes bucket)
+#   Params    param, value              (sigma_rate)
+#   SDn_IDs   as v1 (Name, Team, CPT_ID, CPT_Salary, UTIL_ID, UTIL_Salary)
+# One draw per player per sim: a past game picked by weight gives the per-minute stat line (rate scenario); the minutes
+# scenario is Mins x a ratio from MinPool; the line is scaled to those minutes, each stat rounded to an integer and
+# scored. A lognormal factor (sigma_rate) covers how well the true rate is known. Out of sample (2025-26) the 10-90%
+# band held 80.2% of results (NBA/review/v2proto.R, v2tune.R). Players are drawn independently.
+
+read_nba_input_v2 <- function(file_path, sheets) {
+  rd <- function(s) { dt <- as.data.table(read_excel(file_path, sheet = s)); setnames(dt, trimws(names(dt))); dt }
+  players <- rd("Players"); games <- rd("Games"); prof <- rd("Profiles"); pool <- rd("MinPool")
+  params <- if ("Params" %in% sheets) rd("Params") else data.table(param = character(), value = numeric())
+  gpat <- if ("GamePatterns" %in% sheets) rd("GamePatterns") else NULL
+  sd_names <- grep("^SD\\d+_IDs$", sheets, value = TRUE)
+  sd_ids <- if (length(sd_names)) setNames(lapply(sd_names, rd), sub("_IDs$", "", sd_names)) else list()
+  games[, SimKey := paste0(HomeTeam, "_vs_", AwayTeam)]
+  slate <- copy(players); setnames(slate, "Name", "Player")
+  slate <- merge(slate, games[, .(GameKey, SimKey, GameTime, GameRank, OverUnder, HomeSpread, ShowdownFile)], by = "GameKey", all.x = TRUE)
+  slate <- unique(slate, by = "Player")
+  cat(sprintf("NBA v2 input: %d players | %d games | %d profile rows | %d SD tabs\n", nrow(slate), nrow(games), nrow(prof), length(sd_ids)))
+  list(v2 = list(profiles = prof, minpool = pool, params = params, patterns = gpat), slate = slate, games = games, sd_ids = sd_ids,
+       sim_games = list(), team_data = list())
+}
+
+run_nba_simulation_v2 <- function(input_data, n_sims = 10000, config = NULL, progress_callback = NULL) {
+  cb <- function(d, v) { if (!is.null(progress_callback)) progress_callback(d, v); cat(sprintf("  [%.0f%%] %s\n", v * 100, d)); flush.console() }
+  t0 <- proc.time(); V <- input_data$v2; slate <- copy(input_data$slate)
+  pget <- function(k, d) { p <- V$params[param == k, value]; if (length(p)) as.numeric(p[1]) else d }
+  sg <- pget("sigma_rate", 0.15); rscale <- pget("rate_scale", 1)   # rate_scale: 1 regular season, about 0.95 playoffs (2024-26: oracle-minute bias +2.1 in playoffs, -0.3 regular)
+  slate <- slate[!is.na(Mins) & Mins > 0]
+  prof <- V$profiles; setkey(prof, Name)
+  pool <- V$minpool; bk <- unique(pool[, .(bucket, lo, hi)]); setorder(bk, lo)
+  ratios <- split(pool$ratio, pool$bucket)
+  stats <- c("pts", "tpm", "fgm", "ftm", "reb", "ast", "stl", "blk", "tov")
+  # Game-level minutes patterns (blowouts, early exits, foul trouble, overtime, teammates absorbing minutes): one real game per sim and
+  # game, matched on the expected margin; each team's players take the minutes ratio of the same expected-minutes rank in that game.
+  # This is what gives teammates (+0.03) and opponents (+0.02) their real correlation (NBA/review/game_resample.R).
+  gm <- input_data$games; n_p <- nrow(slate)
+  draw_pass <- function(n_sims, cf) {   # cf: named factor per team on its shooting stats (anchors the team's level to the market total / spread)
+  pat <- V$patterns; rk_ratio <- list()
+  if (!is.null(pat) && nrow(pat)) {
+    slate[, rk := frank(-Mins, ties.method = "first"), by = Team]
+    for (g in unique(slate$GameKey)) {
+      gr <- gm[GameKey == g][1]; sp <- -as.numeric(gr$HomeSpread); bkt <- if (is.na(sp)) 4L else findInterval(sp, c(-9, -5, -2, 2, 5, 9)) + 1L
+      rows <- which(pat$bk == bkt); if (length(rows) < 30) rows <- seq_len(nrow(pat))
+      ix <- sample(rows, n_sims, TRUE)
+      rk_ratio[[g]] <- list(home = as.matrix(pat[ix, paste0("h", 1:10), with = FALSE]), away = as.matrix(pat[ix, paste0("a", 1:10), with = FALSE]), home_team = gr$HomeTeam)
+    }
+  }
+  n_p <- nrow(slate); cb("Drawing player scenarios...", 0.05)
+  M <- setNames(lapply(c(stats, "dk", "fd"), function(s) matrix(0, n_p, n_sims)), c(stats, "dk", "fd"))
+  rr <- function(x) floor(x + runif(length(x)))
+  for (i in seq_len(n_p)) {
+    h <- prof[.(slate$Player[i])]
+    if (!nrow(h) || is.na(h$min[1])) next
+    h <- h[min >= 1]; if (!nrow(h)) next
+    j <- sample.int(nrow(h), n_sims, TRUE, prob = h$w * h$min)
+    b <- bk[slate$Mins[i] >= lo & slate$Mins[i] < hi][1, bucket]; if (is.na(b)) b <- bk$bucket[nrow(bk)]
+    ratio <- sample(ratios[[b]], n_sims, TRUE)   # independent minutes ratio; replaced by the game pattern below when there is one
+    rp <- rk_ratio[[slate$GameKey[i]]]
+    if (!is.null(rp) && slate$rk[i] <= 10) { pr <- if (slate$Team[i] == rp$home_team) rp$home[, slate$rk[i]] else rp$away[, slate$rk[i]]; ratio <- ifelse(is.na(pr), ratio, pr) }
+    mins <- pmin(slate$Mins[i] * ratio, 48)
+    sc <- mins / h$min[j] * rscale * exp(rnorm(n_sims, 0, sg) - sg^2 / 2)
+    cft <- cf[[slate$Team[i]]]; if (is.null(cft) || is.na(cft)) cft <- 1
+    for (s in stats) M[[s]][i, ] <- rr(h[[s]][j] * sc * (if (s %in% c("pts", "fgm", "tpm", "ftm")) cft else 1))
+    if (n_sims >= 1000 && i %% 25 == 0) cb(sprintf("Drawing player scenarios (%d/%d)...", i, n_p), 0.05 + 0.8 * i / n_p)
+  }
+  M }
+  # Anchor each team's average points to the market: implied team points = (total -/+ spread) / 2. A short pass with no anchor measures
+  # what the draws give; the factor (clipped to 0.85-1.15) then scales the shooting stats, a level shift that leaves the variance alone.
+  cf <- as.list(setNames(rep(1, uniqueN(slate$Team)), unique(slate$Team)))
+  if (isTRUE(pget("anchor_total", 1) == 1)) {
+    for (iter in 1:2) {
+    M0 <- draw_pass(1500L, cf); tp <- tapply(rowMeans(pmax(M0$pts, 2 * M0$fgm + pmin(M0$tpm, M0$fgm) + M0$ftm)), slate$Team, sum)
+    for (g in unique(slate$GameKey)) { gr <- gm[GameKey == g][1]; T_ <- as.numeric(gr$OverUnder); hs <- as.numeric(gr$HomeSpread)
+      if (is.na(T_) || is.na(hs)) next
+      for (side in list(c(gr$HomeTeam, (T_ - hs) / 2), c(gr$AwayTeam, (T_ + hs) / 2))) { tm <- side[1]; if (!is.na(tp[tm]) && tp[tm] > 0) cf[[tm]] <- min(max(cf[[tm]] * as.numeric(side[2]) / tp[tm], 0.85), 1.15) } }
+    }
+    cat("  team scoring anchor:", paste(sprintf("%s %.2f", names(cf), unlist(cf)), collapse = " | "), "\n")
+  }
+  M <- draw_pass(n_sims, cf)
+  cb("Scoring...", 0.9)
+  # keep the box-score identities DK scoring relies on: threes cannot exceed field goals, points cover the makes
+  M$tpm <- pmin(M$tpm, M$fgm); M$pts <- pmax(M$pts, 2 * M$fgm + M$tpm + M$ftm)
+  M$dk <- dk_score_nba(M$pts, M$tpm, M$reb, M$ast, M$stl, M$blk, M$tov)
+  M$fd <- fd_score_nba(M$pts, M$fgm, M$tpm, M$reb, M$ast, M$stl, M$blk, M$tov)
+  pn <- slate$Player
+  sim_results <- data.table(SimID = rep(seq_len(n_sims), each = n_p), Player = rep(pn, times = n_sims),
+                            DKScore = as.vector(M$dk), FDScore = as.vector(M$fd))
+  for (s in c("fgm", "ftm", "reb", "ast", "stl", "blk")) sim_results[[s]] <- as.integer(as.vector(M[[s]]))
+  sim_results[["to"]] <- as.integer(as.vector(M$tov)); sim_results[["tpm"]] <- as.integer(as.vector(M$tpm))
+  sim_results[["pts"]] <- as.integer(as.vector(M$pts)); sim_results[["twom"]] <- as.integer(as.vector(pmax(M$fgm - M$tpm, 0)))
+  cb("Building metadata...", 0.95)
+  keep <- intersect(c("Player", "DKID", "FDID", "DKSalary", "FDSalary", "DKPos", "FDPos", "DKOwn", "FDOwn", "Team", "GameKey", "SimKey",
+                      "GameTime", "GameRank", "OverUnder", "HomeSpread", "Mins", "ShowdownFile"), names(slate))
+  # other classic draft groups on the same workbook (DKID_<dg>, DKSalary_<dg>, DKPos_<dg>): kept for the app's SLATE picker (20 Oct 2026)
+  keep <- c(keep, grep("^(DKID|DKSalary|DKPos)_[0-9]+$", names(slate), value = TRUE))
+  metadata <- unique(slate[, ..keep], by = "Player")
+  metadata[, GameTimeSort := as.numeric(as.POSIXct(paste(Sys.Date(), GameTime), format = "%Y-%m-%d %I:%M %p", tz = "America/New_York"))]
+  if (length(input_data$sd_ids)) {
+    sd_all <- rbindlist(lapply(names(input_data$sd_ids), function(n) { dt <- copy(input_data$sd_ids[[n]]); dt[, SDFile := n]; dt }), fill = TRUE)
+    setnames(sd_all, "Name", "Player"); sd_all[, Player := trimws(iconv(Player, to = "ASCII//TRANSLIT"))]
+    sd_sub <- sd_all[, .(Player, Team, SDFile, CPTID = CPT_ID, CPTSalary = as.numeric(CPT_Salary), SDID = as.character(UTIL_ID), SDSalary = as.numeric(UTIL_Salary))]
+    if (!"ShowdownFile" %in% names(metadata)) metadata[, ShowdownFile := NA_character_]
+    metadata <- merge(metadata, sd_sub, by.x = c("Player", "Team", "ShowdownFile"), by.y = c("Player", "Team", "SDFile"), all.x = TRUE)
+  }
+  has_fd <- "FDSalary" %in% names(metadata) && any(!is.na(metadata$FDSalary) & metadata$FDSalary > 0)
+  has_sd <- "CPTSalary" %in% names(metadata) && any(!is.na(metadata$CPTSalary) & metadata$CPTSalary > 0)
+  cat(sprintf("  NBA v2 sim complete: %d sims | %d players | %.1fs\n", n_sims, nrow(metadata), (proc.time() - t0)["elapsed"]))
+  tm <- slate$Team
+  pm <- data.table(Player = pn, Team = tm, DKAvgFP = round(rowMeans(M$dk), 1), FDAvgFP = round(rowMeans(M$fd), 1), AvgFP = round(rowMeans(M$dk), 1),
+                   pts = round(rowMeans(M$pts), 1), tpm = round(rowMeans(M$tpm), 1), twom = round(rowMeans(pmax(M$fgm - M$tpm, 0)), 1),
+                   ftm = round(rowMeans(M$ftm), 1), reb = round(rowMeans(M$reb), 1), ast = round(rowMeans(M$ast), 1),
+                   stl = round(rowMeans(M$stl), 1), blk = round(rowMeans(M$blk), 1), to = round(rowMeans(M$tov), 1),
+                   DKPos = slate$DKPos, FDPos = if ("FDPos" %in% names(slate)) slate$FDPos else NA_character_)
+  setorder(pm, Team, -DKAvgFP)
+  teams <- sort(unique(tm))
+  tmeans <- rbindlist(lapply(teams, function(t) { ix <- which(tm == t)
+    data.table(Team = t, DKAvgFP = round(mean(colSums(M$dk[ix, , drop = FALSE])), 1), FDAvgFP = round(mean(colSums(M$fd[ix, , drop = FALSE])), 1),
+               AvgFP = round(mean(colSums(M$dk[ix, , drop = FALSE])), 1), pts = round(mean(colSums(M$pts[ix, , drop = FALSE])), 1)) }), fill = TRUE)
+  setorder(tmeans, -DKAvgFP)
+  list(sim_results = sim_results[Player %in% metadata$Player], metadata = metadata, has_fd = has_fd, has_sd = has_sd,
+       sport_visuals = list(teams = teams, player_means = pm, team_means = tmeans))
 }
