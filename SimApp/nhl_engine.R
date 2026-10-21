@@ -175,8 +175,82 @@ run_nhl_simulation <- function(input_data, n_sims = 10000, config = NULL, progre
   # Never let a summary cost the sim: a failure here leaves the tab empty.
   vis <- tryCatch(nhl_sim_visuals(bx, sk, sims, G, T, input_data),
                   error = function(e) { warning("NHL visuals: ", conditionMessage(e)); NULL })
+  # Engine review (stat_quantiles.R): skater / goalie / team stat quantiles. Off unless the review's
+  # re-sim worker sets options(gts.stat_quantiles = TRUE); reads sk and bx, draws no random numbers.
+  if (exists("gts_stat_q_on") && gts_stat_q_on())
+    vis <- gts_stat_attach(vis, function() {
+      who <- T[Pos != "G", .(playerId, gameId, Player, Team = team)]
+      skq <- gts_stat_summ(sk, c(playerId = "playerId", game = "game"),
+               list(g = "g", a = "a", pts = quote(g + a), sog = "sog", blk = "blk", toi_min = quote(toi / 60),
+                    dk_fpts = "dk"), "player", list(sog = c(3, 5), blk = 3, pts = c(1, 3), g = c(1, 3)))
+      for (k in c("q", "ge")) if (nrow(skq[[k]])) {
+        skq[[k]][G, on = "game", gameId := i.gameId]
+        skq[[k]] <- merge(who, skq[[k]], by = c("playerId", "gameId"))[, game := NULL]
+      }
+      b <- bx[, .(game, sim, is_home, goals = goals + (end == "SO" & result == "W"), sog, s_sv, s_ga, s_dk)]
+      b[G, on = "game", Team := fifelse(is_home, i.home, i.away)]
+      tot <- b[, .(total_goals = sum(goals)), by = .(game, sim)]
+      tot[G, on = "game", Team := paste(i.away, "@", i.home)]
+      list(skq,
+           gts_stat_summ(b, c(Team = "Team"), list(saves = "s_sv", ga = "s_ga", dk_fpts = "s_dk"), "goalie", list(saves = 35)),
+           gts_stat_summ(b, c(Team = "Team"), list(goals = "goals", sog = "sog"), "team"),
+           gts_stat_summ(tot, c(Team = "Team"), list(total_goals = "total_goals"), "game"))
+    })
+  # Pairwise stat correlations (16 Oct 2026, SIM_RECORD_STANDARD): mean sim correlation by relation, per stat.
+  # Same switch, no random numbers, a failure is a warning.
+  if (exists("gts_stat_q_on") && gts_stat_q_on()) {
+    sc <- tryCatch(nhl_stat_corr(sk, bx, G), error = function(e) { warning("NHL stat corr: ", conditionMessage(e)); NULL })
+    if (!is.null(sc)) { if (is.null(vis)) vis <- list(); vis$stat_corr <- sc }
+  }
   pcb("Done", 1)
   list(sim_results = sims, metadata = meta, sport_visuals = vis)
+}
+
+# Mean pairwise correlation across sims, by relation, for the stats the engine review checks (sog, pts = g + a, blk,
+# dk) between skaters, and goalie saves / GA against own and opposing skaters. Per game, first n_use sims; relations as
+# in nhl_sim_visuals (linemates, D partners, PP1 unit, teammates, opponents). Output columns: rel, stat_a, stat_b, r (mean
+# over games of the mean pair r), games, n_sims.
+nhl_stat_corr <- function(sk, bx, G, n_use = 5000L) {
+  n <- uniqueN(bx$sim); use <- seq_len(min(n_use, n))
+  S <- sk[sim %in% use, .(game, sim, is_home, playerId, grp, slot, pp, sog, blk, pts = g + a, dk)]
+  B <- bx[sim %in% use, .(game, sim, is_home, s_sv, s_ga)]
+  stats <- c("sog", "pts", "blk", "dk"); out <- list()
+  add <- function(rel, sa, sb, r) if (length(r)) out[[length(out) + 1L]] <<- data.table(rel = rel, stat_a = sa, stat_b = sb, r = r)
+  for (gm in sort(unique(S$game))) {
+    X <- S[game == gm][order(is_home, playerId, sim)]
+    pl <- unique(X[, .(is_home, playerId, grp, slot, pp)]); np <- nrow(pl); ns <- length(use)
+    if (np < 2L) next
+    Bg <- B[game == gm][order(is_home, sim)]
+    gh <- Bg[is_home == TRUE]; ga_ <- Bg[is_home == FALSE]
+    ij <- which(upper.tri(diag(np)), arr.ind = TRUE)
+    a <- pl[ij[, 1]]; z <- pl[ij[, 2]]
+    same <- a$is_home == z$is_home
+    sl <- fcoalesce(a$slot, -1L) == fcoalesce(z$slot, -2L)
+    rel <- fcase(same & a$grp == "F" & z$grp == "F" & sl, "Forward linemates",
+                 same & a$grp == "D" & z$grp == "D" & sl, "D partners",
+                 same & a$pp %in% 1L & z$pp %in% 1L, "PP1 unit, not linemates",
+                 same, "Teammates, other lines",
+                 default = "Opponents")
+    for (st in stats) {
+      M <- matrix(X[[st]], nrow = ns); cm <- suppressWarnings(cor(M))
+      r <- cm[ij]; ok <- is.finite(r)
+      if (any(ok)) for (rl in unique(rel[ok])) add(rl, st, st, mean(r[ok & rel == rl]))
+      # goalie saves / GA against own and opposing skaters (skater stat sog or pts; goalie stat saves or ga)
+      if (st %in% c("sog", "pts")) for (gs in c("s_sv", "s_ga")) {
+        for (side in c("own", "opp")) {
+          gv <- function(hm) if (hm) gh[[gs]] else ga_[[gs]]
+          cr <- vapply(seq_len(np), function(i) {
+            hg <- if (side == "own") pl$is_home[i] else !pl$is_home[i]
+            suppressWarnings(cor(M[, i], gv(hg)))
+          }, 0)
+          add(paste("Skater vs", side, "goalie"), st, sub("s_", "", gs), mean(cr[is.finite(cr)]))
+        }
+      }
+    }
+  }
+  if (!length(out)) return(NULL)
+  o <- rbindlist(out)
+  o[, .(r = round(mean(r, na.rm = TRUE), 4), games = .N, n_sims = length(use)), by = .(rel, stat_a, stat_b)]
 }
 
 # =============================================================================
