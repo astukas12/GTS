@@ -1089,9 +1089,20 @@ SPORT_CONFIGS <- list(
       # A Sim_<A>_vs_<B> pool and an IDs tab, and none of the regular-season
       # sheets. That combination is unique to a preseason workbook.
       custom_detect = function(sheets, file_path = NULL) {
+        # 21 Oct 2026: an old-format NBA workbook (IDs, Games, team tabs, Sim_<home>_vs_<away>) has the same sheet names. It is told apart by its COLUMNS: some tab carries both
+        # OverUnder and HomeSpread (NBA / CBB game lines), which a preseason workbook does not. Only read when the cheap checks above already pass.
+        nba_lines <- function() {
+          if (is.null(file_path)) return(FALSE)
+          for (s in sheets) {
+            cols <- tryCatch(names(suppressMessages(readxl::read_excel(file_path, sheet = s, n_max = 0))), error = function(e) character())
+            if (all(c("OverUnder", "HomeSpread") %in% cols)) return(TRUE)
+          }
+          FALSE
+        }
         any(grepl("^Sim_", sheets)) && "IDs" %in% sheets &&
           !("Similar_Games" %in% sheets) &&
-          !any(grepl("_Rushing$", sheets))
+          !any(grepl("_Rushing$", sheets)) &&
+          !nba_lines()
       },
       required_sheets    = NULL,
       required_columns   = NULL,
