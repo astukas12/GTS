@@ -429,6 +429,42 @@ assign_nba_slots_fd <- function(cm) {
 # 8 players: PG/SG/SF/PF/C/G/F/UTIL  $50K  >=2G >=2F >=1C  <=7 from one game
 # ============================================================================
 
+# Phase 1 worker: exact optimal DK lineup for each sim in `od` (a slice of opt_data). Pure function of its inputs, no RNG.
+nba_p1_chunk <- function(od, salary_cap) {
+  suppressMessages({ library(data.table); library(lpSolve) })
+  setkey(od, SimID); ids <- unique(od$SimID); out <- vector("list", length(ids))
+  for (i in seq_along(ids)) {
+    pool<-od[.(ids[i])]; n_p<-nrow(pool); if(n_p<8L) next
+    gkp<-unique(pool$GameKey)
+    gc<-if(length(gkp)>=2L) lapply(gkp,function(gk) as.integer(pool$GameKey==gk)) else list()
+    n_gc<-length(gc)
+    f_con<-rbind(rep(1L,n_p),pool$Salary,as.integer(pool$g_elig),as.integer(pool$f_elig),
+                 as.integer(pool$c_elig),if(n_gc) do.call(rbind,gc) else matrix(nrow=0,ncol=n_p))
+    sol<-tryCatch(lp("max",pool$FantasyPoints,f_con,c("==","<=",">=",">=",">=",rep("<=",n_gc)),
+                     c(8L,salary_cap,2L,2L,1L,rep(7L,n_gc)),all.bin=TRUE)$solution,error=function(e)NULL)
+    if (is.null(sol)||sum(sol)<8L) next
+    chosen<-pool[sol==1]; sig<-paste(sort(chosen$Player),collapse="|")
+    out[[i]]<-data.table(Lineup=sig,TotalSalary=sum(chosen$Salary),TotalScore=sum(chosen$FantasyPoints))
+  }
+  out
+}
+
+# Splits the sims into contiguous blocks over PSOCK workers (GTS_MAX_WORKERS cap through .opt_workers). Results come back in sim
+# order, so the lineup table equals the serial loop's. Serial with one worker or few sims. 21 Oct 2026.
+nba_p1_solve <- function(opt_data, sim_ids, salary_cap, verbose = TRUE) {
+  n_sims <- length(sim_ids)
+  nw <- if (exists(".opt_workers", mode = "function")) .opt_workers() else 1L
+  nw <- max(1L, min(nw, ceiling(n_sims / 500)))
+  if (nw < 2L) return(nba_p1_chunk(opt_data, salary_cap))
+  if (verbose) cat(sprintf("  Using %d workers\n", nw))
+  blocks <- split(sim_ids, cut(seq_along(sim_ids), nw, labels = FALSE))
+  parts <- lapply(blocks, function(b) opt_data[.(b)])
+  fn <- nba_p1_chunk; environment(fn) <- globalenv()
+  cl <- parallel::makeCluster(nw, type = "PSOCK"); on.exit(parallel::stopCluster(cl), add = TRUE)
+  res <- parallel::clusterApply(cl, parts, fn, salary_cap = salary_cap)
+  unlist(res, recursive = FALSE, use.names = FALSE)
+}
+
 find_optimal_lineups_nba <- function(sim_results, metadata, config, verbose=TRUE) {
   if (verbose) cat("\nPhase 1: NBA DK lineups (per-sim LP)...\n")
   setDT(sim_results); setDT(metadata)
@@ -451,33 +487,18 @@ find_optimal_lineups_nba <- function(sim_results, metadata, config, verbose=TRUE
   start_t<-Sys.time(); prog_freq<-max(1L,n_sims%/%20L)
   if (verbose) cat(sprintf("  %d players | %s sims | $%s cap\n",nrow(meta),
                            format(n_sims,big.mark=","),format(salary_cap,big.mark=",")))
-  lineup_list<-vector("list",n_sims)
-  for (i in seq_along(sim_ids)){
-    sid<-sim_ids[i]; pool<-opt_data[.(sid)]; n_p<-nrow(pool); if(n_p<8L) next
-    gkp<-unique(pool$GameKey)
-    gc<-if(length(gkp)>=2L) lapply(gkp,function(gk) as.integer(pool$GameKey==gk)) else list()
-    n_gc<-length(gc)
-    f_con<-rbind(rep(1L,n_p),pool$Salary,as.integer(pool$g_elig),as.integer(pool$f_elig),
-                 as.integer(pool$c_elig),if(n_gc) do.call(rbind,gc) else matrix(nrow=0,ncol=n_p))
-    sol<-tryCatch(lp("max",pool$FantasyPoints,f_con,c("==","<=",">=",">=",">=",rep("<=",n_gc)),
-                     c(8L,salary_cap,2L,2L,1L,rep(7L,n_gc)),all.bin=TRUE)$solution,error=function(e)NULL)
-    if (is.null(sol)||sum(sol)<8L) next
-    chosen<-pool[sol==1]; sig<-paste(sort(chosen$Player),collapse="|")
-    lineup_list[[i]]<-data.table(Lineup=sig,TotalSalary=sum(chosen$Salary),TotalScore=sum(chosen$FantasyPoints))
-    if(verbose&&i%%prog_freq==0L){cat(sprintf("\r  Phase 1: %d%% | %.1fs",round(i/n_sims*100),
-                                              as.numeric(difftime(Sys.time(),start_t,units="secs"))));flush.console()}
-  }
+  lineup_list <- nba_p1_solve(opt_data, sim_ids, salary_cap, verbose = verbose)
   if(verbose) cat("\n")
   valid<-lineup_list[!sapply(lineup_list,is.null)]; if(!length(valid)) stop("No valid NBA DK lineups")
   all_dt<-rbindlist(valid)
   counts<-all_dt[,.(Top1Count=.N,TotalSalary=TotalSalary[1],AvgScore=mean(TotalScore)),by=Lineup]
   counts[,rand:=runif(.N)]; setorder(counts,-Top1Count,rand); counts[,rand:=NULL]
-  slot_list<-vector("list",nrow(counts))
+  slot_list<-vector("list",nrow(counts)); n_ok<-0L   # stops once max_lineups lineups are legal: same first max_lineups, same order
+  cm_cols<-intersect(c("Player","DKPos","game_rank"),names(meta))
   for(li in seq_len(nrow(counts))){
     players<-strsplit(counts$Lineup[li],"\\|")[[1]]
-    cm_cols<-intersect(c("Player","DKPos","game_rank"),names(meta))
     cm<-meta[Player %in% players,..cm_cols]; slots<-assign_nba_slots_dk(cm)
-    if(!is.null(slots)) slot_list[[li]]<-as.data.table(c(list(Lineup=counts$Lineup[li]),slots))
+    if(!is.null(slots)){ slot_list[[li]]<-as.data.table(c(list(Lineup=counts$Lineup[li]),slots)); n_ok<-n_ok+1L; if(n_ok>=max_lineups) break }
   }
   slot_dt<-rbindlist(slot_list[!sapply(slot_list,is.null)])
   counts<-merge(counts,slot_dt,by="Lineup",all.x=TRUE)
@@ -661,6 +682,11 @@ run_nba_simulation_v2 <- function(input_data, n_sims = 10000, config = NULL, pro
   t0 <- proc.time(); V <- input_data$v2; slate <- copy(input_data$slate)
   pget <- function(k, d) { p <- V$params[param == k, value]; if (length(p)) as.numeric(p[1]) else d }
   sg <- pget("sigma_rate", 0.15); rscale <- pget("rate_scale", 1)   # rate_scale: 1 regular season, about 0.95 playoffs (2024-26: oracle-minute bias +2.1 in playoffs, -0.3 regular)
+  # Fixed seeds (21 Oct 2026): with Params `seed` or env GTS_NBA_SEED set, every player's draws (and every game's minutes pattern) come from
+  # a stream seeded by (seed, name, n_sims), so a rerun after news differs only for the players whose inputs changed (plus their team's
+  # minute ranks and scoring anchor). Unset = the old behaviour, one global stream.
+  sb <- pget("seed", NA_real_); if (is.na(sb)) sb <- suppressWarnings(as.numeric(Sys.getenv("GTS_NBA_SEED", NA)))
+  seed_hash <- function(...) { z <- as.numeric(utf8ToInt(paste(..., sep = "|"))); as.integer((sum(z * ((seq_along(z) * 2654435761) %% 1000003)) + sb * 7919) %% 2147483629) }
   slate <- slate[!is.na(Mins) & Mins > 0]
   prof <- V$profiles; setkey(prof, Name)
   pool <- V$minpool; bk <- unique(pool[, .(bucket, lo, hi)]); setorder(bk, lo)
@@ -677,6 +703,7 @@ run_nba_simulation_v2 <- function(input_data, n_sims = 10000, config = NULL, pro
     for (g in unique(slate$GameKey)) {
       gr <- gm[GameKey == g][1]; sp <- -as.numeric(gr$HomeSpread); bkt <- if (is.na(sp)) 4L else findInterval(sp, c(-9, -5, -2, 2, 5, 9)) + 1L
       rows <- which(pat$bk == bkt); if (length(rows) < 30) rows <- seq_len(nrow(pat))
+      if (!is.na(sb)) set.seed(seed_hash("game", g, n_sims))
       ix <- sample(rows, n_sims, TRUE)
       rk_ratio[[g]] <- list(home = as.matrix(pat[ix, paste0("h", 1:10), with = FALSE]), away = as.matrix(pat[ix, paste0("a", 1:10), with = FALSE]), home_team = gr$HomeTeam)
     }
@@ -685,6 +712,7 @@ run_nba_simulation_v2 <- function(input_data, n_sims = 10000, config = NULL, pro
   M <- setNames(lapply(c(stats, "dk", "fd"), function(s) matrix(0, n_p, n_sims)), c(stats, "dk", "fd"))
   rr <- function(x) floor(x + runif(length(x)))
   for (i in seq_len(n_p)) {
+    if (!is.na(sb)) set.seed(seed_hash("player", slate$Player[i], n_sims))
     h <- prof[.(slate$Player[i])]
     if (!nrow(h) || is.na(h$min[1])) next
     h <- h[min >= 1]; if (!nrow(h)) next

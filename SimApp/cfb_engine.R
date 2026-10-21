@@ -548,7 +548,12 @@ read_cfb_input <- function(file_path, slate = NULL, game = NULL) {
                # STYLE HOLD (10 Oct 2026): non-empty = this team's own style is dealt (see cfb_style_hold below)
                style_hold = as.character(o$style_hold %||% NA_character_),
                # share of sims dealt from the style pool (blank = 1); 10 Oct replay favours ~.5 (ab_style_hold/REPLAY.md)
-               style_hold_w = as.numeric(o$style_hold_w %||% NA))
+               style_hold_w = as.numeric(o$style_hold_w %||% NA),
+               # KICKER SHARES (21 Oct 2026): optional team-tab fields fg_share / xp_share, blank = 1. When two kickers
+               # split the work (only one is in the DK pool), `kicker` is credited this share of the team's made field
+               # goals and extra points, thinned per event. fg_share 0.5 + xp_share 1 = half the FGs, every XP.
+               fg_share = as.numeric(o$fg_share %||% NA),
+               xp_share = as.numeric(o$xp_share %||% NA))
   }), fill = TRUE)
 
   # OPTIONAL `projections` / `etr` tabs, read raw. `projections` carries the
@@ -634,6 +639,19 @@ read_cfb_input <- function(file_path, slate = NULL, game = NULL) {
       po <- merge(po, unique(prj[, .(player, own = suppressWarnings(as.numeric(own)))],
                              by = "player"), by = "player", all.x = TRUE)
     else po[, own := NA_real_]
+    # SHOWDOWN OWNERSHIP (fixed 6 Oct 2026). The sheet carries a showdown's
+    # ownership as `flex_own` / `cpt_own` on its SD rows, with `own` left at 0
+    # (CFB/R/slate_sheet.R). Only `own` used to survive this rebuild, so every
+    # showdown on a multi-game card reached the sim with DKOwn = CPTOwn = 0 and
+    # Top1%/Win%/leverage ran against a field with no ownership. Carry both
+    # through for the SD slice; cfb_build_meta() already prefers them.
+    if (identical(prj_slate, "SD") && !is.null(prj)) {
+      for (oc in intersect(c("flex_own", "cpt_own"), names(prj))) {
+        ov <- unique(prj[, .(player, v = suppressWarnings(as.numeric(get(oc))))], by = "player")
+        setnames(ov, "v", oc)
+        po <- merge(po, ov, by = "player", all.x = TRUE)
+      }
+    }
     prj <- po
   } else if (!is.null(etr_raw) && "etr" %in% names(etr_raw)) {
     # SINGLE-SLATE SHEETS NEED THE SAME JOIN (fixed 17 Sep 2026). A standalone
@@ -983,6 +1001,8 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
                 apply(lr, 2, function(cl) { p <- R$usage * cl; p / sum(p) })
               },
          k = tr$kicker, pr = tr$punt_returner, kr = tr$kick_returner,
+         fgs = { x <- tr$fg_share; if (length(x) != 1L || is.na(x)) 1 else min(max(x, 0), 1) },
+         xps = { x <- tr$xp_share; if (length(x) != 1L || is.na(x)) 1 else min(max(x, 0), 1) },
          # kicker/punt_returner/kick_returner are blank on plenty of real team
          # tabs (no punt/kick return man named). An NA_character_ column value
          # slipping into `who` becomes an NA "player" that rides all the way to
@@ -1118,8 +1138,9 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
       sk <- K2[, .(sk = sum(yds)), by = .(sim, qw)]
       sk[, player := QB$player[qw]][, qw := NULL]
     }
-    fg <- E2[kind == CFB_EVT_FG & !is.na(made) & made == 1L,
-             .(fg = sum(cfb_fg_points(ytg))), by = sim]
+    fgE <- E2[kind == CFB_EVT_FG & !is.na(made) & made == 1L]
+    if (cf$fgs < 1) fgE <- fgE[runif(.N) < cf$fgs]
+    fg <- fgE[, .(fg = sum(cfb_fg_points(ytg))), by = sim]
 
     # ---- assemble the full (sim x player) grid -------------------------------
     # Every player in every sim, because a zero counts: bust rate and the whole
@@ -1141,7 +1162,7 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
     if (!is.na(cf$k)) {
       fgv <- rep(0, n_sims); fgv[fg$sim] <- fg$fg
       tdv <- D[, .(t = sum(rtd) + sum(ctd)), by = sim]
-      xpv <- rep(0, n_sims); xpv[tdv$sim] <- tdv$t
+      xpv <- rep(0, n_sims); xpv[tdv$sim] <- if (cf$xps < 1) rbinom(nrow(tdv), tdv$t, cf$xps) else tdv$t
       D[player == cf$k, `:=`(fgp = fgv[sim], xp = xpv[sim])]
     }
     if (!is.na(cf$pr)) D[player == cf$pr & runif(.N) < CFB_PUNT_TD_RATE, rettd := rettd + 1L]
