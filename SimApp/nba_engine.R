@@ -735,7 +735,8 @@ run_nba_simulation_v2 <- function(input_data, n_sims = 10000, config = NULL, pro
   if (length(input_data$sd_ids)) {
     sd_all <- rbindlist(lapply(names(input_data$sd_ids), function(n) { dt <- copy(input_data$sd_ids[[n]]); dt[, SDFile := n]; dt }), fill = TRUE)
     setnames(sd_all, "Name", "Player"); sd_all[, Player := trimws(iconv(Player, to = "ASCII//TRANSLIT"))]
-    sd_sub <- sd_all[, .(Player, Team, SDFile, CPTID = CPT_ID, CPTSalary = as.numeric(CPT_Salary), SDID = as.character(UTIL_ID), SDSalary = as.numeric(UTIL_Salary))]
+    for (cc in c("CPT_Own", "UTIL_Own")) if (!cc %in% names(sd_all)) sd_all[[cc]] <- NA_real_   # optional showdown ownership (percent), 21 Oct 2026
+    sd_sub <- sd_all[, .(Player, Team, SDFile, CPTID = CPT_ID, CPTSalary = as.numeric(CPT_Salary), SDID = as.character(UTIL_ID), SDSalary = as.numeric(UTIL_Salary), CPTOwn = as.numeric(CPT_Own), SDOwn = as.numeric(UTIL_Own))]
     if (!"ShowdownFile" %in% names(metadata)) metadata[, ShowdownFile := NA_character_]
     metadata <- merge(metadata, sd_sub, by.x = c("Player", "Team", "ShowdownFile"), by.y = c("Player", "Team", "SDFile"), all.x = TRUE)
   }
