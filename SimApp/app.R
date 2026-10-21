@@ -2691,7 +2691,7 @@ server <- function(input, output, session) {
     }
   }, ignoreInit = TRUE)
 
-  # NBA slate picker (20 Oct 2026). A classic: same sim, that contest's DK ids / salaries / positions (players not in it
+  # NBA slate picker (20 Oct 2026; 21 Oct: also that slate's own ownership, DKOwn_<dg>). A classic: same sim, that contest's DK ids / salaries / positions (players not in it
   # lose their salary and drop out of the DK pool). The old contest's DK pool and portfolio go.
   observeEvent(input$nba_slate_select, {
     req(isTRUE(rv$sport == "NBA"), rv$sim_metadata)
@@ -2700,7 +2700,7 @@ server <- function(input, output, session) {
     if (is.null(rv$nba_meta_main)) rv$nba_meta_main <- copy(rv$sim_metadata)
     m <- copy(rv$nba_meta_main)
     if (!identical(key, "main")) {
-      for (cc in c("DKID", "DKSalary", "DKPos")) {
+      for (cc in c("DKID", "DKSalary", "DKPos", "DKOwn")) {
         src <- paste0(cc, "_", key)
         if (src %in% names(m)) set(m, j = cc, value = m[[src]])
       }
