@@ -757,7 +757,7 @@ run_nba_simulation_v2 <- function(input_data, n_sims = 10000, config = NULL, pro
   keep <- intersect(c("Player", "DKID", "FDID", "DKSalary", "FDSalary", "DKPos", "FDPos", "DKOwn", "FDOwn", "Team", "GameKey", "SimKey",
                       "GameTime", "GameRank", "OverUnder", "HomeSpread", "Mins", "ShowdownFile"), names(slate))
   # other classic draft groups on the same workbook (DKID_<dg>, DKSalary_<dg>, DKPos_<dg>): kept for the app's SLATE picker (20 Oct 2026)
-  keep <- c(keep, grep("^(DKID|DKSalary|DKPos)_[0-9]+$", names(slate), value = TRUE))
+  keep <- c(keep, grep("^(DKID|DKSalary|DKPos|DKOwn)_[0-9]+$", names(slate), value = TRUE))
   metadata <- unique(slate[, ..keep], by = "Player")
   metadata[, GameTimeSort := as.numeric(as.POSIXct(paste(Sys.Date(), GameTime), format = "%Y-%m-%d %I:%M %p", tz = "America/New_York"))]
   if (length(input_data$sd_ids)) {
