@@ -829,7 +829,7 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
   # whole range and were never centred.
   for (cl in c("gl_share", "sy_share"))
     if (!cl %in% names(PL)) PL[[cl]] <- 0
-  for (cl in c("pass_share","usage","ypc","carry_usage","gl_share","sy_share",
+  for (cl in c("pass_share","pass_share_lo","pass_share_hi","usage","ypc","carry_usage","gl_share","sy_share",
                "salary_util","salary_cpt","dk_id_util","dk_id_cpt"))
     if (cl %in% names(PL)) PL[[cl]] <- cfb_num(PL[[cl]])
   PL[is.na(route_base) | route_base == "", route_base := dk_pos]
@@ -1152,12 +1152,39 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
       if (!cl %in% names(D)) D[, (cl) := 0] else D[is.na(get(cl)), (cl) := 0]
 
     D[, `:=`(pyds = 0, ptd = 0, pint = 0, fgp = 0, xp = 0, rettd = 0L)]
-    # Passing yards, touchdowns and interceptions still ride on the first
-    # quarterback -- splitting those is scoped but not built. Sack YARDAGE now
-    # lands on whoever took the sack.
-    if (!is.na(cf$qb))
-      D[player == cf$qb, `:=`(pyds = v_pyds[sim], ptd = v_ptd[sim],
-                              pint = v_pint[sim])]
+    # TWO-QUARTERBACK PASSING (Andrew, 22 Oct 2026). OPT-IN, for teams where two quarterbacks are EXPECTED
+    # to play. A team is a one-QB team (the first quarterback gets the drawn game's passing yards, TDs and
+    # INTs) unless the sheet gives a second QB a pass_share. Optional per-QB range columns pass_share_lo and
+    # pass_share_hi (team tab, player block): each sim draws that QB's share Uniform(lo, hi), the shares are
+    # normalised to 1 across the quarterbacks, and the drawn game's passing is split on them: yards in
+    # proportion, TDs and INTs by sequential binomial draws. A QB with no range uses his pass_share as a
+    # fixed share. No "backup MAY come in" mode (Andrew, 22 Oct): every QB with a share throws in every sim.
+    # Sacks are dealt separately, per event, above.
+    if (!is.na(cf$qb)) {
+      if (nQ >= 2L) {
+        ord_ <- order(-QB$pass_share); qn_ <- QB$player[ord_]
+        lo_ <- if ("pass_share_lo" %in% names(QB)) QB$pass_share_lo[ord_] else rep(NA_real_, nQ)
+        hi_ <- if ("pass_share_hi" %in% names(QB)) QB$pass_share_hi[ord_] else rep(NA_real_, nQ)
+        ps_ <- QB$pass_share[ord_]
+        lo_[is.na(lo_)] <- ps_[is.na(lo_)]; hi_[is.na(hi_)] <- ps_[is.na(hi_)]
+        SH_ <- vapply(seq_len(nQ), function(k) stats::runif(n_sims, lo_[k], max(hi_[k], lo_[k])), numeric(n_sims))
+        SH_ <- SH_ / rowSums(SH_)
+        left_p <- rep(1, n_sims); left_t <- round(v_ptd); left_i <- round(v_pint); left_y <- v_pyds
+        for (k_ in seq_len(nQ)) {
+          fk_ <- SH_[, k_]
+          if (k_ < nQ) {
+            pk_  <- pmin(1, fk_ / left_p)
+            yk_  <- round(v_pyds * fk_)
+            tk_  <- stats::rbinom(n_sims, left_t, pk_)
+            ik_  <- stats::rbinom(n_sims, left_i, pk_)
+          } else { yk_ <- left_y; tk_ <- left_t; ik_ <- left_i }
+          D[player == qn_[k_], `:=`(pyds = yk_[sim], ptd = tk_[sim], pint = ik_[sim])]
+          left_p <- left_p - fk_; left_t <- left_t - tk_; left_i <- left_i - ik_; left_y <- left_y - yk_
+        }
+      } else
+        D[player == cf$qb, `:=`(pyds = v_pyds[sim], ptd = v_ptd[sim],
+                                pint = v_pint[sim])]
+    }
     if (!is.null(sk)) D[sk, on = .(sim, player), cyds := cyds + i.sk]
     if (!is.na(cf$k)) {
       fgv <- rep(0, n_sims); fgv[fg$sim] <- fg$fg
