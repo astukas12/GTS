@@ -10,6 +10,21 @@ library(data.table); library(readxl); library(lpSolve)
 
 # ── INPUT READER ──────────────────────────────────────────────────────────────
 
+# ── GAME-SCRIPT TABLES (22 Oct 2026) ─────────────────────────────────────────
+# Optional sheets of an old-format NBA workbook, written by NBA/R/old_engine_workbook.R:
+#   Params        key / value rows: script_minutes (1 = on), pool_tilt, rho_<role>, sig_k_<role>, version ...
+#   Script_Shifts role (starter / bench15 / bench<15), margin_class (<10, 10-19, 20+), ot (0/1), shift (minutes vs the projection)
+# A workbook without both sheets behaves exactly as before.
+nba_read_script <- function(file_path) {
+  pr <- as.data.table(read_excel(file_path, sheet = "Params"))[, 1:2]; setnames(pr, c("name", "value"))
+  kv <- setNames(as.list(pr[[2]]), trimws(as.character(pr[[1]]))); num <- function(k, d = NA_real_) { v <- suppressWarnings(as.numeric(kv[[k]])); if (!length(v) || is.na(v)) d else v }
+  sh <- as.data.table(read_excel(file_path, sheet = "Script_Shifts")); setnames(sh, trimws(names(sh)))
+  roles <- c("starter", "bench15", "bench<15"); mcls <- c("<10", "10-19", "20+")
+  shift_mat <- setNames(lapply(roles, function(r) { m <- matrix(0, 3, 2); for (i in 1:3) for (o in 0:1) { v <- sh[role == r & margin_class == mcls[i] & as.integer(ot) == o, shift]; if (length(v) && !is.na(v[1])) m[i, o + 1] <- v[1] }; m }), roles)
+  rho <- setNames(lapply(roles, function(r) num(paste0("rho_", r), 0)), roles); sig_k <- setNames(lapply(roles, function(r) num(paste0("sig_k_", r), 1)), roles)
+  list(on = isTRUE(num("script_minutes", 0) == 1), shift_mat = shift_mat, rho = rho, sig_k = sig_k, version = as.character(kv[["version"]]))
+}
+
 read_nba_input <- function(file_path) {
   sheets <- excel_sheets(file_path)
   if ("Profiles" %in% sheets) return(read_nba_input_v2(file_path, sheets))   # v2 workbook (18 Oct 2026)
@@ -26,7 +41,7 @@ read_nba_input <- function(file_path) {
     dt<-as.data.table(read_excel(file_path,sheet=s)); setnames(dt,trimws(names(dt))); dt
   }), sub("_IDs$","",sd_names)) else list()
   
-  fixed_sheets <- c("IDs","Games",sd_names,sim_names,grep("^H2H_",sheets,value=TRUE))
+  fixed_sheets <- c("IDs","Games","Params","Script_Shifts","Tilt_Info",sd_names,sim_names,grep("^H2H_",sheets,value=TRUE))
   team_sheet_names <- setdiff(sheets, fixed_sheets)
   if (!length(team_sheet_names)) stop("No team tabs found.")
   team_data <- setNames(lapply(team_sheet_names,function(s){
@@ -47,9 +62,12 @@ read_nba_input <- function(file_path) {
   slate <- merge(ids, team_game_lu, by="Team", all.x=TRUE)
   
   slate <- unique(slate, by="Player")
-  cat(sprintf("NBA Input: %d players | %d games | %d team tabs | %d sim sheets\n",
-              nrow(slate),nrow(games),length(team_data),length(sim_games)))
-  list(slate=slate,sim_games=sim_games,team_data=team_data,games=games,sd_ids=sd_ids)
+  script <- NULL
+  if (all(c("Params","Script_Shifts") %in% sheets)) script <- tryCatch(nba_read_script(file_path), error=function(e){ cat("  (game-script tables unreadable, script minutes off:",conditionMessage(e),")\n"); NULL })
+  cat(sprintf("NBA Input: %d players | %d games | %d team tabs | %d sim sheets%s\n",
+              nrow(slate),nrow(games),length(team_data),length(sim_games),
+              if (!is.null(script) && isTRUE(script$on)) " | game-script minutes ON" else ""))
+  list(slate=slate,sim_games=sim_games,team_data=team_data,games=games,sd_ids=sd_ids,script=script)
 }
 
 # ── SCORING ───────────────────────────────────────────────────────────────────
@@ -75,6 +93,7 @@ run_nba_simulation <- function(input_data, n_sims=10000, config=NULL, progress_c
   cb<-function(d,v){if(!is.null(progress_callback))progress_callback(d,v)
     cat(sprintf("  [%.0f%%] %s\n",v*100,d));flush.console()}
   start_time<-proc.time(); team_abbrevs<-unique(slate$Team)
+  record_on<-isTRUE(config$record_extras) || isTRUE(getOption("gts_sim_record"))   # extra per-sim outputs for the sim record (22 Oct 2026); off = nothing extra is computed
   ASSIST_RATE_3PM<-0.80; ASSIST_RATE_2PM<-0.49
   share_stats<-c("fgm","ftm","reb","ast","stl","blk","to")
   sim_col<-c(fgm="fgm",ftm="ftm",reb="reb",ast="ast",stl="stl",blk="blk",to="to")
@@ -135,6 +154,29 @@ run_nba_simulation <- function(input_data, n_sims=10000, config=NULL, progress_c
     pm_proj<-ifelse(is.na(pm_proj)|pm_proj<=0,ifelse(is.na(mins_avg_fb)|mins_avg_fb<=0,24,mins_avg_fb),pm_proj)
     pm_sigma<-if("mins_sigma" %in% names(player_list)) as.numeric(player_list$mins_sigma[pidx]) else rep(3.0,length(pidx))
     pm_sigma[is.na(pm_sigma)|pm_sigma<=0]<-3.0
+    # ---- Game-script minutes (22 Oct 2026). ON only when the workbook carries Params (script_minutes = 1) + Script_Shifts and the Sim_ rows carry `ot`; otherwise the original code below runs unchanged.
+    # One script per sim for the team: margin class (<10, 10-19, 20+) and OT periods come from the sampled historical game row, so every player on the team shares them. Minutes = projection
+    # + shift[role, margin class, OT] + noise (player sigma x script-free scale, shared team factor rho). Team total = 240 + 25*OT; only non-starters are rescaled to it, so the starter shift is kept.
+    script_tab<-input_data$script
+    script_on<-!is.null(script_tab) && isTRUE(script_tab$on) && ("ot" %in% names(dt)) && !isFALSE(getOption("nba_script_on"))
+    ot_s<-NULL; margin_s<-NULL; mcl_s<-NULL
+    if (script_on || record_on) {
+      pts_self_s<-paste0(team,"_pts"); gkp_s<-strsplit(gk,"_vs_")[[1]]; opp_s<-if(gkp_s[1]==team) gkp_s[2] else gkp_s[1]
+      if (pts_self_s %in% names(dt) && paste0(opp_s,"_pts") %in% names(dt)) {
+        margin_s<-abs(as.numeric(dt[[pts_self_s]])[ri]-as.numeric(dt[[paste0(opp_s,"_pts")]])[ri]); mcl_s<-as.integer(cut(margin_s,c(-1,9,19,99),labels=FALSE)) }
+      ot_s<-if("ot" %in% names(dt)) as.integer(dt[["ot"]])[ri] else rep(0L,n_sims); ot_s[is.na(ot_s)]<-0L
+    }
+    if (script_on && !is.null(mcl_s)) {
+      rk_s<-rank(-pm_proj,ties.method="first"); role_s<-ifelse(rk_s<=5,"starter",ifelse(pm_proj>=15,"bench15","bench<15"))
+      shv<-function(r){ m<-script_tab$shift_mat[[r]]; m[cbind(mcl_s,(ot_s>0)+1L)] }
+      zt<-rnorm(n_sims); mins_mat<-matrix(0.0,n_team,n_sims)
+      for(pi in seq_len(n_team)){ r<-role_s[pi]; rr<-script_tab$rho[[r]]; sig<-pm_sigma[pi]*script_tab$sig_k[[r]]
+        mins_mat[pi,]<-pm_proj[pi]+shv(r)+sig*(sqrt(rr)*zt+sqrt(1-rr)*rnorm(n_sims)) }
+      mins_mat<-pmax(pmin(mins_mat,48),0); tgt_s<-240+25*ot_s; is_st<-role_s=="starter"
+      if(any(is_st) && any(!is_st)){ Ss<-colSums(mins_mat[is_st,,drop=FALSE]); Sb<-colSums(mins_mat[!is_st,,drop=FALSE]); kb<-pmin(pmax((tgt_s-Ss)/pmax(Sb,1e-6),0.4),2.5); mins_mat[!is_st,]<-sweep(mins_mat[!is_st,,drop=FALSE],2,kb,`*`) }
+      team_mins_sum<-colSums(mins_mat); team_mins_sum[team_mins_sum<=0]<-240
+      mins_mat<-sweep(mins_mat,2,tgt_s/team_mins_sum,`*`)
+    } else {
     mins_mat<-matrix(0.0,n_team,n_sims)
     for(pi in seq_len(n_team)){
       raw_d<-rnorm(n_sims,mean=pm_proj[pi],sd=pm_sigma[pi])
@@ -163,6 +205,7 @@ run_nba_simulation <- function(input_data, n_sims=10000, config=NULL, progress_c
     team_mins_sum<-colSums(mins_mat)
     team_mins_sum[team_mins_sum<=0]<-240
     mins_mat<-sweep(mins_mat,2,240/team_mins_sum,`*`)
+    }
     # NegBin param matrices
     mu_mat <-matrix(0.0,n_team,length(share_stats),dimnames=list(NULL,share_stats))
     phi_mat<-matrix(4.0,n_team,length(share_stats),dimnames=list(NULL,share_stats))
@@ -179,7 +222,8 @@ run_nba_simulation <- function(input_data, n_sims=10000, config=NULL, progress_c
     aw_raw<-pas*acv; aw_sum<-sum(aw_raw,na.rm=TRUE)
     aw<-if(aw_sum>0) aw_raw/aw_sum else rep(1/n_team,n_team)
     list(pidx=pidx,n_team=n_team,totals=totals,mu_mat=mu_mat,phi_mat=phi_mat,
-         mins_mat=mins_mat,fg3_alpha=fg3_alpha,fg3_beta=fg3_beta,ast_weight=aw)
+         mins_mat=mins_mat,fg3_alpha=fg3_alpha,fg3_beta=fg3_beta,ast_weight=aw,
+         ot_s=ot_s,mcl_s=mcl_s,margin_s=margin_s,gk=gk)
   }),team_abbrevs)
   
   # ── NegBin draws + team-total normalization ──
@@ -371,7 +415,25 @@ run_nba_simulation <- function(input_data, n_sims=10000, config=NULL, progress_c
                to =round(mean(colSums(stat_mats[["to"]] [idx,,drop=FALSE])),1))
   })); setorder(team_means,-DKAvgFP)
   sport_visuals<-list(teams=teams,player_means=player_means,team_means=team_means)
-  list(sim_results=sim_results,metadata=metadata,has_fd=has_fd,has_sd=has_sd,sport_visuals=sport_visuals)
+  res<-list(sim_results=sim_results,metadata=metadata,has_fd=has_fd,has_sd=has_sd,sport_visuals=sport_visuals)
+  if (record_on) {
+    # Extra per-sim outputs for the sim record (22 Oct 2026). Only built when the record flag is on. Usage and possessions are makes-based proxies (the engine draws makes, not attempts):
+    # usage_proxy = (FGM + 0.44*FTM + TOV) share of the team; poss_proxy = team FGM + 0.44*FTM + TOV.
+    cats<-(pts_mat>=10L)+(stat_mats[["reb"]]>=10L)+(stat_mats[["ast"]]>=10L)+(stat_mats[["stl"]]>=10L)+(stat_mats[["blk"]]>=10L)
+    pmin_l<-vector("list",length(team_abbrevs)); tg_l<-vector("list",length(team_abbrevs)); usg<-numeric(n_players)
+    for (ti in seq_along(team_abbrevs)) { td<-team_data_prepped[[ti]]; pidx<-td$pidx; mm<-td$mins_mat
+      qs<-t(apply(mm,1,quantile,probs=c(.05,.25,.5,.75,.95)))
+      pmin_l[[ti]]<-data.table(Player=player_names[pidx],Team=team_abbrevs[ti],min_mean=rowMeans(mm),min_sd=apply(mm,1,sd),min_p05=qs[,1],min_p25=qs[,2],min_p50=qs[,3],min_p75=qs[,4],min_p95=qs[,5])
+      uu<-stat_mats[["fgm"]][pidx,,drop=FALSE]+0.44*stat_mats[["ftm"]][pidx,,drop=FALSE]+stat_mats[["to"]][pidx,,drop=FALSE]; tu<-colSums(uu); tu[tu==0]<-1; usg[pidx]<-rowMeans(sweep(uu,2,tu,`/`))
+      tot<-colSums(mm); ot<-if(is.null(td$ot_s)) rep(0L,n_sims) else td$ot_s; mc<-td$mcl_s
+      tg_l[[ti]]<-data.table(Team=team_abbrevs[ti],SimKey=td$gk,min_total_mean=mean(tot),min_total_sd=sd(tot),ot_rate=mean(ot>0),ot2_rate=mean(ot>1),
+        margin_lt10=if(is.null(mc)) NA_real_ else mean(mc==1L),margin_10_19=if(is.null(mc)) NA_real_ else mean(mc==2L),margin_20plus=if(is.null(mc)) NA_real_ else mean(mc==3L),
+        margin_mean=if(is.null(td$margin_s)) NA_real_ else mean(td$margin_s),poss_proxy_mean=mean(colSums(uu)),poss_proxy_sd=sd(colSums(uu))) }
+    pm<-rbindlist(pmin_l); pm[,usage_proxy:=usg[match(paste(Player,Team),paste(player_names,player_teams))]]
+    pm[,`:=`(dd_rate=rowMeans(cats>=2L)[match(paste(Player,Team),paste(player_names,player_teams))],td_rate=rowMeans(cats>=3L)[match(paste(Player,Team),paste(player_names,player_teams))])]
+    res$record<-list(player_minutes=pm,team_game=rbindlist(tg_l),script=list(on=if(is.null(input_data$script)) FALSE else isTRUE(input_data$script$on),version=if(is.null(input_data$script)) NA_character_ else input_data$script$version),n_sims=n_sims)
+  }
+  res
 }
 
 # ============================================================================
