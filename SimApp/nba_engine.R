@@ -22,7 +22,8 @@ nba_read_script <- function(file_path) {
   roles <- c("starter", "bench15", "bench<15"); mcls <- c("<10", "10-19", "20+")
   shift_mat <- setNames(lapply(roles, function(r) { m <- matrix(0, 3, 2); for (i in 1:3) for (o in 0:1) { v <- sh[role == r & margin_class == mcls[i] & as.integer(ot) == o, shift]; if (length(v) && !is.na(v[1])) m[i, o + 1] <- v[1] }; m }), roles)
   rho <- setNames(lapply(roles, function(r) num(paste0("rho_", r), 0)), roles); sig_k <- setNames(lapply(roles, function(r) num(paste0("sig_k_", r), 1)), roles)
-  list(on = isTRUE(num("script_minutes", 0) == 1), shift_mat = shift_mat, rho = rho, sig_k = sig_k, version = as.character(kv[["version"]]))
+  list(on = isTRUE(num("script_minutes", 0) == 1), shift_mat = shift_mat, rho = rho, sig_k = sig_k, version = as.character(kv[["version"]]),
+       ast_draw = isTRUE(num("ast_draw", 0) == 1), sig_scale = { v <- num("minutes_sigma_scale", 1); if (is.finite(v) && v > 0) v else 1 })
 }
 
 read_nba_input <- function(file_path) {
@@ -154,6 +155,7 @@ run_nba_simulation <- function(input_data, n_sims=10000, config=NULL, progress_c
     pm_proj<-ifelse(is.na(pm_proj)|pm_proj<=0,ifelse(is.na(mins_avg_fb)|mins_avg_fb<=0,24,mins_avg_fb),pm_proj)
     pm_sigma<-if("mins_sigma" %in% names(player_list)) as.numeric(player_list$mins_sigma[pidx]) else rep(3.0,length(pidx))
     pm_sigma[is.na(pm_sigma)|pm_sigma<=0]<-3.0
+    if (!is.null(input_data$script) && is.finite(input_data$script$sig_scale) && input_data$script$sig_scale != 1) pm_sigma<-pm_sigma*input_data$script$sig_scale   # workbook Params minutes_sigma_scale (22 Oct 2026)
     # ---- Game-script minutes (22 Oct 2026). ON only when the workbook carries Params (script_minutes = 1) + Script_Shifts and the Sim_ rows carry `ot`; otherwise the original code below runs unchanged.
     # One script per sim for the team: margin class (<10, 10-19, 20+) and OT periods come from the sampled historical game row, so every player on the team shares them. Minutes = projection
     # + shift[role, margin class, OT] + noise (player sigma x script-free scale, shared team factor rho). Team total = 240 + 25*OT; only non-starters are rescaled to it, so the starter shift is kept.
@@ -332,6 +334,16 @@ run_nba_simulation <- function(input_data, n_sims=10000, config=NULL, progress_c
         elig<-setdiff(order(cfs[,s],decreasing=TRUE),i); top<-elig[seq_len(min(r,length(elig)))]
         cf[top,s]<-cf[top,s]+1L}}
       new_ast<-new_ast+cf
+    }
+    if (!is.null(input_data$script) && isTRUE(input_data$script$ast_draw) && !isFALSE(getOption("nba_ast_draw"))) {
+      # Per-player assist dispersion (22 Oct 2026, workbook Params ast_draw = 1). The deterministic split above (floor of assist weight x assistable baskets) left a player's assists varying only with the team total
+      # (simulated sd about 0.6 vs 1.5-2 real; sd ratio 3.4 on finished slates). Each player keeps his own NegBin draw (ast_fl, scaled to the capped team assists with largest remainder) and the own-basket rule becomes a cap: a player
+      # cannot assist more baskets than his teammates score (team assistable minus his own); any excess moves to teammates with room.
+      cap<-sweep(-assistable,2,colSums(assistable),`+`); cap[cap<0]<-0L
+      over<-pmax(ast_fl-cap,0L); ast_fl<-ast_fl-over
+      for(s_ in which(colSums(over)>0)){ ex<-sum(over[,s_]); while(ex>0){ room<-cap[,s_]-ast_fl[,s_]; ok<-which(room>0); if(!length(ok)) break
+          j<-ok[which.max(room[ok]*aw[ok]+runif(length(ok))*1e-6)]; ast_fl[j,s_]<-ast_fl[j,s_]+1L; ex<-ex-1L } }
+      new_ast<-matrix(as.integer(ast_fl),n_t,n_sims)
     }
     stat_mats[["ast"]][pidx,]<-new_ast
   }
