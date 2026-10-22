@@ -23,7 +23,7 @@ nba_read_script <- function(file_path) {
   shift_mat <- setNames(lapply(roles, function(r) { m <- matrix(0, 3, 2); for (i in 1:3) for (o in 0:1) { v <- sh[role == r & margin_class == mcls[i] & as.integer(ot) == o, shift]; if (length(v) && !is.na(v[1])) m[i, o + 1] <- v[1] }; m }), roles)
   rho <- setNames(lapply(roles, function(r) num(paste0("rho_", r), 0)), roles); sig_k <- setNames(lapply(roles, function(r) num(paste0("sig_k_", r), 1)), roles)
   list(on = isTRUE(num("script_minutes", 0) == 1), shift_mat = shift_mat, rho = rho, sig_k = sig_k, version = as.character(kv[["version"]]),
-       ast_draw = isTRUE(num("ast_draw", 0) == 1), sig_scale = { v <- num("minutes_sigma_scale", 1); if (is.finite(v) && v > 0) v else 1 })
+       ftm_phi = { v <- num("ftm_phi_scale", 1); if (is.finite(v) && v > 0) v else 1 }, ast_draw = isTRUE(num("ast_draw", 0) == 1), sig_scale = { v <- num("minutes_sigma_scale", 1); if (is.finite(v) && v > 0) v else 1 })
 }
 
 read_nba_input <- function(file_path) {
@@ -216,6 +216,8 @@ run_nba_simulation <- function(input_data, n_sims=10000, config=NULL, progress_c
       mu_v<-if(mu_cols[s] %in% names(player_list)){v<-as.numeric(player_list[[mu_cols[s]]][pidx]);v[is.na(v)]<-0;v} else rep(0,n_team)
       phi_v<-if(phi_cols[s] %in% names(player_list)){v<-as.numeric(player_list[[phi_cols[s]]][pidx]);v[is.na(v)]<-4;v} else rep(4,n_team)
       mu_mat[,j]<-mu_v; phi_mat[,j]<-phi_v
+      # free-throw dispersion (22 Oct 2026): workbook Params ftm_phi_scale multiplies the free-throw NegBin phi (below 1 = wider lines). Only when the key is present; options(nba_ftm_phi_scale=<x>) overrides (test / rollback: 1).
+      if (s=="ftm") { fp_<-if(!is.null(getOption("nba_ftm_phi_scale"))) getOption("nba_ftm_phi_scale") else if(!is.null(input_data$script)) input_data$script$ftm_phi else 1; if (is.finite(fp_) && fp_>0 && fp_!=1) phi_mat[,j]<-phi_mat[,j]*fp_ }
     }
     fg3_alpha<-as.numeric(player_list$fg3_alpha[pidx]); fg3_alpha[is.na(fg3_alpha)]<-0.9
     fg3_beta <-as.numeric(player_list$fg3_beta[pidx]);  fg3_beta[is.na(fg3_beta)]<-2.1
