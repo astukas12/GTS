@@ -1856,6 +1856,22 @@ nascar_stage_dom_params <- function(series, track_type) {
 }
 
 prepare_stage_dominator_data <- function(race_profiles, driver_data = NULL) {
+  # The sheet decides the dominator mode (23 Oct 2026, Andrew, plate tracks): Race_Profiles$DomMode "race" | "stage" in row 1 wins. No DomMode: stage columns
+  # present = stage; none = whole race (NASCAR_DOM_MODE / options(nascar.dom_mode) no longer decide). "race" needs only RaceID, StartPos, FinPos, DKDomPoints:
+  # no stage columns and no fitted stage parameters.
+  has_stage <- all(c("S1_Lead", "S1_Fast", "S2_Lead", "S2_Fast", "S3_Lead", "S3_Fast") %in% names(race_profiles))
+  sheet_mode <- if ("DomMode" %in% names(race_profiles)) tolower(trimws(as.character(na.omit(race_profiles$DomMode)[1]))) else NA_character_
+  dom_mode <- if (length(sheet_mode) == 1 && !is.na(sheet_mode) && sheet_mode %in% c("race", "stage")) {
+    sheet_mode
+  } else if (has_stage) "stage" else "race"   # sheet silent: stage columns mean stages, none means full race (Andrew, 23 Oct 2026); the global default no longer decides
+  if (identical(dom_mode, "race") && !has_stage) {   # with stage columns present the full build below still runs (the sim review capture reads them)
+    rpr <- as.data.table(race_profiles)[!is.na(RaceID)]
+    miss <- setdiff(c("RaceID", "StartPos", "FinPos", "DKDomPoints"), names(rpr))
+    if (length(miss)) stop("Race_Profiles is missing ", paste(miss, collapse = ", "), ". A whole-race dominator sheet needs the whole-race lines.")
+    rdd <- lapply(split(rpr, by = "RaceID"), function(p)
+      list(profiles = p, profile_finishes = p$FinPos, profile_starts = p$StartPos, n_profiles = nrow(p)))
+    return(list(mode = "race", races = list(), rdd = rdd, cap = list(DK = Inf, FD = Inf)))
+  }
   need <- c("RaceID", "StartPos", "FinPos", "S1_Lead", "S1_Fast", "S2_Lead", "S2_Fast",
             "S3_Lead", "S3_Fast", "Series", "TrackType")
   miss <- setdiff(need, names(race_profiles))
@@ -1926,7 +1942,7 @@ prepare_stage_dominator_data <- function(race_profiles, driver_data = NULL) {
   # (kappa 1, where the fit said .75-.97), so a real driver's whole day stays with one car, and the stage-1 start gap carries noise (NASCAR_STAGE1_JITTER
   # grid places), so the biggest stage-1 line goes to the nearest start slot most of the time, not always.
   params$kappa[2:3] <- NASCAR_STAGE_KAPPA23
-  list(races = races, theta = params$theta, kappa = params$kappa, cap = cap, q_on = q_on, f_q = f_q,
+  list(mode = dom_mode, races = races, theta = params$theta, kappa = params$kappa, cap = cap, q_on = q_on, f_q = f_q,
        metric_grid = metric_grid, late_q = late_q, s1_fin = s1_fin, rdd = rdd, s1_jit = NASCAR_STAGE1_JITTER)
 }
 
@@ -2040,7 +2056,7 @@ nascar_assign_race_level <- function(race_result, race_weights, stage_data, plat
 }
 
 assign_dominator_points_stagewise <- function(race_result, race_weights, stage_data, platform) {
-  if (identical(getOption("nascar.dom_mode", NASCAR_DOM_MODE), "race"))
+  if (identical(if (!is.null(stage_data$mode)) stage_data$mode else getOption("nascar.dom_mode", NASCAR_DOM_MODE), "race"))
     return(nascar_assign_race_level(race_result, race_weights, stage_data, platform))
   setalloccol(race_result)
   if (nrow(race_weights) == 0) stop("race_weights is empty")
