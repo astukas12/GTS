@@ -2035,7 +2035,7 @@ nascar_stage_deal <- function(f_start, f_fin, room, l_start, l_fin, val, theta, 
 # Tested on the 18-race Phoenix pool, 3,000 sims, average error across nine field-shape checks: race 36%, stage as fitted 22.5%, stage + DKMax floor 30 20.6%,
 # stage + full carry-over + DKMax floor 16.7%. options(nascar.dom_mode = "race") restores the whole-race dealer.
 NASCAR_DOM_MODE <- "stage"
-NASCAR_STAGE_KAPPA23 <- 1        # stage 2-3 pull toward the car that held the same real driver's earlier line
+NASCAR_STAGE_KAPPA23 <- c(0.5, 1)  # stage 2 / 3 pull toward the car that held the same real driver's earlier line (30 Oct 2026, Andrew: stage-2 carry .5, was 1 for both; 5,000-sim Trucks Martinsville test: front-truck zero rates down, pot unchanged)
 NASCAR_STAGE1_JITTER <- 2.5      # noise on the stage-1 start gap, in grid places
 NASCAR_DKMAX_FLOOR <- 30         # every car with a DKMax above 0 gets at least this much room
 
