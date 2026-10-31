@@ -29,7 +29,7 @@
 library(data.table)
 library(readxl)
 
-CBB_ENGINE_VERSION <- "cbb-engine-v1.0 (29 Oct 2026)"
+CBB_ENGINE_VERSION <- "cbb-engine-v1.1 (31 Oct 2026)"
 CBB_ENGINE_FILE0 <- tryCatch(normalizePath(sys.frame(1)$ofile, winslash = "/"), error = function(e) NA_character_)
 # the file this engine was loaded from (found when asked, so a wrapper or a changed working directory does not matter); its md5 goes into every sheet / record
 cbb_engine_info <- function() {
@@ -118,12 +118,21 @@ cbb_cap_redistribute <- function(real, cap, total, iters = 5) {
 # ============================================================================
 
 cbb_default_params <- function() list(
-  sigma_rate = 0.55, rho = 0.5, c_total = 1, c_margin = 1,
-  smult = c(fgm = .6, tpm = 1, ftm = .6, reb = .6, ast = 1, stl = 1.2, blk = 1.2, to = 1),
+  sigma_rate = 0.70, rho = 0.4, c_total = 1, c_margin = 1,
+  smult = c(fgm = .45, tpm = 1, ftm = .45, reb = .3, ast = .4, stl = .25, blk = .9, to = .15),     # rate-noise multiplier per stat (between-game part only: the count noise comes from the discrete deals)
   slot_sd = c(starters = 6.04, `6th-8th` = 6.64, `9th+` = 5.72),
   p_unforced = 0.0256, p_exit = 0.0026, unforced_ratio_mean = 0.49, unforced_ratio_sd = 0.15,
   foul_module = 1, mixture = 1, blowout_shift = 1, blowout_margin = 20,
-  blow_factor = c(starters = 0.944, `6th-8th` = 1.12, `9th+` = 1.0), min_regular = 20, rate_cap = Inf)
+  blow_factor = c(starters = 0.944, `6th-8th` = 1.12, `9th+` = 1.0), min_regular = 20, rate_cap = Inf,
+  flow = 1,                  # minutes follow the drawn game: slot multipliers on |margin|, team minutes 200 + 25 x OT periods of the drawn neighbour (replaces the 20-point blowout shift)
+  min_cap = 40,              # regulation rule: a player never exceeds 40 + 5 x OT periods; the excess goes to teammates
+  min_up = 0.5, min_up_from = 26,   # positive minutes deviations of heavy-minute players are compressed (the forecast mean is kept)
+  z_soft = 2.5,              # soft clip of the rate-noise driver: z -> z_soft * tanh(z / z_soft)
+  sig_gamma = 2,             # rate noise falls with the player's level (DK per minute against the median): real variability grows far more slowly than level
+  mn_stl = 1, mn_blk = 1, mn_to = 1, mn_ast = 1, mn_reb = 1, mn_fgm = 1, mn_ftm = 1,   # these stats are dealt as discrete multinomial draws of the team count
+  mn_use_r0 = 1,             # ... from the player's shrunk baseline rate (per-stat reliability shrinkage is applied by the builder)
+  ast_event = 1,             # assists as discrete events: assisted baskets by scorer, assister a teammate (never the scorer)
+  share_cap = 1)             # no per-player share cap
 
 # light foul module: only trouble-CAUSED pulls change minutes. M0 = planned floor minutes (length n); returns minutes after fouls
 cbb_foul_events <- function(M0, lam, e_k, banks, n) {
@@ -155,6 +164,36 @@ cbb_mixture_events <- function(M0, par, regular) {
   M
 }
 
+`%|||%` <- function(a, b) if (is.null(a) || !length(a) || is.na(a[1])) b else a
+# no player above `cap` minutes (matrix, one cap per sim): the excess goes to teammates in proportion to their room; the team total is kept
+cbb_min_cap_redistribute <- function(M, cap, iters = 8) {
+  for (it in seq_len(iters)) { ex <- pmax(M - cap, 0); if (all(ex < 1e-6)) break; M <- pmin(M, cap); room <- cap - M; rs <- colSums(room); M <- M + sweep(room, 2, colSums(ex) / pmax(rs, 1e-9), "*") }
+  pmin(M, cap + 1e-9)
+}
+# game flow (2025-26 box scores, regulation games): a team's minutes by slot against the game's |margin|, and what overtime adds
+.CBB_FLOW_AM <- c(1.5, 5, 8.5, 12.5, 16.5, 20.5, 26.5, 36)
+.CBB_FLOW_F <- list(starters = c(1.032, 1.034, 1.025, 1.014, .992, .974, .933, .881), `6th-8th` = c(.964, .960, .979, .991, 1.017, 1.025, 1.071, 1.103), `9th+` = c(.998, 1.006, .996, .987, .943, .892, .983, 1.174))
+.CBB_FLOW_OT <- list(starters = c(1, 1.176, 1.323, 1.428), `6th-8th` = c(1, 1.051, 1.117, 1.308), `9th+` = c(1, 1.037, 1.064, 1.073))
+cbb_flow_mult <- function(am, slot, otk) {   # n x N multipliers: the slot's game-flow factor (centred to mean 1 over this game's draws) times the overtime factor
+  n <- length(slot); N <- length(am); out <- matrix(1, n, N)
+  for (s in unique(slot)) { fa <- approx(.CBB_FLOW_AM, .CBB_FLOW_F[[s]], xout = am, rule = 2)$y; fa <- fa / mean(fa); fo <- .CBB_FLOW_OT[[s]][otk + 1L]; out[slot == s, ] <- matrix(fa * fo, sum(slot == s), N, byrow = TRUE) }
+  out
+}
+# n x N shares (columns sum to 1) -> integer counts: a multinomial draw of `size` events per sim (sequential binomials)
+cbb_multinom_deal <- function(shr, size) {
+  n <- nrow(shr); N <- ncol(shr); out <- matrix(0L, n, N); rem <- as.integer(size); prem <- rep(1, N)
+  for (i in seq_len(n - 1L)) { p <- pmin(pmax(shr[i, ] / pmax(prem, 1e-12), 0), 1); xi <- rbinom(N, rem, p); out[i, ] <- xi; rem <- rem - xi; prem <- prem - shr[i, ] }
+  out[n, ] <- rem; out
+}
+# assists as discrete events: assisted baskets are assigned to scorers by their made-FG shares, each basket's assister is a teammate drawn from the assister weights; weights are tilted so a player's expected assists equal his drawn share
+cbb_ast_event_deal <- function(shr, fgm, A_T) {
+  n <- nrow(shr); N <- ncol(shr); s <- sweep(fgm, 2, pmax(colSums(fgm), 1), "/"); w <- shr
+  for (it in 1:6) { den <- pmax(1 - w, 1e-6); E <- w * (matrix(colSums(s / den), n, N, byrow = TRUE) - s / den); E <- sweep(E, 2, pmax(colSums(E), 1e-9), "/"); w <- w * pmin(pmax(shr / pmax(E, 1e-9), .25), 4); w <- sweep(w, 2, pmax(colSums(w), 1e-9), "/") }
+  nb <- cbb_multinom_deal(s, pmin(A_T, as.integer(colSums(fgm)))); out <- matrix(0L, n, N)
+  for (i in seq_len(n)) { pw <- w; pw[i, ] <- 0; pw <- sweep(pw, 2, pmax(colSums(pw), 1e-12), "/"); out <- out + cbb_multinom_deal(pw, nb[i, ]) }
+  out
+}
+
 # per player: Gaussian scale so the TOTAL minutes sd by slot is kept, and a mean shift so the simulated mean minutes equal the forecast
 # (the shift also undoes the upward bias of flooring a low-minute player's noise at 0.5)
 cbb_noise_calibration <- function(mp, sdm, pf40, par, fb, ndraw = 4000) {
@@ -173,6 +212,8 @@ cbb_noise_calibration <- function(mp, sdm, pf40, par, fb, ndraw = 4000) {
       x <- pmax(mp[i] + sh + sdm[i] * scale[i] * z, 0.5)
       if (use_mix)  x <- cbb_mixture_events(x, par, rep(TRUE, ndraw))
       if (use_foul) x <- cbb_foul_events(x, pf40[i] / 40, fb$e_k, fb$banks, ndraw)
+      if (par$min_up < 1 && mp[i] >= par$min_up_from) { d_ <- x - mp[i]; x <- mp[i] + ifelse(d_ > 0, d_ * par$min_up, d_) }
+      if (is.finite(par$min_cap)) x <- pmin(x, par$min_cap)
       sh <- sh + 0.9 * (mp[i] - mean(x))
     }
     shift[i] <- sh
@@ -217,6 +258,7 @@ cbb_core <- function(v1, n_sims, par, cb = function(detail, value) NULL) {
   if (is.null(fb)) par$foul_module <- 0
   if (!is.null(fb) && is.null(fb$e_k)) fb$e_k <- c(NA, sapply(2:5, function(k) max((fb$HK[[as.character(k)]] - fb$base1) / (1 - fb$base1), 0)))
   players <- copy(v1$players); players[, .pid := .I]
+  LVL_REF <- median(with(v1$players, if (all(paste0("r0_", c("fgm", "tpm", "ftm", "reb", "ast", "stl", "blk", "to")) %in% names(v1$players))) 2 * r0_fgm + 1.5 * r0_tpm + r0_ftm + 1.25 * r0_reb + 1.5 * r0_ast + 2 * r0_stl + 2 * r0_blk - 0.5 * r0_to else NA_real_), na.rm = TRUE)
   nP <- nrow(players); S8 <- .CBB_S8
   out <- setNames(lapply(c(S8, "pts", "twom"), function(x) matrix(0L, nP, N)), c(S8, "pts", "twom"))
   MIN <- matrix(NA_real_, nP, N); drawn <- list(); fallback_teams <- character(); ess <- numeric()
@@ -230,6 +272,7 @@ cbb_core <- function(v1, n_sims, par, cb = function(detail, value) NULL) {
     fav_pts <- (Td + Md) / 2; dog_pts <- (Td - Md) / 2
     drawn[[key]] <- data.table(sim = seq_len(N), total = Td, margin_fav = Md, fav_pts = fav_pts, dog_pts = dog_pts)
     blow <- abs(Md) >= par$blowout_margin
+    otk <- if ("ot" %in% names(pool)) pmin(as.integer(pool$ot[k]), 3L) else rep(0L, N)
     for (side in c("fav", "dog")) {
       tm <- if (side == "fav") g$FavTeam else g$DogTeam; pts_draw <- if (side == "fav") fav_pts else dog_pts
       nb_score <- pool[[paste0(tm, "_score")]][k]
@@ -265,24 +308,30 @@ cbb_core <- function(v1, n_sims, par, cb = function(detail, value) NULL) {
           if (par$foul_module && mp[i] >= 12 && !is.null(fb)) x <- cbb_foul_events(x, pf40[i] / 40, fb$e_k, fb$banks, N)
           M[i, ] <- x
         }
-        if (par$blowout_shift) M[, blow] <- M[, blow, drop = FALSE] * par$blow_factor[slot]
-        M <- sweep(M, 2, 200 / colSums(M), "*"); Mm <- M
-        z0 <- matrix(rnorm(n * N), n, N)
+        if (par$min_up < 1) for (i in which(mp >= par$min_up_from)) { d <- M[i, ] - mp[i]; M[i, ] <- mp[i] + ifelse(d > 0, d * par$min_up, d) }
+        if (par$flow) M <- M * cbb_flow_mult(abs(Md), slot, otk) else if (par$blowout_shift) M[, blow] <- M[, blow, drop = FALSE] * par$blow_factor[slot]
+        Tm <- if (par$flow) 200 + 25 * otk else rep(200, N); M <- sweep(M, 2, Tm / colSums(M), "*")
+        if (is.finite(par$min_cap) && par$min_cap * n >= max(Tm)) M <- cbb_min_cap_redistribute(M, matrix(par$min_cap + 5 * otk, n, N, byrow = TRUE))
+        Mm <- M
+        z0 <- matrix(rnorm(n * N), n, N); ast_shr <- NULL
+        lvl_f <- if (par$sig_gamma != 0 && is.finite(LVL_REF)) { dkr <- with(P, 2 * r0_fgm + 1.5 * r0_tpm + r0_ftm + 1.25 * r0_reb + 1.5 * r0_ast + 2 * r0_stl + 2 * r0_blk - 0.5 * r0_to); pmin(pmax(dkr / LVL_REF, .4), 2.5)^(-par$sig_gamma) } else rep(1, n)
         for (s in S8) {
-          Rm <- matrix(0, n, N); sg0 <- par$sigma_rate * par$smult[[s]]
+          Rm <- matrix(0, n, N); sg0 <- par$sigma_rate * par$smult[[s]]; mnS <- isTRUE((par[[paste0("mn_", s)]] %|||% 0) > 0)
           for (r in seq_len(n)) {
-            H <- v1$profiles[[paste0(tm, "|", P$Name[r])]]; has_prof <- !is.null(H) && nrow(H$R) >= 2; sg <- sg0 * (if (has_prof) 1 else 2)
-            base_r <- if (has_prof) H$R[sample.int(nrow(H$R), N, replace = TRUE, prob = H$w), s] else rep(P[[paste0("r0_", s)]][r], N)
-            mult <- exp(sg * (sqrt(par$rho) * z0[r, ] + sqrt(1 - par$rho) * rnorm(N)) - sg^2 / 2)
+            H <- v1$profiles[[paste0(tm, "|", P$Name[r])]]; has_prof <- !is.null(H) && nrow(H$R) >= 2; sg <- sg0 * lvl_f[r] * (if (has_prof) 1 else 2)
+            base_r <- if (has_prof) { if (mnS) rep(if (par$mn_use_r0 > 0) P[[paste0("r0_", s)]][r] else sum(H$R[, s] * H$w) / sum(H$w), N) else H$R[sample.int(nrow(H$R), N, replace = TRUE, prob = H$w), s] } else rep(P[[paste0("r0_", s)]][r], N)
+            zz <- sqrt(par$rho) * z0[r, ] + sqrt(1 - par$rho) * rnorm(N)
+            mult <- if (par$z_soft > 0) { m_ <- exp(sg * par$z_soft * tanh(zz / par$z_soft)); m_ / mean(m_) } else exp(sg * zz - sg^2 / 2)
             Rm[r, ] <- base_r * pmin(mult, par$rate_cap)
           }
-          x <- M * Rm; cs <- colSums(x); cs[cs == 0] <- 1
-          st[[s]] <- sweep(x, 2, cs, "/") * rep(box[[s]], each = n)            # real-valued deal of the drawn team count
+          x <- M * Rm; cs <- colSums(x); cs[cs == 0] <- 1; shr <- sweep(x, 2, cs, "/"); if (s == "ast") ast_shr <- shr
+          st[[s]] <- if (mnS) cbb_multinom_deal(shr, round(box[[s]])) else shr * rep(box[[s]], each = n)      # discrete deal of the team count, or the real-valued deal
         }
         perm <- sample.int(n)
         st$fgm <- cbb_sys_round(st$fgm, perm)
         st$tpm <- cbb_sys_round(cbb_cap_redistribute(st$tpm, st$fgm, box$tpm), perm)   # a made three is a made field goal; the team's threes are kept
         for (s in c("ftm", "reb", "ast", "stl", "blk", "to")) st[[s]] <- cbb_sys_round(st[[s]], perm)
+        if (par$ast_event > 0 && !is.null(ast_shr)) st$ast <- cbb_ast_event_deal(ast_shr, st$fgm, round(box$ast))
       }
       for (s in S8) out[[s]][rows, ] <- as.integer(st[[s]])
       MIN[rows, ] <- Mm
@@ -292,7 +341,7 @@ cbb_core <- function(v1, n_sims, par, cb = function(detail, value) NULL) {
   cb("Assigning assists...", 0.82)
   A3R <- 0.862; A2R <- 0.385
   for (tm in unique(players$Team)) {
-    rows <- which(players$Team == tm); n <- length(rows); if (n < 2) next
+    rows <- which(players$Team == tm); n <- length(rows); if (n < 2 || (par$ast_event > 0 && !(tm %in% fallback_teams))) next
     tpm_t <- out$tpm[rows, , drop = FALSE]; fgm_t <- out$fgm[rows, , drop = FALSE]
     B <- round(tpm_t * A3R + pmax(fgm_t - tpm_t, 0L) * A2R); A0 <- out$ast[rows, , drop = FALSE]
     W <- sweep(A0, 2, pmax(colSums(A0), 1L), "/"); W[, colSums(W) == 0] <- 1 / n
