@@ -23,7 +23,8 @@ nba_read_script <- function(file_path) {
   shift_mat <- setNames(lapply(roles, function(r) { m <- matrix(0, 3, 2); for (i in 1:3) for (o in 0:1) { v <- sh[role == r & margin_class == mcls[i] & as.integer(ot) == o, shift]; if (length(v) && !is.na(v[1])) m[i, o + 1] <- v[1] }; m }), roles)
   rho <- setNames(lapply(roles, function(r) num(paste0("rho_", r), 0)), roles); sig_k <- setNames(lapply(roles, function(r) num(paste0("sig_k_", r), 1)), roles)
   list(on = isTRUE(num("script_minutes", 0) == 1), shift_mat = shift_mat, rho = rho, sig_k = sig_k, version = as.character(kv[["version"]]),
-       ftm_phi = { v <- num("ftm_phi_scale", 1); if (is.finite(v) && v > 0) v else 1 }, ast_draw = isTRUE(num("ast_draw", 0) == 1), sig_scale = { v <- num("minutes_sigma_scale", 1); if (is.finite(v) && v > 0) v else 1 })
+       ftm_phi = { v <- num("ftm_phi_scale", 1); if (is.finite(v) && v > 0) v else 1 }, ast_draw = isTRUE(num("ast_draw", 0) == 1), sig_scale = { v <- num("minutes_sigma_scale", 1); if (is.finite(v) && v > 0) v else 1 },
+       pace_stretch = { v <- num("pace_stretch", 1); if (is.finite(v) && v > 0) v else 1 }, exit_p = { v <- num("exit_p", 0); if (is.finite(v) && v > 0 && v < 1) v else 0 })
 }
 
 read_nba_input <- function(file_path) {
@@ -149,6 +150,10 @@ run_nba_simulation <- function(input_data, n_sims=10000, config=NULL, progress_c
     }),share_stats)
     tpm_cn<-paste0(team,"_tpm")
     totals[["tpm_sim"]]<-if(tpm_cn %in% names(dt)) as.numeric(dt[[tpm_cn]])[ri] else rep(0,n_sims)
+    # Game-total stretch (23 Oct 2026): every team stat total t -> m + k (t - m), m = the (tilted) mean over sims, so the mean stays on the market and the sd of the team total scales by k. The sampled game row is
+    # shared by both teams and all stats, so this is one shared pace / total factor. Workbook Params pace_stretch = k (absent or 1 = off); options(nba_total_stretch = k) overrides (test / rollback: 1).
+    k_st<-if(!is.null(getOption("nba_total_stretch"))) getOption("nba_total_stretch") else if(!is.null(input_data$script)) input_data$script$pace_stretch else 1
+    if (is.finite(k_st) && k_st>0 && k_st!=1) for (nm_ in names(totals)) { v_<-totals[[nm_]]; m_<-mean(v_); totals[[nm_]]<-pmax(m_+k_st*(v_-m_),0) }
     # Minutes: truncated Normal draws renormed to team total of 240
     pm_proj<-as.numeric(player_list$Mins[pidx])
     mins_avg_fb<-if("minutes_avg" %in% names(player_list)) as.numeric(player_list$minutes_avg[pidx]) else rep(NA_real_,length(pidx))
@@ -174,7 +179,12 @@ run_nba_simulation <- function(input_data, n_sims=10000, config=NULL, progress_c
       zt<-rnorm(n_sims); mins_mat<-matrix(0.0,n_team,n_sims)
       for(pi in seq_len(n_team)){ r<-role_s[pi]; rr<-script_tab$rho[[r]]; sig<-pm_sigma[pi]*script_tab$sig_k[[r]]
         mins_mat[pi,]<-pm_proj[pi]+shv(r)+sig*(sqrt(rr)*zt+sqrt(1-rr)*rnorm(n_sims)) }
-      mins_mat<-pmax(pmin(mins_mat,48),0); tgt_s<-240+25*ot_s; is_st<-role_s=="starter"
+      mins_mat<-pmax(pmin(mins_mat,48),0)
+      # Mid-game exit (23 Oct 2026): a player projected 20+ min leaves in a fraction p of sims (injury / ejection) and plays r x projection, r ~ 0.5 x Beta(2.3, 1) (median about 0.37; 2018-26 box scores: a rotation
+      # player plays under half his expected minutes about 2% of games). The rest of the team is rescaled to the team total below. Workbook Params exit_p (absent or 0 = off); options(nba_exit_p = p) overrides.
+      ex_p<-if(!is.null(getOption("nba_exit_p"))) getOption("nba_exit_p") else if(!is.null(input_data$script)) input_data$script$exit_p else 0
+      if (is.finite(ex_p) && ex_p>0) for (pi in which(pm_proj>=20)) { hit<-runif(n_sims)<ex_p; if (any(hit)) mins_mat[pi,hit]<-pm_proj[pi]*0.5*rbeta(sum(hit),2.3,1) }
+      tgt_s<-240+25*ot_s; is_st<-role_s=="starter"
       if(any(is_st) && any(!is_st)){ Ss<-colSums(mins_mat[is_st,,drop=FALSE]); Sb<-colSums(mins_mat[!is_st,,drop=FALSE]); kb<-pmin(pmax((tgt_s-Ss)/pmax(Sb,1e-6),0.4),2.5); mins_mat[!is_st,]<-sweep(mins_mat[!is_st,,drop=FALSE],2,kb,`*`) }
       team_mins_sum<-colSums(mins_mat); team_mins_sum[team_mins_sum<=0]<-240
       mins_mat<-sweep(mins_mat,2,tgt_s/team_mins_sum,`*`)
