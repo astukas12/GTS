@@ -625,6 +625,45 @@ read_input_nhl <- function(path, sheets, showdown = FALSE) {
   unique(m, by = "Key")
 }
 
+# --- CBB ------------------------------------------------------------------
+# Slate workbook (2026 CBB engine): IDs (Name, Team, DKSalary, DKPos, ...) and
+# Games (GameKey "AWAY@HOME", GameTime, Total). Showdown files add SD columns.
+read_input_cbb <- function(path, sheets) {
+  rd <- function(s) suppressMessages(as.data.table(readxl::read_excel(path, sheet = s)))
+  if (!"IDs" %in% sheets)   stop("CBB input needs an 'IDs' sheet.")
+  if (!"Games" %in% sheets) stop("CBB input needs a 'Games' sheet.")
+  num <- function(x, cl) if (cl %in% names(x)) suppressWarnings(as.numeric(x[[cl]])) else rep(NA_real_, nrow(x))
+  chr <- function(x, cl) if (cl %in% names(x)) trimws(as.character(x[[cl]])) else rep(NA_character_, nrow(x))
+
+  p <- rd("IDs")
+  if (!"Name" %in% names(p)) stop("'IDs' sheet has no Name column.")
+  m <- data.table(
+    Player = trimws(as.character(p$Name)),
+    Team   = toupper(chr(p, "Team")),
+    Pos    = toupper(chr(p, "DKPos")),
+    Salary = num(p, "DKSalary")
+  )
+  m <- m[!is.na(Player) & nzchar(Player)]
+  if (!nrow(m)) stop("No player rows found in this workbook.")
+
+  gm <- rd("Games")
+  if (!"GameKey" %in% names(gm)) stop("'Games' sheet has no GameKey column.")
+  gk <- trimws(as.character(gm$GameKey))
+  parts <- strsplit(gk, "@", fixed = TRUE)
+  ok <- vapply(parts, length, 1L) == 2L
+  gl <- rbindlist(lapply(which(ok), function(i) data.table(
+    Team = toupper(trimws(parts[[i]])), Game = gk[i],
+    Tip = chr(gm, "GameTime")[i], Total = num(gm, "Total")[i])))
+  m <- merge(m, unique(gl[!is.na(Team)], by = "Team"), by = "Team", all.x = TRUE)
+  m[, Game := ifelse(is.na(Game), NA_character_, paste0(Game, " (", Tip, ")"))]
+
+  m[, SalaryTier := bucket_quantile(
+      Salary, 4,
+      fmt = function(v) paste0("$", formatC(round(v), format = "d", big.mark = ",")))]
+  m[, Key := norm_name(Player)]
+  unique(m, by = "Key")
+}
+
 SPORTS <- list(
   NASCAR = list(
     label      = "NASCAR",
@@ -724,8 +763,12 @@ SPORTS <- list(
   ),
   CBB = list(
     label = "College Basketball", entity = "Player", slots = c("G", "F", "UTIL"),
-    read_input = NULL, input_hint = NULL,
-    group_dims = character(0), extra_cols = character(0), proj_own = NULL
+    read_input = read_input_cbb,
+    input_hint = "CBB slate workbook (IDs + Games sheets)",
+    group_dims = c("Game" = "Game", "Team" = "Team", "Position" = "Pos",
+                   "Salary Tier" = "SalaryTier"),
+    extra_cols = c("Pos" = "Pos", "Team" = "Team", "Game" = "Game", "Salary" = "Salary"),
+    proj_own   = NULL
   ),
   Soccer = list(
     label      = "Soccer",
@@ -835,6 +878,9 @@ identify_workbook_family <- function(sheets) {
   }
   if ("fights" %in% low)                         return("MMA")
   if ("goalies" %in% low)                        return("NHL")
+  # CBB slate workbooks also carry an IDs sheet; Games + Sim_1/Profiles/FoulBank is theirs.
+  if ("ids" %in% low && "games" %in% low &&
+      any(c("profiles", "foulbank", "sim_1") %in% low)) return("CBB")
   if ("ids" %in% low)                            return("NFL")
   if ("driver" %in% low)                         return("NASCAR")
   NA_character_
