@@ -1673,7 +1673,8 @@ server <- function(input, output, session) {
         progress$set(message="Finding optimal CBB lineups...", value=0)
         cbb_opt_config <- list(salary_cap=rv$config$salary_caps$DK,
                                percentiles=c(0.01,0.05,0.10,0.20),
-                               platform_col="DKScore", max_lineups=5000)
+                               platform_col="DKScore", max_lineups=5000,
+                               pool_spread=rv$config$pool_spread %||% 0)
         progress$set(detail="Phase 1: Building lineup pool (per-sim LP)...", value=0.05)
         lineup_data  <- (if (exists("find_optimal_lineups_cbb_par")) find_optimal_lineups_cbb_par else find_optimal_lineups_cbb)(rv$simulation_results, rv$sim_metadata,
                                                  cbb_opt_config, verbose=TRUE)

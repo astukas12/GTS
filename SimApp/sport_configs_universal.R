@@ -988,6 +988,7 @@ SPORT_CONFIGS <- list(
     salary_caps        = list(DK = 50000, FD = 50000, SD = 50000),
     # LP-based with position constraints (3G / 3F / 2UTIL)
     optimization_modes = list(DK = "standard", FD = "standard", SD = "captain"),
+    pool_spread = 0,   # CBB classic ranking spread (find_optimal_lineups_cbb_par), 0 = off
     max_lineups        = 5000,
     
     standard_metrics = c(
