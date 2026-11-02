@@ -2260,7 +2260,22 @@ server <- function(input, output, session) {
                           cpt_multiplier = 1.5)
         progress$set(message=sprintf("Finding optimal CBB Showdown lineups (%s)...", selected_sd),
                      detail="Phase 1: Building lineup pool...", value=0.05)
-        lineup_data <- find_optimal_lineups_cbb_sd(sd_sim, sd_meta, sd_config, verbose=TRUE)
+        # 2 Nov 2026: CBB showdown now enumerates every legal CPT + 5 in the salary band (enum_captain, as NHL / NBA / Soccer SD) instead of the per-sim greedy
+        # find_optimal_lineups_cbb_sd, which stays as the serial fallback if the enumerator errors or returns nothing. CPT salary is 1.5 x the UTIL (SDSalary) salary on DK, so the
+        # enumerator's own cpt_multiplier reproduces CPTSalary exactly (the sheet's CPT_Salary / UTIL_Salary is 1.5 for every player).
+        lineup_data <- tryCatch({
+          sd_enum_data <- prepare_optimization_data(sd_sim, sd_meta, "SD")
+          if (!"Team" %in% names(sd_enum_data)) sd_enum_data <- merge(sd_enum_data, unique(sd_meta[, .(Player, Team)], by = "Player"), by = "Player")
+          sd_enum_cfg <- list(roster_size = 6L, salary_cap = sd_config$salary_cap, percentiles = sd_config$percentiles, platform_col = "DKScore",
+                              cpt_multiplier = 1.5, max_lineups = 5000L, sport = "CBB")
+          ld <- find_optimal_lineups(sd_enum_data, sd_enum_cfg, mode = "enum_captain", k = 1, verbose = TRUE)
+          ld <- tryCatch(drop_single_team_sd(ld, sd_meta), error = function(e) ld)
+          if (NROW(ld$unique_lineups) == 0) stop("enum_captain returned no lineups")
+          ld
+        }, error = function(e) {
+          message("CBB showdown enumerator failed (", conditionMessage(e), ") - falling back to find_optimal_lineups_cbb_sd")
+          find_optimal_lineups_cbb_sd(sd_sim, sd_meta, sd_config, verbose=TRUE)
+        })
         progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
                                     format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)
         opt_data_sd  <- prepare_optimization_data(sd_sim, sd_meta, "SD")
