@@ -3786,11 +3786,15 @@ find_optimal_lineups_cbb_par <- function(sim_results, metadata, config, verbose 
     if (length(valid) == 0L) stop("No valid CBB lineups found")
     all_dt <- rbindlist(valid)
     counts <- all_dt[, .(Top1Count = .N, TotalSalary = TotalSalary[1], AvgScore = mean(TotalScore)), by = Lineup]
-    counts[, rand := runif(.N)]; setorder(counts, -Top1Count, rand); counts[, rand := NULL]
+    # 2 Nov 2026: rank the unique lineups like CFB/NFL classic do: by Top1Count, then by the lineup's expected points (sum of each player's mean DK points over all sims), NOT at random;
+    # at 50,000 sims nearly every lineup has Top1Count 1, so the random tie-break (and the alphabetical order merge() imposes) made the 5,000 carried into scoring an arbitrary subset.
+    mu_v <- opt_data[, .(m = mean(FantasyPoints)), by = Player]; mu_v <- setNames(mu_v$m, mu_v$Player)
+    pm_ <- matrix(unlist(strsplit(counts$Lineup, "|", fixed = TRUE), use.names = FALSE), ncol = 8L, byrow = TRUE)
+    counts[, ExpScore := rowSums(matrix(mu_v[pm_], nrow = nrow(pm_)))]; setorder(counts, -Top1Count, -ExpScore)
     if (verbose) cat(sprintf("  LP done: %s unique lineups | %.1fs; assigning slots...\n", format(nrow(counts), big.mark = ","), as.numeric(difftime(Sys.time(), start_t, units = "secs"))))
     lg <- cut(seq_len(nrow(counts)), breaks = min(n_cores * 4L, nrow(counts)), labels = FALSE)
     slot_dt <- rbindlist(parallel::parLapply(cl, split(counts$Lineup, lg), .cbb_slot_chunk, meta = meta, asg = assign_cbb_slots))
-    counts <- merge(counts, slot_dt, by = "Lineup", all.x = TRUE)
+    counts <- merge(counts, slot_dt, by = "Lineup", all.x = TRUE); setorder(counts, -Top1Count, -ExpScore)   # merge() sorts by Lineup; restore the ranking before the cap
     unique_lineups <- counts[!is.na(G1), .(TotalSalary, Top1Count, AvgScore, Player1 = G1, Player2 = G2, Player3 = G3, Player4 = F1, Player5 = F2, Player6 = F3, Player7 = UTIL1, Player8 = UTIL2)]
     if (nrow(unique_lineups) > max_lineups) unique_lineups <- unique_lineups[1:max_lineups]
     elapsed <- as.numeric(difftime(Sys.time(), start_t, units = "secs"))
