@@ -1675,7 +1675,7 @@ server <- function(input, output, session) {
                                percentiles=c(0.01,0.05,0.10,0.20),
                                platform_col="DKScore", max_lineups=5000)
         progress$set(detail="Phase 1: Building lineup pool (per-sim LP)...", value=0.05)
-        lineup_data  <- find_optimal_lineups_cbb(rv$simulation_results, rv$sim_metadata,
+        lineup_data  <- (if (exists("find_optimal_lineups_cbb_par")) find_optimal_lineups_cbb_par else find_optimal_lineups_cbb)(rv$simulation_results, rv$sim_metadata,
                                                  cbb_opt_config, verbose=TRUE)
         progress$set(detail=sprintf("Phase 2: Scoring %s lineups...",
                                     format(nrow(lineup_data$unique_lineups), big.mark=",")), value=0.35)

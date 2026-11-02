@@ -3733,3 +3733,69 @@ rates_vs_field <- function(score_matrix, ref, chunk_size = 2000L) {
   }
   list(win_rate = win / n_s * 100, top_pcts = tp / n_s * 100)
 }
+
+# =============================================================================
+# CBB DK CLASSIC OPTIMISER, PARALLEL (2 Nov 2026)
+# -----------------------------------------------------------------------------
+# find_optimal_lineups_cbb() (cbb_engine.R) solves one LP per sim on a single core, then assigns slots to every unique lineup in a serial loop. At the app's default of
+# 50,000 sims that is minutes: Phase 1 (the per-sim LP plus the slot loop) is about 85% of the optimiser's time on a 3,000-sim run, scoring and metrics about 10%.
+# CFB and NFL classic spread their per-sim solves over PSOCK workers (.opt_workers(), chunks, self-contained worker functions); this does the same for CBB: identical LP, identical
+# constraints, identical slot assignment and output, only the loop is split over workers. Same result as the serial function (the LP is deterministic); any worker failure falls back to it.
+# cbb_engine.R is not changed. find_optimal_lineups_cbb stays as the fallback.
+# =============================================================================
+.cbb_lp_chunk <- function(dat, cap) {
+  library(data.table); library(lpSolve)
+  setDT(dat); setkey(dat, SimID); ids <- unique(dat$SimID); out <- vector("list", length(ids))
+  for (i in seq_along(ids)) {
+    pool <- dat[.(ids[i])]; n_p <- nrow(pool); if (n_p < 8L) next
+    res <- tryCatch(lp("max", pool$FantasyPoints, rbind(rep(1, n_p), pool$Salary, as.integer(pool$g_elig), as.integer(pool$f_elig)), c("==", "<=", ">=", ">="), c(8L, cap, 3L, 3L), all.bin = TRUE), error = function(e) list(status = 1L))
+    if (res$status != 0L) next
+    selected <- which(res$solution == 1L); if (length(selected) != 8L) next
+    chosen <- pool[selected]
+    out[[i]] <- data.table(Lineup = paste(sort(chosen$Player), collapse = "|"), TotalSalary = sum(chosen$Salary), TotalScore = sum(chosen$FantasyPoints))
+  }
+  out[!vapply(out, is.null, NA)]
+}
+.cbb_slot_chunk <- function(lineups, meta, asg) {
+  library(data.table); setDT(meta); out <- vector("list", length(lineups))
+  for (li in seq_along(lineups)) {
+    players <- strsplit(lineups[li], "\\|")[[1]]; cm <- meta[Player %in% players, .(Player, PosGroup, game_rank)]
+    slots <- asg(cm, n_g = 3L, n_f = 3L, n_util = 2L)
+    if (!is.null(slots)) out[[li]] <- data.table(Lineup = lineups[li], G1 = slots$g[1], G2 = slots$g[2], G3 = slots$g[3], F1 = slots$f[1], F2 = slots$f[2], F3 = slots$f[3], UTIL1 = slots$util[1], UTIL2 = slots$util[2])
+  }
+  rbindlist(out[!vapply(out, is.null, NA)])
+}
+find_optimal_lineups_cbb_par <- function(sim_results, metadata, config, verbose = TRUE) {
+  n_cores <- .opt_workers()
+  setDT(sim_results)
+  if (n_cores < 2L || !exists("find_optimal_lineups_cbb") || !exists("assign_cbb_slots") || data.table::uniqueN(sim_results$SimID) <= 200L)
+    return(find_optimal_lineups_cbb(sim_results, metadata, config, verbose))
+  out <- tryCatch({
+    if (verbose) cat("\nPhase 1: Finding optimal CBB lineups (per-sim LP, parallel)...\n")
+    setDT(metadata); salary_cap <- config$salary_cap; max_lineups <- if (!is.null(config$max_lineups)) config$max_lineups else 5000L
+    meta <- unique(metadata[, .(Player, DKSalary, PosGroup, GameKey)], by = "Player"); meta[, g_elig := PosGroup %in% c("G", "G/F")]; meta[, f_elig := PosGroup %in% c("F", "G/F")]
+    if ("GameRank" %in% names(metadata)) { meta <- merge(meta, unique(metadata[, .(Player, GameRank)]), by = "Player", all.x = TRUE); meta[, game_rank := GameRank]; meta[is.na(game_rank), game_rank := 1L]; meta[, GameRank := NULL] } else meta[, game_rank := 1L]
+    opt_data <- merge(sim_results[, .(SimID, Player, FantasyPoints = DKScore)], meta[, .(Player, Salary = DKSalary, g_elig, f_elig, game_rank)], by = "Player")
+    opt_data <- opt_data[Salary > 0 & !is.na(Salary) & !is.na(FantasyPoints)]; setkey(opt_data, SimID)
+    sim_ids <- unique(opt_data$SimID); n_sims <- length(sim_ids); start_t <- Sys.time()
+    if (verbose) cat(sprintf("  %s players | %s sims | $%s cap | %d workers\n", format(nrow(meta), big.mark = ","), format(n_sims, big.mark = ","), format(salary_cap, big.mark = ","), n_cores))
+    cl <- parallel::makeCluster(n_cores, type = "PSOCK"); on.exit(parallel::stopCluster(cl), add = TRUE)
+    grp <- cut(seq_along(sim_ids), breaks = min(n_cores * 4L, n_sims), labels = FALSE)
+    chunks <- lapply(split(sim_ids, grp), function(ii) opt_data[SimID %in% ii])
+    valid <- unlist(parallel::parLapply(cl, chunks, .cbb_lp_chunk, cap = salary_cap), recursive = FALSE)
+    if (length(valid) == 0L) stop("No valid CBB lineups found")
+    all_dt <- rbindlist(valid)
+    counts <- all_dt[, .(Top1Count = .N, TotalSalary = TotalSalary[1], AvgScore = mean(TotalScore)), by = Lineup]
+    counts[, rand := runif(.N)]; setorder(counts, -Top1Count, rand); counts[, rand := NULL]
+    if (verbose) cat(sprintf("  LP done: %s unique lineups | %.1fs; assigning slots...\n", format(nrow(counts), big.mark = ","), as.numeric(difftime(Sys.time(), start_t, units = "secs"))))
+    lg <- cut(seq_len(nrow(counts)), breaks = min(n_cores * 4L, nrow(counts)), labels = FALSE)
+    slot_dt <- rbindlist(parallel::parLapply(cl, split(counts$Lineup, lg), .cbb_slot_chunk, meta = meta, asg = assign_cbb_slots))
+    counts <- merge(counts, slot_dt, by = "Lineup", all.x = TRUE)
+    unique_lineups <- counts[!is.na(G1), .(TotalSalary, Top1Count, AvgScore, Player1 = G1, Player2 = G2, Player3 = G3, Player4 = F1, Player5 = F2, Player6 = F3, Player7 = UTIL1, Player8 = UTIL2)]
+    if (nrow(unique_lineups) > max_lineups) unique_lineups <- unique_lineups[1:max_lineups]
+    elapsed <- as.numeric(difftime(Sys.time(), start_t, units = "secs"))
+    if (verbose) cat(sprintf("  ✓ Phase 1: %s unique lineups from %s sims | %.1fs (parallel)\n", format(nrow(unique_lineups), big.mark = ","), format(n_sims, big.mark = ","), elapsed))
+    list(unique_lineups = unique_lineups, n_sims = n_sims, config = config, mode = "cbb")
+  }, error = function(e) { if (verbose) cat("  parallel CBB optimiser failed (", conditionMessage(e), ") - serial path\n"); NULL })
+  if (is.null(out)) find_optimal_lineups_cbb(sim_results, metadata, config, verbose) else out
+}
