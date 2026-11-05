@@ -415,7 +415,7 @@ cbb_old_to_v1 <- function(games, sim_games, team_data) {
 read_cbb_input <- function(file_path) {
   cm <- cbb_read_common(file_path); sheets <- cm$sheets
   fixed <- c("IDs", "Games", "Params", "Profiles", "FoulBank", cm$sd_sheet_names, grep("^Sim_", sheets, value = TRUE))
-  team_sheets <- setdiff(sheets, fixed)
+  team_sheets <- setdiff(sheets, fixed); team_sheets <- team_sheets[!grepl("^_", team_sheets)]   # "_"-prefixed tabs (_Read_Me) are customer-facing notes, never a team
   is_v1 <- "Profiles" %in% sheets && "Params" %in% sheets
   rd <- function(s) { dt <- as.data.table(read_excel(file_path, sheet = s)); setnames(dt, trimws(names(dt))); dt }
   if (is_v1) {
@@ -529,9 +529,11 @@ run_cbb_simulation <- function(input_data, n_sims = 10000, config = NULL, progre
     metadata <- merge(metadata, game_sd_lu, by = "Team", all.x = TRUE)
     sd_all <- rbindlist(lapply(names(input_data$sd_ids), function(n) { dt <- copy(input_data$sd_ids[[n]]); dt[, SDFile := n]; dt }), fill = TRUE)
     setnames(sd_all, "Name", "Player")
-    sd_join_cols <- intersect(c("Player", "Team", "SDFile", "CPT_ID", "CPT_Salary", "UTIL_ID", "UTIL_Salary"), names(sd_all))
+    for (cc in c("CPT_Own", "UTIL_Own")) if (!cc %in% names(sd_all)) sd_all[[cc]] <- NA_real_   # showdown ownership (percent), optional; read by the app as CPTOwn / SDOwn
+    sd_join_cols <- intersect(c("Player", "Team", "SDFile", "CPT_ID", "CPT_Salary", "UTIL_ID", "UTIL_Salary", "CPT_Own", "UTIL_Own"), names(sd_all))
     metadata <- merge(metadata, sd_all[, ..sd_join_cols][, .(Player, Team, SDFile, CPTID = CPT_ID, CPTSalary = CPT_Salary,
-                        SDID = if ("UTIL_ID" %in% names(.SD)) UTIL_ID else NA_integer_, SDSalary = if ("UTIL_Salary" %in% names(.SD)) UTIL_Salary else NA_real_)],
+                        SDID = if ("UTIL_ID" %in% names(.SD)) UTIL_ID else NA_integer_, SDSalary = if ("UTIL_Salary" %in% names(.SD)) UTIL_Salary else NA_real_,
+                        CPTOwn = as.numeric(CPT_Own), SDOwn = as.numeric(UTIL_Own))],
                       by.x = c("Player", "Team", "ShowdownFile"), by.y = c("Player", "Team", "SDFile"), all.x = TRUE)
   }
   sim_results <- sim_results[Player %in% metadata$Player]
