@@ -510,7 +510,7 @@ read_cfb_input <- function(file_path, slate = NULL, game = NULL) {
   # optional projections tab, which must be excluded here or it is read as a
   # team and blows up on the missing S:T block.
   aux <- sh[tolower(sh) %in% c("projections", "etr")]
-  tms <- setdiff(sh, c(gtab, aux))
+  tms <- setdiff(sh, c(gtab, aux)); tms <- tms[!startsWith(tms, "_")]   # "_"-prefixed tabs (_Read_Me) are customer notes, never a team
 
   # LAYOUT-AGNOSTIC. The player block used to be pinned to A:Q and the team
   # block to S:T, which meant adding a column moved both and silently broke

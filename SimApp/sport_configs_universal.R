@@ -565,7 +565,7 @@ SPORT_CONFIGS <- list(
         # Showdown wins the NFL entry; a classic sheet is NFL_CLASSIC below and
         # this entry bails on it, so order does not matter.
         if (!is.na(st) && st == "classic") return(FALSE)
-        tm <- setdiff(sheets, c(sheets[tolower(sheets) == "game"],
+        tm <- setdiff(sheets, c(sheets[tolower(sheets) == "game"], sheets[startsWith(sheets, "_")],
                                 sheets[tolower(sheets) %in% c("projections", "etr")]))[1]
         cols <- tryCatch(names(readxl::read_excel(file_path, sheet = tm, n_max = 1)),
                          error = function(e) character(0))
@@ -707,7 +707,7 @@ SPORT_CONFIGS <- list(
         st <- if (is.null(gh) || !"slate_type" %in% names(gh)) NA_character_
               else tolower(as.character(gh$slate_type[1]))
         if (is.na(st) || st != "classic") return(FALSE)
-        tm <- setdiff(sheets, c(sheets[tolower(sheets) == "game"],
+        tm <- setdiff(sheets, c(sheets[tolower(sheets) == "game"], sheets[startsWith(sheets, "_")],
                                 sheets[tolower(sheets) %in% c("projections", "etr")]))[1]
         cols <- tryCatch(names(readxl::read_excel(file_path, sheet = tm, n_max = 1)),
                          error = function(e) character(0))
@@ -1560,7 +1560,7 @@ SPORT_CONFIGS <- list(
         is_classic <- (!is.null(gh) && "in_classics" %in% names(gh)) ||
                       (!is.na(st) && st == "classic")
         if (is_classic) return(FALSE)
-        tm <- setdiff(sheets, sheets[tolower(sheets) == "game"])[1]
+        tm <- setdiff(sheets, c(sheets[tolower(sheets) == "game"], sheets[startsWith(sheets, "_")]))[1]
         cols <- tryCatch(names(readxl::read_excel(file_path, sheet = tm, n_max = 1)),
                          error = function(e) character(0))
         # A CFB team tab carries carry_usage plus a catch schema. That is
@@ -1700,7 +1700,7 @@ SPORT_CONFIGS <- list(
         is_classic <- (!is.null(gh) && "in_classics" %in% names(gh)) ||
                       (!is.na(st) && st == "classic")
         if (!is_classic) return(FALSE)
-        tm <- setdiff(sheets, c(sheets[tolower(sheets) == "game"],
+        tm <- setdiff(sheets, c(sheets[tolower(sheets) == "game"], sheets[startsWith(sheets, "_")],
                                 sheets[tolower(sheets) %in% c("projections", "etr")]))[1]
         cols <- tryCatch(names(readxl::read_excel(file_path, sheet = tm, n_max = 1)),
                          error = function(e) character(0))

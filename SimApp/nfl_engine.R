@@ -1241,7 +1241,7 @@ read_nfl_input <- function(file_path, slate = NULL, game = NULL) {
   g[, slate_type := tolower(as.character(slate_type))]
 
   aux <- sh[tolower(sh) %in% c("projections", "etr")]
-  tms <- setdiff(sh, c(gtab, aux))
+  tms <- setdiff(sh, c(gtab, aux)); tms <- tms[!startsWith(tms, "_")]   # "_"-prefixed tabs (_Read_Me) are customer notes, never a team
 
   read_tab <- function(tm) {
     x <- as.data.table(readxl::read_excel(file_path, sheet = tm,
