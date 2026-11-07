@@ -1942,6 +1942,14 @@ prepare_stage_dominator_data <- function(race_profiles, driver_data = NULL) {
   # (kappa 1, where the fit said .75-.97), so a real driver's whole day stays with one car, and the stage-1 start gap carries noise (NASCAR_STAGE1_JITTER
   # grid places), so the biggest stage-1 line goes to the nearest start slot most of the time, not always.
   params$kappa[2:3] <- NASCAR_STAGE_KAPPA23
+  # Optional per-sheet overrides (7 Nov 2026, Andrew, ORLY Homestead 5639: "i like start for stage 1 ... not hurting the favorites that dont start in the front who could lead the later stages").
+  # Race_Profiles columns Stage2Theta / Stage3Theta (grid weight in stages 2 and 3; 0 = deal them on the sim finish and quality alone) and Kappa2 / Kappa3 (how strongly a stage-2/3 line follows
+  # the car that held the same real driver's earlier line). Stage 1 is untouched. Sheets without these columns behave exactly as before.
+  .ov <- function(col) if (col %in% names(rp)) { v <- suppressWarnings(as.numeric(rp[[col]][1])); if (length(v) == 1 && !is.na(v)) v else NA_real_ } else NA_real_
+  if (!is.na(.ov("Stage2Theta"))) params$theta[2] <- min(max(.ov("Stage2Theta"), 0), 1)
+  if (!is.na(.ov("Stage3Theta"))) params$theta[3] <- min(max(.ov("Stage3Theta"), 0), 1)
+  if (!is.na(.ov("Kappa2"))) params$kappa[2] <- min(max(.ov("Kappa2"), 0), 1)
+  if (!is.na(.ov("Kappa3"))) params$kappa[3] <- min(max(.ov("Kappa3"), 0), 1)
   list(mode = dom_mode, races = races, theta = params$theta, kappa = params$kappa, cap = cap, q_on = q_on, f_q = f_q,
        metric_grid = metric_grid, late_q = late_q, s1_fin = s1_fin, rdd = rdd, s1_jit = NASCAR_STAGE1_JITTER)
 }
