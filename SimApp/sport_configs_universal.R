@@ -3,8 +3,22 @@
 # Golden Ticket Sims
 # ============================================================================
 
+# Golf showdown detection: Event tab cell `Showdown` ("flex" / "captain") AND a
+# Player tab carrying SDSalary. Both are needed, so a classic golf sheet (no such
+# cell, no SDSalary) never detects as showdown.
+golf_showdown_detect <- function(sheets, file_path, mode) {
+  if (is.null(file_path) || !all(c("Player", "Event", "DKPts") %in% sheets)) return(FALSE)
+  ev <- tryCatch(suppressMessages(readxl::read_excel(file_path, sheet = "Event", n_max = 1)),
+                 error = function(e) NULL)
+  if (is.null(ev) || !"Showdown" %in% names(ev)) return(FALSE)
+  if (!identical(tolower(trimws(as.character(ev$Showdown[1]))), mode)) return(FALSE)
+  pl <- tryCatch(suppressMessages(readxl::read_excel(file_path, sheet = "Player", n_max = 1)),
+                 error = function(e) NULL)
+  !is.null(pl) && "SDSalary" %in% names(pl)
+}
+
 SPORT_CONFIGS <- list(
-  
+
   # ==========================================================================
   # NASCAR
   # ==========================================================================
@@ -807,6 +821,163 @@ SPORT_CONFIGS <- list(
   ),
   
   
+  # ==========================================================================
+  # GOLF SHOWDOWN (DK Round 1 showdown) -- FLEX (6 equal slots) and CAPTAIN
+  # --------------------------------------------------------------------------
+  # Same workbook as classic golf (Player / DKPts / Event tabs) plus SDSalary /
+  # SDID on the Player tab (CPTSalary / CPTID for captain contests) and a
+  # `Showdown` cell on the Event tab ("flex" or "captain"). Both entries MUST
+  # sit before GOLF: detect_sport() returns the first match and a showdown sheet
+  # also satisfies classic's Player + DKPts + W/T5/Cut check. A classic sheet has
+  # neither the Showdown cell nor SDSalary, so it never lands here.
+  # Engine: run_golf_showdown_simulation (golf_showdown_engine.R) -- puts the
+  # sheet's SDSalary / SDID into the standard DKSalary / DKID metadata columns.
+  # ==========================================================================
+  GOLF_SHOWDOWN_FLEX = list(
+    sport_name         = "GOLF_SHOWDOWN_FLEX",
+    sport_display_name = "Golf Showdown (Flex)",
+    player_label       = "Golfer",
+    player_label_plural = "Golfers",
+
+    detection = list(custom_detect = function(sheets, file_path = NULL)
+      golf_showdown_detect(sheets, file_path, "flex")),
+
+    showdown_mode = "flex",
+    platforms    = c("DK"),
+    roster_sizes = list(DK = 6),
+    salary_caps  = list(DK = 50000),
+
+    # Same exact per-sim optimum as classic golf (generate_golf_candidate_pool).
+    max_lineups  = 10000,
+    default_n_sims = 10000L,
+
+    standard_metrics = c("WinRate", "Top1Pct", "Top5Pct", "Top10Pct", "Top20Pct",
+                         "AvgScore", "TotalSalary", "AvgOwn"),
+    custom_metrics = list(
+      list(name = "EarlyLateCount", calculation = "custom", label = "EL Count", decimals = 0)
+    ),
+    metadata_columns = list(
+      list(name = "TeeTimeGroup", label = "Tee Group", type = "text", display = TRUE, filter = TRUE)
+    ),
+    portfolio_filters = list(
+      rate_minimums = list(
+        list(name = "Win",   label = "Win",   step = 0.1),
+        list(name = "Top1",  label = "Top 1", step = 0.5),
+        list(name = "Top5",  label = "Top 5", step = 1),
+        list(name = "Top10", label = "Top 10", step = 2),
+        list(name = "Top20", label = "Top 20", step = 5)
+      ),
+      range_filters = list(
+        list(name = "Salary", label = "Salary (K)", column = "TotalSalary", step = 0.1, format = "salary_k"),
+        list(name = "AvgOwn", label = "Avg Own",    column = "AvgOwn",      step = 0.1, format = "decimal")
+      )
+    ),
+    platform_columns = list(
+      DK = list(salary = "DKSalary", id = "DKID", ownership = "DKOwn", score = "DKScore",
+                platform_label = "DK Golf Showdown")
+    ),
+    download_formats = list(DK = "{Name} ({DKID})"),
+    input_file = list(
+      type            = "excel",
+      required_sheets = c("Player", "DKPts"),
+      player_sheet    = "Player",
+      required_columns = list(
+        base = c("Name", "W", "T5", "T10", "SDSalary", "SDID"),
+        DK   = c("SDID", "SDSalary")
+      )
+    ),
+    simulation = list(
+      function_name = "run_golf_showdown_simulation",
+      output_format = list(
+        sim_results = c("SimID", "Player", "DKScore", "FDScore", "Pool", "FinishPosition"),
+        metadata    = c("Player", "Pool", "TeeTimeGroup", "DKSalary", "DKOwn", "DKID", "SDSalary", "SDID")
+      )
+    ),
+    lineup_metrics_function = "calculate_golf_lineup_metrics",
+    dk_export_slots = list(DK = c("G", "G", "G", "G", "G", "G"))
+  ),
+
+
+  GOLF_SHOWDOWN_CAPTAIN = list(
+    sport_name         = "GOLF_SHOWDOWN_CAPTAIN",
+    sport_display_name = "Golf Showdown (Captain)",
+    player_label       = "Golfer",
+    player_label_plural = "Golfers",
+
+    detection = list(custom_detect = function(sheets, file_path = NULL)
+      golf_showdown_detect(sheets, file_path, "captain")),
+
+    showdown_mode = "captain",
+    platforms    = c("DK"),
+    roster_sizes = list(DK = 6),
+    salary_caps  = list(DK = 50000),
+
+    # Every legal CPT + 5 in the salary band, ranked by winning-script hits
+    # (find_optimal_lineups_enum_captain), as CFB / NHL showdown.
+    optimization_modes = list(DK = "enum_captain"),
+    max_lineups  = 5000,
+    enum_salary_floor_frac = 0.97,
+    enum_win_pct = 0.01,
+    enum_keep    = 5000L,
+    # A 60-golfer pool is 57M rosters in the $48.5k+ band (hours). Build the pool from the
+    # top 40 golfers by mean score (~0.7M rosters at 0.97) and rank on 2,000 sims; scoring
+    # downstream uses every golfer and every sim. Read in the DK button (app.R).
+    enum_pool_top = 40L,
+    enum_sims_max = 2000L,
+    default_n_sims = 10000L,
+    cash_games   = list(enabled = FALSE),
+
+    showdown_config = list(
+      DK = list(enabled = TRUE, captain_multiplier = 1.5,
+                captain_salary_multiplier = 1.5, mode = "captain")
+    ),
+
+    standard_metrics = c("WinRate", "Top1Rate", "Top5Rate", "Top10Rate", "Top20Rate",
+                         "TotalSalary", "AvgOwn"),
+    custom_metrics = list(),
+    metadata_columns = list(
+      list(name = "TeeTimeGroup", label = "Tee Group", type = "text", display = TRUE, filter = TRUE)
+    ),
+    portfolio_filters = list(
+      rate_minimums = list(
+        list(name = "Win",   label = "Win",   step = 0.1),
+        list(name = "Top1",  label = "Top 1", step = 0.5),
+        list(name = "Top5",  label = "Top 5", step = 1),
+        list(name = "Top10", label = "Top 10", step = 2),
+        list(name = "Top20", label = "Top 20", step = 5)
+      ),
+      range_filters = list(
+        list(name = "Salary", label = "Salary (K)", column = "TotalSalary", step = 0.1, format = "salary_k"),
+        list(name = "AvgOwn", label = "Avg Own",    column = "AvgOwn",      step = 0.1, format = "decimal")
+      )
+    ),
+    platform_columns = list(
+      DK = list(salary = "DKSalary", id = "SDID", cpt_id = "CPTID", cpt_salary = "CPTSalary",
+                ownership = "DKOwn", score = "DKScore", cpt_multiplier = 1.5,
+                platform_label = "DK Golf Showdown")
+    ),
+    download_formats = list(DK = "{Name} ({SDID})", DK_CPT = "{Name} ({CPTID})"),
+    input_file = list(
+      type            = "excel",
+      required_sheets = c("Player", "DKPts"),
+      player_sheet    = "Player",
+      required_columns = list(
+        base = c("Name", "W", "T5", "T10", "SDSalary", "SDID", "CPTID"),
+        DK   = c("SDID", "SDSalary", "CPTID")
+      )
+    ),
+    simulation = list(
+      function_name = "run_golf_showdown_simulation",
+      output_format = list(
+        sim_results = c("SimID", "Player", "DKScore", "FDScore", "Pool", "FinishPosition"),
+        metadata    = c("Player", "Pool", "TeeTimeGroup", "DKSalary", "DKOwn", "DKID",
+                        "SDSalary", "SDID", "CPTID", "CPTSalary")
+      )
+    ),
+    dk_export_slots = list(DK = c("CPT", "FLEX", "FLEX", "FLEX", "FLEX", "FLEX"))
+  ),
+
+
   # ==========================================================================
   # GOLF
   # ==========================================================================

@@ -515,3 +515,4 @@ local({
   GOLF_ENGINE_DIR <<- normalizePath(d, winslash = "/")
 })
 source(file.path(GOLF_ENGINE_DIR, "golf_engine_v2.R"))
+source(file.path(GOLF_ENGINE_DIR, "golf_showdown_engine.R"))   # R1 showdown (additive; classic unchanged)

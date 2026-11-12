@@ -96,6 +96,8 @@ sim_box_plot <- function(st, levels, color, fill, title, x_title, h_px, margin_l
 load_sport_input <- function(file_path, sport, config, slate = NULL, game = NULL) {
   reader_map <- list(
     GOLF = read_golf_input,
+    GOLF_SHOWDOWN_FLEX    = read_golf_input,
+    GOLF_SHOWDOWN_CAPTAIN = read_golf_input,
     F1   = read_f1_input,
     CBB  = read_cbb_input,
     NBA  = read_nba_input,
@@ -1086,6 +1088,22 @@ server <- function(input, output, session) {
         rv$sport_visuals      <- NULL
         rv$full_sim_results   <- NULL
         
+      } else if (rv$sport %in% c("GOLF_SHOWDOWN_FLEX", "GOLF_SHOWDOWN_CAPTAIN")) {
+        # Round 1 showdown: mode comes from the config (the sheet's Event-tab Showdown cell)
+        result   <- run_golf_showdown_simulation(
+          input_data        = rv$input_data,
+          n_sims            = input$n_sims,
+          mode              = rv$config$showdown_mode,
+          progress_callback = function(v, m) progress$set(value = v, detail = m)
+        )
+        rv$simulation_results <- result$sim_results
+        rv$sim_metadata       <- result$sim_metadata
+        rv$golf_no_cut        <- TRUE
+        rv$golf_cut_note      <- NULL
+        rv$has_fd             <- FALSE
+        rv$sport_visuals      <- NULL
+        rv$full_sim_results   <- NULL
+
       } else {
         sim_function <- get(rv$config$simulation$function_name)
         result       <- sim_function(
@@ -1594,7 +1612,7 @@ server <- function(input, output, session) {
     progress <- Progress$new(session); on.exit(progress$close())
     tryCatch({
       
-      if (rv$sport == "GOLF") {
+      if (rv$sport %in% c("GOLF", "GOLF_SHOWDOWN_FLEX")) {   # flex showdown: same exact per-sim optimum
         progress$set(message="Finding optimal DK Golf lineups...", value=0)
         no_cut    <- rv$golf_no_cut %||% FALSE
         dk_config  <- list(platform="DK", roster_size=rv$config$roster_sizes$DK,
@@ -1987,7 +2005,22 @@ server <- function(input, output, session) {
           opt_config$cash_keep         <- rv$config$cash_keep %||% 2000L
         }
         progress$set(detail="Phase 1: Building lineup pool...", value=0.05)
-        lineup_data <- find_optimal_lineups(opt_data, opt_config, mode=dk_mode, k=1, verbose=TRUE,
+        # Big enumeration pools (golf showdown: 60 golfers = 57M rosters in the band):
+        # build the pool from the top `enum_pool_top` players by mean score and rank
+        # it on the first `enum_sims_max` sims. Scoring below still uses every sim
+        # and every player. Both keys are opt-in per sport config; absent = unchanged.
+        phase1_data <- opt_data
+        if (identical(dk_mode, "enum_captain") && !is.null(rv$config$enum_pool_top)) {
+          keep_p <- phase1_data[, .(m = mean(FantasyPoints)), by = Player][order(-m)][
+                      seq_len(min(.N, rv$config$enum_pool_top)), Player]
+          phase1_data <- phase1_data[Player %in% keep_p]
+        }
+        if (identical(dk_mode, "enum_captain") && !is.null(rv$config$enum_sims_max)) {
+          sid <- sort(unique(phase1_data$SimID))
+          if (length(sid) > rv$config$enum_sims_max)
+            phase1_data <- phase1_data[SimID %in% sid[seq_len(rv$config$enum_sims_max)]]
+        }
+        lineup_data <- find_optimal_lineups(phase1_data, opt_config, mode=dk_mode, k=1, verbose=TRUE,
                                             progress_callback=function(frac, detail)
                                               progress$set(value=0.05 + frac*0.30, detail=detail))
         # DK showdown rule: a captain-mode lineup needs players from BOTH
