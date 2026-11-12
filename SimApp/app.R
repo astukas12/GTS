@@ -409,6 +409,14 @@ ui <- dashboardPage(
     ")),
     
     tags$script(HTML(r"(
+      // Keep-alive: ping the server every 15s so idle/background tabs and
+      // proxies don't drop the websocket (grey screen). Harmless if unused.
+      setInterval(function() {
+        try {
+          if (window.Shiny && Shiny.shinyapp && Shiny.shinyapp.isConnected())
+            Shiny.setInputValue('gts_keepalive', Date.now(), {priority: 'event'});
+        } catch (e) {}
+      }, 15000);
             // Filename — use shiny:inputchanged as primary (most reliable across versions)
       // This fires after Shiny has fully processed the upload
       $(document).on('shiny:inputchanged', function(e) {
