@@ -923,7 +923,8 @@ SPORT_CONFIGS <- list(
     # top 40 golfers by mean score (~0.7M rosters at 0.97) and rank on 2,000 sims; scoring
     # downstream uses every golfer and every sim. Read in the DK button (app.R).
     enum_pool_top = 40L,
-    enum_sims_max = 2000L,
+    enum_pool_value = 5L,     # of those 40, 5 are the best mean-per-dollar of the rest (cheap plays that make a lineup fit)
+    enum_sims_max = 1000L,
     default_n_sims = 10000L,
     cash_games   = list(enabled = FALSE),
 
@@ -975,6 +976,78 @@ SPORT_CONFIGS <- list(
       )
     ),
     dk_export_slots = list(DK = c("CPT", "FLEX", "FLEX", "FLEX", "FLEX", "FLEX"))
+  ),
+
+
+  # ==========================================================================
+  # GOLF WEEKEND (DK "Weekend Golf": rounds 3 and 4 only, six golfers, $50k, no captain)
+  # --------------------------------------------------------------------------
+  # Same workbook and detection pattern as GOLF_SHOWDOWN_*: Event tab Showdown = "weekend" AND SDSalary on
+  # the Player tab. R1 / R2 columns on the Player tab (real strokes to par) are fixed in every sim; the sim
+  # plays rounds 3 and 4 and scores the two rounds together (see golf_showdown_engine.R). The pool is the
+  # golfers with an SDSalary (those who made the cut). Optimizer = classic golf's exact per-sim optimum.
+  # ==========================================================================
+  GOLF_WEEKEND = list(
+    sport_name         = "GOLF_WEEKEND",
+    sport_display_name = "Golf Weekend (R3 + R4)",
+    player_label       = "Golfer",
+    player_label_plural = "Golfers",
+
+    detection = list(custom_detect = function(sheets, file_path = NULL)
+      golf_showdown_detect(sheets, file_path, "weekend")),
+
+    showdown_mode = "flex",
+    contest       = "weekend",
+    platforms    = c("DK"),
+    roster_sizes = list(DK = 6),
+    salary_caps  = list(DK = 50000),
+    max_lineups  = 10000,
+    default_n_sims = 10000L,
+
+    standard_metrics = c("WinRate", "Top1Pct", "Top5Pct", "Top10Pct", "Top20Pct",
+                         "AvgScore", "TotalSalary", "AvgOwn"),
+    custom_metrics = list(
+      list(name = "EarlyLateCount", calculation = "custom", label = "EL Count", decimals = 0)
+    ),
+    metadata_columns = list(
+      list(name = "TeeTimeGroup", label = "Tee Group", type = "text", display = TRUE, filter = TRUE)
+    ),
+    portfolio_filters = list(
+      rate_minimums = list(
+        list(name = "Win",   label = "Win",   step = 0.1),
+        list(name = "Top1",  label = "Top 1", step = 0.5),
+        list(name = "Top5",  label = "Top 5", step = 1),
+        list(name = "Top10", label = "Top 10", step = 2),
+        list(name = "Top20", label = "Top 20", step = 5)
+      ),
+      range_filters = list(
+        list(name = "Salary", label = "Salary (K)", column = "TotalSalary", step = 0.1, format = "salary_k"),
+        list(name = "AvgOwn", label = "Avg Own",    column = "AvgOwn",      step = 0.1, format = "decimal")
+      )
+    ),
+    platform_columns = list(
+      DK = list(salary = "DKSalary", id = "DKID", ownership = "DKOwn", score = "DKScore",
+                platform_label = "DK Golf Weekend")
+    ),
+    download_formats = list(DK = "{Name} ({DKID})"),
+    input_file = list(
+      type            = "excel",
+      required_sheets = c("Player", "DKPts"),
+      player_sheet    = "Player",
+      required_columns = list(
+        base = c("Name", "W", "T5", "T10", "SDSalary", "SDID"),
+        DK   = c("SDID", "SDSalary")
+      )
+    ),
+    simulation = list(
+      function_name = "run_golf_showdown_simulation",
+      output_format = list(
+        sim_results = c("SimID", "Player", "DKScore", "FDScore", "Pool", "FinishPosition"),
+        metadata    = c("Player", "Pool", "TeeTimeGroup", "DKSalary", "DKOwn", "DKID", "SDSalary", "SDID")
+      )
+    ),
+    lineup_metrics_function = "calculate_golf_lineup_metrics",
+    dk_export_slots = list(DK = c("G", "G", "G", "G", "G", "G"))
   ),
 
 

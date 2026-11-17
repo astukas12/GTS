@@ -98,6 +98,7 @@ load_sport_input <- function(file_path, sport, config, slate = NULL, game = NULL
     GOLF = read_golf_input,
     GOLF_SHOWDOWN_FLEX    = read_golf_input,
     GOLF_SHOWDOWN_CAPTAIN = read_golf_input,
+    GOLF_WEEKEND          = read_golf_input,
     F1   = read_f1_input,
     CBB  = read_cbb_input,
     NBA  = read_nba_input,
@@ -1088,12 +1089,14 @@ server <- function(input, output, session) {
         rv$sport_visuals      <- NULL
         rv$full_sim_results   <- NULL
         
-      } else if (rv$sport %in% c("GOLF_SHOWDOWN_FLEX", "GOLF_SHOWDOWN_CAPTAIN")) {
-        # Round 1 showdown: mode comes from the config (the sheet's Event-tab Showdown cell)
+      } else if (rv$sport %in% c("GOLF_SHOWDOWN_FLEX", "GOLF_SHOWDOWN_CAPTAIN", "GOLF_WEEKEND")) {
+        # Golf showdown / Weekend Golf: mode and contest come from the config (the sheet's Event-tab Showdown
+        # cell); the round comes from the Event tab's Round cell (default 1)
         result   <- run_golf_showdown_simulation(
           input_data        = rv$input_data,
           n_sims            = input$n_sims,
           mode              = rv$config$showdown_mode,
+          contest           = rv$config$contest %||% "showdown",
           progress_callback = function(v, m) progress$set(value = v, detail = m)
         )
         rv$simulation_results <- result$sim_results
@@ -1616,7 +1619,7 @@ server <- function(input, output, session) {
     progress <- Progress$new(session); on.exit(progress$close())
     tryCatch({
       
-      if (rv$sport %in% c("GOLF", "GOLF_SHOWDOWN_FLEX")) {   # flex showdown: same exact per-sim optimum
+      if (rv$sport %in% c("GOLF", "GOLF_SHOWDOWN_FLEX", "GOLF_WEEKEND")) {   # flex showdown / weekend: same exact per-sim optimum
         progress$set(message="Finding optimal DK Golf lineups...", value=0)
         no_cut    <- rv$golf_no_cut %||% FALSE
         dk_config  <- list(platform="DK", roster_size=rv$config$roster_sizes$DK,
@@ -2015,8 +2018,14 @@ server <- function(input, output, session) {
         # and every player. Both keys are opt-in per sport config; absent = unchanged.
         phase1_data <- opt_data
         if (identical(dk_mode, "enum_captain") && !is.null(rv$config$enum_pool_top)) {
-          keep_p <- phase1_data[, .(m = mean(FantasyPoints)), by = Player][order(-m)][
-                      seq_len(min(.N, rv$config$enum_pool_top)), Player]
+          # Top (N - V) by mean score, plus the V best mean-per-dollar of the rest: the cheap value plays
+          # a lineup needs to fit under the cap (top-by-mean alone can leave no legal lineup).
+          pm <- phase1_data[, .(m = mean(FantasyPoints), sal = Salary[1]), by = Player][order(-m)]
+          nv <- rv$config$enum_pool_value %||% 0L
+          nt <- min(nrow(pm), rv$config$enum_pool_top)
+          keep_p <- pm$Player[seq_len(max(0L, nt - nv))]
+          rest <- pm[!Player %in% keep_p][order(-(m / sal))]
+          keep_p <- c(keep_p, rest$Player[seq_len(min(nrow(rest), nv))])
           phase1_data <- phase1_data[Player %in% keep_p]
         }
         if (identical(dk_mode, "enum_captain") && !is.null(rv$config$enum_sims_max)) {

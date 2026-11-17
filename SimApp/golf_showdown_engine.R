@@ -34,6 +34,47 @@ golf_sd_round_points <- function(stp) {
 }
 
 # ---------------------------------------------------------------------------
+# WEEKEND GOLF (DK, rounds 3 and 4 only) and ROUND 4 FINISH POINTS
+# Weekend scoring per hole: dbl eagle+ 10, eagle 6, birdie 3, par 0.5, bogey -0.5, dbl+ -1; +1.75 streak of 3
+# birdies+ (max 1/round), +1.75 bogey-free, +4 hole in one, +2.25 when BOTH rounds are under 70 strokes. Round
+# points come from real rounds at the same score to par (golf/round_pool_wk.csv, make_weekend_pool.R); the
+# under-70 bonus is added from the simulated strokes and the Event tab's Par.
+# Round 4 showdown = the showdown round points + finish points on the 72-hole total (golf_sd_finish_pts).
+# ---------------------------------------------------------------------------
+GOLF_WK <- local({
+  f <- file.path(GOLF_V2_DIR, "round_pool_wk.csv")
+  P <- if (file.exists(f)) data.table::fread(f) else NULL
+  list(pool = P, idx = if (!is.null(P)) split(seq_len(nrow(P)), P$stp) else NULL)
+})
+
+golf_wk_round_points <- function(stp) {
+  P <- GOLF_WK$pool
+  if (is.null(P)) stop("golf/round_pool_wk.csv is missing: run GTS/Golf/showdown_work/make_weekend_pool.R")
+  lo <- min(P$stp); hi <- max(P$stp)
+  s <- pmin(pmax(stp, lo), hi); out <- numeric(length(stp))
+  for (v in names(grp <- split(seq_along(s), s))) {
+    i <- grp[[v]]; idx <- GOLF_WK$idx[[v]]
+    out[i] <- P$wk[idx[sample.int(length(idx), length(i), replace = TRUE)]]
+  }
+  out + 2.6 * (s - stp)               # below the pool's best round: ~2.6 pts per extra stroke
+}
+
+# DK showdown Round 4 finish points by 72-hole position. Ties take the FULL points of the position they tie for
+# (position = min rank, so T3 are each worth 9, nobody is averaged down). 0 beyond 50th / for a missed cut (NA).
+golf_sd_finish_pts <- function(p) {
+  tab <- c(13, 10, 9, 8.5, 8, 7.5, 7, 6.5, 6, 5.5, rep(5, 5), rep(4, 5), rep(3, 5), rep(2, 5), rep(1, 10), rep(0.5, 10))
+  out <- numeric(length(p)); ok <- !is.na(p) & p >= 1 & p <= length(tab); out[ok] <- tab[p[ok]]; out
+}
+
+# A tie for 1st after 72 holes is a playoff: one random winner keeps 1st, the rest take 2nd (as the classic engine).
+golf_sd_playoff <- function(pos) {
+  for (s in which(rowSums(pos == 1, na.rm = TRUE) > 1)) {
+    w <- which(pos[s, ] == 1); pos[s, w] <- 2L; pos[s, w[sample.int(length(w), 1)]] <- 1L
+  }
+  pos
+}
+
+# ---------------------------------------------------------------------------
 # PLAYED ROUNDS (Round 2+ showdown). Additive: none of the v2 functions it
 # mirrors is touched, so classic golf and the Round 1 path are unchanged.
 #
@@ -165,8 +206,8 @@ golf_sd_played_matrix <- function(players_dt, k, par) {
 # the odds are fitted as-is and the round is simulated unconditioned (said in the log line).
 run_golf_showdown_simulation <- function(input_data, n_sims = 10000, progress_callback = NULL,
                                          mode = c("flex", "captain"), fit_sims = 2000L, batch = 2500L,
-                                         round = NULL) {
-  mode <- match.arg(mode); t0 <- Sys.time()
+                                         round = NULL, contest = c("showdown", "weekend")) {
+  mode <- match.arg(mode); contest <- match.arg(contest); t0 <- Sys.time()
   players_dt <- process_golf_players(input_data$player)
   n_p <- nrow(players_dt)
   if (!"SDSalary" %in% names(players_dt) || !any(!is.na(players_dt$SDSalary)))
@@ -180,12 +221,14 @@ run_golf_showdown_simulation <- function(input_data, n_sims = 10000, progress_ca
     round <- if (is.na(rc)) 1L else rc
   }
   round <- as.integer(round)
+  if (contest == "weekend") round <- 3L          # Weekend Golf = rounds 3 and 4: R1-R2 are the played rounds
   if (!round %in% 1:4) stop("round must be 1, 2, 3 or 4")
   played <- if (round > 1L) golf_sd_played_matrix(players_dt, round - 1L, ev$par) else NULL
   if (round == 1L) {
     cat(sprintf("Golf showdown R1 (%s) | %d golfers simulated | %d in pool | %d sims\n", mode, n_p, sum(in_pool), n_sims))
   } else {
-    cat(sprintf("Golf showdown R%d (%s) | %d golfers simulated | %d in pool | %d sims | %s\n", round, mode, n_p,
+    cat(sprintf("Golf %s R%d (%s) | %d golfers simulated | %d in pool | %d sims | %s\n",
+                if (contest == "weekend") "WEEKEND (R3+R4)" else "showdown", round, mode, n_p,
                 sum(in_pool), n_sims,
                 if (is.null(played)) sprintf("R1-R%d scores NOT on the sheet: odds fitted as-is, round NOT conditioned", round - 1L)
                 else sprintf("rounds 1-%d fixed from the sheet (%d golfers with R1)", round - 1L, sum(!is.na(played[, 1])))))
@@ -209,8 +252,20 @@ run_golf_showdown_simulation <- function(input_data, n_sims = 10000, progress_ca
     sr <- sm$strokes[, , round]                         # the contest round's strokes to par
     if (round > 1L && ev$cut_after > 0 && round > ev$cut_after) sr[!sm$made] <- NA
     st <- sr[, keep, drop = FALSE]
-    pts <- matrix(golf_sd_round_points(as.integer(st)), S, k)
-    pts[is.na(st)] <- 0                                 # missed the cut: no round played
+    if (contest == "weekend") {
+      s4 <- sm$strokes[, , 4]; s4[!sm$made] <- NA; st4 <- s4[, keep, drop = FALSE]
+      pts <- matrix(golf_wk_round_points(as.integer(st)), S, k) + matrix(golf_wk_round_points(as.integer(st4)), S, k) +
+             2.25 * ((st + ev$par) < 70 & (st4 + ev$par) < 70)    # +2.25 only when both rounds are complete and under 70
+      pts[is.na(st) | is.na(st4)] <- 0
+      sr <- sr + s4                                     # rank on the weekend total
+    } else {
+      pts <- matrix(golf_sd_round_points(as.integer(st)), S, k)
+      pts[is.na(st)] <- 0                               # missed the cut: no round played
+      if (round == 4L) {                                # + finish points on the 72-hole total (ties full, playoff = 1 winner)
+        fin <- golf_sd_finish_pts(golf_sd_playoff(sm$pos)[, keep, drop = FALSE])
+        pts <- pts + matrix(fin, S, k)
+      }
+    }
     sc[[b]] <- t(pts)
     rk[[b]] <- t(row_rank(sr, "min")[, keep, drop = FALSE])   # that round's rank among the whole field
     cb(0.40 + 0.5 * b / n_b, sprintf("Simulating round %d (%d/%d)...", round, b, n_b))
