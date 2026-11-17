@@ -1100,6 +1100,10 @@ server <- function(input, output, session) {
         rv$sim_metadata       <- result$sim_metadata
         rv$golf_no_cut        <- TRUE
         rv$golf_cut_note      <- NULL
+        # Round 2+ showdown (Event tab `Round`): R1.. scores on the Player tab are fixed in the sim.
+        if (isTRUE(result$round > 1L) && !isTRUE(result$conditioned))
+          showNotification(sprintf("Round %d showdown: no R1-R%d scores on the sheet, so the odds were fitted as-is and the round is NOT conditioned on what was played.",
+                                   result$round, result$round - 1L), type = "warning", duration = 12)
         rv$has_fd             <- FALSE
         rv$sport_visuals      <- NULL
         rv$full_sim_results   <- NULL
