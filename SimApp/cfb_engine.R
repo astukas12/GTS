@@ -93,6 +93,9 @@ CFB_LVL_W     <- 0.6
 CFB_LVL_BW    <- 1.6
 # pool team names (CFBD spelling) that game-tab pool_filter = "option" keeps
 CFB_OPTION_TEAMS <- c("Air Force", "Army", "Navy")
+# pool_filter = "option_fav" (Andrew, 20 Nov 2026, UTEP@AF): only the pool games where an academy was the FAVOURITE by this many points or more.
+# A big-favourite academy (Air Force -21.5) is a different game from the all-academy / underdog academy games in the full option pool.
+CFB_OPTION_FAV_MARGIN <- 14
 
 # Reception yardage buckets and the league's own mix across them. THE LEAGUE MIX
 # IS THE DENOMINATOR of the likelihood ratio -- not the player's own position.
@@ -903,14 +906,14 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
   # fall away on the style dims. Blank / absent = the full pool, as before.
   pf <- if ("pool_filter" %in% names(G)) tolower(trimws(as.character(G$pool_filter[1]))) else NA_character_
   floors <- list()
-  if (identical(pf, "option")) {
-    P <- P[fteam %in% CFB_OPTION_TEAMS | dteam %in% CFB_OPTION_TEAMS]
+  if (pf %in% c("option", "option_fav")) {
+    P <- if (identical(pf, "option_fav")) P[fteam %in% CFB_OPTION_TEAMS & margin >= CFB_OPTION_FAV_MARGIN] else P[fteam %in% CFB_OPTION_TEAMS | dteam %in% CFB_OPTION_TEAMS]
     setkey(P, game_id)
     # the ESS floors are sized for a 4,966-game pool; scale them to this one
     floors <- list(ess_floor = 0.25 * nrow(P), mkt_floor = 0.12 * nrow(P))
     say(sprintf("pool filter: option -- %d service-academy games", nrow(P)), 0.03)
   } else if (!is.na(pf) && nzchar(pf)) {
-    stop("unknown pool_filter \"", pf, "\" on the game tab (known: option)")
+    stop("unknown pool_filter \"", pf, "\" on the game tab (known: option, option_fav)")
   } else {
     # The reverse (Andrew, 19 Sep 2026): an ordinary game never draws an option
     # game either. The academies are their own category -- only a game tagged
@@ -923,7 +926,7 @@ run_cfb_simulation <- function(input_data, n_sims = 10000,
   # regression was fit on ordinary games only
   pys_read <- c(f = pys[[fav]], d = pys[[dog]])
   pys_ask  <- pys_read
-  if (!identical(pf, "option")) {
+  if (!(pf %in% c("option", "option_fav"))) {
     f_reg <- file.path(CFB_DATA_DIR, "cfb_pys_reg.rds")
     rg <- cfb_pys_reg_ask(if (file.exists(f_reg)) readRDS(f_reg) else NULL, G, fav, dog, PL)
     pys_ask <- c(f = cfb_pys_blend(pys_read[["f"]], rg$f), d = cfb_pys_blend(pys_read[["d"]], rg$d))
