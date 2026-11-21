@@ -141,6 +141,11 @@ SPORT_CONFIGS <- list(
     # on both DK Classic and SD. Down from 5,000. (SD's enum_keep is wired to
     # this same max_lineups value in app.R's showdown branch.)
     max_lineups        = 3000,
+    # MMA CLASSIC only (20 Nov 2026, mma_selection.R): Phase 1 keeps every lineup that was optimal in some sim (up to dk_candidate_lineups, ~13-25k
+    # at 50k sims), then the top dk_pool_size by P99 ceiling become the pool that Phase 2/3 score. max_lineups above still drives MMA showdown
+    # (enum_keep) and FD, which are unchanged. dk_pool_size: 8,000-12,000 was the sweet spot in the pool-size test.
+    dk_candidate_lineups = 40000,
+    dk_pool_size         = 10000,
     
     standard_metrics = c(
       "WinRate", "Top1Rate", "Top5Rate", "Top10Rate", "Top20Rate",

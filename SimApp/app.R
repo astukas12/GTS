@@ -19,6 +19,7 @@ source("lineup_rules.R")
 source("cash_game_module.R")
 source("lineup_lab_module.R")
 source("stat_quantiles.R")   # Engine review stat quantiles; inert unless options(gts.stat_quantiles = TRUE)
+source("mma_selection.R")    # MMA classic pool: top N by P99 ceiling (20 Nov 2026 lineup-process study)
 
 # Source all sport engines once at startup.
 # Never re-source inside reactive observers — re-sourcing re-executes all
@@ -1978,7 +1979,7 @@ server <- function(input, output, session) {
                            cpt_multiplier=rv$config$showdown_config$DK$captain_multiplier %||% 1.5,
                            acpt_multiplier=rv$config$showdown_config$DK$acpt_multiplier %||% 1.25,
                            progress_frequency=500, use_parallel=TRUE,
-                           max_lineups=rv$config$max_lineups %||% 5000L,
+                           max_lineups=rv$config$dk_candidate_lineups %||% rv$config$max_lineups %||% 5000L,
                            enum_keep=rv$config$enum_keep %||% 50000L,
                            enum_band_target=rv$config$enum_band_target,
                            # the enumerator's showdown band is sized by sport
@@ -2044,6 +2045,10 @@ server <- function(input, output, session) {
         # metadata has no Team column (F1), so gating on mode alone is safe.
         if (dk_mode %in% c("combinatorial_captain", "enum_captain"))
           lineup_data <- drop_single_team_sd(lineup_data, rv$sim_metadata, platform = "DK")
+        # MMA classic: keep the top dk_pool_size optimal-in-some-sim lineups by P99 ceiling (mma_selection.R); no-op for every other sport.
+        if (identical(dk_mode, "combinatorial") && !is.null(rv$config$dk_pool_size))
+          lineup_data <- tryCatch(mma_trim_pool_by_ceiling(lineup_data, opt_data, rv$config$dk_pool_size),
+                                  error=function(e) { cat("MMA pool trim skipped:", conditionMessage(e), "\n"); lineup_data })
         # Lives beside the pool, not in it: calculate_distribution_metrics
         # returns a plain data.table and would drop anything attached here.
         rv$dk_cash_curve <- lineup_data$cash
