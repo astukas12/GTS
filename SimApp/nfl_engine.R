@@ -456,8 +456,29 @@ nfl_pool_weights <- function(G, target, bw = NFL_POOL_BW, weights = NFL_POOL_W,
   Mz <- sweep(sweep(M, 2, mu, "-"), 2, sg, "/")
   tz <- (tgt - mu) / sg
   d2 <- rowSums(sweep((sweep(Mz, 2, tz, "-"))^2, 2, weights, "*"))
-  w  <- exp(-d2 / (2 * bw^2)); w[!is.finite(w)] <- 0; w <- w / sum(w)
+  w  <- exp(-d2 / (2 * bw^2)); w[!is.finite(w)] <- 0
+  if ("pool_mult" %in% names(G)) w <- w * G$pool_mult     # opt-in game weighting (low_fg_wt)
+  w <- w / sum(w)
   list(w = w, ess = nfl_ess(w), n = nrow(G), bw = bw, weights = weights, dims = dims)
+}
+
+# LOW FIELD-GOAL GAMES (26 Nov 2026, KC@BUF in rain and 20+ mph wind). Opt-in per game: the game tab's low_fg_wt
+# multiplies the base weight of every pool game in which BOTH teams together made NFL_LOW_FG_MAX field goals or fewer.
+# It goes on the BASE weights, so the market total / spread / QB lines are still delivered by the calibration on top.
+# Blank, 1 or a missing column = no column added, and the run is exactly as before. Kicker points are the drawn game's
+# own field goals, so this is the lever for a bad-weather kicking game (on KC@BUF at 3: kickers about -1 DK point).
+NFL_LOW_FG_MAX    <- 2L
+NFL_LOW_FG_WT_CAP <- 10
+
+nfl_pool_add_low_fg <- function(G, wt, seasons = nfl_pool_seasons()) {
+  made_by_game <- rbindlist(lapply(seasons, function(y) {
+    x <- readRDS(file.path(nfl_data_dir(), sprintf("slim_%d_era.rds", y))); setDT(x)
+    x[, .(made = sum(kind == NFL_EVT_FG & made == 1L, na.rm = TRUE)), by = game_id]
+  }))
+  m <- made_by_game$made[match(G$game_id, made_by_game$game_id)]
+  G <- copy(G)
+  G[, pool_mult := fifelse(!is.na(m) & m <= NFL_LOW_FG_MAX, min(max(wt, 1), NFL_LOW_FG_WT_CAP), 1)]
+  G[]
 }
 
 # Damped fixed point delivering a market quantity as the POOL'S OWN WEIGHTED
@@ -973,10 +994,12 @@ nfl_pool_tilt <- function(Gp, target, market, min_n = 40L, ridge = 0.03) {
   tcols <- names(tg); sub <- sub[complete.cases(sub[, ..tcols])]
   if (nrow(sub) < min_n) return(NULL)
   X <- sapply(names(tg), function(nm) (sub[[nm]] - tg[[nm]]) / stats::sd(sub[[nm]]))
-  f  <- function(l) { z <- as.vector(X %*% l); m <- max(z); m + log(sum(exp(z - m))) - log(nrow(X)) + 0.5 * ridge * sum(l^2) }
-  gr <- function(l) { z <- as.vector(X %*% l); w <- exp(z - max(z)); w <- w / sum(w); as.vector(crossprod(X, w)) + ridge * l }
+  lb <- if ("pool_mult" %in% names(sub)) log(sub$pool_mult) else rep(0, nrow(sub))   # low_fg_wt: a base weight
+  nb <- log(sum(exp(lb)))
+  f  <- function(l) { z <- as.vector(X %*% l) + lb; m <- max(z); m + log(sum(exp(z - m))) - nb + 0.5 * ridge * sum(l^2) }
+  gr <- function(l) { z <- as.vector(X %*% l) + lb; w <- exp(z - max(z)); w <- w / sum(w); as.vector(crossprod(X, w)) + ridge * l }
   o <- stats::optim(rep(0, ncol(X)), f, gr, method = "BFGS", control = list(maxit = 500))
-  z <- as.vector(X %*% o$par); w <- exp(z - max(z)); w <- w / sum(w)
+  z <- as.vector(X %*% o$par) + lb; w <- exp(z - max(z)); w <- w / sum(w)
   list(Gp = sub, matcher = "kernel", w = w, ess = nfl_ess(w), n = nrow(sub), bw = NA_real_, target = target,
        total = sum(w * sub$pts_sum), margin = sum(w * sub$margin), relaxed = TRUE, rung = 98L, ladder = NULL)
 }
@@ -1617,6 +1640,12 @@ run_nfl_simulation <- function(input_data, n_sims = 10000, config = NULL,
 
   say("loading pool", 0.03)
   Gp <- nfl_pool_frame()
+  low_fg_wt <- if ("low_fg_wt" %in% names(G)) suppressWarnings(as.numeric(G$low_fg_wt[1])) else NA_real_
+  if (is.finite(low_fg_wt) && low_fg_wt > 1) {
+    Gp <- nfl_pool_add_low_fg(Gp, low_fg_wt)
+    say(sprintf("low field-goal games weighted x%s (%d of %d pool games)", format(min(low_fg_wt, NFL_LOW_FG_WT_CAP)),
+                sum(Gp$pool_mult > 1), nrow(Gp)), 0.035)
+  }
   med_pr <- stats::median(c(Gp$fO_pr, Gp$dO_pr), na.rm = TRUE)
   pys_f <- if (is.finite(pys[[fav]] %||% NA)) pys[[fav]] else stats::median(Gp$fO_pys)
   pys_d <- if (is.finite(pys[[dog]] %||% NA)) pys[[dog]] else stats::median(Gp$dO_pys)
