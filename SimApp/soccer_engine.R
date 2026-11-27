@@ -43,20 +43,22 @@ SOCCER_P <- list(
   p_second_yc = 0.018, p_straight_red = 0.0026,
   p_assist = 0.709,
   
-  # ── SUBSTITUTIONS ──────────────────────────────────────────────────────
-  # Subs are real but unrostered: they absorb a share of the team's production
-  # in the minutes they play, and that production LEAVES the rosterable pool
-  # (lowering starters' totals). Modeled as a phantom "sub bucket" that takes a
-  # per-sim share of each team total, then is discarded. The mean fraction of
-  # outfield minutes played by subs ~ 5 subs × ~18 min / (10 × 90) ≈ 0.10–0.16.
-  sub_share_mean = 0.14,   # mean fraction of team production absorbed by subs
-  sub_share_sd   = 0.05,   # per-sim variation (Beta-distributed around the mean)
-  # Position skew of WHAT subs absorb: teams chase games with attackers, so the
-  # sub bucket takes disproportionately more attacking output and less defensive.
-  # Multipliers on the base sub share, by stat family (1.0 = neutral).
-  sub_skew_attack  = 1.45,  # goals/shots/SOT/CC/crosses (subs are mostly attackers)
-  sub_skew_passes  = 1.00,  # passes (neutral — subs play across the pitch)
-  sub_skew_defense = 0.65,  # tackles/INT/fouls (defenders rarely subbed)
+  # ── SUBSTITUTIONS AND STARTER MINUTES (retune about every 4-6 weeks) ────────
+  # Substitutes are real but unrostered. Each outfield starter either plays the
+  # full match or is taken off (around the 68th minute). The unnamed substitute
+  # group takes the share of team minutes the starters give up, times a
+  # substitute's per-minute rate for each stat, and that production leaves the
+  # rosterable pool. Starters plus substitutes always equal the team total.
+  # P(full match) = logistic(b0 + b1*m + b2*m^2 + position), m = expected minutes
+  # (floored at full_min_floor). Taken-off minutes ~ 89 * Beta with kappa off_kappa.
+  full_b0 = 17.29310, full_b1 = -0.59564, full_b2 = 0.00481, full_bF = -0.60395,
+  full_bM = -0.42394, full_min_floor = 62,
+  off_kappa = 6, off_shift = 0.4,
+  # Substitutes' per-minute rate relative to the team, by stat (tuned on matches
+  # from August 2025 box scores, calibrated on starters to late October 2026).
+  sub_ratio = list(shots = 1.79, sot = 1.51, goals = 0.96, cc = 1.66,
+                   crosses = 2.29, tackles = 1.53, fouls = 1.90, passes = 1.78,
+                   int = 0, yc = 0),
   
   # Goal allocation: plain multinomial over goal-share (team total fixed by
   # scoreline). No per-sim Dirichlet resampling, no scorer boost — correlation
@@ -477,8 +479,21 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
       exp_mins <- pmin(pmax(as.numeric(pl$MIN), 1), 90)
       mins <- exp_mins                          # expected, for the >=60 gates below
       mins_mat <- matrix(90L, n_p, n_sims)
+      gk_row <- grepl("GK", pl$DK_RosterPos)
       for(p in seq_len(n_p)) {
         em <- exp_mins[p]
+        if(!gk_row[p]) {
+          # outfield starter: plays the full match, or is taken off
+          m <- max(em, 1); mp <- max(m, SOCCER_P$full_min_floor)
+          pgp <- substr(as.character(pl$DK_RosterPos[p]), 1, 1)
+          z <- SOCCER_P$full_b0 + SOCCER_P$full_b1*mp + SOCCER_P$full_b2*mp^2 + (if(pgp=="F") SOCCER_P$full_bF else if(pgp=="M") SOCCER_P$full_bM else 0)
+          pfull <- min(plogis(z), 0.995)
+          off <- min(max((m - 90*pfull)/(1 - pfull), 40), 84) + SOCCER_P$off_shift
+          mo <- min(max(off/90, 0.05), 0.98)
+          v <- pmin(pmax(round(89*rbeta(n_sims, mo*SOCCER_P$off_kappa, (1-mo)*SOCCER_P$off_kappa)), 1), 88)
+          v[runif(n_sims) < pfull] <- 90
+          mins_mat[p,] <- as.integer(v); next
+        }
         if(em >= 89) { mins_mat[p,] <- 90L; next }   # nailed-on (e.g. GK)
         mu_frac <- em/90
         kappa   <- 6 + 14*mu_frac                 # higher expected min => tighter
@@ -488,18 +503,11 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
       mats$MIN[pidx,] <- mins_mat
       ms_mat <- mins_mat / 90                     # per-sim minutes weight for shares
       
-      # Per-sim team SUB SHARE: the fraction of team production absorbed by
-      # (unrostered) substitutes this sim. Beta around the mean so it varies.
-      ssm <- SOCCER_P$sub_share_mean; sssd <- SOCCER_P$sub_share_sd
-      sub_kappa <- max(ssm*(1-ssm)/(sssd^2) - 1, 2)
-      sub_f <- rbeta(n_sims, ssm*sub_kappa, (1-ssm)*sub_kappa)   # length n_sims
-      # Stat-family absorbed fractions (subs skew attacking). Clamp < 0.6 so the
-      # starters always retain the majority of any team total.
-      f_atk <- pmin(sub_f * SOCCER_P$sub_skew_attack,  0.60)
-      f_pas <- pmin(sub_f * SOCCER_P$sub_skew_passes,  0.60)
-      f_def <- pmin(sub_f * SOCCER_P$sub_skew_defense, 0.60)
-      # Retained-by-starters multipliers (what's left after subs take their cut)
-      keep_atk <- 1 - f_atk; keep_pas <- 1 - f_pas; keep_def <- 1 - f_def
+      # The unnamed substitute group takes the minutes the starters give up, times
+      # a substitute's per-minute rate for that stat. Starters keep the rest.
+      out_row <- !gk_row
+      sub_gap <- if(any(out_row)) pmax(1 - colSums(mins_mat[out_row,,drop=FALSE]) / (90*sum(out_row)), 0) else rep(0, n_sims)
+      keep_of <- function(st) 1 - pmin(sub_gap * SOCCER_P$sub_ratio[[st]], 0.60)
       
       # Scoreline indices
       gi_vec <- pmin(team_goals,5L)+1L
@@ -696,9 +704,9 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
       # (unrostered) subs and leaves the pool. Integer counts preserved via
       # binomial thinning. Starters' own minutes (ms_mat) then tilt the split
       # toward players who stayed on the pitch.
-      ts_shots <- rbinom(n_sims, t_shots, keep_atk)
-      ts_sot   <- pmin(rbinom(n_sims, t_sot, keep_atk), ts_shots)
-      ts_goals <- pmin(rbinom(n_sims, team_goals, keep_atk), ts_sot)
+      ts_shots <- rbinom(n_sims, t_shots, keep_of("shots"))
+      ts_sot   <- pmin(rbinom(n_sims, t_sot, keep_of("sot")), ts_shots)
+      ts_goals <- pmin(rbinom(n_sims, team_goals, keep_of("goals")), ts_sot)
       
       # ── SHOTS: allocate the starters' portion by shot share × per-sim minutes ──
       raw <- matrix(rnb(n_p*n_sims, rep(ss*mean(pmax(ts_shots,1)), n_sims), SOCCER_P$phi_shots), n_p, n_sims) * ms_mat
@@ -754,7 +762,7 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
       # renormalize per sim; if a column collapses, fall back to flat creation share
       cw_cs <- colSums(create_weight)
       for(s in which(cw_cs <= 0)) create_weight[,s] <- as_s
-      ts_cc <- rbinom(n_sims, t_cc, keep_atk)            # subs absorb attacking CC
+      ts_cc <- rbinom(n_sims, t_cc, keep_of("cc"))            # subs absorb attacking CC
       raw_cc <- matrix(rnb(n_p*n_sims, rep(as_s*mean(pmax(ts_cc,1)), n_sims), SOCCER_P$phi_def), n_p, n_sims)
       raw_cc <- raw_cc * create_weight
       mats$CC[pidx,] <- pmin(norm_to_total(raw_cc, ts_cc, n_p), 8L)
@@ -777,37 +785,37 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
         }
         # Open play crosses = total - corners (attacking → subs absorb a share)
         open_play <- pmax(t_crosses - t_corners, 0L)
-        open_play <- rbinom(n_sims, open_play, keep_atk)
+        open_play <- rbinom(n_sims, open_play, keep_of("crosses"))
         raw_cr <- matrix(rnb(n_p*n_sims, rep(crs*mean(pmax(open_play,1)), n_sims), SOCCER_P$phi_crosses), n_p, n_sims) * ms_mat
         open_crosses <- norm_to_total(raw_cr, open_play, n_p)
         mats$Crosses[pidx,] <- pmin(set_crosses + open_crosses, 15L)
       } else {
         # No set piece data — allocate all crosses by Cross_Share (attacking)
-        tc_cr <- rbinom(n_sims, t_crosses, keep_atk)
+        tc_cr <- rbinom(n_sims, t_crosses, keep_of("crosses"))
         raw_cr <- matrix(rnb(n_p*n_sims, rep(crs*mean(pmax(tc_cr,1)), n_sims), SOCCER_P$phi_crosses), n_p, n_sims) * ms_mat
         mats$Crosses[pidx,] <- pmin(norm_to_total(raw_cr, tc_cr, n_p), 15L)
       }
       
       # Tackles (defensive → subs absorb little)
-      ts_tk <- rbinom(n_sims, t_tackles, keep_def)
+      ts_tk <- rbinom(n_sims, t_tackles, keep_of("tackles"))
       raw_tk <- matrix(rnb(n_p*n_sims, rep(tks*mean(pmax(ts_tk,1)), n_sims), SOCCER_P$phi_tackles), n_p, n_sims) * ms_mat
       mats$Tackles[pidx,] <- pmin(norm_to_total(raw_tk, ts_tk, n_p), 10L)
       
       # Fouls committed (defensive). alloc_capped redistributes the per-player
       # cap overflow instead of clipping it (clipping leaked fouls and broke the
       # FC=FD identity). Cap raised to 8 to match the FD cap basis.
-      ts_fc <- rbinom(n_sims, t_fouls, keep_def)
+      ts_fc <- rbinom(n_sims, t_fouls, keep_of("fouls"))
       raw_fc <- matrix(rnb(n_p*n_sims, rep(fcs*mean(pmax(ts_fc,1)), n_sims), SOCCER_P$phi_fouls), n_p, n_sims) * ms_mat
       player_fc <- alloc_capped(raw_fc, ts_fc, matrix(8L,n_p,n_sims), fcs, n_p)
       mats$FC[pidx,] <- player_fc
       
       # Passes (neutral — subs absorb their minutes share)
-      ts_pa <- rbinom(n_sims, t_passes, keep_pas)
+      ts_pa <- rbinom(n_sims, t_passes, keep_of("passes"))
       raw_pa <- matrix(rnb(n_p*n_sims, rep(pas*mean(pmax(ts_pa,1)), n_sims), 7.0), n_p, n_sims) * ms_mat
       mats$Passes[pidx,] <- norm_to_total(raw_pa, ts_pa, n_p)
       
       # INT (defensive)
-      ts_in <- rbinom(n_sims, t_int, keep_def)
+      ts_in <- rbinom(n_sims, t_int, keep_of("int"))
       raw_in <- matrix(rnb(n_p*n_sims, rep(ints*mean(pmax(ts_in,1)), n_sims), SOCCER_P$phi_def), n_p, n_sims) * ms_mat
       mats$INT[pidx,] <- pmin(norm_to_total(raw_in, ts_in, n_p), 8L)
       
@@ -815,6 +823,7 @@ run_soccer_simulation <- function(input_data, n_sims=10000, config=NULL, progres
       yc_mat <- matrix(0L, n_p, n_sims)
       rc_mat <- matrix(0L, n_p, n_sims)
       # Allocate team YC to players by YC_Share × minutes (benched players can't be booked)
+      t_yc <- rbinom(n_sims, t_yc, keep_of("yc"))
       raw_yc <- matrix(rnb(n_p*n_sims, rep(ycs*mean(t_yc), n_sims), 5.0), n_p, n_sims) * ms_mat
       yc_mat <- pmin(norm_to_total(raw_yc, t_yc, n_p), 2L)
       # Straight reds (rare, from high-foul players)
